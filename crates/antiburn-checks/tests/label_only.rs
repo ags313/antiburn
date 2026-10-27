@@ -26,10 +26,7 @@ fn decode(
 }
 
 fn check() -> antiburn_checks::compiler::CompiledCheck {
-    antiburn_checks::compile(include_str!(
-        "../../../.antiburn/checks/failed-retry-loop.yml"
-    ))
-    .unwrap()
+    antiburn_checks::compile(include_str!("fixtures/retry-review.yml")).unwrap()
 }
 
 #[test]

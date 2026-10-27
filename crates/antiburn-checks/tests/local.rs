@@ -24,10 +24,7 @@ fn local_declarations_have_no_choice_requirements_and_default_to_zero_cooldown()
         compile(&explicit).unwrap().trigger.cooldown,
         Duration::from_secs(300)
     );
-    let model = compile(include_str!(
-        "../../../.antiburn/checks/failed-retry-loop.yml"
-    ))
-    .unwrap();
+    let model = compile(include_str!("../../../.antiburn/checks/scope-creep.yml")).unwrap();
     assert!(!model.is_local());
     assert!(!model.decisions.is_empty());
     assert!(!model.question_requirements().is_empty());

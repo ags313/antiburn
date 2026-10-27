@@ -9,19 +9,19 @@ records validated responses, reported usage, latency, and failures.
 
 Set `ANTIBURN_EVAL_PROVIDER` to one of these values:
 
-| Preset                                  | Model               | Route                     |
-| --------------------------------------- | ------------------- | ------------------------- |
-| `jev`                                   | Pinned Jev          | TypeSafe native           |
-| `ollama-nimble`                         | `nimble:latest`     | Local Ollama native       |
-| `ollama-clef-flash`                     | `clef-flash:latest` | Local Ollama native       |
-| `ollama-tev-small`                      | `tev1:0.8b`         | Local Ollama native       |
-| `cloudflare-clef`                       | `clef`              | Cloudflare native         |
-| `cloudflare-clef-flash`                 | `clef-flash`        | Cloudflare native         |
-| `custom-jev-direct`                     | Pinned Jev          | Exact TypeSafe direct     |
-| `custom-ollama-nimble-direct`           | `nimble:latest`     | Exact local Ollama direct |
-| `custom-ollama-clef-flash-direct`       | `clef-flash:latest` | Exact local Ollama direct |
-| `custom-cloudflare-clef-envelope`       | `clef`              | Exact Cloudflare envelope |
-| `custom-cloudflare-clef-flash-envelope` | `clef-flash`        | Exact Cloudflare envelope |
+| Preset                                  | Model               | Route                                   |
+| --------------------------------------- | ------------------- | --------------------------------------- |
+| `jev`                                   | `jev-latest`        | TypeSafe native, long context           |
+| `ollama-nimble`                         | `nimble:latest`     | Local Ollama native                     |
+| `ollama-clef-flash`                     | `clef-flash:latest` | Local Ollama native                     |
+| `ollama-tev-small`                      | `tev1:0.8b`         | Local Ollama native                     |
+| `cloudflare-clef`                       | `clef`              | Cloudflare native                       |
+| `cloudflare-clef-flash`                 | `clef-flash`        | Cloudflare native                       |
+| `custom-jev-direct`                     | `jev-1.14.0`        | Exact TypeSafe direct, standard context |
+| `custom-ollama-nimble-direct`           | `nimble:latest`     | Exact local Ollama direct               |
+| `custom-ollama-clef-flash-direct`       | `clef-flash:latest` | Exact local Ollama direct               |
+| `custom-cloudflare-clef-envelope`       | `clef`              | Exact Cloudflare envelope               |
+| `custom-cloudflare-clef-flash-envelope` | `clef-flash`        | Exact Cloudflare envelope               |
 
 The default is Jev. Unknown presets fail. Local routes use
 `http://127.0.0.1:11434/v1/systemone`. Hosted routes use production endpoint
@@ -30,14 +30,24 @@ builders. Hosted credentials come only from `TYPESAFE_API_KEY` or
 Keys do not enter configuration records, reports, or client debug output.
 
 Set `ANTIBURN_EVAL_MODEL` to override the preset model before validation,
-endpoint construction, and discovery. Native Jev requires its pinned model.
-Native Cloudflare accepts its supported model names. Ollama and compatible
-Custom endpoints accept other model names.
+endpoint construction, and discovery. Native Jev uses the route-owned
+`jev-latest` alias, not a release-specific model selection.
+Native Cloudflare accepts its supported model names. Ollama names require
+verified discovery data. A Custom model selector does not establish support by
+itself.
 
-Exact Custom presets have an explicit total-input bound: 8,192 tokens for local
-Ollama routes and 65,536 for Jev and Cloudflare routes. These bounds exceed the
-Custom rendering reserve. Discovery can lower a bound. Manual overrides do not
-raise a known provider limit.
+Presets do not supply manual input bounds. Known TypeSafe and Cloudflare routes
+use their production capability profiles. Local Ollama presets, including the
+exact Custom transports, use explicit Ollama discovery below. That lookup belongs
+to these closed diagnostic presets. The app does not discover arbitrary Custom
+endpoints or infer their limits from model names. Missing required limits block
+execution.
+
+Native Jev uses the production long-context capability profile and sends
+`TypeSafe-Danger-Zone-Long-Context: true`. Custom does not receive that header or
+profile. The immutable request alias and the observed served model are separate;
+an alias echo leaves the concrete release unknown. No live call is needed to
+resolve the native route before preparation.
 
 ## Direct requests
 

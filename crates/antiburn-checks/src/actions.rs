@@ -324,10 +324,7 @@ mod probability_tests {
     use std::collections::BTreeMap;
 
     fn check() -> CompiledCheck {
-        crate::compiler::compile(include_str!(
-            "../../../.antiburn/checks/failed-retry-loop.yml"
-        ))
-        .unwrap()
+        crate::compiler::compile(include_str!("../tests/fixtures/retry-review.yml")).unwrap()
     }
 
     fn choice(probabilities: BTreeMap<String, f64>) -> Result<ChoiceResult, ResultError> {
@@ -383,10 +380,7 @@ mod probability_tests {
 
     #[test]
     fn rounded_probability_sums_are_accepted_without_changing_action_thresholds() {
-        let check = crate::compiler::compile(include_str!(
-            "../../../.antiburn/checks/failed-retry-loop.yml"
-        ))
-        .unwrap();
+        let check = check();
         for (probability, expected_status) in [
             (0.949, Some(StatusResult::Success)),
             (0.95, Some(StatusResult::Failure)),

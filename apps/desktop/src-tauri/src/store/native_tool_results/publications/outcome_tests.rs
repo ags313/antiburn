@@ -50,16 +50,27 @@ fn native_outcome_survives_current_outbox_and_published_reader_without_rewriting
     let (record, claim) = claim_and_record_for(&store, native);
     let result = parsed_outcome();
     assert_eq!(result.status, ToolResultStatus::Success);
-    assert!(publish(
-        &store,
-        &record,
-        &claim,
+    let mut connection = store.lock();
+    let tx = connection.transaction().unwrap();
+    super::super::reconcile_with_policy(
+        &tx,
+        &record.key,
+        claim.source_generation,
+        claim.claim_fence,
         &ToolResultBatch {
             source_format: SourceFormat::OpenCodeSqliteV2,
             results: vec![result.clone()],
-            complete: false
-        }
-    ));
+            complete: false,
+        },
+        super::super::PublicationPolicy {
+            suppress_coverage: true,
+            live_eligible: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    drop(connection);
 
     for table in [
         "native_tool_result_current",

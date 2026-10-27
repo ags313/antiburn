@@ -1,57 +1,60 @@
 # Authoring Burn Checks
 
-Use YAML to define one bounded assessment of recorded agent work, with a model
-decision or local status rules. The [specification](specification.md) gives the
-precise rules; the supported subset
-below states what the runtime can execute.
+Write a check that can answer one useful question from selected agent work.
+Use local status rules for recorded facts, or a model decision when the question
+needs judgment. This guide covers the steps and current runtime support. The
+[specification](specification.md) defines the exact language rules.
 
-> **Experimental draft: `v1-prealpha`.** Burn Checks are not yet standardized.
+> **Experimental draft: `v1-alpha`.** Burn Checks are not yet standardized.
 > Syntax, semantics, and capabilities may change, including breaking changes.
 > There is no backward compatibility promise. Check the current draft before
-> creating or changing a definition.
+> creating or changing a definition. Beta and stable scope are not set. Missing
+> capabilities are unassigned future work, not features available today.
 
 ## Write one bounded check
 
-Define one useful behavior, its required evidence, and independent status
-actions. A model check also needs bounded inputs and narrow questions.
-Include a positive case, an allowed case, and an unclear case. Prefer a
-selected-work claim over an unsupported
-whole-session claim. Missing activity does not prove that an action never
-happened. Unknown evidence is different from a known empty collection.
+1. Choose one behavior and the evidence that can prove it. Include a positive
+   case, an allowed case, and an unclear case. Limit the claim to selected work.
+   Missing activity does not prove that an action never happened; unknown data
+   differs from a known empty collection.
+2. Choose an [event](#event-selection) that the source can prove. Review its
+   identity, order, completeness, and producer-version limits in
+   [session coverage](../session-coverage.md#burn-check-source-facts).
+3. Choose the execution form. Start with the complete
+   [local status example](#local-status-checks) for a recorded tool status. For a
+   model judgment, study [Over-exploring](../../.antiburn/checks/over-exploring.yml)
+   or the [typed model example](#typed-questions-and-actions).
+4. Review data exposure before enabling the check. A model input can include
+   private messages, arguments, result text, paths, and current inventories.
+   Select only what the question needs. See [data limits](#data-limits).
+5. [Validate](#validate-in-layers), then [install](#identity-and-installation) the
+   file. Keep unfinished drafts outside active check folders. Configure a
+   [decision connection](#decision-connections) with **Run checks** off, then
+   enable it when ready. Local checks need the selected configuration and base
+   runtime gates too, even though they send no model requests.
+6. Read the [saved result and evidence](#diagnose-and-interpret-results). Test
+   uncertainty and missing data as well as the expected finding. A provider
+   connection test does not prove check quality.
 
-Start with [Failed retry loop](../../.antiburn/checks/failed-retry-loop.yml). It includes
-successful results so relevant recovery can end the failure pattern. Its
-five-result window and three-attempt condition belong to that definition, not
-the generic engine. An unrelated success does not reset the pattern. The check
-can describe only the selected results and requests, not unobserved external
-changes.
+Over-exploring selects completed read/search results in a rolling window of 20,
+with at least 10 matches before assessment. Those sizes, its 120-second cooldown,
+and its question are author policy, not generic engine rules. It permits plausible
+dependencies, tests, and verification. A path or read count alone does not prove
+unrelated work.
 
-The [six canonical repository definitions](README.md#examples) cover retry loops,
-exploration, task scope, instruction comparisons, skill guidance, and fast-mode
-trial advice. Edit their files in `.antiburn/checks/`; the docs do not maintain
-separate YAML copies.
+The [five canonical definitions](README.md#examples) cover exploration, task
+scope, instruction comparisons, skill guidance, and fast-mode trial advice. Edit
+their files in `.antiburn/checks/`; the docs do not keep separate YAML copies.
+All five write failure only when a declared failure label has probability at
+least 0.95. Four use the exact logical complement of their failure condition for
+success. This includes valid uncertain and below-threshold answers. Ignored
+instructions instead requires `no_conflict` at probability 0.95 or above; an
+uncertain answer writes no new result and preserves any earlier saved result.
 
-The maintained examples write failure only when their explicit failure condition
-is true. Each success condition is its exact logical complement. For example,
-Failed retry loop uses these actions:
-
-```yaml
-actions:
-  - type: status
-    if: decisions.review.outputs.verdict == 'stuck' && decisions.review.details.verdict.probabilities.stuck >= 0.95
-    input:
-      result: failure
-      message: The agent may be stuck repeating a failed operation. Review the latest attempts before it continues.
-  - type: status
-    if: "!(decisions.review.outputs.verdict == 'stuck' && decisions.review.details.verdict.probabilities.stuck >= 0.95)"
-    input:
-      result: success
-```
-
-Quote the negated condition so YAML does not read `!` as a tag. This policy
-writes success for valid uncertain answers and answers below the failure gate.
-Success means the assessment does not meet the authored failure condition; it
-does not prove that the work is correct.
+Quote a negated condition so YAML does not read `!` as a tag. Success means only
+what the authored action says about the selected evidence. It does not prove
+correct work, repair, or a clean whole session. Label probability and provider
+confidence are separate values; neither establishes confidence in source facts.
 
 ## Supported subset
 
@@ -133,10 +136,18 @@ Do not discard unsupported fields or actions to make a definition run.
   verifier/watch support, burn estimates, or savings.
 
 Unsupported capabilities include effective `agent.skills`, `repo.branch`,
-historical instruction activation, and message actions. The draft retains broader
-context and action forms; schema acceptance is not runtime admission. The context
-has no measured activity partition. See the
-[example support labels](README.md#examples).
+historical instruction activation, historical effective skill inventories, and
+message actions, including behind `if: false`. The desktop emits only `attached`
+for `session_start`, not `new` or `resumed`. It does not admit remote, WSL, child,
+or historical-only sources for new live checks. These features are not usable
+today; beta and stable scope are not set.
+
+The broader draft and schema retain some unsupported context and action forms.
+Schema acceptance is not compiler admission, source proof, or provider
+compatibility. The context has no measured activity partition. Status does not
+grant native fix prompts, Auto Fix, verification watches, burn estimates, or
+savings, and draft syntax does not commit to adding them. See the
+[example limits](README.md#examples).
 
 ### Event selection
 
@@ -187,6 +198,12 @@ OpenCode user text do not become public messages. See
 message finality and cycle boundaries. Incomplete or unbound
 cycles remain unavailable; standalone usable messages can still be assessed.
 
+The five current native routes can provide admitted user messages, tool calls,
+and tool results. Completed public assistant text is available only under the
+characterized Codex, Pi, and OpenCode V1/V2 contracts, not Claude. Only Codex and
+OpenCode V2 currently prove `turn_end`. Format names do not extend those claims
+to every producer version or to exported, remote, WSL, or child-session sources.
+
 ### Session observations
 
 The desktop emits `session_start` once per observation attachment with reason
@@ -231,7 +248,13 @@ objects. This preserves partial known entries and limits without making an
 unavailable array block an unrelated correction. Current syntax cannot build a
 selected-field object while omitting unavailable fields. Whole scopes can also
 include the other inventory; the questions ignore it, but it still counts toward
-request limits. These scopes cannot shrink to fit. See the
+request limits. Ignored instructions permits truncation of unused skill
+descriptions through `current_global_scope.skills[*].description` and
+`current_repo_scope.skills[*].description`. It preserves instruction text, scope
+metadata, skill names and paths, all available requests, and selected arguments.
+Its 20-result window is unchanged. Skill opportunities keeps its selected
+inventory intact. Both definitions also permit selected result-content
+truncation. Irreducible large input can still stop preparation. See the
 [snapshot architecture](architecture.md#identity-order-and-frozen-evidence).
 
 Current files can support a current-file mismatch, not proof of a past violation.
@@ -367,7 +390,7 @@ actions can use the supported expression functions and frozen context, but not
 undeclared decision results. There is no local decision input or `fit` step.
 Do not write `decisions: {}` or `decisions: null` to select local execution.
 
-Local checks still require **Run model-based checks** enabled and a configured
+Local checks still require **Run checks** enabled and a configured
 selected connection. Credential, authentication, repository pause, source,
 generation, and shutdown gates still apply. A failed cached model discovery or
 missing model output capability alone does not block local execution. Local
@@ -392,15 +415,35 @@ assessment does not replace the earlier status message, evidence, or write time.
 
 ## Decision connections
 
-1. Open **Settings → Checks** and turn on **Run model-based checks**.
-2. Choose a provider under **Model-based checks** and enter its required fields.
-3. Select **Save and use**. To use an unchanged saved profile, select it and choose
-   **Use connection**. Editing a draft does not change the active
-   connection. Testing and refreshing limits do not save or select it.
+1. Open **Settings → Checks → Model-based checks** and turn **Run checks** off
+   while configuring the connection.
+2. Choose **Add connection**, select a provider, and enter its required fields.
+3. Select **Add connection** in the dialog. The first saved connection becomes
+   selected without enabling checks. For another saved connection, choose **Use**.
+4. Enable **Run checks** when ready.
 
-The master setting defaults to on only when no preference was saved. An explicit
-saved off stays off. Malformed or unreadable saved storage keeps execution
-disabled rather than selecting the default.
+The connection list keeps **Add connection** and **Use** visible. Each row's
+actions menu contains **Edit** and **Remove**.
+**Use** selects an existing saved connection. **Edit** opens its settings, and
+**Save** updates that connection without selecting another one. Cancel and
+testing do not change selection. If checks are already on, saving changes to the
+selected connection or choosing **Use** can start checks immediately. Saving an
+inactive connection does not change active work.
+
+Fresh setup without a connection stays off. The master setting preserves an
+existing saved preference. Malformed or unreadable saved storage keeps execution
+disabled rather than selecting a default. **Remove** can delete any connection,
+including the last one. Removing the selected connection turns checks off and
+clears selection. It does not select another provider or erase saved results,
+evidence, or usage. Shared credentials can remain in secure storage; forgetting
+a saved key is a separate explicit action.
+
+A failed operation can have saved some state before credential cleanup fails.
+Use its explicit retry action to finish recovery, including when a removed
+connection no longer has a row. Reopening Settings retains that action. A normal
+settings read or search does not perform recovery. The editor keeps typed values
+until recovery confirms the originating Save or you discard those values.
+Recovery does not turn checks back on after you pause them.
 
 YAML check cards and navigation require a discovered global or repository
 definition. The Settings toggle and provider setup remain available
@@ -416,14 +459,34 @@ The model compatibility limits below apply to checks with decisions. Local
 checks retain the selected-configuration and authentication requirements, but do
 not discover or validate model capabilities.
 
-| Route      | Required setup                                                                                                                                                                   | Compatibility limit                                                                                                                                                     |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Jev        | TypeSafe API key; the app supplies the endpoint and `jev-1.13.0` model                                                                                                           | Direct System One responses. The adapter keeps a local 26-criterion Choice guard; this is not a universal TypeSafe API maximum.                                         |
-| Ollama     | Base URL and an installed decision-capable model; credential only if the server needs one                                                                                        | Requires a compatible System One runner, verified model identity/digest, and accepted output support. An ordinary Ollama chat model does not qualify.                   |
-| Cloudflare | Account ID, API token, and `clef` or `clef-flash`                                                                                                                                | Uses the supported Workers AI System One models and Cloudflare response envelope. Other model names do not inherit this contract.                                       |
-| Custom     | Exact inference URL, model, and direct System One or Cloudflare-envelope response mode; a manual input bound when metadata is unknown; credential only if the endpoint needs one | Both modes enforce the typed System One response contract. An arbitrary chat or structured-generation endpoint does not qualify. Unknown model capacity stays explicit. |
+| Route      | Required setup                                                                                                                    | Compatibility limit                                                                                                                                              |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Jev        | TypeSafe API key; the app supplies the endpoint and `jev-latest` alias                                                            | Direct System One responses with native long context enabled. The adapter keeps a local 26-criterion Choice guard; this is not a universal TypeSafe API maximum. |
+| Ollama     | Base URL and an installed decision-capable model; credential only if the server needs one                                         | Requires a compatible System One runner, verified model identity/digest, and accepted output support. An ordinary Ollama chat model does not qualify.            |
+| Cloudflare | Account ID, API token, and `clef` or `clef-flash`                                                                                 | Uses the supported Workers AI System One models and Cloudflare response envelope. Other model names do not inherit this contract.                                |
+| Custom     | Exact inference URL, model, and direct System One or Cloudflare-envelope response mode; credential only if the endpoint needs one | Requires a supported capability source. Unknown limits block execution. An arbitrary chat or structured-generation endpoint does not qualify.                    |
 
-The [pinned provider contracts](provider-contracts.md) list independent Choice
+Native Jev credentials use the latest stable Jev release, currently 1.14. A new
+release does not require a saved-profile migration. The saved request retains
+`jev-latest`; observed served models belong to individual attempts. A safe retry
+uses the same request, but the alias can resolve to a newer release. An alias
+echo leaves the concrete served release and its price unknown.
+
+The app manages model limits from supported discovery data and documented
+profiles. New work replaces saved manual overrides with those automatic limits.
+Historical prepared requests remain unchanged; incompatible unfinished work
+stops without a new send. Ollama uses the selected installed model and does not
+download updates. Its `latest` tag is not proof of the newest published model.
+Cloudflare uses the selected named model route, not a guaranteed latest-release
+alias. Managed provider settings do not ask for release numbers. Custom keeps
+the exact model selector required by its endpoint.
+
+For Ollama, **Find models** reads the server's installed-model list. It does not
+download or run a model. Select an installed model, then use **Test connection**
+to check support. An installed listing alone does not prove that an ordinary
+chat model supports System One decisions.
+
+The [provider contracts](provider-contracts.md) list independent Choice
 and Score intervals. Ollama's accepted `0.40.1` System One runner profiles permit
 up to 24 criteria per Choice or Score question for `tev1`, or up to 26 for
 accepted `clef` and generic profiles. Other runner/version metadata does not
@@ -436,8 +499,10 @@ label-only answer.
 
 Both Custom modes require that strict typed System One output contract. They do
 not verify a model's capacity or quality. Exact official TypeSafe and Cloudflare
-routes can reuse their known numeric limits. Other compatible Custom endpoints
-need manual input bounds and do not inherit Jev model facts from a model name.
+routes can reuse their known numeric limits. The exact direct TypeSafe Custom
+route recognizes concrete 1.13 and 1.14 with standard, header-free limits, not
+native Jev long context. Other Custom endpoints remain saved but cannot run
+without a supported capability source. A model name does not establish limits.
 Runtime validation rejects incompatible responses, including chat-style output.
 An optional credential can remain absent, but an explicit saved credential
 reference must resolve. An unreadable saved credential does not authorize an
@@ -459,15 +524,16 @@ check without making its definition invalid. A compatible saved connection can
 restore eligibility without a YAML edit.
 
 A label-only Choice route needs a check that reads labels only, not
-`details.<question>.probabilities.<label>`. Failed retry loop requires
-label probabilities for its 0.95 gate. Missing probabilities remain unavailable;
-the runtime does not fabricate a distribution or substitute confidence.
+`details.<question>.probabilities.<label>`. All five canonical definitions require
+label probabilities for their 0.95 gates. Missing probabilities remain
+unavailable; the runtime does not fabricate a distribution or substitute
+confidence. Do not lower an authored gate to make a connection fit.
 
 Numeric limits retain their source: provider metadata, runtime metadata,
-documented defaults, manual bounds, or unknown. Manual bounds can tighten known
-limits or supply missing numeric bounds. They cannot establish question-type,
-probability, or confidence support, override authentication failure, or bypass
-failed or unsupported-runner discovery. Ollama's accepted runner/rendering
+documented profiles, local guards, or unknown. Unknown required bounds block
+execution; the Settings UI does not ask for guessed values. Numeric bounds do
+not establish question-type, probability, or confidence support, override
+authentication failure, or bypass failed discovery. Ollama's accepted runner/rendering
 profiles are narrower than its minimum server-version check. The adapter checks
 model identity and digest rather than inferring support from the model name.
 
@@ -487,8 +553,10 @@ stops without sending to a new provider. Saved complete answers can recover
 publication without discovery, client construction, transport, or inference;
 current configuration, authentication, source, and runtime gates still apply.
 
-A saved connection change or switch cancels unfinished assessments durably while
-preserving definitions, accepted status, and source progress. Switching back does
+A change to the selected connection, an explicit switch, or removal of the
+selected connection cancels unfinished assessments durably while preserving
+definitions, accepted status, and source progress. Inactive edits and removals
+leave active work unchanged. Switching back does
 not revive cancelled work. A late response can still carry incurred usage, but
 cannot publish a cancelled assessment. Unknown delivery does not permit an
 automatic resend. Local usage stays bound to the provider and model of the
@@ -511,6 +579,14 @@ override stays selected instead of authorizing fallback. Keep drafts outside
 active folders. The app watches existing installation chains and reconciles
 periodically; it never creates installation directories. Existing folder access
 settings apply.
+
+**Settings → Checks → Check files** lists enabled folders with confirmed check
+files and their physical file counts, even when **Run checks** is off. The count
+includes invalid and shadowed files, so it is not a count of runnable checks.
+Missing, paused, empty, and uncounted folders do not appear. Reopening Checks
+settings loads a fresh list. Use the folder's file-manager
+button to open that exact existing container. The app does not create a missing
+folder or open its parent instead.
 
 The Checks collection and search show one row per stem. Scoped activations and
 branches remain separate. Internal display/snooze identity is separate from
@@ -573,7 +649,7 @@ Examples use this editor modeline:
 ```
 
 When installing elsewhere, update that path or the editor's `yaml.schemas`
-mapping. For `.antiburn/checks/failed-retry-loop.yml`, use
+mapping. For `.antiburn/checks/over-exploring.yml`, use
 `../../docs/burn-check/schemas/burn-check.schema.json`. Do not add a YAML
 `version` or `$schema` field.
 
@@ -588,7 +664,7 @@ npm --prefix docs/burn-check run validate
 To validate a selected file:
 
 ```sh
-node docs/burn-check/scripts/validate-checks.mjs .antiburn/checks/failed-retry-loop.yml
+node docs/burn-check/scripts/validate-checks.mjs .antiburn/checks/over-exploring.yml
 ```
 
 The validator checks restricted YAML 1.2 and Draft 2020-12 structure. It accepts
@@ -718,8 +794,8 @@ valid and does not trigger a warning. The app explains input-size failures only
 after an actual preparation or provider failure; it does not predict one from
 missing rules. Use `fit` only where
 the question can tolerate missing evidence. Rules select the evaluated `input`
-values, not context roots or YAML source paths. Failed retry loop permits only
-result-text shortening:
+values, not context roots or YAML source paths. For example, this fragment
+permits only result-text shortening:
 
 ```yaml
 input:
@@ -740,8 +816,8 @@ make every candidate fit.
 `recent` applies to an array, such as `activity: recent`. Each turn drops its
 oldest item and retains at least one item from a nonempty array. This can reduce
 the evidence below a check's own question threshold; the model must not infer
-omitted attempts. The maintained Failed retry loop example does not use this
-rule because its question needs at least three attempts.
+omitted activity. The five canonical definitions do not use `recent`; they keep
+the selected result records and permit loss only at their declared string paths.
 
 `truncate` applies only to strings. Each turn removes up to 1 KiB (1,024 bytes)
 of original middle text, keeping a Unicode-safe head and tail and at least 256
@@ -844,14 +920,20 @@ records stop locally; a bounded read-only decoder preserves accepted historical
 input and provenance without authorizing a send.
 
 The selected route separately checks its complete serialized request, token
-estimate, response, and resident-memory bounds. Jev uses a 256 KiB serialized
-request-body limit and local token/resident-request limits. Its state plus longest-question ceiling
-is 32 Ki tokens, with a 4 Ki reserve, leaving 28 Ki (28,672) estimated tokens.
+estimate, response, and resident-memory bounds. Native Jev sends
+`TypeSafe-Danger-Zone-Long-Context: true` on each request. Its total and
+state-plus-longest-question ceilings are both 262,000 estimated tokens, with a
+4,096-token reserve, leaving 257,904 estimated tokens. It uses a 384 KiB
+serialized request-body guard and an 832 KiB resident request-charge guard.
+The shared request-charge budget remains 4 MiB, not a whole-process memory cap.
+Admission and transport each have a separate 60-second deadline.
 The ASCII-weighted UTF-8 estimator charges 0.75 tokens per ASCII-letter byte and
 one token per other byte, rounded up per serialized component. Framing, question,
 criteria, and omission metadata count. This is a local heuristic, not a tokenizer
 or a guarantee that Jev will accept the request. Other routes use their own
-resolved capabilities and reserves; they do not inherit these Jev limits.
+resolved capabilities and reserves; they do not inherit these native Jev limits.
+The header does not bypass local original-input, fitting-work, or
+saved-preparation limits. Settings does not expose manual limit overrides.
 Deterministic request-shape failures use `InvalidRequest`, with a typed criterion
 count/limit when applicable. They are not no-fit outcomes or evidence that the
 provider connection is unavailable. A selected-route criterion mismatch directs
@@ -934,13 +1016,15 @@ It does not read the current Settings connection or expose its endpoint or
 credential. A coding-agent model recorded in session evidence is a separate fact.
 
 A status message explains the result to the user; it is not a fix prompt or an
-agent instruction. In Failed retry loop, only a `stuck` answer with probability
-at least 0.95 writes failure. Every other valid answer writes success, including
-`uncertain` and `stuck`/`clear` below 0.95. That success can clear an earlier
-failure on the same branch. Relevant recovery can also produce a clear answer
-and write success. Another branch's success does not clear a valid failure.
-Explicit success covers the assessed work only; it does not prove repair, a
-clear whole session, or savings.
+agent instruction. Over-exploring fails only for `likely_excess` with label
+probability at least 0.95. Its complementary success action accepts every other
+valid answer, including `uncertain` and below-threshold answers. Ignored
+instructions uses separate gates: its two conflict labels can write failure,
+while only `no_conflict` at probability 0.95 or above writes success. Unmatched
+answers preserve the saved status. A success can clear an earlier failure on the
+same branch, but cannot clear another branch's valid failure. Explicit success
+covers the assessed work only; it does not prove repair, a clean whole session,
+or savings.
 
 These are authored action rules, not an implicit engine fallback. A valid
 assessment advances the accepted watermark. If a different definition matches
@@ -957,10 +1041,18 @@ use existing usage accounting and resource limits, without a new dollar-cap prom
 
 ## Data limits
 
-Select only what the question needs. Arguments, results, public messages, and
-instruction or skill inventories can contain private project data. A message
-window does not bound the separate `session.requests` collection. Do not commit real transcripts, credentials, or
-private captures as examples.
+Select only what the question needs. Arguments, results, public messages, paths,
+and instruction or skill inventories can contain private project data. A model
+check sends its selected inputs to the configured provider. Local status checks
+send no model request. **Test connection** is separate and can send chargeable
+synthetic input.
+
+Collect declared skill descriptions, not skill bodies. A selected tool result
+can still contain file text. A message window does not bound the separate
+`session.requests` collection. Do not commit real transcripts, credentials, or
+private captures as examples. Do not put private reasoning in model inputs. Keep
+provider inputs and responses, credentials, findings, evidence, and native
+record/call IDs out of first-party analytics.
 
 A new public or host event and its published source context must fit within
 4 MiB, 262,144 JSON values, and depth 64. A cycle has at most 4,096 messages and

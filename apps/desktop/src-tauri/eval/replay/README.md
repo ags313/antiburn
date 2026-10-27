@@ -1,7 +1,7 @@
 # Burn Checks replay diagnostics
 
-Run the canonical [Failed retry loop YAML](../../../../../.antiburn/checks/failed-retry-loop.yml) against small synthetic session
-evidence. Burn Checks uses the `v1-prealpha` specification: experimental, not
+Run the [synthetic retry-review fixture](../../../../../crates/antiburn-checks/tests/fixtures/retry-review.yml) against small synthetic session
+evidence. Burn Checks uses the `v1-alpha` specification: experimental, not
 standardized, and subject to breaking changes.
 
 One fixture builder creates `ToolResultBatch` values with linked
@@ -74,9 +74,10 @@ and no status rows. The fixture does not inject gaps or prepared decision input.
 Scripted labels test deterministic engine behavior. Live labels and action
 quality are diagnostics, not accuracy or release gates. The suite has no frozen
 scores, broad dataset, prior-capture gate, or dogfood-equivalence check. The replay
-reads the canonical definition but keeps separate execution and saved state.
+reads a test-only definition and keeps separate execution and saved state. It
+does not validate the five installed repository definitions.
 
-Add a case in `cases.rs` with a maintained YAML reference, synthetic session
+Add a case in `cases.rs` with an explicit test-fixture YAML reference, synthetic session
 evidence, expected trigger prefixes, and scripted labels and status writes. Keep
 the finite bounds explicit. Native parser characterization and real-session
 evaluation are separate work.

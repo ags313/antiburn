@@ -11,13 +11,14 @@ use antiburn_local::analysis::jev::{
     decode_jev_json_with_usage, validate_jev_request_with_capabilities,
     validate_jev_response_with_capabilities,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const MAX_REQUEST_BODY_BYTES: usize = crate::jev::config::OLLAMA_MAX_REQUEST_BODY_BYTES;
 pub const DEFAULT_LOCAL_CONCURRENCY: usize = 4;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_DISCOVERY_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_INSTALLED_MODELS: usize = 1024;
 
 fn inference_slots() -> &'static tokio::sync::Semaphore {
     static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
@@ -46,7 +47,9 @@ impl std::fmt::Display for OllamaError {
             Self::InvalidBaseUrl => "Invalid Ollama base URL",
             Self::OldVersion => "Ollama must be version 0.35.0 or newer",
             Self::MissingModel => "The selected Ollama model is not installed",
-            Self::UnsupportedRunner => "The Ollama model does not support System One decisions",
+            Self::UnsupportedRunner => {
+                "This Ollama model is not supported. Select an installed local System One model"
+            }
             Self::ContextRejected => "The Ollama model rejected the request context",
             Self::RequestBodyTooLarge => "Ollama text requests cannot exceed 64 KiB",
             Self::AuthenticationRejected => "Ollama rejected the configured authentication",
@@ -82,6 +85,12 @@ pub struct DiscoveredModel {
     pub name: String,
     pub digest: Option<String>,
     pub capabilities: ModelCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InstalledOllamaModel {
+    pub id: String,
+    pub label: String,
 }
 
 impl OllamaClient {
@@ -131,6 +140,37 @@ impl OllamaClient {
 
     pub fn inference_endpoint(&self) -> String {
         format!("{}/v1/systemone", self.base_url)
+    }
+
+    pub async fn list_installed_models(&self) -> Result<Vec<InstalledOllamaModel>, OllamaError> {
+        let tags: TagsResponse = self.get_json("/api/tags").await?;
+        if tags.models.len() > MAX_INSTALLED_MODELS {
+            return Err(OllamaError::ResponseTooLarge);
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut models = Vec::new();
+        for tag in tags.models {
+            if remote_model(
+                &tag.name,
+                tag.remote_model.as_deref(),
+                tag.remote_host.as_deref(),
+            ) {
+                continue;
+            }
+            if tag.digest.trim().is_empty()
+                || tag.digest.len() > 256
+                || tag.digest.chars().any(char::is_control)
+                || !crate::jev::config::valid_model_name(&tag.name)
+                || !names.insert(tag.name.clone())
+            {
+                return Err(OllamaError::ResponseDecode);
+            }
+            models.push(InstalledOllamaModel {
+                id: tag.name.clone(),
+                label: tag.name,
+            });
+        }
+        Ok(models)
     }
 
     pub async fn evaluate(
@@ -251,12 +291,26 @@ impl OllamaClient {
         else {
             return Err(OllamaError::MissingModel);
         };
+        if remote_model(
+            &tag.name,
+            tag.remote_model.as_deref(),
+            tag.remote_host.as_deref(),
+        ) {
+            return Err(OllamaError::UnsupportedRunner);
+        }
         if tag.digest.trim().is_empty() {
             return Err(OllamaError::UnsupportedRunner);
         }
         let show: ShowResponse = self
             .post_json("/api/show", &serde_json::json!({"model": model}))
             .await?;
+        if remote_model(
+            model,
+            show.remote_model.as_deref(),
+            show.remote_host.as_deref(),
+        ) {
+            return Err(OllamaError::UnsupportedRunner);
+        }
         if !show
             .capabilities
             .iter()
@@ -265,6 +319,16 @@ impl OllamaClient {
             return Err(OllamaError::UnsupportedRunner);
         }
         let ps: PsResponse = self.get_json("/api/ps").await?;
+        if ps.models.iter().any(|entry| {
+            canonical_model_name(&entry.name) == identity
+                && remote_model(
+                    &entry.name,
+                    entry.remote_model.as_deref(),
+                    entry.remote_host.as_deref(),
+                )
+        }) {
+            return Err(OllamaError::UnsupportedRunner);
+        }
         let loaded = ps.models.iter().find(|entry| {
             canonical_model_name(&entry.name) == identity
                 && entry
@@ -498,6 +562,14 @@ fn canonical_model_name(name: &str) -> String {
     format!("{host}/{namespace}/{model}:{tag}")
 }
 
+fn remote_model(name: &str, remote_model: Option<&str>, remote_host: Option<&str>) -> bool {
+    remote_model.is_some_and(|value| !value.trim().is_empty())
+        || remote_host.is_some_and(|value| !value.trim().is_empty())
+        || name
+            .rsplit_once(':')
+            .is_some_and(|(_, tag)| tag == "cloud" || tag.ends_with("-cloud"))
+}
+
 fn version_at_least(version: &str, minimum: (u64, u64, u64)) -> bool {
     let Some(version) = version.strip_prefix('v').or(Some(version)) else {
         return false;
@@ -524,6 +596,10 @@ struct TagsResponse {
 struct TagModel {
     name: String,
     digest: String,
+    #[serde(default)]
+    remote_model: Option<String>,
+    #[serde(default)]
+    remote_host: Option<String>,
 }
 #[derive(Deserialize)]
 struct PsResponse {
@@ -536,9 +612,17 @@ struct PsModel {
     digest: Option<String>,
     #[serde(default)]
     context_length: Option<u64>,
+    #[serde(default)]
+    remote_model: Option<String>,
+    #[serde(default)]
+    remote_host: Option<String>,
 }
 #[derive(Deserialize)]
 struct ShowResponse {
+    #[serde(default)]
+    remote_model: Option<String>,
+    #[serde(default)]
+    remote_host: Option<String>,
     #[serde(default)]
     capabilities: Vec<String>,
     #[serde(default)]
@@ -693,6 +777,164 @@ mod tests {
     use antiburn_local::analysis::jev::{JevQuestion, PINNED_MODEL};
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn remote_model_classification_uses_metadata_and_explicit_cloud_tags() {
+        for name in ["clef:cloud", "library/clef:cloud", "model:120b-cloud"] {
+            assert!(remote_model(name, None, None));
+        }
+        assert!(remote_model("renamed:latest", Some("clef:cloud"), None));
+        assert!(remote_model(
+            "renamed:latest",
+            None,
+            Some("https://remote.example")
+        ));
+        for name in ["clef", "clef:latest", "clef:9b", "cloud-local:latest"] {
+            assert!(!remote_model(name, None, None));
+            assert!(!remote_model(name, Some(""), Some("")));
+        }
+        assert_eq!(
+            jev_error(OllamaError::UnsupportedRunner),
+            JevError::UnsupportedModel
+        );
+    }
+
+    #[tokio::test]
+    async fn installed_model_lookup_reads_only_tags_and_excludes_remote_models() {
+        let body = json!({"models": [
+            {"name": "selected:9b", "digest": "local-digest"},
+            {"name": "completion-model:latest", "digest": "other-local-digest"},
+            {"name": "clef:cloud", "digest": "remote-digest"},
+            {"name": "model:120b-cloud", "digest": "remote-digest"},
+            {"name": "renamed:latest", "digest": "remote-digest", "remote_model": "clef:cloud"},
+            {"name": "hosted:latest", "digest": "remote-digest", "remote_host": "https://remote.example"}
+        ]}).to_string();
+        for credential in [None, Some("synthetic-token")] {
+            let models = lookup_mock_models(200, body.clone(), None, credential, false)
+                .await
+                .unwrap();
+            assert_eq!(
+                models,
+                vec![
+                    InstalledOllamaModel {
+                        id: "selected:9b".into(),
+                        label: "selected:9b".into()
+                    },
+                    InstalledOllamaModel {
+                        id: "completion-model:latest".into(),
+                        label: "completion-model:latest".into()
+                    },
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn installed_model_lookup_distinguishes_empty_metadata_and_bounded_failures() {
+        for body in [
+            json!({"models": []}),
+            json!({"models": [{"name": "clef:cloud", "digest": "remote"}]}),
+        ] {
+            assert!(
+                lookup_mock_models(200, body.to_string(), None, None, false)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        for (body, expected) in [
+            ("not json".into(), OllamaError::ProviderUnavailable),
+            (json!({"models": {}}).to_string(), OllamaError::ProviderUnavailable),
+            (json!({"models": [{"name": "local:latest"}]}).to_string(), OllamaError::ProviderUnavailable),
+            (json!({"models": [{"name": "local:latest", "digest": ""}]}).to_string(), OllamaError::ResponseDecode),
+            (json!({"models": [{"name": "bad name", "digest": "digest"}]}).to_string(), OllamaError::ResponseDecode),
+            (json!({"models": [{"name": "local:latest", "digest": "digest\n"}]}).to_string(), OllamaError::ResponseDecode),
+            (json!({"models": [{"name": "local:latest", "digest": "digest"}, {"name": "local:latest", "digest": "other"}]}).to_string(), OllamaError::ResponseDecode),
+        ] {
+            assert_eq!(lookup_mock_models(200, body, None, None, false).await, Err(expected));
+        }
+        assert_eq!(
+            lookup_mock_models(401, "{}".into(), None, Some("synthetic-token"), false).await,
+            Err(OllamaError::AuthenticationRejected)
+        );
+        assert_eq!(
+            lookup_mock_models(
+                200,
+                String::new(),
+                Some(MAX_DISCOVERY_BODY_BYTES + 1),
+                None,
+                false
+            )
+            .await,
+            Err(OllamaError::ResponseTooLarge)
+        );
+        assert_eq!(
+            lookup_mock_models(200, String::new(), None, None, true).await,
+            Err(OllamaError::ProviderUnavailable)
+        );
+        for count in [MAX_INSTALLED_MODELS, MAX_INSTALLED_MODELS + 1] {
+            let body = json!({"models": (0..count).map(|index| json!({"name": format!("local:{index}"), "digest": "synthetic-digest"})).collect::<Vec<_>>()}).to_string();
+            let result = lookup_mock_models(200, body, None, None, false).await;
+            if count == MAX_INSTALLED_MODELS {
+                assert_eq!(result.unwrap().len(), count);
+            } else {
+                assert_eq!(result, Err(OllamaError::ResponseTooLarge));
+            }
+        }
+    }
+
+    async fn lookup_mock_models(
+        status: u16,
+        body: String,
+        content_length: Option<usize>,
+        credential: Option<&str>,
+        stall: bool,
+    ) -> Result<Vec<InstalledOllamaModel>, OllamaError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = OllamaClient::with_timeouts(
+                &format!("http://{}/ollama", listener.local_addr().unwrap()),
+                credential.map(str::to_owned), Duration::from_secs(1),
+                if stall { Duration::from_millis(50) } else { Duration::from_secs(2) },
+            ).unwrap();
+            let credential = credential.map(str::to_owned);
+            let (done, completed) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    assert!(request.len() <= 8192);
+                    if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") { break; }
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with("get /ollama/api/tags http/1.1\r\n"));
+                assert!(!request.contains("typesafe-danger-zone-long-context:"));
+                match credential {
+                    Some(secret) => assert!(request.contains(&format!("authorization: bearer {secret}"))),
+                    None => assert!(!request.contains("authorization:")),
+                }
+                if stall {
+                    completed.await.unwrap();
+                    return;
+                }
+                socket.write_all(format!("HTTP/1.1 {status} Mock\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", content_length.unwrap_or(body.len())).as_bytes()).await.unwrap();
+                tokio::select! {
+                    extra = listener.accept() => panic!("Model lookup sent another request: {extra:?}"),
+                    _ = completed => {}
+                }
+            });
+            let result = client.list_installed_models().await;
+            done.send(()).unwrap();
+            server.await.unwrap();
+            result
+        }).await.unwrap()
+    }
 
     #[tokio::test]
     async fn mixed_blocks_use_one_unchanged_send_and_strict_decode_with_or_without_usage() {

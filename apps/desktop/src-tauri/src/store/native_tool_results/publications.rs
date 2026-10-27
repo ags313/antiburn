@@ -15,6 +15,8 @@ use crate::store::{SessionKey, Store};
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PublicationPolicy<'a> {
+    pub invalidation_effects:
+        Option<&'a std::cell::Cell<super::trace_effects::InvalidationEffects>>,
     pub(crate) baseline: Option<u64>,
     pub(crate) history_complete: Option<bool>,
     pub(crate) gap_reason: Option<&'a str>,

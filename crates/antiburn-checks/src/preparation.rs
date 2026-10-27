@@ -500,7 +500,7 @@ mod tests {
         FrozenCandidate {
             activation: ActivationId {
                 scope: crate::domain::ActivationScope::default(),
-                definition_id: "failed-retry-loop".to_owned(),
+                definition_id: "over-exploring".to_owned(),
                 generation: Generation(1),
             },
             branch: BranchId("main-session".to_owned()),
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn actual_example_prepares_requests_and_window_from_frozen_context() {
-        let source = include_str!("../../../.antiburn/checks/failed-retry-loop.yml");
+        let source = include_str!("../../../.antiburn/checks/over-exploring.yml");
         let check = compile(source).expect("the maintained example compiles");
         let prepared = prepare_decision_input(
             &check.decisions[0],

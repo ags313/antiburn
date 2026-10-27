@@ -1,5 +1,6 @@
 //! Fenced capture progress for OpenCode V2 event sessions.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 
 use antiburn_local::analysis::opencode_v2_capture::{
@@ -19,6 +20,7 @@ use super::super::publications::{
 use crate::store::native_tool_results::opencode_v2_status::{
     OpenCodeV2SourceStatus, SOURCE_SQL, upsert_source_status_in,
 };
+use crate::store::native_tool_results::trace_effects::{InvalidationEffects, PublicationEffects};
 use crate::store::selected_source::{
     LIVE_ACTIVATION_SQL, native_opencode_sqlite_format, opencode_v2_source_label,
 };
@@ -252,6 +254,8 @@ impl Store {
         let mut connection = self.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut claims = Vec::with_capacity(records.len());
+        let after_cursor = PublicationEffects::head(&tx)?;
+        let effects = Cell::new(InvalidationEffects::default());
         let mut seen = std::collections::HashSet::new();
         for record in records {
             ensure!(
@@ -266,10 +270,17 @@ impl Store {
         for claim in &claims {
             if let Some((pending, reason)) = pending_scope_retirement(&tx, claim)? {
                 let mut remaining = MAX_RETIREMENT_RESULTS;
-                if !retire_scope_bindings(&tx, &pending, &reason, &mut remaining)? {
+                if !retire_scope_bindings(&tx, &pending, &reason, &mut remaining, &effects)? {
                     clear_scope_retirement(&tx, &pending)?;
                 }
+                let summary = PublicationEffects::collect(&tx, after_cursor, effects.get())?;
                 tx.commit()?;
+                summary.trace(
+                    "capture_retention",
+                    trace_gap_reason(&reason),
+                    Some(pending.claim_fence),
+                    Some(pending.source_generation),
+                );
                 return Ok(OpenCodeV2ReconciliationPreparation::Progress);
             }
         }
@@ -308,11 +319,19 @@ impl Store {
             drop(statement);
             if overflow {
                 for rowid in oldest {
-                    retire_stored_binding(&tx, claim, rowid, "v2-current-retention")?;
+                    retire_stored_binding(&tx, claim, rowid, "v2-current-retention")?
+                        .record(Some(&effects));
                 }
-                publish_gap(&tx, claim, "v2-current-retention")?;
+                publish_gap(&tx, claim, "v2-current-retention")?.record(Some(&effects));
                 save_capture_status(&tx, claim, OpenCodeV2SourceStatus::CaptureGap, now)?;
+                let summary = PublicationEffects::collect(&tx, after_cursor, effects.get())?;
                 tx.commit()?;
+                summary.trace(
+                    "capture_retention",
+                    "current_retention",
+                    Some(claim.claim_fence),
+                    Some(claim.source_generation),
+                );
                 return Ok(OpenCodeV2ReconciliationPreparation::Progress);
             }
         }
@@ -337,6 +356,8 @@ impl Store {
             return Ok(OpenCodeV2ReconciliationPreparation::Fenced);
         }
         let mut pending_claims = Vec::new();
+        let after_cursor = PublicationEffects::head(&tx)?;
+        let effects = Cell::new(InvalidationEffects::default());
         for claim in claims {
             if !retirement_session_matches(&tx, claim)? {
                 return Ok(OpenCodeV2ReconciliationPreparation::Fenced);
@@ -360,13 +381,15 @@ impl Store {
         let mut remaining = MAX_RETIREMENT_RESULTS;
         let mut pending = false;
         for claim in pending_claims {
-            let more = retire_scope_bindings(&tx, claim, reason, &mut remaining)?;
+            let more = retire_scope_bindings(&tx, claim, reason, &mut remaining, &effects)?;
             if !more {
                 clear_scope_retirement(&tx, claim)?;
             }
             pending |= more;
         }
+        let summary = PublicationEffects::collect(&tx, after_cursor, effects.get())?;
         tx.commit()?;
+        summary.trace("capture_retention", trace_gap_reason(reason), None, None);
         Ok(if pending {
             OpenCodeV2ReconciliationPreparation::Progress
         } else {
@@ -447,9 +470,11 @@ impl Store {
                 .query_map([], |row| Ok((claim_from_row(row)?, row.get::<_, i64>(13)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let after_cursor = PublicationEffects::head(&tx)?;
+        let mut effects = InvalidationEffects::default();
         for (claim, lease_expires_at_epoch) in &claims {
             if capture_session_matches(&tx, claim)? {
-                publish_gap(
+                effects += publish_gap(
                     &tx,
                     claim,
                     if *lease_expires_at_epoch <= now {
@@ -474,7 +499,9 @@ impl Store {
                 ],
             )?;
         }
+        let summary = PublicationEffects::collect(&tx, after_cursor, effects)?;
         tx.commit()?;
+        summary.trace("capture_recovery", "lease_recovery", None, None);
         if !claims.is_empty() {
             ::tracing::debug!(
                 event = "opencode_v2_capture_recovery",
@@ -654,6 +681,8 @@ impl Store {
             }
         }
         let mut claims = Vec::with_capacity(starts.len());
+        let after_cursor = PublicationEffects::head(&tx)?;
+        let mut effects = InvalidationEffects::default();
         for start in starts {
             let previous_fence: Option<i64> = tx
                 .query_row(
@@ -717,7 +746,7 @@ impl Store {
                 last_sequence: start.baseline_sequence,
                 history_gap: true,
             };
-            publish_gap(&tx, &claim, "cold-attach")?;
+            effects += publish_gap(&tx, &claim, "cold-attach")?;
             attach_live_checks(&tx, &claim)?;
             save_capture_status(&tx, &claim, OpenCodeV2SourceStatus::Live, now)?;
             claims.push(claim);
@@ -727,7 +756,18 @@ impl Store {
         {
             return Ok(None);
         }
+        let summary = PublicationEffects::collect(&tx, after_cursor, effects)?;
         tx.commit()?;
+        summary.trace(
+            if snapshot.is_some() {
+                "capture_reconciliation"
+            } else {
+                "capture_attachment"
+            },
+            "capture_start",
+            None,
+            None,
+        );
         ::tracing::debug!(
             event = "opencode_v2_capture_started",
             status = "committed",
@@ -932,6 +972,8 @@ impl Store {
             return Ok(false);
         }
         let mut admitted = batch.clone();
+        let after_cursor = PublicationEffects::head(&tx)?;
+        let effects = Cell::new(InvalidationEffects::default());
         admitted.events.clear();
         for event in &batch.events {
             if let NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(result)) =
@@ -1002,6 +1044,7 @@ impl Store {
                 claim.claim_fence,
                 &admitted,
                 PublicationPolicy {
+                    invalidation_effects: Some(&effects),
                     baseline: claim.baseline_sequence,
                     history_complete: Some(complete),
                     gap_reason: (!complete).then_some("v2-history-incomplete"),
@@ -1029,8 +1072,15 @@ impl Store {
                 ],
             )?;
         }
+        let summary = PublicationEffects::collect(&tx, after_cursor, effects.get())?;
         tx.commit()?;
-        if !admitted.events.is_empty() {
+        summary.trace(
+            "live_capture",
+            "native_event",
+            Some(claim.claim_fence),
+            Some(claim.source_generation),
+        );
+        if summary.through_cursor > summary.after_cursor {
             ::tracing::debug!(
                 event = "opencode_v2_evidence_published",
                 status = "committed",
@@ -1058,6 +1108,8 @@ impl Store {
         let mut released = 0;
         let mut transitions = 0;
         let mut retirement_remaining = MAX_RETIREMENT_RESULTS;
+        let after_cursor = PublicationEffects::head(&tx)?;
+        let effects = Cell::new(InvalidationEffects::default());
         for claim in claims {
             if !capture_claims_match(&tx, std::slice::from_ref(claim), now, false)? {
                 continue;
@@ -1081,9 +1133,9 @@ impl Store {
             };
             if session_matches {
                 if retire_scope {
-                    retire_scope_bindings(&tx, claim, reason, &mut retirement_remaining)?;
+                    retire_scope_bindings(&tx, claim, reason, &mut retirement_remaining, &effects)?;
                 }
-                publish_gap(&tx, claim, reason)?;
+                publish_gap(&tx, claim, reason)?.record(Some(&effects));
                 let status = match reason {
                     "event-version-unsupported" => OpenCodeV2SourceStatus::VersionUnsupported,
                     "source-limit" | "recovery-capacity" => OpenCodeV2SourceStatus::SourceLimit,
@@ -1109,7 +1161,9 @@ impl Store {
             )?;
             released += 1;
         }
+        let summary = PublicationEffects::collect(&tx, after_cursor, effects.get())?;
         tx.commit()?;
+        summary.trace("capture_gap", trace_gap_reason(reason), None, None);
         if transitions > 0 {
             ::tracing::debug!(
                 event = "opencode_v2_capture_gap",
@@ -1318,6 +1372,7 @@ fn retire_scope_bindings(
     claim: &OpenCodeV2CaptureClaim,
     reason: &str,
     remaining: &mut usize,
+    effects: &Cell<InvalidationEffects>,
 ) -> Result<bool> {
     let mut statement = tx.prepare(
         "SELECT c.rowid FROM native_tool_result_current c INDEXED BY native_tool_result_current_session
@@ -1346,7 +1401,7 @@ fn retire_scope_bindings(
     drop(statement);
     *remaining -= rowids.len();
     for rowid in rowids {
-        retire_stored_binding(tx, claim, rowid, reason)?;
+        retire_stored_binding(tx, claim, rowid, reason)?.record(Some(effects));
     }
     Ok(tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM native_tool_result_current c
@@ -1373,7 +1428,7 @@ fn retire_stored_binding(
     claim: &OpenCodeV2CaptureClaim,
     rowid: i64,
     reason: &str,
-) -> Result<()> {
+) -> Result<InvalidationEffects> {
     let generation = current_source_generation(tx, &claim.key)?;
     let inserted = tx.execute(
         "INSERT INTO native_tool_result_publication (
@@ -1408,8 +1463,7 @@ fn retire_stored_binding(
         publication_sequence = ?2, source_generation = ?3, claim_fence = ?4 WHERE rowid = ?1",
         params![rowid, tx.last_insert_rowid(), generation, claim.claim_fence],
     )?;
-    super::super::evidence::invalidate_native_dependents_in(tx, &claim.key)?;
-    Ok(())
+    super::super::evidence::invalidate_native_dependents_in(tx, &claim.key)
 }
 
 fn current_cwd(tx: &Transaction<'_>, key: &SessionKey) -> Result<Option<String>> {
@@ -1773,7 +1827,7 @@ fn capture_session_matches(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim)
 fn invalidate_selected_generic_dependents(
     tx: &Transaction<'_>,
     claim: &OpenCodeV2CaptureClaim,
-) -> Result<()> {
+) -> Result<InvalidationEffects> {
     let affected = "WITH affected AS (
         SELECT d.candidate_id FROM burn_check_candidate_dependency d
         JOIN burn_check_candidate q ON q.candidate_id = d.candidate_id
@@ -1790,17 +1844,18 @@ fn invalidate_selected_generic_dependents(
           AND o.event_kind IN ('user_message', 'assistant_message', 'tool_call', 'response_cycle')
           AND p.project_cwd IS ?6 AND p.session_incarnation = ?7
     )";
-    for update in [
+    let mut counts = [0; 3];
+    for (count, update) in counts.iter_mut().zip([
         "UPDATE burn_check_candidate SET state = 'stale'
           WHERE candidate_id IN (SELECT candidate_id FROM affected)
             AND state IN ('pending', 'claimed', 'dispatching', 'answered')",
         "UPDATE burn_check_assessment_history SET evidence_valid = 0
-          WHERE candidate_id IN (SELECT candidate_id FROM affected)",
+          WHERE evidence_valid = 1 AND candidate_id IN (SELECT candidate_id FROM affected)",
         "UPDATE burn_check_current_status SET evidence_valid = 0
-          WHERE assessment_id IN (SELECT assessment_id FROM burn_check_assessment_history
+          WHERE evidence_valid = 1 AND assessment_id IN (SELECT assessment_id FROM burn_check_assessment_history
             WHERE candidate_id IN (SELECT candidate_id FROM affected))",
-    ] {
-        tx.execute(
+    ]) {
+        *count = tx.execute(
             &format!("{affected} {update}"),
             params![
                 claim.key.to_identity_json(),
@@ -1813,10 +1868,18 @@ fn invalidate_selected_generic_dependents(
             ],
         )?;
     }
-    Ok(())
+    Ok(InvalidationEffects {
+        unfinished_stale: counts[0],
+        accepted_evidence_revoked: counts[1],
+        current_status_revoked: counts[2],
+    })
 }
 
-fn publish_gap(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim, reason: &str) -> Result<()> {
+fn publish_gap(
+    tx: &Transaction<'_>,
+    claim: &OpenCodeV2CaptureClaim,
+    reason: &str,
+) -> Result<InvalidationEffects> {
     // Reconciliation can prove only tool results. Keep other identities unavailable after a gap.
     tx.execute(
         "UPDATE native_tool_result_current AS c SET is_removed = 1, complete = 0
@@ -1835,8 +1898,8 @@ fn publish_gap(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim, reason: &st
             claim.incarnation.0
         ],
     )?;
-    invalidate_selected_generic_dependents(tx, claim)?;
-    super::super::observers::break_continuity_in(tx, &claim.key)?;
+    let mut effects = invalidate_selected_generic_dependents(tx, claim)?;
+    effects += super::super::observers::break_continuity_in(tx, &claim.key)?;
     let batch = ToolResultBatchRef {
         source_format: SourceFormat::OpenCodeSqliteV2,
         results: &[],
@@ -1851,7 +1914,8 @@ fn publish_gap(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim, reason: &st
         false,
         Some(reason),
         PublicationGapKind::SegmentReset,
-    )
+    )?;
+    Ok(effects)
 }
 
 fn attach_live_checks(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim) -> Result<()> {
@@ -1909,6 +1973,7 @@ fn trace_gap_reason(reason: &str) -> &'static str {
         "checks-disabled" => "checks_disabled",
         "worker-stopped" => "worker_stopped",
         "recovery-capacity" => "recovery_capacity",
+        "v2-current-retention" => "current_retention",
         _ => "other_capture_gap",
     }
 }

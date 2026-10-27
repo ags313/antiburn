@@ -107,6 +107,9 @@ mod settings;
 mod startup_registration;
 mod storage_health;
 mod store;
+#[cfg(test)]
+#[path = "store/burn_checks/trace_capture_tests.rs"]
+mod trace_capture;
 // This bridge keeps the CH-007 evidence readers reachable. The insights
 // commands consume the backlog reader, but `Store::evidence` still has no
 // production caller outside tests, so the re-export stays until CH-013's
@@ -924,6 +927,8 @@ mod tests {
             "get_system_one_settings",
             "test_system_one_connection",
             "save_system_one_connection",
+            "remove_system_one_connection",
+            "retry_system_one_connection_operation",
             "switch_system_one_connection",
             "refresh_system_one_limits",
             "remove_system_one_credential",

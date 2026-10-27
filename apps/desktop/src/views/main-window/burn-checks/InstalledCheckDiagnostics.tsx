@@ -1,5 +1,5 @@
 import { ChevronRight, ExternalLink } from "lucide-react"
-import { useId, useRef, useState } from "react"
+import { Fragment, useId, useRef, useState } from "react"
 
 import {
   openInstalledCheckDefinition,
@@ -7,7 +7,10 @@ import {
   type InstalledCheckDiagnosticSourcePayload,
 } from "../../../lib/insightsIpc"
 import { pluralize } from "../../../lib/presentation/text"
-import { installedCheckDiagnosticKey } from "../../../lib/presentation/installedCheckDiagnostics"
+import {
+  installedCheckDiagnosticDetails,
+  installedCheckDiagnosticKey,
+} from "../../../lib/presentation/installedCheckDiagnostics"
 import { CheckDetailPanel } from "./CheckDetailPanel"
 
 function OpenCheckFile({
@@ -110,14 +113,10 @@ function DiagnosticContent({
     <>
       <p className="whitespace-pre-wrap wrap-anywhere">{diagnostic.message}</p>
       <DiagnosticLocation source={diagnostic.source} active={active} />
-      {(diagnostic.details.length > 0 || diagnostic.affectedSessionCount > 0) && (
-        <details>
-          <summary className="burn-check-action type-caption">Technical details</summary>
-          <div className="mt-2 space-y-3">
-            <DiagnosticDetails diagnostic={diagnostic} />
-          </div>
-        </details>
-      )}
+      <details>
+        <summary className="burn-check-action type-caption">Technical details</summary>
+        <DiagnosticDetails diagnostic={diagnostic} />
+      </details>
     </>
   )
 }
@@ -142,24 +141,24 @@ function DiagnosticLocation({
 }
 
 function DiagnosticDetails({ diagnostic }: { diagnostic: InstalledCheckDiagnosticPayload }) {
+  const details = installedCheckDiagnosticDetails(diagnostic)
   return (
-    <div className="space-y-2 type-caption">
-      {diagnostic.affectedSessionCount > 0 && (
-        <p className="text-label-tertiary">
-          {diagnostic.affectedSessionCount} affected{" "}
-          {pluralize(diagnostic.affectedSessionCount, "session", "sessions")}
-        </p>
+    <div className="mt-2 space-y-2 type-caption">
+      {details.length > 0 && (
+        <dl className="grid grid-cols-[fit-content(40%)_minmax(0,1fr)] items-baseline gap-x-3 gap-y-1">
+          {details.map((detail) => (
+            <Fragment key={JSON.stringify([detail.label, detail.value])}>
+              <dt className="text-label-tertiary wrap-anywhere">{detail.label}</dt>
+              <dd className="whitespace-pre-wrap text-label-secondary wrap-anywhere">
+                {detail.code ? <code>{detail.value}</code> : detail.value}
+              </dd>
+            </Fragment>
+          ))}
+        </dl>
       )}
-      <dl className="space-y-2">
-        {diagnostic.details.map((detail, index) => (
-          <div key={`${detail.label}:${index}`}>
-            <dt className="text-label-secondary wrap-anywhere">{detail.label}</dt>
-            <dd className="font-mono whitespace-pre-wrap text-label-tertiary wrap-anywhere">
-              {detail.value}
-            </dd>
-          </div>
-        ))}
-      </dl>
+      <p className="text-label-tertiary wrap-anywhere">
+        <code>{diagnostic.code}</code>
+      </p>
     </div>
   )
 }

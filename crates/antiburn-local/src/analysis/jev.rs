@@ -9,15 +9,18 @@ pub mod edit_hunks;
 mod json_decode;
 mod requests;
 
-pub use json_decode::{JevUsageLocation, decode_jev_json_with_usage};
+pub use json_decode::{
+    JevUsageLocation, decode_jev_json_with_observation, decode_jev_json_with_usage,
+};
 pub use requests::{
-    JevAnswer, JevError, JevQuestion, JevRequest, JevResponse, JevUsage,
-    estimate_jev_rendered_question_tokens, highest_probability_choice, validate_jev_request,
-    validate_jev_request_with_capabilities, validate_jev_response,
-    validate_jev_response_with_capabilities,
+    JevAnswer, JevError, JevQuestion, JevRequest, JevResponse, JevResponseObservation, JevUsage,
+    estimate_jev_rendered_question_tokens, estimate_jev_request_tokens, highest_probability_choice,
+    validate_jev_request, validate_jev_request_with_capabilities, validate_jev_response,
+    validate_jev_response_with_capabilities, validate_native_jev_response_with_capabilities,
 };
 
 pub const PINNED_MODEL: &str = "jev-1.13.0";
+pub const NATIVE_MODEL_ALIAS: &str = "jev-latest";
 /// Bound the full serialized request before checking the returned token usage.
 pub const MAX_REQUEST_BYTES: usize = 60 * 1024;
 /// Use a conservative byte proxy for Jev's state-plus-question token limit.
@@ -155,6 +158,14 @@ fn limit_as_usize(value: Option<u64>) -> Option<usize> {
     value.and_then(|value| usize::try_from(value).ok())
 }
 
+fn valid_response_model(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
+}
+
 fn json_count(value: &impl Serialize, maximum: usize) -> Result<JsonByteCount, serde_json::Error> {
     let mut writer = JsonByteCount {
         bytes: 0,
@@ -202,3 +213,7 @@ fn validate_probability_sum(values: impl Iterator<Item = f64>) -> Result<(), Jev
 #[cfg(test)]
 #[path = "jev/wire_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "jev/native_tests.rs"]
+mod native_tests;

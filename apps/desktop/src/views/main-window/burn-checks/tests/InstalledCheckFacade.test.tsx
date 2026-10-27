@@ -241,11 +241,10 @@ describe("installed checks in the existing UI", () => {
     expect(detail.querySelector("header")).toHaveTextContent(text)
     expect(
       within(detail).getByText(
-        `This check is waiting for new tool results. It needs ${count} more ${count === 1 ? "tool result" : "tool results"} before it can assess session activity.`,
+        `Needs ${count} more ${count === 1 ? "tool result" : "tool results"}.`,
       ),
     ).toBeVisible()
-    expect(within(detail).queryByText("No concern in this assessment.")).not.toBeInTheDocument()
-    expect(screen.queryByText(/Needs .* more tool results?/)).not.toBeInTheDocument()
+    expect(within(detail).queryByText(/Saved check result/)).not.toBeInTheDocument()
     expect(screen.queryByRole("region", { name: "Checking 1" })).not.toBeInTheDocument()
   })
 
@@ -253,7 +252,7 @@ describe("installed checks in the existing UI", () => {
     { catchingUp: true, waitingForDataCount: 0 },
     { catchingUp: false, waitingForDataCount: 1 },
   ])(
-    "explains the first assessment wait during catch-up ($catchingUp, $waitingForDataCount)",
+    "explains the first check wait during catch-up ($catchingUp, $waitingForDataCount)",
     async ({ catchingUp, waitingForDataCount }) => {
       setup(
         null,
@@ -279,17 +278,14 @@ describe("installed checks in the existing UI", () => {
       fireEvent.click(await screen.findByRole("button", { name: "Not assessed (1)" }))
       fireEvent.click(screen.getByRole("button", { name: "Failed retry loop, Not assessed" }))
       const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
-      expect(
-        within(detail).getByText(
-          "Session activity is still being processed. No assessment result is available yet.",
-        ),
-      ).toBeVisible()
-      expect(within(detail).queryByText(/needs 3 more tool results/)).not.toBeInTheDocument()
+      expect(within(detail).getByText("Processing session activity.")).toBeVisible()
+      expect(within(detail).getByText("No check result yet.")).toBeVisible()
+      expect(within(detail).queryByText(/Needs 3 more tool results/)).not.toBeInTheDocument()
     },
   )
 
   it.each([0, 1])(
-    "shows the idle fallback only without prior assessments (%i completed without status)",
+    "shows the idle fallback only without saved check results (%i started)",
     async (reviewedWithoutStatus) => {
       setup(
         null,
@@ -323,9 +319,7 @@ describe("installed checks in the existing UI", () => {
         expect(fallback).toBeVisible()
       } else {
         expect(fallback).not.toBeInTheDocument()
-        expect(
-          screen.getByText("No assessed sessions are in the current window."),
-        ).toBeVisible()
+        expect(screen.getByText("No check results in the current window.")).toBeVisible()
       }
     },
   )
@@ -377,15 +371,9 @@ describe("installed checks in the existing UI", () => {
         "activity-row-title-shimmer",
       )
       const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
-      expect(within(detail).getByText("Checking")).toBeVisible()
-      expect(
-        within(detail).getByText(
-          "This check is queued or running. No assessment result is available yet.",
-        ),
-      ).toBeVisible()
-      expect(
-        within(detail).queryByText("No concern in this assessment."),
-      ).not.toBeInTheDocument()
+      expect(within(detail).getByRole("heading", { name: "Checking" })).toBeVisible()
+      expect(within(detail).getByText("No check result yet.")).toBeVisible()
+      expect(within(detail).queryByText(/Saved check result/)).not.toBeInTheDocument()
       expect(screen.getByRole("status")).toHaveTextContent(
         "Failed retry loop: Not assessed · Checking",
       )
@@ -415,11 +403,7 @@ describe("installed checks in the existing UI", () => {
       expect(passedRow).toHaveTextContent("Passed")
       await waitFor(() => expect(passedRow).toHaveFocus())
       expect(screen.getByText("No repeated failure found.")).toBeVisible()
-      expect(
-        within(detail).queryByText(
-          "This check is queued or running. No assessment result is available yet.",
-        ),
-      ).not.toBeInTheDocument()
+      expect(within(detail).queryByText("No check result yet.")).not.toBeInTheDocument()
       expect(screen.queryByRole("region", { name: "Checking 1" })).not.toBeInTheDocument()
     },
   )
@@ -452,9 +436,7 @@ describe("installed checks in the existing UI", () => {
     fireEvent.click(row)
     const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
     expect(detail.querySelector("header")).toHaveTextContent("Not assessed")
-    expect(
-      within(detail).getByText("This check could not complete the latest assessment."),
-    ).toBeVisible()
+    expect(within(detail).getByText("A recent check could not finish.")).toBeVisible()
     expect(
       screen.queryByText("This check has not checked any sessions yet."),
     ).not.toBeInTheDocument()
@@ -471,6 +453,7 @@ describe("installed checks in the existing UI", () => {
           reviewFailed: 0,
           reviewedWithoutStatus: 1,
           checkingCount: 0,
+          waitingForEvents: null,
           targets: [],
         },
       ],
@@ -482,6 +465,7 @@ describe("installed checks in the existing UI", () => {
       }),
     ).toHaveTextContent("Not assessed")
     expect(detail.querySelector("header")).toHaveTextContent("Not assessed")
+    expect(within(detail).getByText("The check finished without a new result.")).toBeVisible()
     expect(
       screen.queryByText("This check has not checked any sessions yet."),
     ).not.toBeInTheDocument()
@@ -581,7 +565,7 @@ describe("installed checks in the existing UI", () => {
     expect(waiting).toHaveTextContent("Not assessed")
     const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
     expect(detail.querySelector("header")).toHaveTextContent("Not assessed")
-    expect(screen.queryByText(/Needs .* more tool results/)).not.toBeInTheDocument()
+    expect(screen.getByText("Needs 3 more tool results.")).toBeVisible()
     expect(
       within(waiting).queryByText(/action results|session data|No status change/),
     ).not.toBeInTheDocument()
@@ -894,6 +878,8 @@ describe("installed checks in the existing UI", () => {
       screen.getByText("Fix the YAML syntax at the marked line, then save the check file."),
     ).toBeVisible()
     expect(screen.queryByText("Invalid YAML.")).not.toBeInTheDocument()
+    expect(screen.queryByText("No concern in the checked work.")).not.toBeInTheDocument()
+    expect(screen.queryByText(/Saved check result/)).not.toBeInTheDocument()
   })
 
   it("uses logical installed snoozes, preserves totals and restores the ordinary group", async () => {

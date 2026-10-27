@@ -1,7 +1,7 @@
 use antiburn_checks::{compile, diagnostics::DiagnosticCode};
 
 fn definition(categories: &str, condition: &str) -> String {
-    include_str!("../../../.antiburn/checks/failed-retry-loop.yml")
+    include_str!("../../../.antiburn/checks/scope-creep.yml")
         .replace(
             "  tool_result:",
             &format!("  tool_result:\n    tools: [{categories}]"),

@@ -137,8 +137,15 @@ export const SETTINGS_SEARCH_TARGETS = {
   },
   decisionConnection: {
     pane: "checks",
-    label: "Saved connection",
-    aliases: ["saved connections", "profiles", "active connection", "switch provider"],
+    label: "Connections",
+    aliases: [
+      "saved connections",
+      "profiles",
+      "active connection",
+      "switch provider",
+      "add connection",
+      "remove connection",
+    ],
   },
   ollamaUrl: { pane: "checks", label: "Ollama URL", aliases: ["Ollama base URL", "server"] },
   ollamaModel: { pane: "checks", label: "Ollama model", aliases: ["local decision model"] },
@@ -178,35 +185,24 @@ export const SETTINGS_SEARCH_TARGETS = {
     label: "Response mode",
     aliases: ["Custom response", "direct", "Cloudflare envelope"],
   },
-  decisionModelLimits: {
+  checkDirectories: {
     pane: "checks",
-    label: "Model limits",
-    aliases: ["advanced", "refresh model limits", "manual limits", "context overrides"],
+    label: "Check files",
+    aliases: ["check folders", "check directories", "discovery", "YAML files"],
   },
-  decisionTotalInput: {
+  checkModelUsage: {
     pane: "checks",
-    label: "Total input tokens",
-    aliases: ["manual total input tokens"],
-  },
-  decisionStateInput: {
-    pane: "checks",
-    label: "State and longest question tokens",
-    aliases: ["manual state tokens"],
-  },
-  decisionRuntimeContext: {
-    pane: "checks",
-    label: "Loaded context tokens",
-    aliases: ["manual runtime context", "context size"],
+    label: "Model usage",
+    aliases: ["check requests", "check cost", "usage details"],
   },
   smartChecksEnabled: {
     pane: "checks",
-    label: "Run model-based checks",
+    label: "Run checks",
     aliases: [
       "model-based checks",
       "enable model-based checks",
       "pause model-based checks",
       "Jev checks",
-      "discovery",
     ],
   },
   theme: {

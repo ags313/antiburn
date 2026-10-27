@@ -59,6 +59,13 @@ pub(super) fn disabled(directory: &Path) -> DirectoryChecks {
     }
 }
 
+pub(super) fn has_check_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("yml" | "yaml")
+    )
+}
+
 fn read_check_files(directory: &Path) -> io::Result<Vec<CheckFile>> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -69,10 +76,7 @@ fn read_check_files(directory: &Path) -> io::Result<Vec<CheckFile>> {
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if !matches!(
-            path.extension().and_then(|extension| extension.to_str()),
-            Some("yml" | "yaml")
-        ) {
+        if !has_check_extension(&path) {
             continue;
         }
         let content = match entry.file_type() {

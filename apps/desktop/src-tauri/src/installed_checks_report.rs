@@ -23,6 +23,8 @@ use crate::store::{SessionKey, Store};
 
 #[path = "installed_checks_report/preparation.rs"]
 mod preparation;
+#[path = "installed_checks_report/served_models.rs"]
+mod served_models;
 use preparation::ReportPreparation;
 
 const MAX_DEFINITIONS: usize = 128;
@@ -352,6 +354,7 @@ fn trace_report(row: &InstalledCheckReportPayload) {
         Option<(u8, bool)>,
         usize,
         u64,
+        [u64; 2],
     );
     static PREVIOUS: OnceLock<Mutex<BTreeMap<String, State>>> = OnceLock::new();
     let state = (
@@ -366,6 +369,7 @@ fn trace_report(row: &InstalledCheckReportPayload) {
             .map(|waiting| (waiting.count, waiting.catching_up)),
         row.diagnostics.len(),
         row.review_failed,
+        diagnostic_categories(row),
     );
     let mut previous = PREVIOUS
         .get_or_init(Default::default)
@@ -404,6 +408,7 @@ fn trace_report(row: &InstalledCheckReportPayload) {
         clean = row.clean,
         unavailable = row.unavailable,
         diagnostics = row.diagnostics.len(),
+        diagnostic_categories = ?diagnostic_categories(row),
         review_failed = row.review_failed,
         checking = row.checking_count,
         waiting_for_data = row.waiting_for_data_count,
@@ -413,6 +418,58 @@ fn trace_report(row: &InstalledCheckReportPayload) {
             .waiting_for_events
             .is_some_and(|waiting| waiting.catching_up)
     );
+}
+
+fn diagnostic_categories(row: &InstalledCheckReportPayload) -> [u64; 2] {
+    row.diagnostics
+        .iter()
+        .fold([0; 2], |mut signature, diagnostic| {
+            let category = match diagnostic.code.as_str() {
+                "opencode-v2-service-unavailable" => 0,
+                "opencode-v2-authentication-rejected" => 1,
+                "opencode-v2-source-mismatch" => 2,
+                "opencode-v2-version-unsupported" => 3,
+                "opencode-v2-capture-gap" => 4,
+                "opencode-v2-source-limit" => 5,
+                "provider-authentication" => 6,
+                "provider-rate-limited" => 7,
+                "provider-overloaded" => 8,
+                "provider-unavailable" => 9,
+                "provider-delivery-unknown" => 10,
+                "provider-invalid-response" => 11,
+                "provider-context-rejected" => 12,
+                "provider-invalid-request" => 13,
+                "provider-profile-changed" => 14,
+                "storage-failed" => 15,
+                "local-state-invalid" => 16,
+                "source-unavailable" => 17,
+                "source-unsafe-admission" => 18,
+                "input-too-large" => 19,
+                "preparation-resource-limit" => 20,
+                "fit-config-invalid" => 21,
+                "input-unavailable" => 22,
+                "input-invalid" => 23,
+                "input-shortened" => 24,
+                "assessment-failed" => 25,
+                "assessment-cancelled" => 26,
+                "action-failed" => 27,
+                "condition-failed" => 28,
+                "condition-unavailable" => 29,
+                "filter-evidence-unavailable" => 30,
+                "filter-evidence-incomplete" => 31,
+                "filter-evidence-invalid" => 32,
+                "filter-work-limit" => 33,
+                code if code.starts_with("yaml-") => 34,
+                code if code.starts_with("config-") => 35,
+                code if code.starts_with("compile-") => 36,
+                code if code.starts_with("discovery-") => 37,
+                _ => 38,
+            };
+            let severity =
+                usize::from(diagnostic.severity == InstalledCheckDiagnosticSeverity::Error);
+            signature[severity] |= 1_u64 << category;
+            signature
+        })
 }
 
 fn storage_diagnostic() -> InstalledCheckDiagnostic {
@@ -555,27 +612,27 @@ fn runtime_diagnostics(
         let (code, title, message) = match diagnostic.code {
             AuthenticationRejected => (
                 "provider-authentication",
-                "Reconnect the assessment provider",
+                "Reconnect the check provider",
                 "The provider rejected the saved credential. Update the selected connection in Settings → Checks.",
             ),
             RateLimited => (
                 "provider-rate-limited",
                 "Provider rate limit reached",
-                "The assessment provider reached its rate limit. Check your provider limits before assessing new activity.",
+                "The check provider reached its rate limit. Check your provider limits before checking new activity.",
             ),
             ProviderOverloaded => (
                 "provider-overloaded",
-                "The assessment provider is busy",
-                "The provider could not complete this assessment. Check its availability before assessing new activity.",
+                "The check provider is busy",
+                "The provider could not finish this check. Check its availability before checking new activity.",
             ),
             ProviderUnavailable => (
                 "provider-unavailable",
-                "The assessment provider is unavailable",
+                "The check provider is unavailable",
                 "Check the selected connection in Settings → Checks and your network connection.",
             ),
             DeliveryUnknown => (
                 "provider-delivery-unknown",
-                "The assessment did not finish",
+                "The check did not finish",
                 "The connection ended before the provider confirmed a response. This can include a timeout. The request may have reached the provider, so antiburn will not resend it automatically.",
             ),
             InvalidResponse | InvalidDecision => (
@@ -595,12 +652,12 @@ fn runtime_diagnostics(
             ),
             Cancelled => (
                 "assessment-cancelled",
-                "The assessment was stopped",
-                "The check or provider connection changed before this assessment finished. Check the definition and the selected connection in Settings → Checks.",
+                "The check stopped",
+                "The check definition or provider connection changed before the check finished. Review the definition and selected connection in Settings → Checks.",
             ),
             StorageFailure => (
                 "storage-failed",
-                "The assessment could not be saved",
+                "The check result could not be saved",
                 "Check available disk space and local data access, then refresh Checks.",
             ),
             ActionFailed => (
@@ -679,7 +736,7 @@ fn runtime_diagnostics(
                         PreparationResourceLimit => Some((
                             "preparation-resource-limit",
                             "Input preparation reached a local limit",
-                            "A local preparation limit stopped this assessment. Select less input or fewer fitting targets. Nothing was sent to the provider.",
+                            "A local preparation limit stopped this check. Select less input or fewer fitting targets. Nothing was sent to the provider.",
                         )),
                         InvalidFit => Some((
                             "fit-config-invalid",
@@ -724,7 +781,7 @@ fn runtime_diagnostics(
                         IncompatibleProfile => Some((
                             "provider-profile-changed",
                             "The decision configuration changed",
-                            "The saved request no longer matches this decision model's configuration. New activity can create a new assessment; the saved request was not sent again.",
+                            "The saved request no longer matches this decision model's configuration. New activity can start a new check. The saved request was not sent again.",
                         )),
                     };
                     if let Some((code, title, message)) = text {
@@ -785,7 +842,14 @@ fn runtime_diagnostics(
                     diagnostic.details.extend(details);
                 }
             } else if branch.latest_outcome.as_deref() == Some("assessed") {
-                diagnostics.push(payload("input-shortened", InstalledCheckDiagnosticSeverity::Info, "Input shortened", "Fitting rules shortened this assessment's input. Session evidence is unchanged.", source.clone(), details));
+                diagnostics.push(payload(
+                    "input-shortened",
+                    InstalledCheckDiagnosticSeverity::Info,
+                    "Input shortened",
+                    "Fitting rules shortened this check's input. Session evidence is unchanged.",
+                    source.clone(),
+                    details,
+                ));
             }
         }
     }
@@ -793,7 +857,7 @@ fn runtime_diagnostics(
         diagnostics.push(local_state_diagnostic());
     }
     if failed && diagnostics.is_empty() && !condition_false {
-        diagnostics.push(payload("assessment-failed", InstalledCheckDiagnosticSeverity::Error, "The assessment did not complete", "No new status was written. Check the definition, session source access, and selected connection before assessing new activity.", source, Vec::new()));
+        diagnostics.push(payload("assessment-failed", InstalledCheckDiagnosticSeverity::Error, "The check did not finish", "No new status was written. Check the definition, session source access, and selected connection before checking new activity.", source, Vec::new()));
     }
     if let Some(decision) = &diagnostic_decision {
         for diagnostic in &mut diagnostics {
@@ -876,7 +940,7 @@ fn no_fit_text(
         None => (
             "preparation-incomplete",
             "Input preparation did not complete",
-            "The saved assessment stopped at a local preparation limit, but it does not identify which limit. Review the selected input and fitting rules. Nothing was sent to the provider.",
+            "The saved check stopped at a local preparation limit, but the saved data does not identify which limit. Review the selected input and fitting rules. Nothing was sent to the provider.",
         ),
     }
 }
@@ -1025,6 +1089,7 @@ struct CurrentSession {
     journal_owned: bool,
     catching_up: bool,
     v2_status: Option<OpenCodeV2SourceStatus>,
+    capture_alert_relevant: bool,
 }
 
 fn current_sessions(
@@ -1088,7 +1153,11 @@ fn current_sessions(
                          AND d.parser_revision IN (?5, 63, 64) AND d.blocked = 0
                           AND ({can_arrive})
                            AND (d.pending = 1 OR d.observed_generation <> s.source_generation)))),
-                  ({v2_status})
+                   ({v2_status}),
+                   (COALESCE(s.updated_at_epoch >= ?11, 0) OR EXISTS(SELECT 1 FROM burn_check_candidate c
+                     WHERE c.check_id = ?8 AND c.activation_scope_key = ?9 AND c.generation = ?10
+                       AND c.session_key_json = json_array(s.environment_key, s.agent, s.session_id)
+                       AND c.state IN ('pending', 'claimed', 'dispatching', 'answered')))
            FROM session s LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
            WHERE s.environment_key = ?1 AND s.cwd = ?2
              AND COALESCE(s.updated_at_epoch, s.started_at_epoch) >= ?3
@@ -1104,17 +1173,7 @@ fn current_sessions(
                      AND p.session_id = s.session_id AND p.publication_sequence > a.applied_sequence
                      AND {target}
                     AND (p.session_incarnation IS NULL OR
-                       (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd)))
-                 OR EXISTS(SELECT 1 FROM opencode_v2_source_status d
-                   WHERE ({OPENCODE_V2_SOURCE_SQL}) AND d.environment_key = s.environment_key
-                     AND d.agent = s.agent AND d.session_id = s.session_id
-                     AND d.incarnation = s.incarnation
-                     AND d.source_label = s.source_label AND d.cwd = s.cwd)
-                 OR EXISTS(SELECT 1 FROM opencode_v2_capture d
-                   WHERE ({OPENCODE_V2_SOURCE_SQL}) AND d.environment_key = s.environment_key
-                     AND d.agent = s.agent AND d.session_id = s.session_id
-                     AND d.incarnation = s.incarnation
-                     AND d.source_label = s.source_label AND d.cwd = s.cwd))
+                       (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd))))
              AND s.environment_key = 'native' AND s.wsl_distro IS NULL
              AND s.agent IN ('claude-code', 'codex', 'pi', 'opencode')
              AND NOT EXISTS(SELECT 1 FROM session_relation r
@@ -1153,6 +1212,7 @@ fn current_sessions(
                         journal_owned: row.get(5)?,
                         catching_up: row.get(6)?,
                         v2_status: None,
+                        capture_alert_relevant: row.get(8)?,
                     },
                     row.get::<_, Option<String>>(7)?,
                 ))
@@ -1531,7 +1591,7 @@ fn opencode_v2_diagnostic(status: OpenCodeV2SourceStatus) -> Option<InstalledChe
             "opencode-v2-capture-gap",
             "OpenCode live checks are unavailable",
             "Keep OpenCode and antiburn running, then rescan sessions.",
-            "Live capture is not active for this session. Live checks cannot replay earlier events. Earlier assessments cover only their saved input.",
+            "Live capture is not active for this session. Live checks cannot replay earlier events. Earlier checks cover only their saved input.",
         ),
         SourceLimit => (
             "opencode-v2-source-limit",
@@ -1606,12 +1666,18 @@ fn read_row(
                 });
             }
             for session in active {
+                if session.v2_status.is_some() && !session.ready && !session.capture_alert_relevant
+                {
+                    continue;
+                }
                 if session.v2_status.is_some() && !session.ready {
                     blocked_sources
                         .insert((session.key.agent.clone(), session.key.session_id.clone()));
                 }
                 if let Some(status) = session.v2_status {
-                    if let Some(diagnostic) = opencode_v2_diagnostic(status) {
+                    if session.capture_alert_relevant
+                        && let Some(diagnostic) = opencode_v2_diagnostic(status)
+                    {
                         diagnostics.add(
                             diagnostic,
                             Some((session.key.agent.clone(), session.key.session_id.clone())),
@@ -2120,8 +2186,7 @@ pub(crate) fn read_evidence(
                 reference("assessed-input"),
                 &block.input,
             );
-            input.explanation =
-                "These are the decision input values used for this assessment.".into();
+            input.explanation = "These are the decision input values used for this check.".into();
             if !block.report.omissions.is_empty() {
                 input.limitation = Some("Input was shortened under the check's fitting rules. Omitted records and text were not assessed.".into());
             }
@@ -2146,12 +2211,13 @@ pub(crate) fn read_evidence(
                 "decision-connection".into(),
                 &serde_json::json!({
                     "provider": provider_name(provenance.provider),
-                    "model": provenance.model,
+                    "requestedModel": provenance.model,
                     "modelRevision": provenance.model_revision,
                     "connectionRevision": provenance.connection_revision,
+                    "usageObservations": served_models::for_assessment(&transaction, &locator.assessment)?,
                 }),
             );
-            connection.explanation = "This connection produced the saved assessment. Current Settings can use a different connection.".into();
+            connection.explanation = "This saved connection identifies the requested model. Usage observations identify served models for each decision and attempt, not one release for the whole check. Missing observations and alias echoes leave the served release unknown. Current Settings can use a different connection.".into();
             items.push(connection);
         }
         return Ok(BurnCheckTargetEvidence {
@@ -2192,7 +2258,7 @@ pub(crate) fn read_evidence(
         ));
     }
     for item in &mut items {
-        item.limitation = Some("Exact assessed input was not saved for this assessment. This is original source evidence; it does not show which values were sent to the model.".into());
+        item.limitation = Some("Exact assessed input was not saved for this check. This is original source evidence; it does not show which values were sent to the model.".into());
     }
     Ok(BurnCheckTargetEvidence {
         status: BurnCheckEvidenceStatus::Available,

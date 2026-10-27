@@ -67,7 +67,7 @@ export function fixtureChecksReport(): ChecksReportPayload {
   if (new URLSearchParams(window.location.search).get("checks") === "installed") {
     return {
       evidenceSettled: true,
-      windowSessions: 5,
+      windowSessions: 6,
       pendingEvidence: 0,
       deferredEvidence: 0,
       estimatedTokenBurnBasisPoints: null,
@@ -133,12 +133,20 @@ function installedChecks(): InstalledCheckReportPayload[] {
     source: null,
     details: [
       { label: "Diagnostic code", value: "opencode-v2-capture-gap" },
-      { label: "Reason", value: "Live capture is not active for this session." },
+      {
+        label: "Reason",
+        value:
+          "Live capture is not active for this session. Live checks cannot replay earlier events. Earlier checks cover only their saved input.",
+      },
+      {
+        label: "Stored analysis",
+        value: "Stored-session analysis does not require this live connection.",
+      },
     ],
     affectedSessionCount: 1,
   }
   return [
-    installedCheck("installed:first-assessment", "First assessment", { checkingCount: 1 }),
+    installedCheck("installed:first-assessment", "First check", { checkingCount: 1 }),
     installedCheck("installed:waiting", "Waiting for activity", {
       hasStarted: true,
       waitingForEvents: { event: "toolResult", count: 3, catchingUp: false },
@@ -162,7 +170,12 @@ function installedChecks(): InstalledCheckReportPayload[] {
       clean: 1,
       checkingCount: 1,
       waitingForEvents: { event: "toolResult", count: 1, catchingUp: false },
-      explanation: "The saved assessment found no concern.",
+    }),
+    installedCheck("installed:saved-pass-explanation", "Saved pass with explanation", {
+      hasStarted: true,
+      clean: 1,
+      checkingCount: 1,
+      explanation: "The saved check found no concern.",
     }),
     installedCheck("installed:saved-failure", "Saved failure", {
       hasStarted: true,

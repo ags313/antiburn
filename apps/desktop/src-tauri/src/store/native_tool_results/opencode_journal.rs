@@ -1,4 +1,4 @@
-//! Append-safe leases and atomic pre-alpha OpenCode journal publication.
+//! Append-safe leases and atomic OpenCode journal publication.
 
 use antiburn_local::analysis::{OpenCodeJournalCursor, OpenCodeToolResultPage, PARSER_REVISION};
 use antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS;
@@ -299,6 +299,7 @@ impl Store {
             claim.claim_fence,
             &page.evidence,
             PublicationPolicy {
+                invalidation_effects: None,
                 baseline: Some(baseline),
                 history_complete: Some(history_complete),
                 gap_reason,

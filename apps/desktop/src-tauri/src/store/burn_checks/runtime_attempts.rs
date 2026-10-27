@@ -123,6 +123,10 @@ impl StoreCheckStore {
         }
         tx.commit()?;
         if newly_saved {
+            let failure = match preparation {
+                PreparationRecord::Rejected(failure) => Some(failure),
+                _ => None,
+            };
             ::tracing::debug!(
                 event = "burn_check_preparation_committed",
                 activation_ref = activation_ref(&claimed.candidate.activation),
@@ -134,6 +138,11 @@ impl StoreCheckStore {
                     PreparationRecord::Rejected(_) => "rejected",
                     PreparationRecord::Local(_) => "local",
                 },
+                preparation_failure_code = ?failure.map(|failure| failure.code),
+                no_fit_reason = ?failure.and_then(|failure| failure.context.no_fit_reason),
+                budget_kind = ?failure.and_then(|failure| failure.context.budget.as_ref().map(|budget| budget.kind)),
+                budget_observed = failure.and_then(|failure| failure.context.budget.as_ref().map(|budget| budget.observed)),
+                budget_maximum = failure.and_then(|failure| failure.context.budget.as_ref().map(|budget| budget.maximum)),
                 elapsed_ms = started.elapsed().as_millis() as u64,
             );
         }
@@ -547,8 +556,8 @@ impl StoreCheckStore {
         diagnostic: Option<&EvaluationDiagnostic>,
     ) -> Result<ClaimOutcome> {
         let claim = self.claim_record(claimed)?;
-        let preparation_code = match preparation {
-            Some(PreparationRecord::Rejected(failure)) => Some(failure.code),
+        let preparation_failure = match preparation {
+            Some(PreparationRecord::Rejected(failure)) => Some(failure),
             _ => None,
         };
         let preparation = preparation.map(encode_preparation).transpose()?;
@@ -572,7 +581,7 @@ impl StoreCheckStore {
             "terminal claim is already settled"
         );
         let state = if stale { saved_state.as_str() } else { state };
-        tx.execute("INSERT INTO burn_check_assessment_history
+        let inserted = tx.execute("INSERT INTO burn_check_assessment_history
             SELECT ?4, candidate_id, check_id, activation_scope_key, generation, branch_key, trigger_position, ?5, answer_json, ?6, 0, ?7
               FROM burn_check_candidate WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3
               ON CONFLICT(candidate_id) DO NOTHING",
@@ -582,16 +591,22 @@ impl StoreCheckStore {
             WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3",
             params![claim.candidate_id, claim.owner, claim.fence, state, now_epoch(), preparation, diagnostic.map(serde_json::to_string).transpose()?])?;
         tx.commit()?;
-        ::tracing::debug!(
-            event = "burn_check_candidate_settled",
-            activation_ref = activation_ref(&claimed.candidate.activation),
-            candidate_ref = candidate_ref(&claimed.candidate),
-            generation = claimed.candidate.activation.generation.0,
-            claim_fence = claimed.fence,
-            status = if stale { "stale" } else if not_assessed { "not_assessed" } else { "execution_failed" },
-            preparation_reason = ?preparation_code,
-            evaluation_reason = ?diagnostic.map(|diagnostic| diagnostic.code),
-        );
+        if inserted > 0 || saved_state != state {
+            ::tracing::debug!(
+                event = "burn_check_candidate_settled",
+                activation_ref = activation_ref(&claimed.candidate.activation),
+                candidate_ref = candidate_ref(&claimed.candidate),
+                generation = claimed.candidate.activation.generation.0,
+                claim_fence = claimed.fence,
+                status = if stale { "stale" } else if not_assessed { "not_assessed" } else { "execution_failed" },
+                preparation_reason = ?preparation_failure.map(|failure| failure.code),
+                no_fit_reason = ?preparation_failure.and_then(|failure| failure.context.no_fit_reason),
+                budget_kind = ?preparation_failure.and_then(|failure| failure.context.budget.as_ref().map(|budget| budget.kind)),
+                budget_observed = preparation_failure.and_then(|failure| failure.context.budget.as_ref().map(|budget| budget.observed)),
+                budget_maximum = preparation_failure.and_then(|failure| failure.context.budget.as_ref().map(|budget| budget.maximum)),
+                evaluation_reason = ?diagnostic.map(|diagnostic| diagnostic.code),
+            );
+        }
         Ok(if stale {
             ClaimOutcome::Stale
         } else {

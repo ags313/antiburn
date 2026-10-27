@@ -5,13 +5,19 @@ use std::time::{Duration, Instant};
 use crate::jev::config::SystemOneResponseMode;
 use crate::jev::config::system_one_endpoint;
 use antiburn_local::analysis::jev::{
-    JevAnswer, JevError, JevRequest, JevResponse, JevUsage, JevUsageLocation, MAX_RESPONSE_BYTES,
-    capabilities::ModelCapabilities, decode_jev_json_with_usage, highest_probability_choice,
+    JevAnswer, JevError, JevRequest, JevResponse, JevResponseObservation, JevUsage,
+    JevUsageLocation, MAX_RESPONSE_BYTES, capabilities::ModelCapabilities,
+    decode_jev_json_with_observation, decode_jev_json_with_usage, highest_probability_choice,
     validate_jev_request_with_capabilities, validate_jev_response_with_capabilities,
+    validate_native_jev_response_with_capabilities,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[cfg(test)]
+#[path = "client_native_tests.rs"]
+mod native_tests;
 
 fn async_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -39,7 +45,7 @@ impl TypeSafeClient {
         request: &JevRequest,
         endpoint: &str,
     ) -> Result<JevResponse, JevError> {
-        self.evaluate_at_with_capabilities(request, endpoint, &ModelCapabilities::jev_default())
+        self.evaluate_at_with_capabilities(request, endpoint, &ModelCapabilities::jev_native())
             .await
     }
 
@@ -60,15 +66,12 @@ impl TypeSafeClient {
         request: &JevRequest,
         endpoint: &str,
         capabilities: &ModelCapabilities,
-        record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
+        record_usage: impl Fn(JevResponseObservation) -> Result<(), JevError>,
     ) -> Result<JevResponse, JevError> {
         let body = JevSystemOneAdapter::encode_request(request, capabilities)?;
         let send_started = Instant::now();
-        let mut response = async_client()
-            .post(endpoint)
-            .bearer_auth(self.api_key.as_ref())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
+        let mut response = self
+            .request_builder(endpoint, body)
             .send()
             .await
             .map_err(|error| {
@@ -120,22 +123,29 @@ impl TypeSafeClient {
         }
         let body_elapsed_ms = body_started.elapsed().as_millis();
         let validation_started = Instant::now();
-        let response = JevSystemOneAdapter::decode_response_with_usage(
-            &body,
-            request,
-            capabilities,
-            record_usage,
-        )?;
+        let response: JevResponse =
+            decode_jev_json_with_observation(&body, JevUsageLocation::Direct, record_usage)?;
+        validate_native_jev_response_with_capabilities(&response, request, capabilities)?;
         let (mismatch_count, largest_gap) = choice_mismatches(&response);
         if mismatch_count > 0 {
-            ::tracing::warn!(event = "typesafe_choice_probability_mismatch", model = %response.model,
-                question_count = request.questions.len(), mismatch_count, largest_probability_gap = largest_gap,
-                input_tokens = response.usage.input_tokens, output_tokens = response.usage.output_tokens);
+            ::tracing::warn!(
+                event = "typesafe_choice_probability_mismatch",
+                question_count = request.questions.len(),
+                mismatch_count,
+                largest_probability_gap = largest_gap,
+                input_tokens = response.usage.input_tokens,
+                output_tokens = response.usage.output_tokens
+            );
         }
-        ::tracing::debug!(event = "typesafe_request_timing", model = %response.model,
-            question_count = request.questions.len(), input_tokens = response.usage.input_tokens,
-            output_tokens = response.usage.output_tokens, send_elapsed_ms, body_elapsed_ms,
-            validation_elapsed_ms = validation_started.elapsed().as_millis());
+        ::tracing::debug!(
+            event = "typesafe_request_timing",
+            question_count = request.questions.len(),
+            input_tokens = response.usage.input_tokens,
+            output_tokens = response.usage.output_tokens,
+            send_elapsed_ms,
+            body_elapsed_ms,
+            validation_elapsed_ms = validation_started.elapsed().as_millis()
+        );
         Ok(response)
     }
 
@@ -146,6 +156,15 @@ impl TypeSafeClient {
         Ok(Self {
             api_key: api_key.into(),
         })
+    }
+
+    fn request_builder(&self, endpoint: &str, body: Vec<u8>) -> reqwest::RequestBuilder {
+        async_client()
+            .post(endpoint)
+            .bearer_auth(self.api_key.as_ref())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("TypeSafe-Danger-Zone-Long-Context", "true")
+            .body(body)
     }
 }
 
@@ -223,13 +242,7 @@ pub async fn evaluate_custom_with_usage(
             )?
         }
     };
-    let mut builder = async_client()
-        .post(endpoint)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body);
-    if let Some(credential) = credential {
-        builder = builder.bearer_auth(credential);
-    }
+    let builder = custom_request_builder(endpoint, credential, body);
     let mut response = builder.send().await.map_err(|error| {
         if error.is_builder() {
             JevError::InvalidRequestSchema
@@ -296,6 +309,21 @@ pub async fn evaluate_custom_with_usage(
     }
 }
 
+fn custom_request_builder(
+    endpoint: &str,
+    credential: Option<&str>,
+    body: Vec<u8>,
+) -> reqwest::RequestBuilder {
+    let builder = async_client()
+        .post(endpoint)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body);
+    match credential {
+        Some(credential) => builder.bearer_auth(credential),
+        None => builder,
+    }
+}
+
 #[cfg(test)]
 mod custom_transport_tests {
     use super::*;
@@ -322,7 +350,7 @@ mod custom_transport_tests {
     {
         use antiburn_local::analysis::jev::JevQuestion;
 
-        let caps = ModelCapabilities::jev_default();
+        let caps = ModelCapabilities::jev_native();
         let request = JevRequest {
             model: caps.model.clone(),
             state: json!("synthetic evidence"),
@@ -374,6 +402,15 @@ mod custom_transport_tests {
                 (valid.replace(r#""noul":{"type":"noul","noul":0.2}"#, r#""extra":{"type":"noul","noul":0.2}"#), Err(JevError::ResponseAnswerMissing), true),
                 (valid.replace(r#""noul":{"type":"noul","noul":0.2}"#, r#""noul":{"type":"choice","choice":"yes","probabilities":{"yes":0.1,"no":0.9},"confidence":0.8}"#), Err(JevError::ResponseAnswerTypeMismatch), true),
             ];
+            cases.push((
+                valid.replace(&caps.model, "future/jev:release-2099"),
+                if transport == "typesafe" {
+                    Ok(())
+                } else {
+                    Err(JevError::ResponseModelMismatch)
+                },
+                true,
+            ));
             if transport == "custom-envelope" {
                 for (body, _, _) in &mut cases {
                     *body = format!(r#"{{"success":true,"result":{body}}}"#);
@@ -408,6 +445,12 @@ mod custom_transport_tests {
                             received.windows(4).position(|bytes| bytes == b"\r\n\r\n")
                             && received.len() >= end + 4 + expected_request.len()
                         {
+                            let headers =
+                                String::from_utf8_lossy(&received[..end]).to_ascii_lowercase();
+                            assert_eq!(
+                                headers.contains("typesafe-danger-zone-long-context: true"),
+                                transport == "typesafe"
+                            );
                             assert_eq!(&received[end + 4..], expected_request);
                             break;
                         }
@@ -438,7 +481,7 @@ mod custom_transport_tests {
                             &request,
                             &endpoint,
                             &caps,
-                            record_usage,
+                            |observation| record_usage(observation.usage),
                         )
                         .await
                 } else {
@@ -478,7 +521,7 @@ mod custom_transport_tests {
 
     #[tokio::test]
     async fn usage_survives_invalid_answers_in_typesafe_and_both_custom_modes() {
-        let capabilities = ModelCapabilities::jev_default();
+        let capabilities = ModelCapabilities::jev_native();
         let request = request(&capabilities.model);
         for transport in ["typesafe", "custom-direct", "custom-envelope"] {
             for (answer, usage, callback_error, expected) in [
@@ -552,7 +595,7 @@ mod custom_transport_tests {
                             &request,
                             &endpoint,
                             &capabilities,
-                            record_usage,
+                            |observation| record_usage(observation.usage),
                         )
                         .await
                 } else {
@@ -600,6 +643,7 @@ mod custom_transport_tests {
                     }
                 }
                 let headers = headers.to_ascii_lowercase();
+                assert!(!headers.contains("typesafe-danger-zone-long-context:"));
                 assert_eq!(
                     headers.contains("authorization: bearer first"),
                     authenticated
@@ -807,7 +851,7 @@ mod tests {
         use std::io::Write as _;
         let (headers_sent, headers_received) = tokio::sync::oneshot::channel();
         let request = JevRequest {
-            model: antiburn_local::analysis::jev::PINNED_MODEL.to_owned(),
+            model: antiburn_local::analysis::jev::NATIVE_MODEL_ALIAS.to_owned(),
             state: json!({"text": "synthetic evidence"}),
             questions: BTreeMap::from([(
                 "q".to_owned(),
@@ -870,7 +914,7 @@ mod tests {
     async fn typesafe_http_contract_preserves_the_request_and_validates_the_response() {
         use std::io::{Read as _, Write as _};
         let request = JevRequest {
-            model: antiburn_local::analysis::jev::PINNED_MODEL.to_owned(),
+            model: antiburn_local::analysis::jev::NATIVE_MODEL_ALIAS.to_owned(),
             state: json!({"text": "synthetic evidence"}),
             questions: BTreeMap::from([(
                 "q".to_owned(),
@@ -881,7 +925,7 @@ mod tests {
             )]),
         };
         let response_body = serde_json::to_vec(&json!({
-            "model": antiburn_local::analysis::jev::PINNED_MODEL,
+            "model": "jev-1.14.0",
             "answers": {"q": {"type": "noul", "noul": 0.2}},
             "usage": {"input_tokens": 12, "output_tokens": 1}
         }))
@@ -941,7 +985,7 @@ mod tests {
     async fn known_http_errors_do_not_include_response_or_request_secrets() {
         use std::io::{Read as _, Write as _};
         let request = JevRequest {
-            model: antiburn_local::analysis::jev::PINNED_MODEL.to_owned(),
+            model: antiburn_local::analysis::jev::NATIVE_MODEL_ALIAS.to_owned(),
             state: json!({"text": "private synthetic request content"}),
             questions: BTreeMap::from([(
                 "q".to_owned(),

@@ -14,7 +14,8 @@ use antiburn_local::analysis::jev::{
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const CLOUDFLARE_CONTEXT_TOKENS: u64 = 65_536;
+const CLEF_CONTEXT_TOKENS: u64 = 65_536;
+const CLEF_FLASH_CONTEXT_TOKENS: u64 = 24_576;
 const CLOUDFLARE_MAX_QUESTIONS: u32 = 64;
 const SAFE_STATE_BYTES: u64 = 30 * 1024;
 const SAFE_BODY_BYTES: u64 = 60 * 1024;
@@ -156,9 +157,14 @@ impl CloudflareClient {
 }
 
 /// Return limits from published Clef metadata plus explicit conservative local guards.
-/// Cloudflare's model pages publish the 65,536-token context and 64-question cap.
+/// Cloudflare publishes each route's context and a 64-question cap.
 /// Their API schemas do not publish a tokenizer or state-specific token limit.
 pub fn cloudflare_capabilities(model: &str) -> ModelCapabilities {
+    let context = match model {
+        "clef" => Some(CLEF_CONTEXT_TOKENS),
+        "clef-flash" => Some(CLEF_FLASH_CONTEXT_TOKENS),
+        _ => None,
+    };
     ModelCapabilities {
         output: if valid_model(model) {
             SystemOneOutputCapabilities {
@@ -179,11 +185,13 @@ pub fn cloudflare_capabilities(model: &str) -> ModelCapabilities {
         } else {
             SystemOneOutputCapabilities::default()
         },
-        total_input_tokens: CapabilityLimit::known(
-            CLOUDFLARE_CONTEXT_TOKENS,
-            CapabilitySource::DocumentedDefault,
-        ),
-        state_and_longest_question_tokens: CapabilityLimit::known(32_768, CapabilitySource::Manual),
+        total_input_tokens: context.map_or_else(CapabilityLimit::unknown, |tokens| {
+            CapabilityLimit::known(tokens, CapabilitySource::DocumentedDefault)
+        }),
+        state_and_longest_question_tokens: context
+            .map_or_else(CapabilityLimit::unknown, |tokens| {
+                CapabilityLimit::known(tokens.min(32_768), CapabilitySource::Manual)
+            }),
         state_and_longest_question_bytes: CapabilityLimit::known(
             SAFE_STATE_BYTES,
             CapabilitySource::Manual,
@@ -417,6 +425,8 @@ mod tests {
                     received.extend_from_slice(&chunk[..count]);
                     if let Some(end) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n")
                         && received.len() >= end + 4 + expected_request.len() {
+                        let headers = String::from_utf8_lossy(&received[..end]).to_ascii_lowercase();
+                        assert!(!headers.contains("typesafe-danger-zone-long-context:"));
                         assert_eq!(&received[end + 4..], expected_request);
                         break;
                     }
@@ -623,15 +633,22 @@ mod tests {
         .unwrap();
         for model in ["clef", "clef-flash"] {
             let capabilities = cloudflare_capabilities(model);
-            assert_eq!(
-                metadata["models"][model]["context_window_tokens"],
-                CLOUDFLARE_CONTEXT_TOKENS
-            );
+            let context = if model == "clef" { 65_536 } else { 24_576 };
+            assert_eq!(metadata["models"][model]["context_window_tokens"], context);
             assert_eq!(
                 metadata["models"][model]["maximum_questions"],
                 CLOUDFLARE_MAX_QUESTIONS
             );
-            assert_eq!(capabilities.total_input_tokens.value, Some(65_536));
+            assert_eq!(capabilities.total_input_tokens.value, Some(context));
+            assert_eq!(
+                capabilities.state_and_longest_question_tokens.value,
+                Some(context.min(32_768))
+            );
+            assert_eq!(capabilities.usable_input_tokens(), Some(context - 4_096));
+            assert_eq!(
+                capabilities.usable_state_tokens(),
+                Some(context.min(32_768) - 4_096)
+            );
             assert_eq!(
                 capabilities.total_input_tokens.source,
                 CapabilitySource::DocumentedDefault
@@ -693,6 +710,36 @@ mod tests {
             validate_jev_request_with_capabilities(&oversized, &cloudflare_capabilities("clef")),
             Err(JevError::RequestTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn flash_rejects_input_that_fits_clef_but_exceeds_its_documented_context() {
+        for (model, fits) in [("clef", true), ("clef-flash", false)] {
+            let request = JevRequest {
+                model: model.into(),
+                state: json!("x".repeat(28 * 1024)),
+                questions: BTreeMap::from([(
+                    "q".into(),
+                    JevQuestion::Noul {
+                        instructions: json!("Synthetic check"),
+                        criteria: None,
+                    },
+                )]),
+            };
+            let capabilities = cloudflare_capabilities(model);
+            let result = CloudflareAdapter::encode_request(&request, model, &capabilities);
+            if fits {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(JevError::RequestTokenLimitExceeded {
+                        maximum: 20_480,
+                        ..
+                    })
+                ));
+            }
+        }
     }
 
     #[test]

@@ -110,7 +110,7 @@ describe("installed check assessed evidence", () => {
     "keeps exact $event input separate for each decision without tool-result fields",
     async ({ event, value, expected }) => {
       const secondInput = { note: "Only this value went to the second decision." }
-      const limitation = "This assessment covers only these saved decision input values."
+      const limitation = "This check covers only these saved decision input values."
       setupEvidence({
         status: "available",
         items: [
@@ -347,7 +347,7 @@ describe("installed check assessed evidence", () => {
 
   it("retains original-source headings and the unsaved-input limit for legacy evidence", async () => {
     const limitation =
-      "Exact assessed input was not saved for this assessment. This is original source evidence; it does not show which values were sent to the model."
+      "Exact assessed input was not saved for this check. This is original source evidence; it does not show which values were sent to the model."
     setupEvidence({
       status: "available",
       items: [

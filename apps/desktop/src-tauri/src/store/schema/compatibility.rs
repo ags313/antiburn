@@ -26,6 +26,7 @@ struct Profile {
     decisions: bool,
     evidence: bool,
     selection: bool,
+    served_model: bool,
 }
 
 impl Profile {
@@ -40,6 +41,7 @@ impl Profile {
             decisions: version >= 87,
             evidence: version >= 88,
             selection: version >= 89,
+            served_model: version >= 90,
         }
     }
 
@@ -54,6 +56,7 @@ impl Profile {
             decisions: version >= 85,
             evidence: version >= 86,
             selection: version >= 87,
+            served_model: false,
         }
     }
 }
@@ -62,7 +65,7 @@ pub(in crate::store) fn repair_branch_version(
     connection: &mut Connection,
     current: i64,
 ) -> Result<i64> {
-    if !(81..=89).contains(&current) {
+    if !(81..=90).contains(&current) {
         return Ok(current);
     }
     let transaction = connection.transaction()?;
@@ -332,6 +335,11 @@ fn read_profile(connection: &Connection) -> Result<Profile> {
         "publication selection",
         &[("native_tool_result_publication", "session_selection_json")],
     )?;
+    let served_model = columns(
+        connection,
+        "usage served model",
+        &[("burn_check_decision_usage", "served_model")],
+    )?;
     Ok(Profile {
         quota,
         capture,
@@ -342,6 +350,7 @@ fn read_profile(connection: &Connection) -> Result<Profile> {
         decisions,
         evidence,
         selection,
+        served_model,
     })
 }
 

@@ -1,6 +1,6 @@
 # Product analytics measurement contract
 
-Current model-based check event contract: 2026-10-23. The historical foundation
+Current model-based check event contract: 2026-10-27. The historical foundation
 audit below was made on 2026-09-08 at `3ce2b1da`. This is a source audit, not an analysis of
 production event volumes. The collector, warehouse, release secrets, and live
 dashboards were not inspected. The findings below preserve the state at that
@@ -574,7 +574,7 @@ native lifecycle event. See the [public catalog](analytics.md#model-based-check-
 | Product question and decision                                                                           | Metric and denominator                                                                                                                                                                                              | Completed boundary and owner                                                                                                                                 |
 | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Do readers deliberately enable or pause model-based checks? Improve control placement.                  | Reporting installations with saved master transitions, split by enabled/disabled. This measures transitions, not all current enabled installations.                                                                 | Native settings persistence emits `label=enablement`, `detail=enabled` or `disabled` after a changed value is saved.                                         |
-| Can readers save, switch, remove credentials, and test decision connections? Improve setup reliability. | Reporting installations with each provider outcome. Test success fraction is successful settled explicit tests divided by all settled explicit tests, by provider. Saves are not tests.                             | Native `jev/settings.rs` commands emit a provider label and `provider_saved`, `provider_switched`, `credential_removed`, `test_succeeded`, or `test_failed`. |
+| Can readers save, select, remove, and test decision connections? Improve setup reliability. | Reporting installations with each provider outcome. Test success fraction is successful settled explicit tests divided by all settled explicit tests, by provider. Saves are not tests or selections. | Native `jev/settings.rs` commands emit a provider label and `provider_saved`, `provider_switched`, `connection_removed`, `credential_removed`, `test_succeeded`, or `test_failed`. |
 | Do generic fix-prompt actions reach preparation and clipboard success? Improve action reliability.      | Successful `burn_check_prompt_copied` relative to `burn_check_prompt_prepared` with `detail=ready`. Report other preparation outcomes separately and allow late delivery. No per-check classification is available. | Existing deliberate prompt handlers emit preparation once per target action and clipboard success once. Neither event carries a check label.                 |
 
 Emit saved transitions only after durable success and an actual change. Failed
@@ -588,6 +588,22 @@ Cloudflare, or Custom, subject to each route's verified capabilities. Selecting
 an unsaved draft and refreshing its limits are not saved transitions. Both
 Custom response modes share the existing `custom` category. These events do not
 measure capability admission or prove that a YAML assessment ran.
+
+`provider_saved` records a durable connection create or edit. Editing an inactive
+connection does not select it. `provider_switched` records an explicit saved
+connection selection. Creating the first connection selects it without a separate
+switch event or an enablement event. `connection_removed` records a durable
+profile removal, not key revocation. Removing the selected connection also saves
+master disablement and clears selection; emit its changed enablement outcome at
+that durable boundary. Removing an inactive connection does not emit disablement.
+Canceled confirmations, stale revisions, missing profiles, failed removals, and
+readback requests emit no removal success. Shared credentials can remain after
+profile removal. Only explicit credential removal uses `credential_removed`.
+The event carries no connection ID, revision, profile count, or selected state.
+Removal totals measure completed operations, not a removal success rate: canceled
+and failed removals have no setup outcome. Segment releases with separate Save
+and Use controls from earlier releases where Save and use also changed selection.
+Do not infer connection selections from `provider_saved` in the current contract.
 
 The four native-check labels, finding/evidence observations, assessment outcomes,
 and history-window/run events are retired from the runtime contract. They are
@@ -701,6 +717,41 @@ their call sites; tests inject the OS opener and event sink without launching an
 application or making provider requests. The public catalog in
 [analytics.md](analytics.md#yaml-input-fitting-and-definition-opens) names the same
 boundaries, vocabularies, and limits.
+
+### Check folder opens (implemented 2026-10-27)
+
+Product question: can readers open a discovered check folder from Settings?
+Use the result to improve folder-action discovery and native-open errors.
+
+Measure `succeeded` divided by all `burn_check_directory_opened` completions,
+with `missing`, `unavailable`, and `open_failed` reported separately. Show
+distinct reporting installations and segment at the first supporting app version
+and OS. The denominator is observed settled explicit requests, not all Settings
+views, folders, files, or people. A completion does not prove a file edit, a
+successful check, or visible Finder content.
+
+The native installed-check directory command owns completion after its issued
+reference, current repository membership, grants, canonical directory binding,
+remote-cache exclusion, and native opener settle. The event serializes only
+`{ "detail": "<closed outcome>" }` with the standard envelope. It contains no
+path, reference, name, count, input, model, cost, or private error. Renderer
+interaction input rejects it. It does not reuse the definition-open event.
+
+Maximum volume is one completion per settled explicit request. The UI suppresses
+same-folder concurrent presses; each later explicit retry is another request.
+Reads, passive discovery, search, dialog opening, and disclosure expansion do not
+emit it. There is no analytics-only filesystem or provider work. A hidden window
+can finish a started open. A crash before completion, opt-out, absent endpoint,
+and delivery loss remain unobserved. Existing capture, queue, and retry gates
+apply. Delivery deduplicates by `messageId`; use capture time and allow late
+arrivals. Do not join this event to check outcomes with invented identifiers.
+
+The action refreshes the analytics session timeout but does not establish a
+deliberate core view by itself. Native tests inject a folder opener and event
+sink. Cover all fixed outcomes, one completion, exact property serialization,
+native-only IPC, user-oriented classification, and consent/queue gates without
+opening a file manager or making provider requests. See the
+[public catalog](analytics.md#check-folder-opens).
 
 ### Legacy Ignored Instructions tuples
 

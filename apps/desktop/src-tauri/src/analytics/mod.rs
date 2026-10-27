@@ -198,6 +198,17 @@ pub(crate) fn record_burn_check_definition_opened(
     );
 }
 
+pub(crate) fn record_burn_check_directory_opened(
+    app: &tauri::AppHandle,
+    outcome: event::BurnCheckDirectoryOpenOutcome,
+) {
+    record(
+        app,
+        event::EventName::BurnCheckDirectoryOpened,
+        outcome.facts(),
+    );
+}
+
 #[cfg(not(feature = "analytics"))]
 pub(crate) fn record_check_enablement_saved(
     _app: &tauri::AppHandle,
@@ -2283,10 +2294,19 @@ mod enabled {
                     EventName::BurnCheckDefinitionOpened,
                     event::BurnCheckDefinitionOpenOutcome::Succeeded.facts(),
                 ),
+                (
+                    EventName::BurnCheckDirectoryOpened,
+                    event::BurnCheckDirectoryOpenOutcome::Succeeded.facts(),
+                ),
                 event::ModelCheckLifecycle::Enablement { enabled: true }.resolve(),
                 event::ModelCheckLifecycle::ProviderSetup {
                     provider: event::DecisionProvider::Jev,
                     outcome: event::ProviderSetupOutcome::Saved,
+                }
+                .resolve(),
+                event::ModelCheckLifecycle::ProviderSetup {
+                    provider: event::DecisionProvider::Jev,
+                    outcome: event::ProviderSetupOutcome::ConnectionRemoved,
                 }
                 .resolve(),
                 event::ModelCheckLifecycle::ProviderTest {
@@ -2940,6 +2960,9 @@ mod enabled {
                 .unwrap();
             store
                 .queue_analytics_event(EventName::BurnCheckDefinitionOpened.as_str(), "{}")
+                .unwrap();
+            store
+                .queue_analytics_event(EventName::BurnCheckDirectoryOpened.as_str(), "{}")
                 .unwrap();
 
             clear_local_state(&store);

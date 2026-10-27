@@ -702,7 +702,7 @@ mod tests {
     }
 
     fn activation() -> EffectiveActivation {
-        let source = include_str!("../../../.antiburn/checks/failed-retry-loop.yml");
+        let source = include_str!("../tests/fixtures/retry-review.yml");
         activation_for(source)
     }
 
@@ -764,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn actual_definition_replays_each_trigger_before_reading_later_requests() {
+    fn synthetic_definition_replays_each_trigger_before_reading_later_requests() {
         let store = Arc::new(MemoryStore::default());
         let evaluator = Arc::new(ScriptedEvaluator {
             inputs: Mutex::new(Vec::new()),

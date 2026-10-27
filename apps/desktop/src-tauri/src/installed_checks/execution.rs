@@ -1,6 +1,6 @@
 use super::*;
 use crate::jev::worker::{ExecutionSnapshot, WorkerHandle};
-use crate::store::burn_checks::trace_refs;
+use crate::store::burn_checks::{BurnCheckCandidateClaim, trace_refs};
 use antiburn_checks::decision::{DecisionAttempt, DecisionInput};
 use antiburn_checks::domain::ActivationId;
 use antiburn_checks::engine::PreparationValidationPurpose;
@@ -8,6 +8,7 @@ use antiburn_checks::expression_eval::EvaluationBudget;
 use antiburn_checks::prepared_assessment::PreparedAssessment;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
 
 pub(super) type CapabilityFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ModelCapabilities>> + Send + 'a>>;
@@ -101,6 +102,7 @@ enum SelectedExecution {
     Model {
         generation: u64,
         evaluator: Box<TypeSafeDecisionEvaluator>,
+        send_claim: Arc<OnceLock<BurnCheckCandidateClaim>>,
     },
 }
 
@@ -192,6 +194,9 @@ impl InstalledDecisionEvaluator {
         let model = snapshot.connection.model.clone();
         let cancellation_runtime = Arc::clone(&runtime);
         let activation_id = activation.id.clone();
+        let send_activation = activation.clone();
+        let send_claim = Arc::new(OnceLock::<BurnCheckCandidateClaim>::new());
+        let cancellation_claim = Arc::clone(&send_claim);
         let rejection_runtime = Arc::clone(&runtime);
         let usage_runtime = Arc::clone(&runtime);
         let authentication_activation = activation.id.clone();
@@ -208,6 +213,22 @@ impl InstalledDecisionEvaluator {
         .with_cancellation(move || {
             !current(&*cancellation_runtime, generation)
                 || !activation_current(&*cancellation_runtime, &activation_id)
+                || cancellation_claim.get().is_some_and(|claim| {
+                    match StoreCheckStore::provider_dispatch_is_current(
+                        cancellation_runtime.store(),
+                        &send_activation,
+                        claim,
+                    ) {
+                        Ok(current) => !current,
+                        Err(_) => {
+                            ::tracing::error!(
+                                event = "installed_check_dispatch_read_failed",
+                                reason = "storage_read_failed"
+                            );
+                            true
+                        }
+                    }
+                })
         })
         .with_authentication_rejection(move || {
             #[cfg(test)]
@@ -227,14 +248,18 @@ impl InstalledDecisionEvaluator {
             Ok(())
         })
         .with_usage(Arc::new(move |candidate, attempt, usage| {
-            let recorded = usage_runtime.store().record_burn_check_decision_usage(
-                candidate,
-                attempt,
-                &check_id,
-                (provider, &model),
-                usage,
-                time::OffsetDateTime::now_utc().unix_timestamp(),
-            );
+            #[cfg(test)]
+            let response_received = usage.is_some();
+            let recorded = usage_runtime
+                .store()
+                .record_burn_check_decision_observation(
+                    candidate,
+                    attempt,
+                    &check_id,
+                    (provider, &model),
+                    usage,
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                );
             diagnostics::runtime_result(
                 &usage_activation,
                 diagnostics::RuntimeStage::UsageWrite,
@@ -242,7 +267,7 @@ impl InstalledDecisionEvaluator {
             )
             .map_err(|_| "Could not record Burn Check provider usage.".to_owned())?;
             #[cfg(test)]
-            if usage.is_some() {
+            if response_received {
                 usage_runtime.stage(Stage::ResponseReceipt);
             }
             Ok(())
@@ -252,6 +277,7 @@ impl InstalledDecisionEvaluator {
             execution: SelectedExecution::Model {
                 generation,
                 evaluator: Box::new(selected),
+                send_claim,
             },
         })))
     }
@@ -264,6 +290,7 @@ impl InstalledDecisionEvaluator {
             SelectedExecution::Model {
                 generation,
                 evaluator,
+                ..
             } if current(&*self.runtime, *generation) => Ok(evaluator),
             _ => Err(antiburn_checks::fit::PreparationFailure {
                 code: antiburn_checks::fit::PreparationFailureCode::ProviderUnavailable,
@@ -272,6 +299,39 @@ impl InstalledDecisionEvaluator {
                 context: Default::default(),
             }),
         }
+    }
+
+    fn bind_dispatch_claim(
+        &self,
+        activation: &EffectiveActivation,
+        candidate: &antiburn_checks::domain::FrozenCandidate,
+        attempt: &DecisionAttempt,
+    ) -> std::result::Result<(), EvaluationFailure> {
+        let SelectedExecution::Model { send_claim, .. } = &self.execution else {
+            return Err(unavailable_evaluation(unavailable_preparation()));
+        };
+        let claim = match StoreCheckStore::provider_dispatch_claim(
+            self.runtime.store(),
+            activation,
+            candidate,
+            attempt,
+        ) {
+            Ok(Some(claim)) => claim,
+            Ok(None) => return Err(stale_dispatch()),
+            Err(_) => {
+                return Err(EvaluationFailure {
+                    code: EvaluationFailureCode::StorageFailure,
+                    kind: AttemptFailure::Permanent,
+                    detail: "Could not check the Burn Check dispatch claim.".into(),
+                    attempts: 0,
+                });
+            }
+        };
+        // All decision blocks in this assessment keep the same claim.
+        if send_claim.get_or_init(|| claim.clone()) != &claim {
+            return Err(stale_dispatch());
+        }
+        Ok(())
     }
 }
 
@@ -392,11 +452,14 @@ impl DecisionEvaluator for InstalledDecisionEvaluator {
         Box::pin(async move {
             let started = Instant::now();
             let result = match self.selected() {
-                Ok(selected) => {
-                    selected
-                        .evaluate_prepared(activation, candidate, prepared, attempt)
-                        .await
-                }
+                Ok(selected) => match self.bind_dispatch_claim(activation, candidate, attempt) {
+                    Ok(()) => {
+                        selected
+                            .evaluate_prepared(activation, candidate, prepared, attempt)
+                            .await
+                    }
+                    Err(failure) => Err(failure),
+                },
                 Err(failure) => Err(unavailable_evaluation(failure)),
             };
             trace_refs::provider_attempt_completed(candidate, attempt, &result, started.elapsed());
@@ -411,6 +474,15 @@ fn unavailable_preparation() -> antiburn_checks::fit::PreparationFailure {
         detail: "The selected connection is unavailable.".into(),
         report: None,
         context: Default::default(),
+    }
+}
+
+fn stale_dispatch() -> EvaluationFailure {
+    EvaluationFailure {
+        code: EvaluationFailureCode::Cancelled,
+        kind: AttemptFailure::Permanent,
+        detail: "The Burn Check candidate is no longer eligible.".into(),
+        attempts: 0,
     }
 }
 

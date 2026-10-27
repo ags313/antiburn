@@ -230,13 +230,19 @@ The name does not imply that an Ignored Instructions detector runs.
 
 | Event                                    | Closed properties                                                                                                                                               | Completed boundary                                                                                |
 | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `antiburn.ignored_instruction_lifecycle` | `label`: `enablement`; `detail`: `enabled` or `disabled`.                                                                                                       | The Run model-based checks master setting changes and is saved successfully.                          |
-| `antiburn.ignored_instruction_lifecycle` | `label`: `jev`, `cloudflare`, `ollama`, or `custom`; `detail`: `provider_saved`, `provider_switched`, `credential_removed`, `test_succeeded`, or `test_failed`. | A provider save, switch, or credential removal succeeds, or one explicit connection test settles. |
+| `antiburn.ignored_instruction_lifecycle` | `label`: `enablement`; `detail`: `enabled` or `disabled`.                                                                                                       | The Run checks master setting changes and is saved successfully.                                  |
+| `antiburn.ignored_instruction_lifecycle` | `label`: `jev`, `cloudflare`, `ollama`, or `custom`; `detail`: `provider_saved`, `provider_switched`, `connection_removed`, `credential_removed`, `test_succeeded`, or `test_failed`. | A connection save, selection, connection removal, or credential removal succeeds, or one explicit connection test settles. |
 
 Provider operations belong to native Settings commands in
 `apps/desktop/src-tauri/src/jev/settings.rs`. Failed saves, no-op switches,
 startup restoration, migration, and Settings refresh emit no saved transition.
-Read-only limit refresh emits no provider lifecycle event.
+Saving an inactive connection does not select it. Creating the first connection
+selects it without a separate switch or enablement event. Removing the selected
+connection emits removal after durable success and disablement only if the master
+setting changed. It does not choose a replacement. Canceled or failed removal
+emits no removal success. Connection removal does not claim key revocation;
+shared credentials can remain. Explicit key removal has its separate outcome.
+Read-only model lookup and metadata refresh emit no provider lifecycle event.
 One explicit settled test emits one outcome, including validation or credential
 failure after the command starts. Internal retries do not create extra tests.
 Cancellation or process exit can leave an outcome unobserved. Analytics never
@@ -320,6 +326,28 @@ Existing consent, environment-disablement, endpoint, queue, and retry gates appl
 to both events. Reports start at the first shipping app version with these native
 producers. Earlier fixed-check, prompt-preparation, and visible-outcome events
 retain their separate meanings.
+
+#### Check folder opens
+
+`antiburn.burn_check_directory_opened` records one completed explicit request to
+open a discovered check folder. It uses only `detail`: `succeeded`, `missing`,
+`unavailable`, or `open_failed`. It carries no folder name, path, source reference,
+check count, model, cost, or error text. The renderer cannot submit this event.
+
+The native directory command records the result after reference, current-folder,
+access, and native-opener checks settle. Success means that the OS accepted the
+open request, not that Finder became visible or that the reader changed a file.
+Missing covers expired references and removed folders. Unavailable covers
+rejected location, access, or directory-binding checks. Open failed covers the
+native opener and blocking worker.
+
+The UI suppresses concurrent presses for the same folder. Each later explicit
+retry can produce one new completion. Inventory reads, Settings search,
+disclosure changes, and automatic refresh do not emit it or open a folder.
+Window hiding does not undo a started request; process exit before completion
+can leave it unobserved. This deliberate action refreshes the analytics session
+timeout. Existing consent and delivery gates apply. Keep it separate from
+definition opens and project-folder opens; none proves repair or check success.
 
 ### Remote-host operations
 

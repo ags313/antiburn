@@ -1,8 +1,7 @@
 use antiburn_local::analysis::jev::capabilities::{
-    CapabilityLimit, CapabilitySource, ModelCapabilities, ModelLimitOverride,
-    SystemOneOutputCapabilities,
+    CapabilityLimit, CapabilitySource, ModelCapabilities,
 };
-use antiburn_local::analysis::jev::{JevError, PINNED_MODEL};
+use antiburn_local::analysis::jev::{JevError, NATIVE_MODEL_ALIAS, PINNED_MODEL};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -11,7 +10,6 @@ const SYSTEM_ONE_HOSTNAME: &str = "api.typesafe.ai";
 const SYSTEM_ONE_API_PATH: &str = "/v1/systemone";
 const MAX_MODEL_NAME_BYTES: usize = 128;
 const MAX_ACCOUNT_ID_BYTES: usize = 64;
-const MAX_MANUAL_CONTEXT_TOKENS: u64 = antiburn_local::analysis::jev::MAX_REQUEST_TOKENS;
 pub(crate) const OLLAMA_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 pub fn system_one_endpoint() -> String {
@@ -43,9 +41,15 @@ async fn resolve_capabilities(
         .validate()
         .map_err(|_| JevError::InvalidRequestSchema)?;
     if connection.provider != SystemOneProvider::Ollama {
-        return connection
+        let capabilities = connection
             .capabilities()
-            .map_err(|_| JevError::InvalidRequestSchema);
+            .map_err(|_| JevError::InvalidRequestSchema)?;
+        if capabilities.usable_input_tokens().is_none()
+            || capabilities.usable_state_tokens().is_none()
+        {
+            return Err(JevError::UnsupportedModel);
+        }
+        return Ok(capabilities);
     }
     let SystemOneEndpoint::BaseUrl(base) = &connection.endpoint else {
         return Err(JevError::InvalidRequestSchema);
@@ -128,19 +132,79 @@ pub struct ContextLimitOverride {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(try_from = "ConnectionFields", into = "ConnectionFields")]
 pub struct SystemOneConnection {
     pub provider: SystemOneProvider,
     pub endpoint: SystemOneEndpoint,
     pub model: String,
-    #[serde(default)]
     pub model_revision: Option<String>,
-    #[serde(default = "default_response_mode")]
     pub response_mode: SystemOneResponseMode,
     pub credential: Option<CredentialReference>,
     pub revision: u64,
-    #[serde(default)]
     pub context_override: Option<ContextLimitOverride>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionFields {
+    provider: SystemOneProvider,
+    endpoint: SystemOneEndpoint,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    model_revision: Option<String>,
+    #[serde(default = "default_response_mode")]
+    response_mode: SystemOneResponseMode,
+    credential: Option<CredentialReference>,
+    revision: u64,
+    #[serde(default)]
+    context_override: Option<ContextLimitOverride>,
+}
+
+impl TryFrom<ConnectionFields> for SystemOneConnection {
+    type Error = &'static str;
+
+    fn try_from(fields: ConnectionFields) -> Result<Self, Self::Error> {
+        let native = fields.provider == SystemOneProvider::Jev;
+        Ok(Self {
+            provider: fields.provider,
+            endpoint: fields.endpoint,
+            model: if native {
+                NATIVE_MODEL_ALIAS.to_owned()
+            } else {
+                fields.model.ok_or("Missing model.")?
+            },
+            model_revision: if native { None } else { fields.model_revision },
+            response_mode: fields.response_mode,
+            credential: fields.credential,
+            revision: fields.revision,
+            context_override: fields.context_override,
+        })
+    }
+}
+
+impl From<SystemOneConnection> for ConnectionFields {
+    fn from(connection: SystemOneConnection) -> Self {
+        let native = connection.provider == SystemOneProvider::Jev;
+        Self {
+            provider: connection.provider,
+            endpoint: connection.endpoint,
+            model: Some(if native {
+                NATIVE_MODEL_ALIAS.to_owned()
+            } else {
+                connection.model
+            }),
+            model_revision: if native {
+                None
+            } else {
+                connection.model_revision
+            },
+            response_mode: connection.response_mode,
+            credential: connection.credential,
+            revision: connection.revision,
+            context_override: connection.context_override,
+        }
+    }
 }
 
 fn default_response_mode() -> SystemOneResponseMode {
@@ -152,7 +216,6 @@ pub enum ConnectionValidationError {
     InvalidModel,
     InvalidEndpoint,
     InvalidCredentialReference,
-    InvalidContextOverride,
     ProviderEndpointMismatch,
     CloudflareModelEndpointMismatch,
     InvalidRevision,
@@ -166,12 +229,11 @@ impl Default for SystemOneConnection {
 }
 
 impl SystemOneConnection {
-    /// Keep current installations on their existing TypeSafe endpoint and model.
     pub fn jev_default() -> Self {
         Self {
             provider: SystemOneProvider::Jev,
             endpoint: SystemOneEndpoint::ProviderDefault,
-            model: PINNED_MODEL.to_owned(),
+            model: NATIVE_MODEL_ALIAS.to_owned(),
             model_revision: None,
             response_mode: SystemOneResponseMode::Direct,
             credential: Some(CredentialReference::LegacyTypeSafe),
@@ -181,10 +243,21 @@ impl SystemOneConnection {
     }
 
     pub fn validate(&self) -> Result<(), ConnectionValidationError> {
+        self.validate_fields(false)
+    }
+
+    pub(crate) fn validate_ollama_model_lookup(&self) -> Result<(), ConnectionValidationError> {
+        if self.provider != SystemOneProvider::Ollama {
+            return Err(ConnectionValidationError::ProviderEndpointMismatch);
+        }
+        self.validate_fields(true)
+    }
+
+    fn validate_fields(&self, allow_empty_model: bool) -> Result<(), ConnectionValidationError> {
         if self.revision == 0 {
             return Err(ConnectionValidationError::InvalidRevision);
         }
-        if !valid_model_name(&self.model) {
+        if !(allow_empty_model && self.model.is_empty()) && !valid_model_name(&self.model) {
             return Err(ConnectionValidationError::InvalidModel);
         }
         if self.model_revision.as_ref().is_some_and(|revision| {
@@ -197,11 +270,6 @@ impl SystemOneConnection {
         {
             return Err(ConnectionValidationError::InvalidCredentialReference);
         }
-        if let Some(override_limits) = &self.context_override
-            && !valid_context_override(override_limits)
-        {
-            return Err(ConnectionValidationError::InvalidContextOverride);
-        }
         if self.provider == SystemOneProvider::Custom
             && !matches!(
                 self.response_mode,
@@ -213,7 +281,7 @@ impl SystemOneConnection {
 
         match (&self.provider, &self.endpoint) {
             (SystemOneProvider::Jev, SystemOneEndpoint::ProviderDefault)
-                if self.model == PINNED_MODEL =>
+                if self.model == NATIVE_MODEL_ALIAS && self.model_revision.is_none() =>
             {
                 Ok(())
             }
@@ -233,20 +301,7 @@ impl SystemOneConnection {
                 validate_url(value, true)
             }
             _ => Err(ConnectionValidationError::ProviderEndpointMismatch),
-        }?;
-        let capabilities = self.resolved_capabilities();
-        let limits_invalid = capabilities
-            .usable_input_tokens()
-            .is_some_and(|tokens| tokens == 0)
-            || capabilities
-                .usable_state_tokens()
-                .is_some_and(|tokens| tokens == 0);
-        let limits_missing = capabilities.usable_input_tokens().is_none()
-            || capabilities.usable_state_tokens().is_none();
-        if limits_invalid || (self.provider != SystemOneProvider::Ollama && limits_missing) {
-            return Err(ConnectionValidationError::InvalidContextOverride);
         }
-        Ok(())
     }
 
     pub fn inference_endpoint(&self) -> Result<String, ConnectionValidationError> {
@@ -276,7 +331,7 @@ impl SystemOneConnection {
 
     fn resolved_capabilities(&self) -> ModelCapabilities {
         let mut capabilities = match self.provider {
-            SystemOneProvider::Jev => ModelCapabilities::jev_default(),
+            SystemOneProvider::Jev => ModelCapabilities::jev_native(),
             SystemOneProvider::Cloudflare => {
                 crate::jev_cloudflare::cloudflare_capabilities(&self.model)
             }
@@ -296,7 +351,6 @@ impl SystemOneConnection {
                         CapabilitySource::DocumentedDefault,
                     );
                 } else {
-                    limits.output = SystemOneOutputCapabilities::typed_adapter();
                     if let Some(verified) = self.custom_route_capabilities() {
                         limits = verified;
                     }
@@ -314,9 +368,12 @@ impl SystemOneConnection {
         };
         match self.response_mode {
             SystemOneResponseMode::Direct
-                if endpoint == &system_one_endpoint() && self.model == PINNED_MODEL =>
+                if endpoint == &system_one_endpoint()
+                    && matches!(self.model.as_str(), PINNED_MODEL | "jev-1.14.0") =>
             {
-                Some(ModelCapabilities::jev_default())
+                let mut capabilities = ModelCapabilities::jev_default();
+                capabilities.model.clone_from(&self.model);
+                Some(capabilities)
             }
             SystemOneResponseMode::CloudflareEnvelope => {
                 let account = endpoint
@@ -332,18 +389,11 @@ impl SystemOneConnection {
         }
     }
 
+    // Legacy context overrides do not change capabilities for new work.
     pub(crate) fn apply_capability_overrides(
         &self,
         mut capabilities: ModelCapabilities,
     ) -> ModelCapabilities {
-        if let Some(override_limits) = &self.context_override {
-            capabilities = capabilities.with_override(&ModelLimitOverride {
-                total_input_tokens: override_limits.total_input_tokens,
-                state_and_longest_question_tokens: override_limits
-                    .state_and_longest_question_tokens,
-                runtime_context_tokens: override_limits.runtime_context_tokens,
-            });
-        }
         if capabilities.model_revision.is_none() {
             capabilities.model_revision.clone_from(&self.model_revision);
         }
@@ -351,7 +401,7 @@ impl SystemOneConnection {
     }
 }
 
-fn valid_model_name(value: &str) -> bool {
+pub(crate) fn valid_model_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_MODEL_NAME_BYTES
         && value
@@ -375,17 +425,6 @@ fn valid_reference_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
 }
 
-fn valid_context_override(value: &ContextLimitOverride) -> bool {
-    [
-        value.total_input_tokens,
-        value.state_and_longest_question_tokens,
-        value.runtime_context_tokens,
-    ]
-    .into_iter()
-    .flatten()
-    .all(|tokens| (1..=MAX_MANUAL_CONTEXT_TOKENS).contains(&tokens))
-}
-
 fn validate_url(value: &str, allow_query: bool) -> Result<(), ConnectionValidationError> {
     let url = Url::parse(value).map_err(|_| ConnectionValidationError::InvalidEndpoint)?;
     if !matches!(url.scheme(), "http" | "https")
@@ -402,13 +441,12 @@ fn validate_url(value: &str, allow_query: bool) -> Result<(), ConnectionValidati
 
 #[cfg(test)]
 mod tests {
-    use super::MAX_MANUAL_CONTEXT_TOKENS;
     use super::{
         ConnectionValidationError, ContextLimitOverride, CredentialReference, SystemOneConnection,
         SystemOneEndpoint, SystemOneProvider, SystemOneResponseMode, system_one_endpoint,
     };
-    use antiburn_local::analysis::jev::PINNED_MODEL;
     use antiburn_local::analysis::jev::capabilities::CapabilitySource;
+    use antiburn_local::analysis::jev::{NATIVE_MODEL_ALIAS, PINNED_MODEL};
     use serde::Deserialize;
 
     #[test]
@@ -417,7 +455,7 @@ mod tests {
 
         assert_eq!(connection.provider, SystemOneProvider::Jev);
         assert_eq!(connection.endpoint, SystemOneEndpoint::ProviderDefault);
-        assert_eq!(connection.model, PINNED_MODEL);
+        assert_eq!(connection.model, NATIVE_MODEL_ALIAS);
         assert_eq!(
             connection.credential,
             Some(CredentialReference::LegacyTypeSafe)
@@ -431,8 +469,14 @@ mod tests {
 
     #[test]
     fn model_revision_preserves_legacy_settings_and_validates_discovered_identity() {
-        let mut encoded = serde_json::to_value(SystemOneConnection::default()).unwrap();
-        encoded.as_object_mut().unwrap().remove("model_revision");
+        let mut encoded = serde_json::to_value(SystemOneConnection {
+            provider: SystemOneProvider::Ollama,
+            endpoint: SystemOneEndpoint::BaseUrl("http://localhost:11434".into()),
+            model: "synthetic-model".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        encoded.as_object_mut().unwrap().remove("modelRevision");
         let mut connection: SystemOneConnection = serde_json::from_value(encoded).unwrap();
         assert_eq!(connection.model_revision, None);
         connection.model_revision = Some("sha256:model-digest".into());
@@ -447,6 +491,103 @@ mod tests {
                 Err(ConnectionValidationError::InvalidModelRevision)
             );
         }
+    }
+
+    #[test]
+    fn native_settings_boundary_preserves_every_field_except_release_selection() {
+        for credential in [
+            CredentialReference::LegacyTypeSafe,
+            CredentialReference::Connection("personal-key".into()),
+        ] {
+            for model in [Some("jev-1.13.0"), Some("obsolete-model"), None] {
+                let mut raw = serde_json::json!({
+                    "provider":"jev", "endpoint":{"kind":"provider_default"},
+                    "modelRevision":"obsolete-pin", "credential":credential, "revision":41,
+                    "contextOverride":{"totalInputTokens":12000,"stateAndLongestQuestionTokens":9000,"runtimeContextTokens":10000}
+                });
+                if let Some(model) = model {
+                    raw["model"] = serde_json::json!(model);
+                }
+                let connection: SystemOneConnection = serde_json::from_value(raw.clone()).unwrap();
+                connection.validate().unwrap();
+                let encoded = serde_json::to_value(&connection).unwrap();
+                raw["model"] = serde_json::json!(NATIVE_MODEL_ALIAS);
+                raw["modelRevision"] = serde_json::Value::Null;
+                raw["responseMode"] = serde_json::json!("direct");
+                assert_eq!(encoded, raw);
+                assert_eq!(connection.capabilities().unwrap().model_revision, None);
+                let mut invalid = encoded.clone();
+                invalid["endpoint"] =
+                    serde_json::json!({"kind":"exact_url","value":"https://wrong.invalid"});
+                let decoded: SystemOneConnection = serde_json::from_value(invalid.clone()).unwrap();
+                assert_eq!(
+                    decoded.validate(),
+                    Err(ConnectionValidationError::ProviderEndpointMismatch)
+                );
+                assert_eq!(serde_json::to_value(decoded).unwrap(), invalid);
+            }
+        }
+        let mut nonnative = serde_json::to_value(SystemOneConnection {
+            provider: SystemOneProvider::Ollama,
+            endpoint: SystemOneEndpoint::BaseUrl("http://localhost:11434".into()),
+            model: "authored-model".into(),
+            model_revision: Some("authored-revision".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let decoded: SystemOneConnection = serde_json::from_value(nonnative.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), nonnative);
+        nonnative.as_object_mut().unwrap().remove("model");
+        assert!(serde_json::from_value::<SystemOneConnection>(nonnative).is_err());
+    }
+
+    #[test]
+    fn only_native_route_uses_long_context_and_ignores_legacy_manual_limits() {
+        let mut connection = SystemOneConnection::default();
+        let native = connection.capabilities().unwrap();
+        assert_eq!(native.total_input_tokens.value, Some(262_000));
+        assert_eq!(
+            native.state_and_longest_question_tokens.value,
+            Some(262_000)
+        );
+        for model in [PINNED_MODEL, "jev-1.14.0"] {
+            connection.provider = SystemOneProvider::Custom;
+            connection.endpoint = SystemOneEndpoint::ExactUrl(system_one_endpoint());
+            connection.model = model.into();
+            let standard = connection.capabilities().unwrap();
+            assert_eq!(standard.total_input_tokens.value, Some(65_536));
+            assert_eq!(
+                standard.state_and_longest_question_tokens.value,
+                Some(32_768)
+            );
+            connection.context_override = Some(ContextLimitOverride {
+                total_input_tokens: Some(262_000),
+                ..Default::default()
+            });
+            assert_eq!(connection.capabilities().unwrap(), standard);
+            connection.context_override = None;
+        }
+        connection.model = NATIVE_MODEL_ALIAS.into();
+        connection.validate().unwrap();
+        connection.context_override = Some(ContextLimitOverride {
+            total_input_tokens: Some(8192),
+            ..Default::default()
+        });
+        let alias_custom = connection.capabilities().unwrap();
+        assert_eq!(alias_custom.total_input_tokens.value, None);
+        assert_eq!(alias_custom.output, Default::default());
+        connection = SystemOneConnection::default();
+        connection.context_override = Some(ContextLimitOverride {
+            total_input_tokens: Some(262_000),
+            ..Default::default()
+        });
+        connection.validate().unwrap();
+        connection
+            .context_override
+            .as_mut()
+            .unwrap()
+            .total_input_tokens = Some(262_001);
+        assert_eq!(connection.capabilities().unwrap(), native);
     }
 
     #[test]
@@ -480,6 +621,76 @@ mod tests {
             connection.inference_endpoint().unwrap(),
             "http://localhost:11434/v1/systemone"
         );
+    }
+
+    #[test]
+    fn ollama_model_lookup_allows_no_selection_but_keeps_connection_validation() {
+        let connection = SystemOneConnection {
+            provider: SystemOneProvider::Ollama,
+            endpoint: SystemOneEndpoint::BaseUrl("http://localhost:11434".into()),
+            model: String::new(),
+            credential: None,
+            ..Default::default()
+        };
+        assert_eq!(connection.validate_ollama_model_lookup(), Ok(()));
+        assert_eq!(
+            connection.validate(),
+            Err(ConnectionValidationError::InvalidModel)
+        );
+
+        for (invalid, expected) in [
+            (
+                SystemOneConnection {
+                    revision: 0,
+                    ..connection.clone()
+                },
+                ConnectionValidationError::InvalidRevision,
+            ),
+            (
+                SystemOneConnection {
+                    model: "invalid model".into(),
+                    ..connection.clone()
+                },
+                ConnectionValidationError::InvalidModel,
+            ),
+            (
+                SystemOneConnection {
+                    model_revision: Some("digest\n".into()),
+                    ..connection.clone()
+                },
+                ConnectionValidationError::InvalidModelRevision,
+            ),
+            (
+                SystemOneConnection {
+                    credential: Some(CredentialReference::Connection("invalid/reference".into())),
+                    ..connection.clone()
+                },
+                ConnectionValidationError::InvalidCredentialReference,
+            ),
+            (
+                SystemOneConnection {
+                    provider: SystemOneProvider::Custom,
+                    ..connection.clone()
+                },
+                ConnectionValidationError::ProviderEndpointMismatch,
+            ),
+            (
+                SystemOneConnection {
+                    endpoint: SystemOneEndpoint::ExactUrl("http://localhost:11434".into()),
+                    ..connection.clone()
+                },
+                ConnectionValidationError::ProviderEndpointMismatch,
+            ),
+            (
+                SystemOneConnection {
+                    endpoint: SystemOneEndpoint::BaseUrl("http://localhost:11434?query=1".into()),
+                    ..connection
+                },
+                ConnectionValidationError::InvalidEndpoint,
+            ),
+        ] {
+            assert_eq!(invalid.validate_ollama_model_lookup(), Err(expected));
+        }
     }
 
     #[test]
@@ -537,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_requires_usable_input_and_state_budgets_before_activation() {
+    fn unknown_custom_stays_readable_but_manual_bounds_do_not_supply_capabilities() {
         let mut connection = SystemOneConnection {
             provider: SystemOneProvider::Custom,
             endpoint: SystemOneEndpoint::ExactUrl("https://proxy.example/infer".into()),
@@ -568,17 +779,18 @@ mod tests {
             }),
         ] {
             connection.context_override = limits;
+            connection.validate().unwrap();
             assert_eq!(
-                connection.validate(),
-                Err(ConnectionValidationError::InvalidContextOverride)
+                connection.capabilities().unwrap().usable_input_tokens(),
+                None
             );
             assert_eq!(
-                connection.capabilities(),
-                Err(ConnectionValidationError::InvalidContextOverride)
+                connection.capabilities().unwrap().usable_state_tokens(),
+                None
             );
             assert_eq!(
-                connection.inference_endpoint(),
-                Err(ConnectionValidationError::InvalidContextOverride)
+                connection.inference_endpoint().unwrap(),
+                "https://proxy.example/infer"
             );
         }
         for limits in [
@@ -593,8 +805,8 @@ mod tests {
         ] {
             connection.context_override = Some(limits);
             let capabilities = connection.capabilities().unwrap();
-            assert_eq!(capabilities.usable_input_tokens(), Some(1));
-            assert_eq!(capabilities.usable_state_tokens(), Some(1));
+            assert_eq!(capabilities.usable_input_tokens(), None);
+            assert_eq!(capabilities.usable_state_tokens(), None);
         }
         connection.provider = SystemOneProvider::Ollama;
         connection.endpoint = SystemOneEndpoint::BaseUrl("http://localhost:11434".into());
@@ -607,8 +819,8 @@ mod tests {
             ..ContextLimitOverride::default()
         });
         assert_eq!(
-            connection.validate(),
-            Err(ConnectionValidationError::InvalidContextOverride)
+            connection.capabilities().unwrap().usable_input_tokens(),
+            None
         );
     }
 
@@ -670,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_cloudflare_route_and_context_override_mismatches() {
+    fn rejects_cloudflare_route_mismatches_even_with_legacy_overrides() {
         let mut connection = SystemOneConnection {
             provider: SystemOneProvider::Cloudflare,
             endpoint: SystemOneEndpoint::CloudflareAccount("bad/account".into()),
@@ -700,12 +912,12 @@ mod tests {
         });
         assert_eq!(
             connection.validate(),
-            Err(ConnectionValidationError::InvalidContextOverride)
+            Err(ConnectionValidationError::CloudflareModelEndpointMismatch)
         );
     }
 
     #[test]
-    fn custom_context_override_is_applied_as_a_bounded_manual_limit() {
+    fn custom_context_override_cannot_invent_a_supported_profile() {
         let connection = SystemOneConnection {
             provider: SystemOneProvider::Custom,
             endpoint: SystemOneEndpoint::ExactUrl("https://proxy.example/api".into()),
@@ -721,35 +933,27 @@ mod tests {
             }),
         };
         let capabilities = connection.capabilities().unwrap();
-        assert_eq!(capabilities.total_input_tokens.value, Some(8192));
+        assert_eq!(capabilities.total_input_tokens.value, None);
         assert_eq!(
             capabilities.total_input_tokens.source,
-            CapabilitySource::Manual
+            CapabilitySource::Unknown
         );
-        assert_eq!(
-            capabilities.state_and_longest_question_tokens.value,
-            Some(6144)
-        );
-        assert_eq!(capabilities.runtime_context_tokens.value, Some(8192));
-        assert_eq!(
-            capabilities.output,
-            super::SystemOneOutputCapabilities::typed_adapter()
-        );
+        assert_eq!(capabilities.state_and_longest_question_tokens.value, None);
+        assert_eq!(capabilities.runtime_context_tokens.value, None);
+        assert_eq!(capabilities.output, Default::default());
 
         let too_large = SystemOneConnection {
             context_override: Some(ContextLimitOverride {
-                total_input_tokens: Some(MAX_MANUAL_CONTEXT_TOKENS + 1),
+                total_input_tokens: Some(u64::MAX),
                 ..ContextLimitOverride::default()
             }),
             ..connection
         };
-        assert_eq!(
-            too_large.validate(),
-            Err(ConnectionValidationError::InvalidContextOverride)
-        );
+        too_large.validate().unwrap();
+        assert_eq!(too_large.capabilities().unwrap(), capabilities);
     }
     #[test]
-    fn ollama_connection_can_save_unknown_limits_and_manual_limits_keep_their_source() {
+    fn ollama_connection_uses_discovered_limits_instead_of_legacy_manual_limits() {
         use antiburn_local::analysis::jev::capabilities::{CapabilityLimit, ModelCapabilities};
 
         let mut connection = SystemOneConnection {
@@ -769,9 +973,9 @@ mod tests {
             ..ContextLimitOverride::default()
         });
         let manual = connection.capabilities().unwrap();
-        assert_eq!(manual.total_input_tokens.source, CapabilitySource::Manual);
-        assert_eq!(manual.usable_input_tokens(), Some(1024));
-        assert_eq!(manual.usable_state_tokens(), Some(1024));
+        assert_eq!(manual.total_input_tokens.source, CapabilitySource::Unknown);
+        assert_eq!(manual.usable_input_tokens(), None);
+        assert_eq!(manual.usable_state_tokens(), None);
         assert_eq!(manual.runtime_context_tokens, CapabilityLimit::unknown());
         assert_eq!(manual.output, Default::default());
         let discovered = ModelCapabilities {
@@ -784,7 +988,7 @@ mod tests {
             ..unknown
         };
         let lower = connection.apply_capability_overrides(discovered.clone());
-        assert_eq!(lower.usable_input_tokens(), Some(1024));
+        assert_eq!(lower.usable_input_tokens(), Some(1026));
         assert_eq!(lower.runtime_context_tokens.value, Some(2050));
         connection
             .context_override
@@ -800,6 +1004,7 @@ mod tests {
         let mut connection = SystemOneConnection {
             provider: SystemOneProvider::Custom,
             endpoint: SystemOneEndpoint::ExactUrl(system_one_endpoint()),
+            model: PINNED_MODEL.into(),
             context_override: Some(ContextLimitOverride {
                 total_input_tokens: Some(8192),
                 ..Default::default()
@@ -822,13 +1027,10 @@ mod tests {
         ] {
             connection.endpoint = SystemOneEndpoint::ExactUrl(endpoint.into());
             let capabilities = connection.capabilities().unwrap();
-            assert_eq!(
-                capabilities.output,
-                super::SystemOneOutputCapabilities::typed_adapter()
-            );
+            assert_eq!(capabilities.output, Default::default());
             assert_eq!(
                 capabilities.total_input_tokens.source,
-                CapabilitySource::Manual
+                CapabilitySource::Unknown
             );
             assert_eq!(capabilities.runtime_context_tokens.value, None);
         }
@@ -836,7 +1038,7 @@ mod tests {
         connection.response_mode = SystemOneResponseMode::CloudflareEnvelope;
         assert_eq!(
             connection.capabilities().unwrap().output,
-            super::SystemOneOutputCapabilities::typed_adapter()
+            Default::default()
         );
         for model in ["clef", "clef-flash"] {
             connection.model = model.into();
@@ -850,10 +1052,44 @@ mod tests {
             connection.response_mode = SystemOneResponseMode::Direct;
             assert_eq!(
                 connection.capabilities().unwrap().output,
-                super::SystemOneOutputCapabilities::typed_adapter()
+                Default::default()
             );
             connection.response_mode = SystemOneResponseMode::CloudflareEnvelope;
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_custom_execution_is_blocked_without_a_network_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/infer?route=selected",
+            listener.local_addr().unwrap()
+        );
+        let connection = SystemOneConnection {
+            provider: SystemOneProvider::Custom,
+            endpoint: SystemOneEndpoint::ExactUrl(endpoint.clone()),
+            model: "selected-model".into(),
+            context_override: Some(ContextLimitOverride {
+                total_input_tokens: Some(8192),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&connection).unwrap();
+        let decoded: SystemOneConnection = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, connection);
+        assert_eq!(decoded.inference_endpoint().unwrap(), endpoint);
+        for execution in [false, true] {
+            assert_eq!(
+                super::resolve_capabilities(&decoded, None, execution).await,
+                Err(super::JevError::UnsupportedModel)
+            );
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -872,6 +1108,10 @@ mod tests {
             "unknown-encoding",
             "changed-digest",
             "changed-digest-cold",
+            "remote-model",
+            "remote-host",
+            "remote-show",
+            "remote-running",
         ] {
             let mut responses = ollama_discovery_responses(None, None, 65536);
             let expected = match case {
@@ -912,6 +1152,25 @@ mod tests {
                 }
                 "unknown-encoding" => {
                     responses[2].2["model_info"]["decision.type"] = json!("unknown");
+                    super::JevError::UnsupportedModel
+                }
+                "remote-model" | "remote-host" => {
+                    let field = if case == "remote-model" {
+                        "remote_model"
+                    } else {
+                        "remote_host"
+                    };
+                    responses[1].2["models"][0][field] = json!("synthetic-remote");
+                    responses.truncate(2);
+                    super::JevError::UnsupportedModel
+                }
+                "remote-show" => {
+                    responses[2].2["remote_host"] = json!("https://remote.example");
+                    responses.truncate(3);
+                    super::JevError::UnsupportedModel
+                }
+                "remote-running" => {
+                    responses[3].2 = json!({"models": [{"name": "selected:latest", "digest": "pinned-digest", "remote_model": "remote-model"}]});
                     super::JevError::UnsupportedModel
                 }
                 _ => {
@@ -977,12 +1236,9 @@ mod tests {
                 limits.usable_input_tokens(),
                 Some(context.min(maximum) - limits.rendering_reserve_tokens)
             );
-            let state_limit = manual
-                .and_then(|limits| limits.state_and_longest_question_tokens)
-                .unwrap_or(context.min(maximum));
             assert_eq!(
                 limits.usable_state_tokens(),
-                Some(state_limit - limits.rendering_reserve_tokens)
+                Some(context.min(maximum) - limits.rendering_reserve_tokens)
             );
             let request = JevRequest {
                 model: limits.model.clone(),
@@ -1000,7 +1256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execution_resolution_skips_loading_for_loaded_configured_or_manual_capacity() {
+    async fn execution_resolution_skips_loading_only_for_discovered_capacity() {
         for (loaded, configured, manual, expected, source) in [
             (
                 Some(4096),
@@ -1017,24 +1273,24 @@ mod tests {
                 CapabilitySource::ProviderMetadata,
             ),
             (
-                None,
+                Some(4096),
                 None,
                 Some(ContextLimitOverride {
                     total_input_tokens: Some(6000),
                     ..Default::default()
                 }),
-                6000,
-                CapabilitySource::Manual,
+                4096,
+                CapabilitySource::RuntimeMetadata,
             ),
             (
                 None,
-                None,
+                Some(8192),
                 Some(ContextLimitOverride {
                     runtime_context_tokens: Some(6000),
                     ..Default::default()
                 }),
-                6000,
-                CapabilitySource::Manual,
+                8192,
+                CapabilitySource::ProviderMetadata,
             ),
         ] {
             let limits = resolve_mock_ollama(

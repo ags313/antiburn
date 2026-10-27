@@ -7,44 +7,49 @@ use super::super::fixtures;
 
 #[test]
 fn presets_bind_exact_models_routes_and_response_modes() {
-    for name in [
-        "jev",
-        "ollama-nimble",
-        "ollama-clef-flash",
-        "ollama-tev-small",
-        "cloudflare-clef",
-        "cloudflare-clef-flash",
-        "custom-jev-direct",
-        "custom-ollama-nimble-direct",
-        "custom-ollama-clef-flash-direct",
-        "custom-cloudflare-clef-envelope",
-        "custom-cloudflare-clef-flash-envelope",
+    for (name, model) in [
+        ("jev", antiburn_local::analysis::jev::NATIVE_MODEL_ALIAS),
+        ("ollama-nimble", "nimble:latest"),
+        ("ollama-clef-flash", "clef-flash:latest"),
+        ("ollama-tev-small", "tev1:0.8b"),
+        ("cloudflare-clef", "clef"),
+        ("cloudflare-clef-flash", "clef-flash"),
+        ("custom-jev-direct", "jev-1.14.0"),
+        ("custom-ollama-nimble-direct", "nimble:latest"),
+        ("custom-ollama-clef-flash-direct", "clef-flash:latest"),
+        ("custom-cloudflare-clef-envelope", "clef"),
+        ("custom-cloudflare-clef-flash-envelope", "clef-flash"),
     ] {
         let preset = ProviderPreset::parse(name).unwrap();
         let connection = preset.connection(Some("synthetic-account")).unwrap();
         connection.validate().unwrap();
-        assert_eq!(connection.model, preset.model());
+        assert_eq!(connection.model, model);
+        assert_eq!(
+            connection.provider,
+            if name == "jev" {
+                SystemOneProvider::Jev
+            } else if name.starts_with("ollama-") {
+                SystemOneProvider::Ollama
+            } else if name.starts_with("cloudflare-") {
+                SystemOneProvider::Cloudflare
+            } else {
+                SystemOneProvider::Custom
+            }
+        );
         assert!(connection.credential.is_none());
+        assert!(connection.context_override.is_none());
         let capabilities = connection.capabilities().unwrap();
-        if connection.provider == SystemOneProvider::Ollama && connection.context_override.is_none()
-        {
+        assert_eq!(capabilities.model, model);
+        if preset.local() {
             assert_eq!(capabilities.usable_input_tokens(), None);
             assert_eq!(capabilities.usable_state_tokens(), None);
+            assert_eq!(capabilities.output, Default::default());
         } else {
             assert!(capabilities.usable_input_tokens().unwrap() > 0);
             assert!(capabilities.usable_state_tokens().unwrap() > 0);
         }
-        if connection.provider == SystemOneProvider::Custom {
-            assert_eq!(
-                connection
-                    .context_override
-                    .as_ref()
-                    .unwrap()
-                    .total_input_tokens,
-                Some(if preset.local() { 8192 } else { 65_536 })
-            );
-        } else {
-            assert!(connection.context_override.is_none());
+        if preset.cloudflare() && model == "clef-flash" {
+            assert_eq!(capabilities.total_input_tokens.value, Some(24_576));
         }
         if capabilities.usable_state_tokens().is_some() {
             let request = fixtures::request(&capabilities.model);
@@ -55,7 +60,7 @@ fn presets_bind_exact_models_routes_and_response_modes() {
             );
             assert!(request.state.get("work_items").is_none());
         } else {
-            assert_eq!(connection.provider, SystemOneProvider::Ollama);
+            assert!(preset.local());
             assert!(matches!(
                 validate_jev_request_with_capabilities(
                     &fixtures::request(&capabilities.model),
@@ -114,29 +119,60 @@ fn direct_request_keeps_all_questions_and_obeys_selected_capabilities() {
 }
 
 #[test]
-fn custom_preset_limits_preserve_explicit_bounds_and_lower_discovered_limits() {
+fn native_and_custom_eval_presets_use_their_production_route_limits() {
+    let native = ProviderPreset::Jev.connection(None).unwrap();
+    let custom = ProviderPreset::CustomJevDirect.connection(None).unwrap();
+    assert_eq!(
+        native.model,
+        antiburn_local::analysis::jev::NATIVE_MODEL_ALIAS
+    );
+    assert_eq!(
+        native.capabilities().unwrap().total_input_tokens.value,
+        Some(262_000)
+    );
+    assert_eq!(custom.model, "jev-1.14.0");
+    let standard = custom.capabilities().unwrap();
+    assert_eq!(standard.total_input_tokens.value, Some(65_536));
+    assert_eq!(
+        standard.state_and_longest_question_tokens.value,
+        Some(32_768)
+    );
+}
+
+#[test]
+fn custom_preset_ignores_legacy_bounds_and_preserves_discovered_limits() {
     let mut connection = ProviderPreset::CustomOllamaNimbleDirect
         .connection(None)
         .unwrap();
+    let unknown = connection.capabilities().unwrap();
+    assert_eq!(unknown.usable_input_tokens(), None);
+    assert_eq!(unknown.usable_state_tokens(), None);
     connection.context_override = Some(ContextLimitOverride {
         total_input_tokens: Some(6144),
         state_and_longest_question_tokens: Some(5120),
         runtime_context_tokens: Some(7168),
     });
     connection.validate().unwrap();
-    let mut discovered = ModelCapabilities::jev_default();
+    assert_eq!(connection.capabilities().unwrap(), unknown);
+    let mut discovered = ModelCapabilities {
+        model: connection.model.clone(),
+        model_revision: Some("synthetic-digest".into()),
+        ..ModelCapabilities::jev_default()
+    };
     discovered.runtime_context_tokens =
         antiburn_local::analysis::jev::capabilities::CapabilityLimit::known(
             5000,
             antiburn_local::analysis::jev::capabilities::CapabilitySource::RuntimeMetadata,
         );
-    let capabilities = connection.apply_capability_overrides(discovered);
-    assert_eq!(capabilities.total_input_tokens.value, Some(6144));
+    let capabilities = connection.apply_capability_overrides(discovered.clone());
+    assert_eq!(capabilities, discovered);
+    assert_eq!(capabilities.total_input_tokens.value, Some(65_536));
     assert_eq!(
         capabilities.state_and_longest_question_tokens.value,
-        Some(5120)
+        Some(32_768)
     );
     assert_eq!(capabilities.runtime_context_tokens.value, Some(5000));
+    assert_eq!(capabilities.rendering_reserve_tokens, 4096);
     assert_eq!(capabilities.usable_input_tokens(), Some(904));
     assert_eq!(capabilities.usable_state_tokens(), Some(904));
 }
@@ -183,6 +219,11 @@ async fn loopback_request(
                         "POST /exact/path?route=validation HTTP/1.1"
                     }));
                     assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+                    assert!(
+                        !headers
+                            .to_ascii_lowercase()
+                            .contains("typesafe-danger-zone-long-context:")
+                    );
                     break serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + length])
                         .unwrap();
                 }

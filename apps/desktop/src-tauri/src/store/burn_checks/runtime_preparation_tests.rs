@@ -252,12 +252,22 @@ fn jev_budget_rejection_occurs_before_the_engine_writes_dispatch_intent() {
     let store =
         Arc::new(Store::open_in_memory(Path::new("/tmp/antiburn-preparation-test")).unwrap());
     let (store, adapter, active) = fixture_with_definition(store, &source);
-    let evaluator = crate::jev::decision_evaluator::TypeSafeDecisionEvaluator::new(
-        crate::jev::client::TypeSafeClient::new("synthetic-key".into()).unwrap(),
-    )
-    .with_usage(Arc::new(|_, _, _| {
-        panic!("local no-fit must not reach provider usage settlement")
-    }));
+    let connection = crate::jev::config::SystemOneConnection::default();
+    let mut capabilities = connection.capabilities().unwrap();
+    capabilities.total_input_tokens.value = Some(8192);
+    let evaluator =
+        crate::jev::decision_evaluator::TypeSafeDecisionEvaluator::from_selected_snapshot(
+            connection,
+            Some("synthetic-key".into()),
+            capabilities,
+        )
+        .unwrap()
+        .with_usage(Arc::new(|_, _, _| {
+            panic!("local no-fit must not reach provider usage settlement")
+        }))
+        .with_diagnostics(Arc::new(|_| {
+            panic!("local no-fit must not reach provider dispatch")
+        }));
     let engine = CheckEngine::new(adapter, Arc::new(evaluator));
     engine
         .apply_source_page(&active, &event(&store, 1, "one", "branch", 1))
@@ -272,6 +282,7 @@ fn jev_budget_rejection_occurs_before_the_engine_writes_dispatch_intent() {
         "burn_check_evaluation_attempt",
         "burn_check_cooldown",
         "burn_check_current_status",
+        "burn_check_decision_usage",
     ] {
         assert_eq!(
             store
@@ -297,36 +308,182 @@ fn jev_budget_rejection_occurs_before_the_engine_writes_dispatch_intent() {
     assert_eq!(failure.code, PreparationFailureCode::NoFit);
 }
 
+#[tokio::test]
+async fn native_alias_unknown_delivery_stays_terminal_after_store_reopen() {
+    use crate::jev::config::SystemOneConnection;
+    use crate::jev::decision_evaluator::TypeSafeDecisionEvaluator;
+    use std::io::{Read, Write};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(directory.path()).unwrap());
+    let (store, adapter, active) = fixture_with_definition(store, CHECK);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0; 4096];
+            let count = socket.read(&mut chunk).unwrap();
+            assert!(count > 0);
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .map(|value| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                if bytes.len() >= end + 4 + length {
+                    assert!(headers.contains("typesafe-danger-zone-long-context: true"));
+                    break;
+                }
+            }
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        drop(socket);
+        listener.set_nonblocking(true).unwrap();
+        listener
+    });
+    let usage = Arc::new(Mutex::new(Vec::new()));
+    let recorded = usage.clone();
+    let connection = SystemOneConnection::default();
+    let caps = connection.capabilities().unwrap();
+    let evaluator = Arc::new(
+        TypeSafeDecisionEvaluator::from_selected_snapshot(
+            connection,
+            Some("synthetic-key".into()),
+            caps,
+        )
+        .unwrap()
+        .with_native_test_endpoint(endpoint)
+        .with_usage(Arc::new(move |_, _, observation| {
+            recorded.lock().unwrap().push(observation);
+            Ok(())
+        })),
+    );
+    let engine = CheckEngine::new(adapter.clone(), evaluator.clone());
+    engine
+        .apply_source_page(&active, &event(&store, 1, "one", "branch", 1))
+        .unwrap();
+    let StartOutcome::Started(task) = engine.start_one_due(&active, 100_000).unwrap() else {
+        panic!("Native candidate must start");
+    };
+    let result = task.await.unwrap();
+    assert_eq!(result.attempts, 1);
+    assert!(
+        matches!(result.outcome, RunOutcome::Failed(_)),
+        "{result:?}"
+    );
+    assert_eq!(*usage.lock().unwrap(), [None]);
+    let preparation: String = store
+        .lock()
+        .query_row(
+            "SELECT preparation_json FROM burn_check_candidate",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(preparation.contains(antiburn_local::analysis::jev::NATIVE_MODEL_ALIAS));
+    drop(engine);
+    drop(adapter);
+    drop(store);
+    let reopened = Arc::new(Store::open(directory.path()).unwrap());
+    let adapter = Arc::new(
+        StoreCheckStore::new(reopened.clone(), "owner-2".into(), active.id.scope.clone()).unwrap(),
+    );
+    adapter.register_activation(&active).unwrap();
+    assert!(adapter.load_recovery(None, 10).unwrap().is_empty());
+    let engine = CheckEngine::new(adapter, evaluator);
+    assert!(matches!(
+        engine.start_one_due(&active, 200_000).unwrap(),
+        StartOutcome::NotDue
+    ));
+    let saved: String = reopened
+        .lock()
+        .query_row(
+            "SELECT preparation_json FROM burn_check_candidate",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(saved, preparation);
+    let attempts: i64 = reopened
+        .lock()
+        .query_row(
+            "SELECT COUNT(*) FROM burn_check_evaluation_attempt",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts, 1);
+    let (candidate_state, attempt_state, outcome, diagnostic): (String, String, String, String) =
+        reopened
+            .lock()
+            .query_row(
+                "SELECT c.state, a.state, a.outcome, c.diagnostic_json
+               FROM burn_check_candidate c
+               JOIN burn_check_evaluation_attempt a ON a.candidate_id = c.candidate_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+    assert_eq!(candidate_state, "execution_failed");
+    assert_eq!(attempt_state, "settled");
+    assert_eq!(outcome, "unknown");
+    let diagnostic: antiburn_checks::engine::EvaluationDiagnostic =
+        serde_json::from_str(&diagnostic).unwrap();
+    assert_eq!(diagnostic.code, EvaluationFailureCode::DeliveryUnknown);
+    let listener = server.join().unwrap();
+    assert!(
+        matches!(listener.accept(),Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+}
+
 #[test]
 fn cloudflare_request_rules_fail_before_dispatch_intent_cooldown_or_usage() {
     use crate::jev::config::{
-        ContextLimitOverride, SystemOneConnection, SystemOneEndpoint, SystemOneProvider,
-        SystemOneResponseMode,
+        SystemOneConnection, SystemOneEndpoint, SystemOneProvider, SystemOneResponseMode,
     };
     use crate::jev::decision_evaluator::TypeSafeDecisionEvaluator;
 
     let question_id = "a".repeat(101);
     let source = CHECK.replace("verdict", &question_id);
-    for provider in [SystemOneProvider::Cloudflare, SystemOneProvider::Custom] {
+    for (provider, endpoint, expected) in [
+        (
+            SystemOneProvider::Cloudflare,
+            SystemOneEndpoint::CloudflareAccount("synthetic-account".into()),
+            PreparationFailureCode::InvalidRequest,
+        ),
+        (
+            SystemOneProvider::Custom,
+            SystemOneEndpoint::ExactUrl(
+                crate::jev_cloudflare::account_endpoint("synthetic-account", "clef").unwrap(),
+            ),
+            PreparationFailureCode::InvalidRequest,
+        ),
+        (
+            SystemOneProvider::Custom,
+            SystemOneEndpoint::ExactUrl("https://synthetic.example/systemone".into()),
+            PreparationFailureCode::ProviderUnavailable,
+        ),
+    ] {
         let connection = SystemOneConnection {
             provider,
-            endpoint: match provider {
-                SystemOneProvider::Cloudflare => {
-                    SystemOneEndpoint::CloudflareAccount("synthetic-account".into())
-                }
-                _ => SystemOneEndpoint::ExactUrl("https://synthetic.example/systemone".into()),
-            },
+            endpoint,
             model: "clef".into(),
             model_revision: None,
             response_mode: SystemOneResponseMode::CloudflareEnvelope,
             credential: None,
             revision: 1,
-            context_override: (provider == SystemOneProvider::Custom).then_some(
-                ContextLimitOverride {
-                    total_input_tokens: Some(16_384),
-                    ..Default::default()
-                },
-            ),
+            context_override: None,
         };
         let capabilities = connection.capabilities().unwrap();
         let evaluator = TypeSafeDecisionEvaluator::from_selected_snapshot(
@@ -336,10 +493,10 @@ fn cloudflare_request_rules_fail_before_dispatch_intent_cooldown_or_usage() {
         )
         .unwrap()
         .with_usage(Arc::new(|_, _, _| {
-            panic!("invalid adapter input must not reach usage settlement")
+            panic!("local preflight rejection must not reach usage settlement")
         }))
         .with_diagnostics(Arc::new(|_| {
-            panic!("invalid adapter input must not reach provider dispatch")
+            panic!("local preflight rejection must not reach provider dispatch")
         }));
         let store =
             Arc::new(Store::open_in_memory(Path::new("/synthetic/cloudflare-preflight")).unwrap());
@@ -349,7 +506,7 @@ fn cloudflare_request_rules_fail_before_dispatch_intent_cooldown_or_usage() {
             .apply_source_page(&active, &event(&store, 1, "one", "branch", 1))
             .unwrap();
         let StartOutcome::Started(task) = engine.start_one_due(&active, 100_000).unwrap() else {
-            panic!("invalid adapter input must settle locally");
+            panic!("preflight rejection must settle locally");
         };
         let settled = poll_settlement(task);
         assert!(matches!(settled.outcome, RunOutcome::NotAssessed(_)));
@@ -380,11 +537,17 @@ fn cloudflare_request_rules_fail_before_dispatch_intent_cooldown_or_usage() {
             )
             .unwrap();
         let PreparationRecord::Rejected(failure) = serde_json::from_str(&saved).unwrap() else {
-            panic!("invalid adapter input must retain a typed preparation failure");
+            panic!("preflight rejection must retain a typed preparation failure");
         };
-        assert_eq!(failure.code, PreparationFailureCode::InvalidRequest);
-        let field = format!("decisions.review.output.{question_id}");
-        assert_eq!(failure.context.field.as_deref(), Some(field.as_str()));
+        assert_eq!(failure.code, expected);
+        if expected == PreparationFailureCode::InvalidRequest {
+            let field = format!("decisions.review.output.{question_id}");
+            assert_eq!(failure.context.field.as_deref(), Some(field.as_str()));
+            assert_eq!(failure.context.decision.as_deref(), Some("review"));
+        } else {
+            assert_eq!(failure.context, Default::default());
+            assert_eq!(failure.report, None);
+        }
     }
 }
 

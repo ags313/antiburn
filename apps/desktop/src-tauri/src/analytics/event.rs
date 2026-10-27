@@ -91,6 +91,8 @@ pub enum EventName {
     BurnCheckInputPrepared,
     /// An explicit installed-check definition open request settled.
     BurnCheckDefinitionOpened,
+    /// An explicit installed-check directory open request settled.
+    BurnCheckDirectoryOpened,
     /// The Sessions sidebar filter changed to a different selection.
     #[cfg(feature = "analytics")]
     SessionFilterSelected,
@@ -187,6 +189,7 @@ pub const EVERY_EVENT: &[EventName] = &[
     EventName::BurnCheckOutcomeObserved,
     EventName::BurnCheckInputPrepared,
     EventName::BurnCheckDefinitionOpened,
+    EventName::BurnCheckDirectoryOpened,
     EventName::SessionFilterSelected,
     EventName::SessionFiltersChanged,
     EventName::RemoteHostConnectionChecked,
@@ -237,6 +240,7 @@ impl EventName {
             EventName::BurnCheckOutcomeObserved => "antiburn.burn_check_outcome_observed",
             EventName::BurnCheckInputPrepared => "antiburn.burn_check_input_prepared",
             EventName::BurnCheckDefinitionOpened => "antiburn.burn_check_definition_opened",
+            EventName::BurnCheckDirectoryOpened => "antiburn.burn_check_directory_opened",
             EventName::ProjectFolderAction => "antiburn.project_folder_action",
             EventName::MemoryAction => "antiburn.memory_action",
             EventName::SessionFilterSelected => "antiburn.session_filter_selected",
@@ -276,6 +280,7 @@ impl EventName {
             | EventName::BurnCheckPromptPrepared
             | EventName::BurnCheckPromptCopied
             | EventName::BurnCheckDefinitionOpened
+            | EventName::BurnCheckDirectoryOpened
             | EventName::SessionFilterSelected
             | EventName::SessionFiltersChanged
             | EventName::RemoteHostConnectionChecked
@@ -302,6 +307,7 @@ impl EventName {
                         | "disabled"
                         | "provider_saved"
                         | "provider_switched"
+                        | "connection_removed"
                         | "credential_removed"
                         | "test_succeeded"
                         | "test_failed"
@@ -587,6 +593,28 @@ impl BurnCheckDefinitionOpenOutcome {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BurnCheckDirectoryOpenOutcome {
+    Succeeded,
+    Missing,
+    Unavailable,
+    OpenFailed,
+}
+
+impl BurnCheckDirectoryOpenOutcome {
+    pub(crate) fn facts(self) -> Facts {
+        Facts {
+            detail: Some(match self {
+                Self::Succeeded => "succeeded",
+                Self::Missing => "missing",
+                Self::Unavailable => "unavailable",
+                Self::OpenFailed => "open_failed",
+            }),
+            ..Facts::default()
+        }
+    }
+}
+
 #[cfg(feature = "analytics")]
 pub fn claude_limit_reset_facts(
     diagnostic: crate::provider_usage::live::anthropic::LimitResetDiagnostic,
@@ -810,6 +838,7 @@ pub enum DecisionProvider {
 pub enum ProviderSetupOutcome {
     Saved,
     Switched,
+    ConnectionRemoved,
     CredentialRemoved,
 }
 
@@ -859,6 +888,7 @@ impl ModelCheckLifecycle {
                 match outcome {
                     ProviderSetupOutcome::Saved => "provider_saved",
                     ProviderSetupOutcome::Switched => "provider_switched",
+                    ProviderSetupOutcome::ConnectionRemoved => "connection_removed",
                     ProviderSetupOutcome::CredentialRemoved => "credential_removed",
                 },
             ),
@@ -1940,6 +1970,13 @@ mod tests {
         (BurnCheckDefinitionOpenOutcome::OpenFailed, "open_failed"),
     ];
 
+    const DIRECTORY_OPEN_OUTCOMES: &[(BurnCheckDirectoryOpenOutcome, &str)] = &[
+        (BurnCheckDirectoryOpenOutcome::Succeeded, "succeeded"),
+        (BurnCheckDirectoryOpenOutcome::Missing, "missing"),
+        (BurnCheckDirectoryOpenOutcome::Unavailable, "unavailable"),
+        (BurnCheckDirectoryOpenOutcome::OpenFailed, "open_failed"),
+    ];
+
     #[test]
     fn installed_check_payloads_have_only_closed_outcomes_and_correct_session_classification() {
         for &(outcome, detail) in PREPARATION_OUTCOMES {
@@ -1949,6 +1986,11 @@ mod tests {
         }
         for &(outcome, detail) in DEFINITION_OPEN_OUTCOMES {
             let name = EventName::BurnCheckDefinitionOpened;
+            assert!(name.is_user_oriented(&outcome.facts()));
+            assert_closed_payload((name, outcome.facts()), name.as_str(), None, Some(detail));
+        }
+        for &(outcome, detail) in DIRECTORY_OPEN_OUTCOMES {
+            let name = EventName::BurnCheckDirectoryOpened;
             assert!(name.is_user_oriented(&outcome.facts()));
             assert_closed_payload((name, outcome.facts()), name.as_str(), None, Some(detail));
         }
@@ -2064,6 +2106,7 @@ mod tests {
         for (kind, outcome) in [
             ("burnCheckInputPrepared", "shortened"),
             ("burnCheckDefinitionOpened", "succeeded"),
+            ("burnCheckDirectoryOpened", "succeeded"),
         ] {
             assert!(
                 serde_json::from_value::<Interaction>(serde_json::json!({
@@ -2094,6 +2137,7 @@ mod tests {
             .iter()
             .map(|(_, detail)| detail)
             .chain(DEFINITION_OPEN_OUTCOMES.iter().map(|(_, detail)| detail))
+            .chain(DIRECTORY_OPEN_OUTCOMES.iter().map(|(_, detail)| detail))
         {
             assert!(
                 section.contains(&format!("`{detail}`")),
@@ -2102,6 +2146,7 @@ mod tests {
         }
         assert!(section.contains("antiburn.burn_check_input_prepared"));
         assert!(section.contains("antiburn.burn_check_definition_opened"));
+        assert!(section.contains("antiburn.burn_check_directory_opened"));
     }
 
     #[test]
@@ -2130,6 +2175,10 @@ mod tests {
             for (outcome, detail) in [
                 (ProviderSetupOutcome::Saved, "provider_saved"),
                 (ProviderSetupOutcome::Switched, "provider_switched"),
+                (
+                    ProviderSetupOutcome::ConnectionRemoved,
+                    "connection_removed",
+                ),
                 (
                     ProviderSetupOutcome::CredentialRemoved,
                     "credential_removed",
@@ -2282,6 +2331,7 @@ mod tests {
             for (label, detail) in [
                 ("enablement", "enabled"),
                 ("jev", "provider_saved"),
+                ("jev", "connection_removed"),
                 ("history_window", "future"),
                 ("backfill", "requested"),
                 ("execution", "completed"),
@@ -2851,6 +2901,7 @@ mod tests {
             for outcome in [
                 ProviderSetupOutcome::Saved,
                 ProviderSetupOutcome::Switched,
+                ProviderSetupOutcome::ConnectionRemoved,
                 ProviderSetupOutcome::CredentialRemoved,
             ] {
                 lifecycles.push(ModelCheckLifecycle::ProviderSetup { provider, outcome });
@@ -2897,6 +2948,7 @@ mod tests {
                 | EventName::BurnCheckOutcomeObserved
                 | EventName::BurnCheckInputPrepared
                 | EventName::BurnCheckDefinitionOpened
+                | EventName::BurnCheckDirectoryOpened
                 | EventName::ProjectFolderAction
                 | EventName::MemoryAction
                 | EventName::SessionFilterSelected
@@ -2922,7 +2974,7 @@ mod tests {
         }
         assert_eq!(
             EVERY_EVENT.len(),
-            44,
+            45,
             "a variant was added to the match above but not to EVERY_EVENT"
         );
         assert!(EVERY_EVENT.iter().copied().all(listed));

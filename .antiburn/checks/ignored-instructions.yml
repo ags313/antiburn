@@ -20,6 +20,8 @@ decisions:
       activity: ${{ window.messages }}
     # Keep instructions, exceptions, corrections, and arguments intact.
     fit:
+      "current_global_scope.skills[*].description": truncate
+      "current_repo_scope.skills[*].description": truncate
       "activity[*].tool.result.content": truncate
     output:
       decision:
@@ -63,6 +65,7 @@ actions:
       result: failure
       message: The selected work may differ from current instruction files. This does not show that the rule was active or ignored when the work happened.
   - type: status
-    if: "!((decisions.review.outputs.decision == 'recorded_correction_conflict' && decisions.review.details.decision.probabilities.recorded_correction_conflict >= 0.95) || (decisions.review.outputs.decision == 'current_file_mismatch' && decisions.review.details.decision.probabilities.current_file_mismatch >= 0.95))"
+    if: decisions.review.outputs.decision == 'no_conflict' && decisions.review.details.decision.probabilities.no_conflict >= 0.95
     input:
       result: success
+      message: The supplied rules and corrections show no direct conflict in the selected work. This does not assess missing evidence or past instruction activation.

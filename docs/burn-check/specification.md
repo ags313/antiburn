@@ -1,19 +1,42 @@
-# Burn Checks specification: v1-prealpha
+# Burn Checks specification: v1-alpha
 
-**Audience:** authors, parser/compiler implementers, and source-adapter owners.
-**Scope:** the current draft language for authored Burn Checks. MUST, MUST NOT,
-and SHOULD define precise requirements within this draft; they do not promise
-stability or support for every capability.
+Use this reference to write definitions, build parsers and compilers, or implement
+source adapters. MUST, MUST NOT, and SHOULD define requirements within this draft.
+They do not promise language stability or support for every capability.
 
-> **Experimental draft: `v1-prealpha`.** Burn Checks are not yet standardized.
+> **Experimental draft: `v1-alpha`.** Burn Checks are not yet standardized.
 > Syntax, semantics, and capabilities may change, including breaking changes.
 > There is no backward compatibility promise. A schema-valid definition can use
 > features the runtime or a source adapter cannot execute. See the
 > [supported subset](authoring.md#supported-subset).
 
+## Current implementation
+
+The runtime supports local status checks and independent model decision blocks
+with Choice, Score, and Noul questions. It accepts seven events in three
+families: public messages and tool calls/results, proven response-cycle ends,
+and host session observations. Each source must prove its event and bindings.
+The desktop emits `session_start` reason `attached` only. `session_idle` records
+a 120-second observation boundary, not real idle time, model occupancy, or savings.
+
+Message actions are not supported, including behind `if: false`. Effective
+`agent.skills`, `repo.branch`, historical instruction activation, and historical
+effective skill inventories are also unavailable. Remote, WSL, child, and
+historical-only sources do not start new live checks. Native fix prompts, Auto
+Fix, verification watches, burn estimates, and savings are not Burn Check
+capabilities. Broader draft forms do not promise product support.
+
+Missing capabilities are unassigned future work. Beta and stable scope are not
+set, and missing features are not usable today. Use the
+[authoring guide](authoring.md#supported-subset) for the implemented subset,
+[session coverage](../session-coverage.md#burn-check-source-facts) for accepted
+source shapes and producer versions, and [provider contracts](provider-contracts.md)
+for typed output and connection limits. Schema acceptance, compiler admission,
+source proof, and provider compatibility are separate requirements.
+
 ## 1. Version and compatibility
 
-The specification label is exactly **`v1-prealpha`**. It identifies this draft,
+The specification label is exactly **`v1-alpha`**. It identifies this draft,
 not a YAML field or an internal serialization version. A check MUST NOT add a
 YAML `version` or `$schema` instance field. The JSON Schema dialect is
 Draft 2020-12; it is separate from the specification label.
@@ -24,9 +47,9 @@ hosted `$id`; authors and editors MUST use the checked-in asset or a verified
 equivalent. A runtime MUST use this asset or a verified equivalent and test
 structural parity. Editor validation does not activate a definition.
 
-The [authoring guide](authoring.md#supported-subset) states implemented capabilities. Runtimes
-MUST reject unsupported definitions before activation and MUST NOT silently
-remove unsupported fields or actions.
+The [authoring guide](authoring.md#supported-subset) states implemented
+capabilities. Runtimes MUST reject unsupported definitions before activation and
+MUST NOT silently remove unsupported fields or actions.
 
 Before changing the contract, maintainers MUST review the impact on authored
 definitions, source/provider capabilities, execution, and persisted state. They
@@ -79,9 +102,13 @@ assessments remain available.
 File presence MUST NOT bypass provider configuration, user pause settings,
 source availability, or shared resource limits.
 
-The desktop master setting defaults to enabled only when no preference was
-saved. It MUST preserve explicit saved off and disable execution when saved
-storage is malformed or unreadable. YAML check cards and navigation MUST require
+The desktop MUST keep a fresh setup without a connection disabled. It MUST
+preserve explicit saved off and disable execution when saved storage is malformed
+or unreadable. Saving an inactive connection MUST NOT select it. Creating the
+first connection selects it without enabling checks. Removing the selected
+connection MUST disable checks and clear selection without choosing a replacement
+or deleting accepted results, evidence, or usage. Empty connection settings MUST
+remain empty across restart. YAML check cards and navigation MUST require
 a discovered global or repository definition. Settings MUST keep the master
 toggle and decision-model setup available without definitions. A discovered
 check without a configured System One provider MUST show an actionable setup
@@ -1097,7 +1124,7 @@ Unknown delivery still does not authorize a resend.
 The current release applies the [deployed preparation limits](authoring.md#preparation-limits)
 to original input size, nodes and depth, rule/path size, target expansion,
 traversal, attempted turns, and cumulative serialized-request validation work.
-These are release resource limits, not new YAML fields or a shared evidence
+These are release resource limits, not YAML fields or a shared evidence
 retention cap. Admission can stop before checking whether the request fits.
 
 One 64 MiB (67,108,864-byte) fitting-work allowance covers all blocks, turns,
@@ -1176,17 +1203,21 @@ No action, invalid action, unavailable data, or provider failure leaves the
 prior status unchanged. A valid accepted assessment advances its watermark
 even if all actions skip; a not-assessed result does not. An older assessment
 cannot replace a newer accepted status or claim a later notice. Keep history
-when status changes. Display success as **No concern in this assessment**,
-not “Resolved.”
+when status changes. Describe a retained success as a saved check result, not
+"Resolved" or the result of work still running. When showing progress beside a
+saved result, keep both meanings clear in one status panel.
 
-The maintained Failed retry loop example fails only for `stuck` with label
-probability at or above 0.95. Its success action uses the exact complement of that
-condition, so uncertain and below-threshold answers explicitly write success. This is an
-authored policy, not an engine fallback. For definitions with no matching action,
-acceptance MUST retain the prior status-writing assessment, explanation, evidence,
-and write time while advancing the accepted watermark. Without a prior write,
-engine status remains unassessed. The runtime MUST NOT synthesize a success action
-when no condition matches.
+The maintained Over-exploring example fails only for `likely_excess` with label
+probability at or above 0.95. Its success action uses the exact complement, so
+uncertain and below-threshold answers explicitly write success. Ignored
+instructions instead requires `no_conflict` at probability 0.95 or above to
+write success; an uncertain answer writes no result. These are authored policies,
+not engine fallbacks.
+
+For definitions with no matching action, acceptance MUST retain the prior
+status-writing assessment, explanation, evidence, and write time while advancing
+the accepted watermark. Without a prior write, engine status remains unassessed.
+The runtime MUST NOT synthesize a success action when no condition matches.
 
 Model evidence MUST show each decision's saved original evaluated input, exact
 fitted input, and nonempty omission report from the status-writing assessment,
@@ -1239,18 +1270,19 @@ Example text MUST NOT imply that current instruction files prove past
 applicability, that a skill was never used, or that timing occupancy proves
 counterfactual savings.
 
-| Term                  | Definition                                                                                          |
-| --------------------- | --------------------------------------------------------------------------------------------------- |
-| Activation generation | Durable identity for one effective definition and enabled state                                     |
-| Assessment            | One accepted or rejected evaluation of a frozen candidate                                           |
-| Candidate             | Trigger and selected evidence frozen for a possible assessment                                      |
-| Completeness          | Whether the source proves selected membership and required content                                  |
-| Current status        | Latest accepted status write for one check/branch/generation                                        |
-| Native order          | Source-proven position within a producer's data, distinct from timestamps and delivery order        |
-| Not assessed          | No valid decision could be made because evidence, capability, limits, or execution were unavailable |
-| Response cycle        | Host interaction boundary that can include automatic continuation and tools                         |
-| Uncertain answer      | A valid authored model result whose meaning is uncertain; not an execution failure                  |
-| Window                | Rolling array of selected matching messages ending at a trigger                                     |
+| Term                        | Definition                                                                                          |
+| --------------------------- | --------------------------------------------------------------------------------------------------- |
+| Activation generation       | Durable identity for one effective definition and enabled state                                     |
+| Assessment                  | One accepted or rejected evaluation of a frozen candidate                                           |
+| Candidate                   | Trigger and selected evidence frozen for a possible assessment                                      |
+| Completeness                | Whether the source proves selected membership and required content                                  |
+| Current status              | Latest accepted status write for one check/branch/generation                                        |
+| Native order                | Source-proven position within a producer's data, distinct from timestamps and delivery order        |
+| Not assessed (saved status) | No accepted status write yet; a valid no-write assessment can leave this status unchanged           |
+| Not-assessed candidate      | Evidence, capability, limits, or execution prevented assessment; this is separate from saved status |
+| Response cycle              | Host interaction boundary that can include automatic continuation and tools                         |
+| Uncertain answer            | A valid authored model result whose meaning is uncertain; not an execution failure                  |
+| Window                      | Rolling array of selected matching messages ending at a trigger                                     |
 
 Runtime capabilities belong in [authoring](authoring.md#supported-subset).
 Source and result limits belong in [session coverage](../session-coverage.md)

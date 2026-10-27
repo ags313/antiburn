@@ -400,7 +400,8 @@ pub(crate) fn activity_in(
     session: &SessionKey,
     activity: &NativeActivityObservation,
     now_ms: i64,
-) -> Result<()> {
+) -> Result<super::trace_effects::InvalidationEffects> {
+    let mut effects = super::trace_effects::InvalidationEffects::default();
     ensure!(
         !activity.token.is_empty() && activity.token.len() <= 4096,
         "invalid activity token"
@@ -437,20 +438,21 @@ pub(crate) fn activity_in(
             idle_emitted_revision = NULL, idle_publication = NULL WHERE check_id = ?1 AND activation_scope_key = ?2
             AND generation = ?3 AND observer_epoch = ?4",
             params![check, scope, generation, epoch, activity.token, serde_json::to_string(&activity.position)?, activity.native_at_ms, now_ms])?;
-        tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3
+        effects.unfinished_stale += tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3
             AND branch_key = ?4 AND state IN ('pending', 'claimed', 'dispatching', 'answered')
             AND EXISTS(SELECT 1 FROM burn_check_candidate_dependency d WHERE d.candidate_id = burn_check_candidate.candidate_id
               AND json_type(d.dependency_binding_json, '$.SessionActivity') = 'object')",
             params![check, scope, generation, session.to_identity_json()])?;
     }
-    Ok(())
+    Ok(effects)
 }
 
 pub(crate) fn rebind_source_in(
     tx: &Transaction<'_>,
     session: &SessionKey,
     format: antiburn_local::analysis::SourceFormat,
-) -> Result<()> {
+) -> Result<super::trace_effects::InvalidationEffects> {
+    let mut effects = super::trace_effects::InvalidationEffects::default();
     let mut statement = tx.prepare("SELECT t.check_id, t.activation_scope_key, t.generation, s.source_label
         FROM burn_check_session_attachment t JOIN burn_check_activation a USING(check_id, activation_scope_key)
         JOIN session s ON json_array(s.environment_key, s.agent, s.session_id) = t.branch_key
@@ -476,13 +478,13 @@ pub(crate) fn rebind_source_in(
             observation_started_at_ms = NULL, idle_deadline_ms = NULL, idle_emitted_revision = NULL, idle_publication = NULL
             WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3 AND branch_key = ?4",
             params![check, scope, generation, session.to_identity_json(), source_label, format])?;
-        tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE check_id = ?1 AND activation_scope_key = ?2
+        effects.unfinished_stale += tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE check_id = ?1 AND activation_scope_key = ?2
             AND generation = ?3 AND branch_key = ?4 AND state IN ('pending', 'claimed', 'dispatching', 'answered')
             AND EXISTS(SELECT 1 FROM burn_check_candidate_dependency d WHERE d.candidate_id = burn_check_candidate.candidate_id
               AND json_type(d.dependency_binding_json, '$.SessionActivity') = 'object')",
             params![check, scope, generation, session.to_identity_json()])?;
     }
-    Ok(())
+    Ok(effects)
 }
 
 pub(crate) fn selection_in(
@@ -550,7 +552,11 @@ pub(crate) fn selection_in(
     Ok(())
 }
 
-pub(crate) fn break_continuity_in(tx: &Transaction<'_>, session: &SessionKey) -> Result<()> {
+pub(crate) fn break_continuity_in(
+    tx: &Transaction<'_>,
+    session: &SessionKey,
+) -> Result<super::trace_effects::InvalidationEffects> {
+    let mut effects = super::trace_effects::InvalidationEffects::default();
     tx.execute(
         "UPDATE burn_check_session_attachment SET session_selection_json = NULL
         WHERE branch_key = ?1 AND source_format = '\"open_code_v2_sqlite\"'",
@@ -559,11 +565,12 @@ pub(crate) fn break_continuity_in(tx: &Transaction<'_>, session: &SessionKey) ->
     tx.execute("UPDATE burn_check_session_attachment SET continuity_eligible = 0, idle_deadline_ms = NULL,
         activity_revision = activity_revision + 1, idle_emitted_revision = NULL WHERE branch_key = ?1 AND continuity_eligible = 1",
         [session.to_identity_json()])?;
-    tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE branch_key = ?1
+    effects.unfinished_stale += tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE branch_key = ?1
         AND state IN ('pending', 'claimed', 'dispatching', 'answered') AND EXISTS(
           SELECT 1 FROM burn_check_candidate_dependency d WHERE d.candidate_id = burn_check_candidate.candidate_id
             AND json_type(d.dependency_binding_json, '$.SessionActivity') = 'object')", [session.to_identity_json()])?;
-    super::evidence::invalidate_native_dependents_in(tx, session)
+    effects += super::evidence::invalidate_native_dependents_in(tx, session)?;
+    Ok(effects)
 }
 
 pub(crate) fn frontier_in(

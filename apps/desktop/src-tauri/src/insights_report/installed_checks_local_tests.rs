@@ -10,7 +10,7 @@ use antiburn_checks::source::{PublicationCursor, SourceBatch, SourceEvent};
 
 const LOCAL_CHECK: &str = "name: Local report fixture\non:\n  tool_result:\nactions:\n  - type: status\n    if: message.tool.arguments.write\n    input:\n      result: failure\n      message: ${{ message.tool.arguments.explanation }}\n";
 
-struct NoModel;
+pub(super) struct NoModel;
 
 impl DecisionEvaluator for NoModel {
     fn preparation_recorded(&self, _: &antiburn_checks::fit::PreparationRecord) {
@@ -58,7 +58,7 @@ fn local_fixture() -> (
     local_fixture_with_source(LOCAL_CHECK)
 }
 
-fn local_fixture_with_source(
+pub(super) fn local_fixture_with_source(
     source: &str,
 ) -> (
     Arc<Store>,
@@ -164,7 +164,7 @@ fn settle(task: antiburn_checks::engine::EvaluationTask<'_>) {
     assert_eq!(settled.attempts, 0);
 }
 
-fn start_and_accept(
+pub(super) fn start_and_accept(
     engine: &CheckEngine<StoreCheckStore, NoModel>,
     active: &EffectiveActivation,
     now: u64,

@@ -6,7 +6,10 @@ use std::fmt;
 
 use serde::de::{self, DeserializeOwned, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 
-use super::{JevError, JevUsage, MAX_RESPONSE_BYTES};
+use super::{
+    JevError, JevResponseObservation, JevUsage, MAX_RESPONSE_BYTES, NATIVE_MODEL_ALIAS,
+    valid_response_model,
+};
 
 // Count the root as depth one and bound untyped envelope metadata as well.
 const MAX_JSON_DEPTH: usize = 64;
@@ -19,11 +22,22 @@ pub enum JevUsageLocation {
 }
 
 /// Records unambiguous usage before rejecting duplicate keys or invalid answers.
-/// The first pass retains object keys only, not a second response value tree.
 pub fn decode_jev_json_with_usage<T: DeserializeOwned>(
     body: &[u8],
     location: JevUsageLocation,
     record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
+) -> Result<T, JevError> {
+    decode_jev_json_with_observation(body, location, |observation| {
+        record_usage(observation.usage)
+    })
+}
+
+/// Record usage and safe served identity before typed answer validation.
+/// The first pass retains keys and one model name, not a second value tree.
+pub fn decode_jev_json_with_observation<T: DeserializeOwned>(
+    body: &[u8],
+    location: JevUsageLocation,
+    record_observation: impl Fn(JevResponseObservation) -> Result<(), JevError>,
 ) -> Result<T, JevError> {
     if body.len() > MAX_RESPONSE_BYTES {
         return Err(JevError::ResponseTooLarge);
@@ -42,7 +56,10 @@ pub fn decode_jev_json_with_usage<T: DeserializeOwned>(
     .map_err(|_| JevError::ResponseDecode)?;
     decoder.end().map_err(|_| JevError::ResponseDecode)?;
     if let Some(usage) = scanned.usage {
-        record_usage(usage)?;
+        record_observation(JevResponseObservation {
+            usage,
+            served_model: scanned.model,
+        })?;
     }
     if state.duplicate {
         return Err(JevError::ResponseDecode);
@@ -60,6 +77,7 @@ struct ScanState {
 enum Role {
     Envelope,
     Response,
+    Model,
     Usage,
     Token,
     Other,
@@ -69,6 +87,7 @@ enum Role {
 struct ScannedValue {
     usage: Option<JevUsage>,
     token: Option<u64>,
+    model: Option<String>,
 }
 
 struct ScanSeed<'a> {
@@ -99,9 +118,11 @@ impl<'de> Visitor<'de> for ScanSeed<'_> {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut keys = BTreeSet::new();
         let mut usage = None;
+        let mut model = None;
         let mut input_tokens = None;
         let mut output_tokens = None;
         let mut ambiguous_usage = false;
+        let mut ambiguous_model = false;
         while let Some(key) = map.next_key_seed(KeySeed)? {
             let duplicate = keys.contains(&key);
             if duplicate {
@@ -111,10 +132,13 @@ impl<'de> Visitor<'de> for ScanSeed<'_> {
                     Role::Response => key == "usage",
                     _ => false,
                 };
+                ambiguous_model |= matches!(self.role, Role::Envelope)
+                    || matches!(self.role, Role::Response) && key == "model";
             }
             let role = match (self.role, key.as_ref()) {
                 (Role::Envelope, "result") => Role::Response,
                 (Role::Response, "usage") => Role::Usage,
+                (Role::Response, "model") => Role::Model,
                 (Role::Usage, "input_tokens" | "output_tokens") => Role::Token,
                 _ => Role::Other,
             };
@@ -125,7 +149,12 @@ impl<'de> Visitor<'de> for ScanSeed<'_> {
             })?;
             if !duplicate {
                 match (self.role, key.as_ref()) {
-                    (Role::Envelope, "result") | (Role::Response, "usage") => usage = child.usage,
+                    (Role::Envelope, "result") => {
+                        usage = child.usage;
+                        model = child.model;
+                    }
+                    (Role::Response, "usage") => usage = child.usage,
+                    (Role::Response, "model") => model = child.model,
                     (Role::Usage, "input_tokens") => input_tokens = child.token,
                     (Role::Usage, "output_tokens") => output_tokens = child.token,
                     _ => {}
@@ -144,6 +173,7 @@ impl<'de> Visitor<'de> for ScanSeed<'_> {
         Ok(ScannedValue {
             usage: if ambiguous_usage { None } else { usage },
             token: None,
+            model: if ambiguous_model { None } else { model },
         })
     }
 
@@ -162,7 +192,7 @@ impl<'de> Visitor<'de> for ScanSeed<'_> {
     fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
         Ok(ScannedValue {
             token: matches!(self.role, Role::Token).then_some(value),
-            usage: None,
+            ..ScannedValue::default()
         })
     }
 
@@ -178,8 +208,14 @@ impl<'de> Visitor<'de> for ScanSeed<'_> {
         Ok(ScannedValue::default())
     }
 
-    fn visit_str<E: de::Error>(self, _value: &str) -> Result<Self::Value, E> {
-        Ok(ScannedValue::default())
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(ScannedValue {
+            model: (matches!(self.role, Role::Model)
+                && value != NATIVE_MODEL_ALIAS
+                && valid_response_model(value))
+            .then(|| value.to_owned()),
+            ..ScannedValue::default()
+        })
     }
 
     fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
@@ -216,6 +252,7 @@ impl<'de> Visitor<'de> for KeySeed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
     use serde_json::Value;
 
     fn decode(
@@ -238,6 +275,158 @@ mod tests {
         input_tokens: 12,
         output_tokens: 1,
     });
+
+    fn decode_observed_response(
+        response: &str,
+        expected_model: Option<&str>,
+        expect_success: bool,
+    ) {
+        #[derive(Deserialize)]
+        struct Envelope {
+            result: super::super::JevResponse,
+        }
+
+        for envelope in [false, true] {
+            let body = if envelope {
+                format!(
+                    r#"{{"success":true,"model":"ignored-envelope-model","result":{response}}}"#
+                )
+            } else {
+                response.to_owned()
+            };
+            let calls = std::cell::Cell::new(0);
+            let record = |observation: JevResponseObservation| {
+                calls.set(calls.get() + 1);
+                assert_eq!(Some(observation.usage), KNOWN);
+                assert_eq!(observation.served_model.as_deref(), expected_model);
+                Ok(())
+            };
+            let result = if envelope {
+                decode_jev_json_with_observation::<Envelope>(
+                    body.as_bytes(),
+                    JevUsageLocation::CloudflareEnvelope,
+                    record,
+                )
+                .map(|envelope| envelope.result)
+            } else {
+                decode_jev_json_with_observation::<super::super::JevResponse>(
+                    body.as_bytes(),
+                    JevUsageLocation::Direct,
+                    record,
+                )
+            };
+            assert_eq!(calls.get(), 1);
+            if expect_success {
+                assert!(result.is_ok(), "{response}");
+            } else {
+                assert_eq!(result, Err(JevError::ResponseDecode), "{response}");
+            }
+        }
+    }
+
+    #[test]
+    fn observations_keep_only_safe_unambiguous_nonalias_model_names() {
+        for (model, expected) in [
+            ("jev-1.14.0", Some("jev-1.14.0")),
+            ("future/jev:release_2040", Some("future/jev:release_2040")),
+            (NATIVE_MODEL_ALIAS, None),
+            ("", None),
+            ("unsafe name", None),
+            ("unsafe\nname", None),
+            ("漢字", None),
+            ("unsafe?name", None),
+        ] {
+            let body = format!(
+                r#"{{"model":{},"answers":{{"q":{{"type":"noul","noul":0.5}}}},"usage":{USAGE}}}"#,
+                serde_json::to_string(model).unwrap()
+            );
+            decode_observed_response(&body, expected, true);
+        }
+        for length in [128, 129] {
+            let model = "a".repeat(length);
+            let body = format!(r#"{{"model":"{model}","answers":{{}},"usage":{USAGE}}}"#);
+            decode_observed_response(&body, (length == 128).then_some(model.as_str()), true);
+        }
+    }
+
+    #[test]
+    fn invalid_answers_do_not_erase_usage_or_observed_model() {
+        for answers in [
+            r#"{"q":{}}"#,
+            r#"{"q":{"type":"noul","noul":"invalid"}}"#,
+            r#"{"q":{"type":"noul","noul":0.5,"extra":true}}"#,
+            r#"{"q":{"type":"noul","noul":0.5,"noul":0.8}}"#,
+            r#"{"q":{},"q":{}}"#,
+        ] {
+            let body = format!(
+                r#"{{"model":"future/jev:release_2040","answers":{answers},"usage":{USAGE}}}"#
+            );
+            decode_observed_response(&body, Some("future/jev:release_2040"), false);
+        }
+    }
+
+    #[test]
+    fn missing_malformed_and_duplicate_models_do_not_erase_independent_usage() {
+        for fields in [
+            "".to_owned(),
+            r#""model":null,"#.to_owned(),
+            r#""model":42,"#.to_owned(),
+            r#""model":[],"#.to_owned(),
+            r#""model":{"model":"nested-model"},"#.to_owned(),
+            r#""model":"jev-1.14.0","model":"jev-1.14.0","#.to_owned(),
+            r#""model":"jev-1.14.0","model":"future-model","#.to_owned(),
+            r#""model":"jev-1.14.0","\u006dodel":"future-model","#.to_owned(),
+            r#""model":"jev-1.14.0","model":null,"#.to_owned(),
+        ] {
+            let body = format!(r#"{{{fields}"answers":{{}},"usage":{USAGE}}}"#);
+            decode_observed_response(&body, None, false);
+        }
+    }
+
+    #[test]
+    fn model_observation_uses_only_the_selected_response_path() {
+        let body = format!(
+            r#"{{"model":"jev-1.14.0","metadata":{{"model":"ignored-metadata-model"}},"answers":{{}},"usage":{USAGE}}}"#
+        );
+        decode_observed_response(&body, Some("jev-1.14.0"), true);
+        let body = format!(
+            r#"{{"metadata":{{"model":"ignored-metadata-model"}},"result":{{"model":"ignored-result-model"}},"answers":{{}},"usage":{USAGE}}}"#
+        );
+        decode_observed_response(&body, None, false);
+    }
+
+    #[test]
+    fn duplicate_usage_never_records_an_observation_from_a_valid_model() {
+        for fields in [
+            format!(r#""usage":{USAGE},"usage":{USAGE}"#),
+            r#""usage":{"input_tokens":12,"input_tokens":12,"output_tokens":1}"#.into(),
+            r#""usage":{"input_tokens":12,"output_tokens":1,"output_tokens":1}"#.into(),
+        ] {
+            let body = format!(r#"{{"model":"jev-1.14.0","answers":{{}},{fields}}}"#);
+            let result: Result<Value, _> =
+                decode_jev_json_with_observation(body.as_bytes(), JevUsageLocation::Direct, |_| {
+                    panic!("ambiguous usage cannot settle an observation")
+                });
+            assert_eq!(result, Err(JevError::ResponseDecode));
+        }
+    }
+
+    #[test]
+    fn observation_storage_failure_precedes_model_and_answer_decode_errors() {
+        let body = format!(
+            r#"{{"model":"jev-1.14.0","model":"future-model","answers":{{"q":{{}}}},"usage":{USAGE}}}"#
+        );
+        let result: Result<super::super::JevResponse, _> = decode_jev_json_with_observation(
+            body.as_bytes(),
+            JevUsageLocation::Direct,
+            |observation| {
+                assert_eq!(Some(observation.usage), KNOWN);
+                assert_eq!(observation.served_model, None);
+                Err(JevError::ProgressStorageFailure)
+            },
+        );
+        assert_eq!(result, Err(JevError::ProgressStorageFailure));
+    }
 
     #[test]
     fn duplicates_at_every_level_fail_without_losing_independent_usage() {

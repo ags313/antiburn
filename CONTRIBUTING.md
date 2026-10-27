@@ -16,7 +16,8 @@ Thank you for contributing.
 ## Privacy and safety
 
 antiburn keeps its session index locally and needs no project-operated account.
-**Run model-based checks** controls YAML discovery and activation in Settings → Checks.
+**Run checks** under Settings → Checks → Model-based checks controls YAML check
+activation. Settings can still read check-folder entry metadata while it is off.
 The provider controls under **Model-based checks** select the active System One connection: Jev, compatible
 Ollama, Cloudflare, or Custom. Settings owns routing; decision-level YAML `model`
 is an unknown field, not a migration input. Observed coding-agent model fields
@@ -31,7 +32,8 @@ skill inventory inputs. Selected tool results can still contain file text. Keep 
 credentials, findings, evidence, and
 native record/call IDs out of first-party analytics. Store only bounded local
 usage aggregates, including the actual provider, model, and price version used
-for estimates. Keep unpriced usage explicit; a matching model name does not
+for estimates. Keep unpriced usage distinct in stored accounting; Settings omits
+absent estimates rather than showing zero. A matching model name does not
 make a Custom or Cloudflare request a TypeSafe-priced request.
 Do not retain request histories or session identifiers for billing summaries.
 Session deletion keeps already-incurred totals. **Clear index…** in Settings →
@@ -53,7 +55,7 @@ author policy, not an accuracy guarantee.
 Validate YAML language support separately from selected-connection capabilities.
 Check criterion count, label-probability support, and confidence support without
 substituting one for another. A provider feature does not enable unsupported YAML
-syntax. Manual limits cannot bypass failed discovery or establish output support.
+syntax. Numeric limits cannot bypass failed discovery or establish output support.
 See the [connection contract](docs/burn-check/authoring.md#decision-connections)
 for setup and provider limits.
 

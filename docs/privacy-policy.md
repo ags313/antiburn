@@ -14,7 +14,7 @@ its session index locally. Ordinary session analysis does not upload sessions,
 transcripts, prompts, messages, titles, source code, filenames, paths,
 repository or branch names, working directories, token counts, or costs.
 
-If you enable **Run model-based checks** in **Settings → Checks**, authored YAML
+If you enable **Run checks** under **Settings → Checks → Model-based checks**, authored YAML
 definitions can review new local session activity. The provider controls under
 **Model-based checks** select Jev through TypeSafe, compatible Ollama, Cloudflare, or a Custom System
 One endpoint. Custom supports direct System One and Cloudflare-envelope
@@ -37,16 +37,28 @@ charges can apply. An Ollama or Custom connection can use a local or remote
 endpoint; its address determines where the request goes. Provider requests and
 authentication credentials are separate from first-party analytics. Credentials
 use native credential storage or memory,
-not the session database. Turning off model-based checks stops new discovery
-and activation while retaining saved connections and local results. Removing a
-credential is a separate action. Past requests cannot be withdrawn from their
-recipient.
+not the session database. Turning off model-based checks stops new check
+activation while retaining saved connections and local results. Settings can
+still read check-folder entry metadata for its file counts without running
+checks. Removing a saved connection does not erase local results or usage.
+Removing the selected connection turns checks off and clears selection rather
+than choosing another provider. Shared credentials can remain after a connection
+is removed; forgetting a saved credential is a separate explicit action. Past
+requests cannot be withdrawn from their recipient.
 
-Editing a connection draft does not select it. **Save and use** saves and
-selects it; testing or refreshing limits does neither. An optional connection
+Editing or saving an inactive connection does not select it. The first saved
+connection becomes selected without enabling checks; later selection requires
+**Use**. Saving changes to the selected connection updates the configuration
+that checks use. Testing neither saves nor selects a connection. An optional connection
 test sends synthetic input and can incur charges. Developer replay is an
 explicit, isolated diagnostic; the app does not automatically assess historical
 YAML activity.
+
+Connection recovery runs only at an explicit retry or startup recovery boundary.
+A settings read does not complete a pending connection operation. Recovery
+preserves a saved off setting and does not authorize resending an unknown request.
+Its local journal stores connection metadata and credential references, not
+credential values. Operation tokens and Save request tags do not enter analytics.
 
 Antiburn keeps local assessment progress, frozen selected input, answers, and
 status provenance for recovery. Compatible accepted answers can be reused without
@@ -59,8 +71,10 @@ Settings shows estimated usage, not a spending cap or provider invoice.
 
 Each assessment uses one captured connection. Local preparation retains the
 actual provider/model and an endpoint digest, not the raw endpoint or credential.
-Changing connections cancels unfinished assessments while keeping accepted
-results and source progress. Switching back does not revive cancelled work or
+Changing or removing the selected connection, or choosing another connection,
+cancels unfinished assessments while keeping accepted results and source progress.
+Inactive connection edits and removals leave active work unchanged. Switching
+back does not revive cancelled work or
 authorize a resend. Available reported usage can still be recorded for an
 earlier attempt even when its answer cannot be published. These local routing
 facts do not enter analytics.
@@ -160,10 +174,10 @@ The separate provider assessment request is not a first-party analytics event.
 The installation identifier is random and changes every 30 days. The live
 analytics-session identifier is generated in memory and changes when the app
 restarts, when the installation identifier rotates, or after 30 minutes without
-a captured analytics event. Each queued event contains the identifier, so that
+a user-oriented analytics event. Each queued event contains the identifier, so that
 serialized value remains in the local analytics queue on disk until the event
-is sent or removed. Background events can keep an analytics session active, and
-one app run can contain more than one; it does not measure a user visit or time
+is sent or removed. Background events do not extend the inactivity timeout. One
+app run can contain more than one analytics session; it does not measure a user visit or time
 spent. Neither identifier comes from your hardware, account, name, or email
 address.
 

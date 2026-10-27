@@ -209,6 +209,8 @@ tauri-plugin-updater = "2"
 keyring = { version = "3.6.3", default-features = false, features = [
   "apple-native",
 ] }
+# Read numeric Keychain status codes without formatting credential errors.
+security-framework = { version = "3.7.0", default-features = false }
 # macOS 13+ login-item registration for the main application. Unlike the
 # cross-platform plugin, this uses Apple's current System Settings-visible API.
 smappservice-rs = "0.1"

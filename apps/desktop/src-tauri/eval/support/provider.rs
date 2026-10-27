@@ -64,12 +64,10 @@ fn discover_configuration() -> EvalConfiguration {
         );
         connection.model_revision = discovered.digest;
         discovered.capabilities
-    } else if preset.cloudflare() {
-        jev_cloudflare::cloudflare_capabilities(&connection.model)
     } else {
-        let mut capabilities = ModelCapabilities::jev_default();
-        capabilities.model.clone_from(&connection.model);
-        capabilities
+        connection
+            .capabilities()
+            .expect("Production selected-connection limits must resolve")
     };
     EvalConfiguration {
         preset,

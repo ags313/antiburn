@@ -83,7 +83,7 @@ fn seed(connection: &Connection) {
         INSERT INTO burn_check_current_status VALUES ('fixture', '{}', 'accepted', 1, 'failure', 'assessment', 1, 1, 92);
         INSERT INTO burn_check_acceptance_watermark VALUES ('fixture', '{}', 'accepted', 1, 1);
         INSERT INTO burn_check_cooldown VALUES ('fixture', '{}', 1, 'accepted', 150);
-        INSERT INTO burn_check_decision_usage VALUES ('accepted:1', 1);
+        INSERT INTO burn_check_decision_usage (attempt_id, usage_known) VALUES ('accepted:1', 1);
         UPDATE session_incarnation_seq SET value = 30;
         UPDATE evidence_claim_fence_seq SET value = 40;
         UPDATE work_queue_schedule SET next_ticket = 50, successful_turns = 12;
@@ -283,10 +283,10 @@ fn pinned_histories_preserve_populated_state_through_disk_open_and_reopen() {
                 let store = Store::open(directory.path()).unwrap_or_else(|error| {
                     panic!("branch={branch}, version={version}: {error:#}")
                 });
-                assert_eq!(store.schema_version().unwrap(), 89);
+                assert_eq!(store.schema_version().unwrap(), 90);
                 store.migrate().unwrap();
                 let connection = store.lock();
-                assert_eq!(read_profile(&connection).unwrap(), Profile::canonical(89));
+                assert_eq!(read_profile(&connection).unwrap(), Profile::canonical(90));
                 for (table, (columns, expected)) in &before {
                     assert_eq!(
                         rows(&connection, table, columns),
@@ -337,7 +337,7 @@ fn branch_repair_maps_each_known_shape_and_canonical_profiles_are_no_ops() {
             expected
         );
     }
-    for version in 81..=89 {
+    for version in 81..=90 {
         let mut connection = Connection::open_in_memory().unwrap();
         for sql in &super::super::MIGRATIONS[..version] {
             connection.execute_batch(sql).unwrap();
@@ -712,7 +712,7 @@ fn failed_evidence_migration_rolls_back_temporary_work_and_keeps_the_version() {
         .execute_batch("DROP TABLE current_evidence_copy")
         .unwrap();
     store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 89);
+    assert_eq!(store.schema_version().unwrap(), 90);
 }
 
 #[test]
@@ -1006,7 +1006,7 @@ fn interrupted_untyped_upgrade_keeps_its_boundary_and_preserves_newer_typed_gaps
         drop(connection);
         for _ in 0..2 {
             let store = Store::open(directory.path()).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 89);
+            assert_eq!(store.schema_version().unwrap(), 90);
             assert_eq!(gap_kind(&store.lock(), old_gap), "partial");
             assert_eq!(gap_kind(&store.lock(), new_gap), "invalidated");
             assert!(store.internal_value(UNTYPED_GAP_HEAD_KEY).is_none());

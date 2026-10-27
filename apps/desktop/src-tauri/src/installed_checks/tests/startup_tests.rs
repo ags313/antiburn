@@ -46,7 +46,7 @@ async fn native_file_startup_assesses_latest_once_in_either_attachment_order() {
             assert!(deliver(&fixture, now).await);
             std::fs::write(
                 fixture.global.join("failed-retry-loop.yml"),
-                CHECK.replace("name: Failed retry loop", "name: Startup window"),
+                CHECK.replace("name: Synthetic retry review", "name: Startup window"),
             )
             .unwrap();
         }
@@ -698,6 +698,35 @@ async fn validated_file_move_cancels_unfinished_idle_and_starts_a_full_new_inter
     host.reconcile(&Admission::Ready).unwrap();
     assert!(deliver(&fixture, now).await);
     drain(&mut host);
+    let first_idle_deadline_ms = fixture
+        .store
+        .next_session_idle_deadline()
+        .unwrap()
+        .expect("startup must set an idle deadline");
+    assert_eq!(first_idle_deadline_ms % 1000, 0);
+    let now = first_idle_deadline_ms / 1000 - 120;
+    assert!(deliver(&fixture, now + 119).await);
+    drain(&mut host);
+    let early_counts: (i64, i64) = fixture.store.lock().query_row(
+        "SELECT (SELECT COUNT(*) FROM native_tool_result_publication WHERE event_kind = 'session_idle'),
+            (SELECT COUNT(*) FROM burn_check_candidate)", [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(
+        early_counts,
+        (0, 0),
+        "idle publication and candidate must wait for deadline {first_idle_deadline_ms}"
+    );
+    assert_eq!(
+        fixture.store.next_session_idle_deadline().unwrap(),
+        Some(first_idle_deadline_ms)
+    );
+    assert_eq!(
+        fixture
+            .store
+            .request_due_session_idle_catchup(first_idle_deadline_ms)
+            .unwrap(),
+        1
+    );
     assert!(deliver(&fixture, now + 120).await);
     drain(&mut host);
     assert_eq!(
@@ -708,7 +737,7 @@ async fn validated_file_move_cancels_unfinished_idle_and_starts_a_full_new_inter
                 .get::<_, String>(
                 0
             ))
-            .unwrap(),
+            .expect("delivery at the persisted idle deadline must create a candidate"),
         "pending"
     );
     let renamed = fixture.directory.path().join("moved-idle.jsonl");

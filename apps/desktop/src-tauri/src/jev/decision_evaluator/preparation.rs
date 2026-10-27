@@ -560,7 +560,7 @@ pub(super) fn validate_selected_request_limits(
         _ => validate_jev_request_with_capabilities(request, capabilities),
     }
     .map_err(|error| (error, PreparationBudgetKind::RequestBytes))?;
-    resident_bytes(request, capabilities)
+    resident_bytes(request, capabilities, descriptor.provider)
         .map_err(|error| (error, PreparationBudgetKind::ResidentBytes))?;
     Ok(())
 }

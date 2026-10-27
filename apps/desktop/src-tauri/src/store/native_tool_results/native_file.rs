@@ -304,6 +304,7 @@ impl Store {
             claim.fence,
             &page.evidence,
             PublicationPolicy {
+                invalidation_effects: None,
                 baseline: Some(page.baseline_offset),
                 history_complete: Some(history_complete && unsafe_reason.is_none()),
                 gap_reason: unsafe_reason

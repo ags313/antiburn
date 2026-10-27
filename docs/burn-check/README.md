@@ -1,168 +1,188 @@
 # Burn Checks
 
-Burn Checks assess recorded agent work from YAML definitions, with a model
-decision or local status rules. The repository maintains six definitions for
-retry loops, exploration, task scope, instruction comparisons, skill guidance,
-and fast-mode trial advice. Each checks selected work, not whole-session quality.
+Use Burn Checks to review selected agent work against rules you write in YAML.
+A check can ask a model a narrow question or apply local status rules. Antiburn
+shows the result and its saved evidence in Checks, so you can decide what needs
+attention. A result covers the selected work, not the quality of a whole session.
 
-> **Experimental draft: `v1-prealpha`.** Burn Checks are not yet standardized.
-> Syntax, semantics, and capabilities may change, including breaking changes.
-> There is no backward compatibility promise. Use the current
-> [specification](specification.md) and [supported subset](authoring.md#supported-subset).
-
-## Try the repository dogfood checks
-
-The six canonical definitions live in `.antiburn/checks/`. See the
-[definition table](#examples) for each file and its evidence limits. There is no
-second maintained YAML copy in the documentation.
-
-1. Enable this repository in Antiburn's native session discovery.
-2. Open **Settings → Checks → Model-based checks**, turn on **Run model-based
-   checks**, choose a provider, enter its required fields, and select **Save and
-   use**. Jev is the recommended route. **Test connection** is optional; it sends
-   synthetic input and can incur charges. See [decision connections](authoring.md#decision-connections)
-   for compatible models and output requirements.
-3. Continue normal work in a supported native main session. Discovery is
-   automatic for supported active native main sessions. Fresh attachment can use
-   bounded recent results and assess the latest ready window once. Later new
-   terminal results with safe identity and order enter the live window, including
-   usable partial evidence. It does not replay older windows.
-4. Find a definition by its display name in Checks or local search. A check starts in
-   **Not assessed** until an accepted assessment writes a pass or failure. The
-   card stays in **Failed**, **Passed**, or **Not assessed** during later work.
-   Queued or running work adds **Checking** beside that result. A saved failure
-   stays visible while another assessment runs. Open the detail pane for waiting
-   progress, status messages, and evidence. A capture alert appears only when the
-   current connection is unavailable, not merely because earlier history is partial.
-
-**Run model-based checks** defaults to on when no preference was saved. An explicit
-saved off stays off; malformed or unreadable storage keeps execution disabled.
-YAML check cards and navigation appear only when a global or repository
-definition is discovered. The Settings toggle and provider setup stay
-available without definitions. A discovered check with no configured System One
-provider shows a setup error in its detail pane and directs you to Settings.
-Without a discovered definition, the app creates no placeholder check or error.
-
-Failed retry loop needs at least three results in a rolling window of five. It
-excludes relevant recovery, requested retries, and expected polling. None of the
-definitions promises a finding in every session. All six require label
-probabilities; a label-only Choice route cannot run them. Do not replace
-probabilities with confidence or lower a gate to make a route fit. Failed retry
-loop fails only when the model selects
-`stuck` with a label probability of at least 0.95. Every other valid answer, including
-`uncertain`, explicitly writes success and clears any earlier failure message.
-All six definitions use complementary success and failure conditions with a 0.95
-failure-label probability gate. This threshold is author policy, not an accuracy
-guarantee or confidence in the underlying source facts.
-Success means the failure condition did not match; it does not prove repair or
-whole-session correctness. Missing data or a failed assessment does not write
-success. Snooze hides active failure summaries;
-it does not pause evaluation. Historical assessment requires explicit isolated
-developer replay. Developer replay uses isolated state even when it reads a
-canonical definition.
-
-Each definition permits middle-text shortening only for
-`activity[*].tool.result.content`. It preserves selected result records, linked
-arguments, request/authorization text, and selected inventory scopes. Shortening is reported to the model
-and in the check detail. If initial local request-size or preparation limits stop
-preparation, the candidate is not assessed and no provider request is sent.
-A preparation-limit stop does not prove that further permitted shortening could
-not fit. Open the detail's **Open check file** action
-to repair a definition in its default application. See
-[fit large inputs](authoring.md#fit-large-inputs) for the limits.
-
-YAML definition names do not identify native detectors. Each definition needs the
-runtime and source capabilities listed below.
+> **Experimental draft: `v1-alpha`.** Burn Checks are not yet standardized.
+> Syntax, semantics, and capabilities can change, including breaking changes.
+> There is no backward compatibility promise. Beta and stable scope are not set.
+> Use the current [specification](specification.md) and
+> [supported subset](authoring.md#supported-subset).
 
 ## Install your own check
 
-Put an immediate `.yml` or `.yaml` file in `~/.antiburn/checks/` or a known native
-repository's `.antiburn/checks/` directory. Create the directory yourself; the app
-only watches and reconciles it. A project file replaces the global file with the
-same lowercase filename stem. Definitions do not merge.
+1. Create `~/.antiburn/checks/` for global checks, or `.antiburn/checks/` inside a
+   known native repository. The app watches these folders but does not create them.
+2. Put an immediate `.yml` or `.yaml` definition in that folder. A project file
+   replaces a global file with the same lowercase filename stem; files do not
+   merge. See [identity and installation](authoring.md#identity-and-installation)
+   for naming, access, and invalid-override rules.
+3. Configure a connection and enable **Run checks** as described below. Local
+   checks also need this setup, but do not send model requests.
 
-See [authoring](authoring.md) for identity, supported features, validation, and
-diagnostics. Burn Checks use the existing Checks collection, detail pane,
-search, and snoozes. They provide status and explanations, without native fix
-prompts, Auto Fix, verification watches, burn estimates, or savings.
+Start with [authoring](authoring.md#write-one-bounded-check) to choose evidence,
+write local or model rules, and validate a file. Selected messages, arguments,
+results, paths, instruction text, and skill descriptions can contain private data.
+Inputs selected by a model check can leave the machine in provider requests.
 
-Settings selects one provider and model for all decision blocks in an assessment.
-Do not put `model` in a YAML decision. It is an unknown field; the app does not
-migrate or rewrite the file. Observed coding-agent model fields remain source
-facts. A model check still needs a compatible connection.
+## Try the repository dogfood checks
 
-Omit `decisions` for a local status check. It uses frozen context without model
-discovery, warm-up, provider preparation, transport, inference, attempts, or usage
-records. It still requires the master setting, a configured selected connection,
-and the existing credential/authentication and runtime gates. Failed cached model
-discovery alone does not block it. Local cooldown defaults to `0s`; model cooldown
-defaults to `60s`. Local evidence is **Frozen local context**, not model input.
-See [local status checks](authoring.md#local-status-checks).
+The five [canonical definitions](#examples) live in `.antiburn/checks/`. The docs
+link to those files; they do not keep a second YAML copy.
 
-Inputs can use pure functions, dynamic brackets, nested projections, embedded
-text templates, and bounded maps with nested aliases. Status actions can compute
-their result and explanation from frozen context and validated typed outputs.
-These forms share an assessment evaluation budget. Omit decisions for local work,
-or use independent named blocks with up to eight mixed Choice, Score, and Noul
-questions per block. All blocks prepare before the first inference call and run
-sequentially on one captured connection. Actions wait for the complete valid
-answer set. Shared runtime work and retained-state limits bound the assessment;
-there is no syntax-only block count limit. Choose message events, a proven
-`turn_end`, or session start/idle observations from one trigger family. Message
-alternatives share one rolling window; cycles and session events have no window.
-Model/mode filters read only the event's scope, while tool filters use recorded
-categories and paths. Source support and finality still limit each event.
-Current session selection does not relabel past work. The desktop emits start
-reason `attached` and observes idle at a persisted 120-second boundary; it does
-not measure model occupancy or savings. Current global and repository
-instruction and skill scopes freeze during candidate selection when a definition
-references them. They do not prove past activation, effective session loading, or
-historical non-use. Message actions remain unsupported, including behind false
-conditions. The six canonical definitions remain tool-result checks. See
-[event selection](authoring.md#event-selection),
-[typed questions](authoring.md#typed-questions-and-actions),
-[input transformations](authoring.md#transform-selected-input) and
-[evaluation limits](authoring.md#shared-evaluation-limits).
+1. Enable this repository in Antiburn's native session discovery.
+2. Open **Settings → Checks → Model-based checks** and turn **Run checks** off
+   during setup. Choose **Add connection**, select a provider, enter its fields,
+   then select **Add connection** in the dialog. The first connection becomes
+   selected without enabling checks. Choose **Use** to select another saved
+   connection. Enable **Run checks** when ready.
+3. Continue work in a supported active native main session. Fresh attachment can
+   assess the latest ready window from bounded recent tool results once. Later
+   safe terminal results enter the live window. It does not replay older windows.
+   OpenCode V2 starts from a verified future boundary instead of stored results.
+4. Find the check by its display name in Checks or local search. Open its detail
+   pane for evidence, waiting progress, and diagnostics. **Open check file** opens
+   the definition in its default application.
 
-Omitting `fit` is valid and does not produce a missing-fit warning. Input-size
-explanations require an actual preparation or provider failure. The runtime
-shortens only authorized fit targets and never adds summary calls.
+Jev is the recommended route. **Test connection** is optional: it sends synthetic
+input and can incur charges. All five examples need label probabilities. A
+label-only Choice route cannot run them. Do not substitute provider confidence
+or lower a probability gate to make a connection fit. See
+[decision connections](authoring.md#decision-connections).
+
+Fresh setup without a connection stays off. **Run checks** preserves an existing
+saved preference; malformed or unreadable storage disables execution. Removing
+the selected connection turns checks off and clears selection without choosing
+a replacement or deleting saved results. Check cards and navigation require a
+discovered definition. Settings stays available without one. A discovered check
+without a configured provider shows a setup error in its detail pane; the app
+does not create a placeholder check.
+
+## What works today
+
+The runtime supports local status checks and model checks with independent named
+decision blocks. Each block can mix up to eight Choice, Score, and Noul questions.
+Settings selects one connection for the complete assessment. A decision-level
+YAML `model` field is invalid; coding-agent model fields remain source evidence.
+
+Choose one trigger family. Each event still needs proof from a supported source:
+
+| Family         | Events                                                          | Current boundary                                                                                                                            |
+| -------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Message        | `user_message`, `assistant_message`, `tool_call`, `tool_result` | Public, admitted records only. Alternatives can share one rolling window.                                                                   |
+| Response cycle | `turn_end`                                                      | Requires a proven complete native response-cycle boundary. Inactivity does not prove one.                                                   |
+| Session        | `session_start`, `session_idle`                                 | The desktop emits start reason `attached` only. Idle is a persisted 120-second observation, not proof of real idle time or model occupancy. |
+
+Only tool results can seed bounded recent work at attachment. Other public
+message kinds and response cycles are future-only. Source, producer-version,
+identity, order, and native-main-session limits still apply. Remote, WSL, child,
+and historical-only sources do not start new live checks. See
+[event selection](authoring.md#event-selection) and
+[live attachment](authoring.md#identity-and-installation).
+
+Inputs can use frozen context, pure functions, dynamic brackets, nested
+projections, text templates, and bounded maps. Optional `fit` rules permit loss
+only from named input targets. The runtime prepares all model blocks before
+inference, runs them in order on one captured connection, and waits for the full
+valid answer set before actions. Shared evaluation and retained-state limits
+bound the assessment. See [input transformations](authoring.md#transform-selected-input),
+[typed questions](authoring.md#typed-questions-and-actions), and
+[input fitting](authoring.md#fit-large-inputs).
+
+Local checks omit `decisions`. They use frozen context without model discovery,
+warm-up, provider preparation, transport, inference, attempts, or usage records.
+They still need the master setting, a selected configured connection, and the
+credential/authentication and runtime gates. Failed cached model discovery alone
+does not block them. Local cooldown defaults to `0s`; model cooldown defaults to
+`60s`. See [local status checks](authoring.md#local-status-checks).
+
+### Read a result safely
+
+A card stays **Not assessed** until an accepted action writes **Passed** or
+**Failed**. Queued or running work adds **Checking** beside the saved result; it
+does not clear a failure. Snooze hides active failure summaries but does not pause
+evaluation. A capture alert describes a current source failure, not an older
+history gap alone.
+
+All five examples use a 0.95 failure-label probability gate. Ignored instructions
+also requires `no_conflict` at 0.95 or above to write success; uncertainty leaves
+the saved result unchanged. The other four use the exact complement of their
+failure condition for success, including valid uncertain answers. These are
+author policies, not accuracy guarantees or confidence in source facts. Success
+does not prove repair, whole-session correctness, or savings. Missing evidence
+and execution failures do not create success.
+
+Usable partial evidence can be assessed, with its limits shown to the model.
+Missing is not empty or clean. A user-slot record can come from an API or
+extension and does not prove human approval. Tool execution status does not prove
+program success: a completed shell tool can report a nonzero exit. Current
+instruction files and skill descriptions do not prove past activation, effective
+session loading, or historical non-use.
+
+Each example permits middle-text shortening of
+`activity[*].tool.result.content`. Ignored instructions also permits unused skill
+descriptions to shrink. Protected requests, arguments, instruction text, scope
+limits, skill names, and paths stay intact. The model and detail pane report
+shortening. A local preparation stop sends no provider request; a resource-limit
+stop does not prove that further allowed shortening could not fit. Omitting
+`fit` is valid and creates no warning by itself.
+
+## What does not work today
+
+Schema acceptance alone does not make a check runnable. The compiler rejects
+unsupported fields and actions before activation, including message actions
+behind `if: false`. The current runtime does not supply effective `agent.skills`,
+`repo.branch`, historical instruction activation, or historical effective skill
+inventories. Desktop `session_start` does not emit `new` or `resumed`.
+
+Burn Checks provide status and explanations through the existing collection,
+detail pane, search, navigation, and snoozes. They do not provide native fix
+prompts, Auto Fix, verification watches, burn estimates, or savings. A YAML name
+does not identify a native detector or grant its capabilities. Automatic history
+assessment is unavailable; developer replay uses explicit isolated state.
+
+Missing capabilities are future work with no assigned release. Beta and stable
+scope are not set. Draft syntax is not a promise to implement those capabilities,
+and missing features are not usable today.
 
 ## Examples
 
-These six canonical dogfood definitions use the local schema modeline and the
-validated runtime subset. Structural validity alone does not establish source
-support. The linked coverage documents state the accepted sources and versions.
+These five tool-result checks use the local schema modeline and the supported
+runtime subset. Structural validity does not prove source support. The coverage
+documents state accepted sources, producer versions, and result limits.
 
-| Definition                                                              | Runtime support  | Assessed scope and limits                                                                                                                                                       |
-| ----------------------------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [Failed retry loop](../../.antiburn/checks/failed-retry-loop.yml)       | Supported subset | Repeated unresolved failure in selected results, with recovery and requested-retry exclusions                                                                                   |
-| [Over-exploring](../../.antiburn/checks/over-exploring.yml)             | Supported subset | Clearly unrelated completed reads/searches; plausible dependencies, tests, and verification remain allowed                                                                      |
-| [Scope creep](../../.antiburn/checks/scope-creep.yml)                   | Supported subset | Supported completed work on a separate objective, with user approval kept separate from tool claims                                                                             |
-| [Ignored instructions](../../.antiburn/checks/ignored-instructions.yml) | Supported subset | Current-file mismatch and recorded prior-correction conflict have separate labels and messages; partial scopes remain explicit                                                  |
-| [Skill opportunities](../../.antiburn/checks/skill-opportunities.yml)   | Supported subset | Inventory-level next-step advice from observed configured descriptions, without a specific skill pick or historical non-use claim                                               |
-| [Fast mode value](../../.antiburn/checks/fast-mode-value.yml)           | Supported subset | Standard-mode trial advice for explicitly non-urgent work; recorded speed, selected catalog mode, requested-tier preference, and name hints do not prove served tier or savings |
+| Definition                                                              | Assessed scope and limits                                                                                                                                              |
+| ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Over-exploring](../../.antiburn/checks/over-exploring.yml)             | Clearly unrelated completed reads/searches. Plausible dependencies, tests, and verification remain allowed.                                                            |
+| [Scope creep](../../.antiburn/checks/scope-creep.yml)                   | Supported completed work on a separate objective. User approval stays separate from tool claims.                                                                       |
+| [Ignored instructions](../../.antiburn/checks/ignored-instructions.yml) | Separate current-file mismatch and recorded prior-correction conflict labels. Partial scopes remain explicit.                                                          |
+| [Skill opportunities](../../.antiburn/checks/skill-opportunities.yml)   | Inventory-level next-step advice from observed declared descriptions, without a specific skill pick or historical non-use claim.                                       |
+| [Fast mode value](../../.antiburn/checks/fast-mode-value.yml)           | Standard-mode trial advice for explicitly non-urgent work. Speed records, catalog mode, requested-tier preference, and name hints do not prove served tier or savings. |
 
-The instruction and skill checks select whole current scopes so absent arrays
-stay unavailable rather than becoming empty. These inputs can include the other
-inventory in that scope. The questions ignore unrelated entries, but the whole
-scope must fit unchanged. See the [snapshot boundary and input limit](architecture.md#identity-order-and-frozen-evidence).
+The instruction and skill checks select whole current scopes to preserve missing
+arrays and scope limits. Each can include the other inventory in that scope.
+Ignored instructions can shorten only unused skill descriptions there; Skill
+opportunities keeps its inventory intact. See the
+[snapshot boundary](architecture.md#identity-order-and-frozen-evidence).
 
-Over-exploring does not count arbitrary shell commands as reads. Codex supports
-the reviewed single-file numbered shell-read shape only when a successful result
-proves its complete output extent. Other shell exploration stays outside this
-check's window. See [check limits](../check-coverage.md#burn-check-definitions).
+Over-exploring does not treat arbitrary shell commands as reads. Codex admits
+only the reviewed single-file numbered shell-read shape when a successful result
+proves the complete output extent. Other shell exploration stays outside its
+window. See [check limits](../check-coverage.md#burn-check-definitions).
 
 ## Reference
 
-- [Provider contracts](provider-contracts.md): pinned typed wire shapes and local
-  criteria limits, separate from YAML support.
-- [Authoring guide](authoring.md): installation, supported subset, and validation.
-- [Specification: `v1-prealpha`](specification.md): precise current draft rules.
-- [Schema](schemas/burn-check.schema.json): structural validation for the draft.
+- [Authoring guide](authoring.md): write, install, validate, and diagnose a check.
+- [Specification: `v1-alpha`](specification.md): exact draft rules.
+- [Schema](schemas/burn-check.schema.json): structural validation only.
+- [Provider contracts](provider-contracts.md): accepted typed responses and local
+  limits, separate from YAML and source support.
+- [Architecture](architecture.md): ownership, dataflow, and recovery.
 - [Expression parity corpus](tests/expression-parity.json): synthetic YAML with
-  separate schema and compiler admission expectations, not runtime evidence proof.
-- [Architecture](architecture.md): ownership and dataflow.
+  separate schema and compiler expectations, not runtime evidence proof.
 - [Session coverage](../session-coverage.md#burn-check-source-facts): accepted
   source shapes, producer pins, and evidence limits.
-- [Check coverage](../check-coverage.md#burn-check-definitions): finding and result limits.
+- [Check coverage](../check-coverage.md#burn-check-definitions): finding and result
+  eligibility.

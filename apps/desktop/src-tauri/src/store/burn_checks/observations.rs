@@ -5,6 +5,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::{BurnCheckCandidateRecord, BurnCheckObservationRecord, payload_sha256};
 use crate::store::Store;
+use crate::store::native_tool_results::trace_effects::InvalidationEffects;
 
 pub(super) struct RuntimeCheckpoint<'a> {
     pub expected: &'a str,
@@ -43,6 +44,7 @@ impl Store {
         } = *page;
         let mut connection = self.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut effects = InvalidationEffects::default();
         let activation: Option<(i64, i64, bool)> = tx
             .query_row(
                 "SELECT generation, applied_sequence, enabled FROM burn_check_activation
@@ -232,9 +234,9 @@ impl Store {
                 },
             );
             if changed {
-                tx.execute(
+                effects.current_status_revoked += tx.execute(
                     "UPDATE burn_check_current_status SET evidence_valid = 0
-                       WHERE check_id = ?1 AND activation_scope_key = ?2 AND assessment_id IN (
+                       WHERE evidence_valid = 1 AND check_id = ?1 AND activation_scope_key = ?2 AND assessment_id IN (
                          SELECT a.assessment_id FROM burn_check_assessment_history a
                          JOIN burn_check_candidate_dependency d
                            ON d.candidate_id = a.candidate_id
@@ -246,9 +248,9 @@ impl Store {
                         previous.as_ref().map(|entry| entry.0.as_str())
                     ],
                 )?;
-                tx.execute(
+                effects.accepted_evidence_revoked += tx.execute(
                     "UPDATE burn_check_assessment_history SET evidence_valid = 0
-                       WHERE check_id = ?1 AND activation_scope_key = ?2 AND candidate_id IN (
+                       WHERE evidence_valid = 1 AND check_id = ?1 AND activation_scope_key = ?2 AND candidate_id IN (
                          SELECT candidate_id FROM burn_check_candidate_dependency
                           WHERE observation_id = ?3 AND session_key_json = ?4)",
                     params![
@@ -258,7 +260,7 @@ impl Store {
                         previous.as_ref().map(|entry| entry.0.as_str())
                     ],
                 )?;
-                tx.execute(
+                effects.unfinished_stale += tx.execute(
                     "UPDATE burn_check_candidate SET state = 'stale'
                       WHERE check_id = ?1 AND activation_scope_key = ?2
                         AND state IN ('pending', 'claimed', 'dispatching', 'answered')
@@ -310,11 +312,11 @@ impl Store {
         }
         if let Some(checkpoint) = &checkpoint {
             for branch in checkpoint.invalidated_branches {
-                tx.execute("UPDATE burn_check_current_status SET evidence_valid = 0 WHERE check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3
+                effects.current_status_revoked += tx.execute("UPDATE burn_check_current_status SET evidence_valid = 0 WHERE evidence_valid = 1 AND check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3
                     AND assessment_id IN (SELECT h.assessment_id FROM burn_check_assessment_history h WHERE NOT EXISTS (
                       SELECT 1 FROM burn_check_candidate_dependency d WHERE d.candidate_id = h.candidate_id
                         AND json_type(d.dependency_binding_json, '$.SessionActivity') = 'object'))", params![check_id, activation_scope_key, branch])?;
-                tx.execute("UPDATE burn_check_assessment_history SET evidence_valid = 0 WHERE check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3
+                effects.accepted_evidence_revoked += tx.execute("UPDATE burn_check_assessment_history SET evidence_valid = 0 WHERE evidence_valid = 1 AND check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3
                     AND NOT EXISTS (SELECT 1 FROM burn_check_candidate_dependency d WHERE d.candidate_id = burn_check_assessment_history.candidate_id
                       AND json_type(d.dependency_binding_json, '$.SessionActivity') = 'object')", params![check_id, activation_scope_key, branch])?;
             }
@@ -323,7 +325,7 @@ impl Store {
                 .iter()
                 .chain(checkpoint.reset_branches)
             {
-                tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3 AND state IN ('pending', 'claimed', 'dispatching', 'answered')", params![check_id, activation_scope_key, branch])?;
+                effects.unfinished_stale += tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3 AND state IN ('pending', 'claimed', 'dispatching', 'answered')", params![check_id, activation_scope_key, branch])?;
             }
         }
         for candidate in candidates {
@@ -464,7 +466,7 @@ impl Store {
                         &candidate.candidate_id,
                     )?;
                 if !dependencies_current {
-                    tx.execute(
+                    effects.unfinished_stale += tx.execute(
                         "UPDATE burn_check_candidate SET state = 'stale'
                           WHERE candidate_id = ?1 AND state = 'pending'",
                         params![candidate.candidate_id],
@@ -518,14 +520,36 @@ impl Store {
                 cursor
             ],
         )?;
-        if let Some(checkpoint) = checkpoint {
+        if let Some(checkpoint) = &checkpoint {
             tx.execute(
                 "UPDATE burn_check_activation SET checkpoint_json = ?3
                   WHERE check_id = ?1 AND activation_scope_key = ?2",
                 params![check_id, activation_scope_key, checkpoint.next],
             )?;
         }
+        let trace_generation = u64::try_from(generation)?;
+        let activation_ref = checkpoint.as_ref().map(|checkpoint| {
+            super::trace_refs::activation_ref(&antiburn_checks::domain::ActivationId {
+                definition_id: check_id.into(),
+                scope: checkpoint.scope.clone(),
+                generation: antiburn_checks::domain::Generation(trace_generation),
+            })
+        });
         tx.commit()?;
+        if effects != InvalidationEffects::default() {
+            ::tracing::debug!(
+                event = "burn_check_evidence_transition_committed",
+                publication_origin = "runtime_source_page",
+                reason = "selected_evidence_changed",
+                activation_ref,
+                generation,
+                publication_after_cursor = cursor,
+                publication_through_cursor = through_sequence,
+                accepted_evidence_revoked = effects.accepted_evidence_revoked,
+                current_status_revoked = effects.current_status_revoked,
+                unfinished_stale = effects.unfinished_stale,
+            );
+        }
         Ok(true)
     }
 }

@@ -242,6 +242,23 @@ impl ModelCapabilities {
         }
     }
 
+    /// Native Jev limits require the TypeSafe long-context request header.
+    pub fn jev_native() -> Self {
+        Self {
+            total_input_tokens: CapabilityLimit::known(
+                262_000,
+                CapabilitySource::DocumentedDefault,
+            ),
+            state_and_longest_question_tokens: CapabilityLimit::known(
+                262_000,
+                CapabilitySource::DocumentedDefault,
+            ),
+            request_body_bytes: CapabilityLimit::known(384 * 1024, CapabilitySource::Manual),
+            model: super::NATIVE_MODEL_ALIAS.to_owned(),
+            ..Self::jev_default()
+        }
+    }
+
     /// Return the strictest known input-token ceiling before rendering reserve.
     pub fn usable_input_tokens(&self) -> Option<u64> {
         [
@@ -561,5 +578,51 @@ mod tests {
         assert_eq!(capabilities.usable_state_tokens(), Some(28 * 1024));
         assert_eq!(capabilities.questions_per_request.value, Some(128));
         assert_eq!(capabilities.usable_input_tokens(), Some(60 * 1024));
+    }
+
+    #[test]
+    fn native_jev_changes_only_model_input_and_request_body_limits() {
+        let standard = ModelCapabilities::jev_default();
+        let native = ModelCapabilities::jev_native();
+        assert_eq!(native.model, super::super::NATIVE_MODEL_ALIAS);
+        assert_eq!(native.model_revision, None);
+        assert_eq!(native.total_input_tokens.value, Some(262_000));
+        assert_eq!(
+            native.state_and_longest_question_tokens.value,
+            Some(262_000)
+        );
+        assert_eq!(native.rendering_reserve_tokens, 4_096);
+        assert_eq!(native.usable_input_tokens(), Some(257_904));
+        assert_eq!(native.usable_state_tokens(), Some(257_904));
+        assert_eq!(native.request_body_bytes.value, Some(393_216));
+        assert_eq!(native.response_body_bytes.value, Some(65_536));
+
+        let mut expected = standard;
+        expected.model = super::super::NATIVE_MODEL_ALIAS.to_owned();
+        expected.total_input_tokens.value = Some(262_000);
+        expected.state_and_longest_question_tokens.value = Some(262_000);
+        expected.request_body_bytes.value = Some(393_216);
+        assert_eq!(native, expected);
+    }
+
+    #[test]
+    fn native_manual_overrides_still_lower_capacity() {
+        let native = ModelCapabilities::jev_native();
+        let lower = native.with_override(&ModelLimitOverride {
+            total_input_tokens: Some(100_000),
+            state_and_longest_question_tokens: Some(90_000),
+            runtime_context_tokens: Some(80_000),
+        });
+        assert_eq!(lower.usable_input_tokens(), Some(75_904));
+        assert_eq!(lower.usable_state_tokens(), Some(75_904));
+        assert_eq!(lower.model, native.model);
+        assert_eq!(lower.output, native.output);
+        assert_eq!(lower.request_body_bytes, native.request_body_bytes);
+        let higher = native.with_override(&ModelLimitOverride {
+            total_input_tokens: Some(300_000),
+            state_and_longest_question_tokens: Some(300_000),
+            runtime_context_tokens: None,
+        });
+        assert_eq!(higher, native);
     }
 }

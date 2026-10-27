@@ -1,5 +1,7 @@
 use super::*;
 use crate::jev::config::{ContextLimitOverride, SystemOneEndpoint};
+use crate::store::burn_checks::trace_capture::LogCapture;
+use std::collections::BTreeSet;
 use std::sync::{Arc, Condvar};
 use std::time::Duration;
 
@@ -233,12 +235,13 @@ fn suspending_keyless_providers_fences_dispatch_and_publication_until_explicit_r
 #[tokio::test]
 async fn preparation_runs_off_the_async_executor() {
     let caller = std::thread::current().id();
-    let prepared = run_blocking_preparation(move || {
-        assert_ne!(std::thread::current().id(), caller);
-        Ok(42)
-    })
-    .await
-    .unwrap();
+    let prepared =
+        run_blocking_preparation(BlockingPreparationStage::PreparationStart, move || {
+            assert_ne!(std::thread::current().id(), caller);
+            Ok(42)
+        })
+        .await
+        .unwrap();
     assert_eq!(prepared, 42);
 }
 
@@ -255,7 +258,7 @@ async fn cancelled_preparation_holds_its_slot_until_blocking_work_finishes() {
         let active = Arc::clone(&active);
         let peak = Arc::clone(&peak);
         tasks.push(tokio::spawn(async move {
-            run_blocking_preparation(move || {
+            run_blocking_preparation(BlockingPreparationStage::PreparationStart, move || {
                 let count = active.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(count, Ordering::SeqCst);
                 started.send(index).unwrap();
@@ -290,4 +293,112 @@ async fn cancelled_preparation_holds_its_slot_until_blocking_work_finishes() {
     }
     assert!(held);
     assert_eq!(peak.load(Ordering::SeqCst), PREPARATION_WORKERS as u64);
+}
+
+#[test]
+fn fast_blocking_preparation_traces_keep_only_fixed_stage_timing_and_result_fields() {
+    let captured = LogCapture::default();
+    tracing::subscriber::with_default(captured.clone(), || {
+        for stage in [
+            BlockingPreparationStage::WorkProbe,
+            BlockingPreparationStage::PreparationStart,
+        ] {
+            for succeeded in [true, false] {
+                trace_blocking_preparation(
+                    stage,
+                    Duration::from_millis(998),
+                    Duration::from_millis(999),
+                    succeeded,
+                );
+            }
+        }
+    });
+    let events = captured.events("burn_check_blocking_preparation");
+    assert_eq!(events.len(), 4);
+    let allowed = ["event", "stage", "slot_wait_ms", "elapsed_ms", "succeeded"]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for (event, (stage, succeeded)) in events.iter().zip([
+        ("work_probe", true),
+        ("work_probe", false),
+        ("preparation_start", true),
+        ("preparation_start", false),
+    ]) {
+        assert_eq!(event.level, tracing::Level::TRACE);
+        assert_eq!(event.fields["stage"], format!("{stage:?}"));
+        assert_eq!(event.fields["slot_wait_ms"], "998");
+        assert_eq!(event.fields["elapsed_ms"], "999");
+        assert_eq!(event.fields["succeeded"], succeeded.to_string());
+        assert_eq!(
+            event
+                .fields
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            allowed
+        );
+    }
+}
+
+#[test]
+fn blocking_preparation_traces_promote_slow_slot_wait_or_work_at_one_second() {
+    let captured = LogCapture::default();
+    let timings = [(1000, 1), (1, 1000), (1000, 1000), (2000, 3000)];
+    tracing::subscriber::with_default(captured.clone(), || {
+        for stage in [
+            BlockingPreparationStage::WorkProbe,
+            BlockingPreparationStage::PreparationStart,
+        ] {
+            for succeeded in [true, false] {
+                for (slot_wait_ms, elapsed_ms) in timings {
+                    trace_blocking_preparation(
+                        stage,
+                        Duration::from_millis(slot_wait_ms),
+                        Duration::from_millis(elapsed_ms),
+                        succeeded,
+                    );
+                }
+            }
+        }
+    });
+    let events = captured.events("burn_check_blocking_preparation");
+    assert_eq!(events.len(), 16);
+    for (events, (stage, succeeded)) in events.chunks_exact(4).zip([
+        ("work_probe", true),
+        ("work_probe", false),
+        ("preparation_start", true),
+        ("preparation_start", false),
+    ]) {
+        for (event, (slot_wait_ms, elapsed_ms)) in events.iter().zip(timings) {
+            assert_eq!(event.level, tracing::Level::DEBUG);
+            assert_eq!(event.fields["stage"], format!("{stage:?}"));
+            assert_eq!(event.fields["slot_wait_ms"], slot_wait_ms.to_string());
+            assert_eq!(event.fields["elapsed_ms"], elapsed_ms.to_string());
+            assert_eq!(event.fields["succeeded"], succeeded.to_string());
+        }
+    }
+}
+
+#[tokio::test]
+async fn blocking_preparation_preserves_idle_outcomes_and_errors() {
+    assert!(
+        !run_blocking_preparation(BlockingPreparationStage::WorkProbe, || Ok(false))
+            .await
+            .unwrap()
+    );
+    let outcome = run_blocking_preparation(BlockingPreparationStage::PreparationStart, || {
+        Ok(antiburn_checks::engine::StartOutcome::NotDue)
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        antiburn_checks::engine::StartOutcome::NotDue
+    ));
+    let error = run_blocking_preparation(BlockingPreparationStage::WorkProbe, || {
+        Err::<bool, _>(anyhow::anyhow!("PRIVATE_BLOCKING_PREPARATION_ERROR"))
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(error.to_string(), "PRIVATE_BLOCKING_PREPARATION_ERROR");
 }

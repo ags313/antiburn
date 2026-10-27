@@ -99,7 +99,7 @@ describe("installed check event waits", () => {
         reviewedWithoutStatus,
         hasStarted: true,
         checkingCount: progress === "checking" ? 1 : 0,
-        explanation: "Saved assessment result.",
+        explanation: "The saved check found no concern.",
         targets: finding > 0 ? installed.targets : [],
       })
       const collection = within(
@@ -116,23 +116,20 @@ describe("installed check event waits", () => {
       const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
       expect(detail.querySelector("header")).toHaveTextContent(status)
       if (progress === "checking") {
-        expect(within(detail).getByText("This check is queued or running.")).toBeVisible()
+        expect(within(detail).getByRole("heading", { name: "Checking" })).toBeVisible()
       } else if (progress === "catching up") {
-        expect(
-          within(detail).getByText("Session activity is still being processed."),
-        ).toBeVisible()
-        expect(detail).not.toHaveTextContent(/needs 3 more/)
+        expect(within(detail).getByText("Processing session activity.")).toBeVisible()
+        expect(detail).not.toHaveTextContent(/Needs 3 more/)
       } else {
-        expect(detail).toHaveTextContent("It needs 3 more idle observations")
+        expect(detail).toHaveTextContent("Needs 3 more idle observations.")
         expect(
           within(detail).getByText(
             "Idle observations record at least 120 seconds without observed activity. They do not prove that the agent finished.",
           ),
         ).toBeVisible()
       }
-      expect(detail).not.toHaveTextContent("No assessment result is available yet.")
       if (clean > 0) {
-        expect(within(detail).getByText("Saved assessment result.")).toBeVisible()
+        expect(within(detail).getByText("The saved check found no concern.")).toBeVisible()
       } else if (finding > 0) {
         expect(within(detail).getByText("Review the recorded work.")).toBeVisible()
       }
@@ -152,11 +149,7 @@ describe("installed check event waits", () => {
       fireEvent.click(row)
       const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
       expect(detail.querySelector("header")).toHaveTextContent(status)
-      expect(
-        within(detail).getByText(
-          `This check is waiting for new ${plural}. It needs ${count} more ${label} before it can assess session activity.`,
-        ),
-      ).toBeVisible()
+      expect(within(detail).getByText(`Needs ${count} more ${label}.`)).toBeVisible()
       if (limit) expect(within(detail).getByText(limit)).toBeVisible()
       if (event !== "toolResult") expect(detail).not.toHaveTextContent(/tool results?/)
       expect(screen.queryByRole("region", { name: "Checking 1" })).not.toBeInTheDocument()
@@ -174,16 +167,13 @@ describe("installed check event waits", () => {
         }),
       )
       const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
-      expect(
-        within(detail).getByText(
-          "Session activity is still being processed. No assessment result is available yet.",
-        ),
-      ).toBeVisible()
-      expect(detail).not.toHaveTextContent(/Waiting on|needs 3 more/)
+      expect(within(detail).getByText("Processing session activity.")).toBeVisible()
+      expect(within(detail).getByText("No check result yet.")).toBeVisible()
+      expect(detail).not.toHaveTextContent(/Waiting on|Needs 3 more/)
     },
   )
 
-  it("uses an assessment-scoped pass without a tool-result claim", async () => {
+  it("uses a saved check result without a tool-result claim", async () => {
     setup(
       null,
       false,
@@ -209,7 +199,7 @@ describe("installed check event waits", () => {
         name: "Failed retry loop, Passed",
       }),
     )
-    expect(screen.getByText("No concern in this assessment.")).toBeVisible()
+    expect(screen.getByText("Saved check result: no concern found.")).toBeVisible()
     expect(screen.queryByText(/No issue found in the checked results/)).not.toBeInTheDocument()
   })
 })

@@ -114,12 +114,21 @@ The first-run disclosure renders the same rows, with the same
 available while the first run takes over the main window.
 
 Decision-provider controls belong to the Checks Settings metadata. Search can
-reveal the Jev, Ollama, Cloudflare, and Custom setup fields, saved connections,
-Custom response mode, and model limits. Revealing a provider-specific target can
-select its draft for editing, but it must not save or activate that draft, test
-the connection, or refresh limits. Only **Save and use** or an explicit
-saved-profile activation changes routing. Tests and limit refresh are separate
-actions. Search focus must preserve field values and the saved active connection.
+reveal the Jev, Ollama, Cloudflare, and Custom setup fields in the connection
+dialog, the connection list, Custom response mode, Check files, and Model usage.
+There are no manual model-limit targets. Revealing a provider-specific target can
+open its draft for editing, but it must not save or activate that draft or test
+the connection. Search for a folder reveals its disclosure, not the native open
+action. **Use** explicitly changes selection. Saving the first connection selects
+it without enabling checks; other saves preserve selection. Saving changes to
+the selected connection updates its configuration. Removing that connection
+pauses checks and clears selection. Search focus preserves field values and the
+confirmed selection, including a valid empty selection. Search must not focus
+Remove as the primary target of a connection row.
+
+When Model usage has no current recorded information to show, its search result
+focuses the Model-based checks group itself. It does not add an empty usage row
+or focus the Run checks switch. Search never changes enablement or routing.
 
 The contextual filter menu owns result and spend choices, while live session state
 supplies counts. Fixed filters are excluded from search. The top-level Sessions

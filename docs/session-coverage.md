@@ -26,8 +26,15 @@ remain separate.
 Capture health is separate from historical completeness. First attachment and
 recovery can leave earlier history incomplete without proving that an event was
 lost. A working capture does not show an alert for that older limit. Current
-connection failures remain actionable. File-backed agents use watched appends
+connection failures remain actionable for active sessions and unfinished checks.
+An expired capture or saved error alone does not make an inactive session current.
+An unapplied detach publication can still need consumption, but does not by
+itself justify a current capture alert. Gap consumption and evidence invalidation
+remain active even when the alert is not relevant.
+Its missing evidence stays unknown. File-backed agents use watched appends
 and bounded suffix reads, not an OpenCode service connection.
+Stored OpenCode V2 metrics do not replace or invalidate live-capture evidence.
+Only the verified capture path publishes live updates and corrections.
 
 For YAML Burn Checks, a user message means accepted content in the user slot. A
 human, extension, or API can supply it. Claude meta, synthetic, plan, and explicit

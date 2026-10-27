@@ -1,5 +1,7 @@
 #[path = "../support/protocol.rs"]
 mod support;
+#[path = "../../src/store/burn_checks/trace_capture_tests.rs"]
+mod trace_capture;
 use support::fixtures;
 pub(crate) use support::{jev_cloudflare, jev_ollama};
 pub(crate) mod jev {

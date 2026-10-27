@@ -4,11 +4,7 @@ use antiburn_checks::expression_eval::{EvaluationBudget, EvaluationValue};
 use antiburn_checks::preparation::evaluate_decision_input_with_budget;
 use serde_json::{Value, json};
 
-pub const DEFINITIONS: [(&str, &str); 6] = [
-    (
-        "failed-retry-loop",
-        include_str!("../../../../.antiburn/checks/failed-retry-loop.yml"),
-    ),
+pub const DEFINITIONS: [(&str, &str); 5] = [
     (
         "over-exploring",
         include_str!("../../../../.antiburn/checks/over-exploring.yml"),

@@ -2485,7 +2485,10 @@ impl Store {
             cleanup.commit()?;
             return Ok(false);
         }
-        if let Some(batch) = options.batch {
+        // Stored V2 snapshots cannot prove live event continuity or corrections.
+        if let Some(batch) = options.batch.filter(|batch| {
+            batch.source_format != antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
+        }) {
             let source_format = serde_json::to_string(&batch.source_format)?;
             if batch.complete {
                 remove_native_tool_results_from_other_formats_in(
@@ -2587,6 +2590,17 @@ impl Store {
             )?;
         }
         transaction.commit()?;
+        if options.batch.is_some_and(|batch| {
+            batch.source_format == antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
+        }) {
+            ::tracing::debug!(
+                event = "stored_metrics_committed",
+                publication_origin = "stored_metrics",
+                live_evidence_ownership = "excluded",
+                metrics_claim_fence = completion.claim_fence,
+                metrics_source_generation = record.analyzed_generation,
+            );
+        }
         Ok(true)
     }
 

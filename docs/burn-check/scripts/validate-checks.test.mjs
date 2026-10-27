@@ -127,6 +127,7 @@ test("validates the canonical Draft 2020-12 schema", async () => {
     ),
   );
   assert.equal(schema.$schema, "https://json-schema.org/draft/2020-12/schema");
+  assert.equal(schema.title, "Burn Checks v1-alpha");
   assert.equal("$id" in schema, false);
   assert.doesNotThrow(() => validate(JSON.stringify(base())));
 });
@@ -208,7 +209,7 @@ test("allows the standard non-specific YAML tag", () => {
   assert.deepEqual(parseCheck("name: ! Plain\n"), { name: "Plain" });
 });
 
-test("validates the exact six linked definition files, names, and schema modelines", async () => {
+test("validates the exact five linked definition files, names, and schema modelines", async () => {
   const directory = new URL("../../../.antiburn/checks/", import.meta.url);
   const readme = await readFile(
     new URL("../README.md", import.meta.url),
@@ -223,7 +224,6 @@ test("validates the exact six linked definition files, names, and schema modelin
   );
   const files = entries.map((entry) => entry.name);
   const names = {
-    "failed-retry-loop.yml": "Failed retry loop",
     "over-exploring.yml": "Over-exploring",
     "scope-creep.yml": "Scope creep",
     "ignored-instructions.yml": "Ignored instructions",
@@ -257,14 +257,45 @@ test("validates the exact six linked definition files, names, and schema modelin
       check.actions.every((action) => action.type === "status"),
       file,
     );
+    const failures = check.actions.filter(
+      (action) => action.input.result === "failure",
+    );
+    assert.equal(failures.length, file === "ignored-instructions.yml" ? 2 : 1);
+    for (const action of failures) {
+      assert.match(
+        action.if,
+        /^decisions\.review\.outputs\.([a-z][a-z0-9_]*) == '([a-z][a-z0-9_]*)' && decisions\.review\.details\.\1\.probabilities\.\2 >= 0\.95$/,
+        file,
+      );
+    }
+    if (file !== "ignored-instructions.yml") {
+      assert.equal(
+        check.actions.find((action) => action.input.result === "success")?.if,
+        `!(${failures[0].if})`,
+        file,
+      );
+    }
     for (const decision of Object.values(check.decisions)) {
       assert.equal("model" in decision, false, file);
       assert.deepEqual(
         decision.fit,
         {
+          ...(file === "ignored-instructions.yml"
+            ? {
+                "current_global_scope.skills[*].description": "truncate",
+                "current_repo_scope.skills[*].description": "truncate",
+              }
+            : {}),
           "activity[*].tool.result.content": "truncate",
         },
         file,
+      );
+    }
+    if (file === "ignored-instructions.yml") {
+      assert.deepEqual(check.on.window, { size: 20, min: 3 });
+      assert.equal(
+        check.actions.find((action) => action.input.result === "success")?.if,
+        "decisions.review.outputs.decision == 'no_conflict' && decisions.review.details.decision.probabilities.no_conflict >= 0.95",
       );
     }
   }
@@ -347,8 +378,9 @@ test("schema accepts cycle triggers and draft-only message actions", () => {
 });
 
 test("validator states its structural boundary without claiming evidence proof", () => {
-  assert.match(validationBoundary, /v1-prealpha/);
+  assert.match(validationBoundary, /v1-alpha/);
   assert.match(validationBoundary, /no backward compatibility promise/);
+  assert.match(validationBoundary, /Beta and stable scope are not set/);
   assert.match(validationBoundary, /not runtime support, native source proof/);
   assert.match(validationBoundary, /Message actions remain unsupported/);
 });
@@ -464,6 +496,19 @@ test("the mixed message authoring example is structurally valid", async () => {
   )?.[1];
   assert.ok(example, "The mixed message example must remain complete.");
   assert.doesNotThrow(() => validate(example));
+});
+
+test("the local authoring example omits model decisions and is structurally valid", async () => {
+  const source = await readFile(
+    new URL("../authoring.md", import.meta.url),
+    "utf8",
+  );
+  const example = source.match(
+    /```yaml\n(name: Recorded tool error\n[\s\S]*?)\n```/,
+  )?.[1];
+  assert.ok(example, "The local authoring example must remain complete.");
+  const check = validate(example);
+  assert.equal("decisions" in check, false);
 });
 
 test("accepts structural expressions without claiming to parse them", () => {

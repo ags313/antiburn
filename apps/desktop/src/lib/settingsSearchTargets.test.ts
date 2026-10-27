@@ -5,11 +5,13 @@ import { settingsControlLabel } from "./settingsSearchTargets"
 it.each(["macos", "windows", "linux"] as const)(
   "keeps model-based check search destinations on %s",
   (platform) => {
-    expect(settingsControlLabel("smartChecksEnabled", platform)).toBe("Run model-based checks")
+    expect(settingsControlLabel("smartChecksEnabled", platform)).toBe("Run checks")
     for (const [query, control] of [
-      ["Run model-based checks", "smartChecksEnabled"],
+      ["Run checks", "smartChecksEnabled"],
       ["Model-based checks", "smartChecksEnabled"],
-      ["discovery", "smartChecksEnabled"],
+      ["discovery", "checkDirectories"],
+      ["check folders", "checkDirectories"],
+      ["model usage", "checkModelUsage"],
       ["TypeSafe API key", "typeSafeApiKey"],
       ["Jev API key", "typeSafeApiKey"],
       ["decision model", "decisionProvider"],
@@ -24,10 +26,6 @@ it.each(["macos", "windows", "linux"] as const)(
       ["Custom model", "customModel"],
       ["Custom API key", "customApiKey"],
       ["response mode", "customResponseMode"],
-      ["Model limits", "decisionModelLimits"],
-      ["Total input tokens", "decisionTotalInput"],
-      ["State and longest question tokens", "decisionStateInput"],
-      ["Loaded context tokens", "decisionRuntimeContext"],
     ] as const) {
       const result = searchApp(query, platform).find(
         (result) => result.target.kind === "setting" && result.target.control === control,
@@ -41,3 +39,10 @@ it.each(["macos", "windows", "linux"] as const)(
     }
   },
 )
+
+it("does not keep removed model-limit destinations", () => {
+  for (const query of ["manual limits", "total input tokens", "loaded context tokens"])
+    expect(
+      searchApp(query, "macos").filter((result) => result.target.kind === "setting"),
+    ).toEqual([])
+})

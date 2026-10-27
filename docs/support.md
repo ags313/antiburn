@@ -283,12 +283,18 @@ the next time it looks.
 
 **Model-based checks** can send an authored YAML check's selected tool results,
 arguments, and available user-slot text to the selected System One connection.
-In **Settings → Checks**, enable **Run model-based checks**, choose Jev, Ollama,
-Cloudflare, or Custom under **Model-based checks**, enter the required fields, and
-select **Save and use**. **Test connection** is optional, sends synthetic input,
+In **Settings → Checks → Model-based checks**, turn **Run checks** off during
+setup. Choose **Add connection**, select Jev, Ollama, Cloudflare, or Custom, enter
+its fields, and select **Add connection** in the dialog. The first connection
+becomes selected without enabling checks. Choose **Use** for another saved
+connection, then enable **Run checks** when ready. **Edit** and **Save** update a
+connection without selecting another one. **Remove** can delete any connection;
+removing the selected connection turns checks off and clears selection. Saved
+results and usage remain. **Test connection** in the dialog is optional, sends synthetic input,
 and can incur provider charges. Compatible models and output capabilities are
 required; an arbitrary chat endpoint is not supported. Custom supports direct
-System One and Cloudflare-envelope responses. See
+System One and Cloudflare-envelope responses, but unknown limits block execution.
+The app manages supported limits without manual overrides. See
 [decision connections](burn-check/authoring.md#decision-connections) for the
 provider-specific fields and limits. The selected Settings connection owns
 routing; decision-level YAML `model` is rejected as an unknown field.
@@ -345,11 +351,11 @@ signed bundle and restarts antiburn. The app never depends on either connection.
   with a rejected name replaced by a fixed placeholder instead of being sent;
   the app version; and the operating system. The payload has no
   field able to carry anything else. The analytics-session identifier changes
-  after 30 minutes without a captured analytics event, when the app restarts,
+  after 30 minutes without a user-oriented analytics event, when the app restarts,
   or when the installation identifier rotates.
   Its generator is memory-only, but each queued event stores the value on disk
-  until that event is sent or removed. Background events can keep it active, so
-  it does not measure a user visit or time spent. Because each event is
+  until that event is sent or removed. Background events do not extend its
+  inactivity timeout. It does not measure a user visit or time spent. Because each event is
   timestamped and the installation identifier lasts up to 30 days, the events
   do show roughly when events were captured within that window; they do not show
   the content or identity of what the app was used on. Resource ranges can

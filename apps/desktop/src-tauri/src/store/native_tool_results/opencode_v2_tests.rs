@@ -17,6 +17,9 @@ mod capture_gaps;
 #[path = "opencode_v2_tracing_tests.rs"]
 mod tracing_tests;
 
+#[path = "opencode_v2_request_history_tests.rs"]
+mod request_history;
+
 fn setup() -> (
     tempfile::TempDir,
     Store,

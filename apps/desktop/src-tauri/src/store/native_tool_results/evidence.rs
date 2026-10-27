@@ -503,7 +503,9 @@ impl PublicationBudget {
         &mut self,
         tx: &Transaction<'_>,
         operation: impl FnOnce() -> Result<()>,
+        effects: Option<&std::cell::Cell<super::trace_effects::InvalidationEffects>>,
     ) -> Result<bool> {
+        let before = effects.map(std::cell::Cell::get);
         tx.execute_batch("SAVEPOINT native_evidence_output")?;
         operation()?;
         let (count, bytes, head): (usize, usize, i64) = tx.query_row(
@@ -517,6 +519,9 @@ impl PublicationBudget {
         )?;
         if self.count + count > self.count_limit || self.bytes + bytes > self.byte_limit {
             tx.execute_batch("ROLLBACK TO native_evidence_output; RELEASE native_evidence_output")?;
+            if let (Some(effects), Some(before)) = (effects, before) {
+                effects.set(before);
+            }
             ensure!(
                 count <= self.count_limit && bytes <= self.byte_limit,
                 "one native evidence output exceeds its page budget"
@@ -556,9 +561,10 @@ pub(crate) fn reconcile_evidence_in(
         }
     }
     if let Some(reason) = unsafe_reason {
-        super::admission::invalidate_in(tx, session, reason)?;
+        super::admission::invalidate_in(tx, session, reason)?.record(policy.invalidation_effects);
     }
-    super::observers::rebind_source_in(tx, session, batch.source_format)?;
+    super::observers::rebind_source_in(tx, session, batch.source_format)?
+        .record(policy.invalidation_effects);
     let journal = batch.source_format == antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1;
     let mut budget = PublicationBudget {
         head: tx.query_row(
@@ -597,23 +603,27 @@ pub(crate) fn reconcile_evidence_in(
                 _ => None,
             })
             .collect();
-        if !budget.apply(tx, || {
-            super::publications::publish_coverage_with_kind_in(
-                tx,
-                session,
-                generation,
-                fence,
-                (&ToolResultBatch {
-                    source_format: batch.source_format,
-                    results,
-                    complete: false,
-                })
-                    .into(),
-                complete,
-                policy.gap_reason,
-                policy.gap_kind,
-            )
-        })? {
+        if !budget.apply(
+            tx,
+            || {
+                super::publications::publish_coverage_with_kind_in(
+                    tx,
+                    session,
+                    generation,
+                    fence,
+                    (&ToolResultBatch {
+                        source_format: batch.source_format,
+                        results,
+                        complete: false,
+                    })
+                        .into(),
+                    complete,
+                    policy.gap_reason,
+                    policy.gap_kind,
+                )
+            },
+            policy.invalidation_effects,
+        )? {
             return Ok(false);
         }
     }
@@ -628,23 +638,27 @@ pub(crate) fn reconcile_evidence_in(
                 let reason = super::admission::reason(failure.reason).ok_or_else(|| {
                     anyhow::anyhow!("admission failure must have an unsafe reason")
                 })?;
-                if !budget.apply(tx, || {
-                    super::publications::publish_coverage_with_kind_in(
-                        tx,
-                        session,
-                        generation,
-                        fence,
-                        (&ToolResultBatch {
-                            source_format: batch.source_format,
-                            results: Vec::new(),
-                            complete: false,
-                        })
-                            .into(),
-                        false,
-                        Some(reason),
-                        PublicationGapKind::Invalidated,
-                    )
-                })? {
+                if !budget.apply(
+                    tx,
+                    || {
+                        super::publications::publish_coverage_with_kind_in(
+                            tx,
+                            session,
+                            generation,
+                            fence,
+                            (&ToolResultBatch {
+                                source_format: batch.source_format,
+                                results: Vec::new(),
+                                complete: false,
+                            })
+                                .into(),
+                            false,
+                            Some(reason),
+                            PublicationGapKind::Invalidated,
+                        )
+                    },
+                    policy.invalidation_effects,
+                )? {
                     return Ok(false);
                 }
             }
@@ -655,7 +669,8 @@ pub(crate) fn reconcile_evidence_in(
                     "activity source mismatch"
                 );
                 if event.live_eligible && after_baseline(activity.position, policy.baseline) {
-                    super::observers::activity_in(tx, session, activity, now_ms)?;
+                    super::observers::activity_in(tx, session, activity, now_ms)?
+                        .record(policy.invalidation_effects);
                 }
             }
             NativeEvidenceFact::SessionSelection(selection) => {
@@ -694,33 +709,43 @@ pub(crate) fn reconcile_evidence_in(
                         WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3 AND source_format = ?4 AND owner_message_id = ?5)",
                         params![session.environment_key, session.agent, session.session_id, format, removal.message_id], |r| r.get(0))?;
                     if !bound
-                        && !budget.apply(tx, || {
-                            super::publications::publish_coverage_with_kind_in(
-                                tx,
-                                session,
-                                generation,
-                                fence,
-                                (&ToolResultBatch {
-                                    source_format: batch.source_format,
-                                    results: Vec::new(),
-                                    complete: false,
-                                })
-                                    .into(),
-                                false,
-                                Some("native-message-removal-unbound"),
-                                PublicationGapKind::Invalidated,
-                            )
-                        })?
+                        && !budget.apply(
+                            tx,
+                            || {
+                                super::publications::publish_coverage_with_kind_in(
+                                    tx,
+                                    session,
+                                    generation,
+                                    fence,
+                                    (&ToolResultBatch {
+                                        source_format: batch.source_format,
+                                        results: Vec::new(),
+                                        complete: false,
+                                    })
+                                        .into(),
+                                    false,
+                                    Some("native-message-removal-unbound"),
+                                    PublicationGapKind::Invalidated,
+                                )
+                            },
+                            policy.invalidation_effects,
+                        )?
                     {
                         return Ok(false);
                     }
                 }
                 for identity in identities {
-                    if !budget.apply(tx, || {
-                        remove_current_in(
-                            tx, session, &format, &identity, removal, generation, fence,
-                        )
-                    })? {
+                    if !budget.apply(
+                        tx,
+                        || {
+                            remove_current_in(
+                                tx, session, &format, &identity, removal, generation, fence,
+                            )?
+                            .record(policy.invalidation_effects);
+                            Ok(())
+                        },
+                        policy.invalidation_effects,
+                    )? {
                         return Ok(false);
                     }
                 }
@@ -758,12 +783,12 @@ pub(crate) fn reconcile_evidence_in(
                     tx.execute("UPDATE native_tool_result_current SET owner_message_id = ?6 WHERE environment_key = ?1
                         AND agent = ?2 AND session_id = ?3 AND source_format = ?4 AND native_identity = ?5",
                         params![session.environment_key, session.agent, session.session_id, format, payload.identity()?, payload.owner()])?;
-                    invalidate_native_dependents_in(tx, session)?;
+                    invalidate_native_dependents_in(tx, session)?.record(policy.invalidation_effects);
                 } else {
-                    upsert_in(tx, session, &format, generation, fence, payload, live)?;
+                    upsert_in(tx, session, &format, generation, fence, payload, live)?.record(policy.invalidation_effects);
                 }
                 Ok(())
-                })? { return Ok(false); }
+                }, policy.invalidation_effects)? { return Ok(false); }
             }
             NativeEvidenceFact::ResponseCycle(cycle) => {
                 ensure!(
@@ -787,21 +812,27 @@ pub(crate) fn reconcile_evidence_in(
                     ),
                     "cycle key does not match its native source"
                 );
-                if !budget.apply(tx, || {
-                    upsert_in(
-                        tx,
-                        session,
-                        &format,
-                        generation,
-                        fence,
-                        NativeEvidencePayload::ResponseCycle(cycle.clone()),
-                        event.live_eligible
-                            && after_baseline(
-                                cycle.context.first_eligible_position,
-                                policy.baseline,
-                            ),
-                    )
-                })? {
+                if !budget.apply(
+                    tx,
+                    || {
+                        upsert_in(
+                            tx,
+                            session,
+                            &format,
+                            generation,
+                            fence,
+                            NativeEvidencePayload::ResponseCycle(cycle.clone()),
+                            event.live_eligible
+                                && after_baseline(
+                                    cycle.context.first_eligible_position,
+                                    policy.baseline,
+                                ),
+                        )?
+                        .record(policy.invalidation_effects);
+                        Ok(())
+                    },
+                    policy.invalidation_effects,
+                )? {
                     return Ok(false);
                 }
             }
@@ -810,23 +841,27 @@ pub(crate) fn reconcile_evidence_in(
     if !policy.suppress_coverage
         && !has_admission_failure
         && policy.history_complete.is_none()
-        && !budget.apply(tx, || {
-            super::publications::publish_coverage_with_kind_in(
-                tx,
-                session,
-                generation,
-                fence,
-                (&ToolResultBatch {
-                    source_format: batch.source_format,
-                    results: Vec::new(),
-                    complete: false,
-                })
-                    .into(),
-                policy.history_complete.unwrap_or(batch.history_complete),
-                policy.gap_reason,
-                policy.gap_kind,
-            )
-        })?
+        && !budget.apply(
+            tx,
+            || {
+                super::publications::publish_coverage_with_kind_in(
+                    tx,
+                    session,
+                    generation,
+                    fence,
+                    (&ToolResultBatch {
+                        source_format: batch.source_format,
+                        results: Vec::new(),
+                        complete: false,
+                    })
+                        .into(),
+                    policy.history_complete.unwrap_or(batch.history_complete),
+                    policy.gap_reason,
+                    policy.gap_kind,
+                )
+            },
+            policy.invalidation_effects,
+        )?
     {
         return Ok(false);
     }
@@ -850,7 +885,7 @@ fn upsert_in(
     fence: i64,
     mut payload: NativeEvidencePayload,
     live: bool,
-) -> Result<()> {
+) -> Result<super::trace_effects::InvalidationEffects> {
     ensure!(
         payload.session() == session.session_id,
         "evidence session mismatch"
@@ -866,7 +901,7 @@ fn upsert_in(
         .as_ref()
         .is_some_and(|old| old.0 > revision || (old.2 && !payload.removed()))
     {
-        return Ok(());
+        return Ok(Default::default());
     }
     if let Some((_, old, _, Some(_))) = &previous {
         match &mut payload {
@@ -886,23 +921,23 @@ fn upsert_in(
         .as_ref()
         .is_some_and(|old| old.1 == encoded && old.2 == payload.removed())
     {
-        return Ok(());
+        return Ok(Default::default());
     }
     let mut bindings = Vec::new();
     if let NativeEvidencePayload::ResponseCycle(cycle) = &payload {
         if cycle.messages.len() > 4096 {
-            return Ok(());
+            return Ok(Default::default());
         }
         for member in &cycle.messages {
             let member = message_payload(member);
             let Some(binding) = current_binding_in(tx, session, &member.identity()?)? else {
-                return Ok(());
+                return Ok(Default::default());
             };
             if binding.revision != i64::try_from(member.revision())?
                 || binding.payload_sha256
                     != super::super::burn_checks::payload_sha256(&member.json()?)
             {
-                return Ok(());
+                return Ok(Default::default());
             }
             bindings.push(binding);
         }
@@ -911,7 +946,7 @@ fn upsert_in(
     if matches!(payload, NativeEvidencePayload::ResponseCycle(_))
         && encoded.len() + binding_json.len() > 4 * 1024 * 1024
     {
-        return Ok(());
+        return Ok(Default::default());
     }
     let position = serde_json::to_string(&payload.position())?;
     let first = previous.and_then(|old| old.3);
@@ -953,8 +988,7 @@ fn upsert_in(
         first_eligible_publication = excluded.first_eligible_publication",
         params![session.environment_key, session.agent, session.session_id, format, identity, position, revision,
             encoded, payload.removed(), sequence, generation, fence, payload.kind().name(), first, payload.owner()])?;
-    invalidate_native_dependents_in(tx, session)?;
-    Ok(())
+    invalidate_native_dependents_in(tx, session)
 }
 
 pub(crate) fn current_binding_in(
@@ -993,7 +1027,7 @@ fn remove_current_in(
     removal: &antiburn_local::analysis::NativeMessageRemoval,
     generation: i64,
     fence: i64,
-) -> Result<()> {
+) -> Result<super::trace_effects::InvalidationEffects> {
     let position = &removal.position;
     let revision = removal.revision;
     let (kind, payload, old_revision): (String, String, u64) = tx.query_row("SELECT event_kind, payload_json, native_revision
@@ -1056,7 +1090,8 @@ fn remove_current_in(
 pub(crate) fn invalidate_native_dependents_in(
     tx: &Transaction<'_>,
     session: &SessionKey,
-) -> Result<()> {
+) -> Result<super::trace_effects::InvalidationEffects> {
+    let mut effects = super::trace_effects::InvalidationEffects::default();
     let mut stmt = tx.prepare(
         "SELECT DISTINCT d.candidate_id FROM burn_check_candidate_dependency d
         JOIN burn_check_candidate c USING(candidate_id) WHERE d.session_key_json = ?1
@@ -1068,20 +1103,20 @@ pub(crate) fn invalidate_native_dependents_in(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for id in ids {
         if !super::observers::typed_dependencies_current_in(tx, &id)? {
-            tx.execute(
+            effects.unfinished_stale += tx.execute(
                 "UPDATE burn_check_candidate SET state = 'stale' WHERE candidate_id = ?1
             AND state IN ('pending', 'claimed', 'dispatching', 'answered')",
                 [&id],
             )?;
-            tx.execute("UPDATE burn_check_assessment_history SET evidence_valid = 0 WHERE candidate_id = ?1", [&id])?;
-            tx.execute(
-                "UPDATE burn_check_current_status SET evidence_valid = 0 WHERE assessment_id IN
+            effects.accepted_evidence_revoked += tx.execute("UPDATE burn_check_assessment_history SET evidence_valid = 0 WHERE candidate_id = ?1 AND evidence_valid = 1", [&id])?;
+            effects.current_status_revoked += tx.execute(
+                "UPDATE burn_check_current_status SET evidence_valid = 0 WHERE evidence_valid = 1 AND assessment_id IN
             (SELECT assessment_id FROM burn_check_assessment_history WHERE candidate_id = ?1)",
                 [&id],
             )?;
         }
     }
-    Ok(())
+    Ok(effects)
 }
 
 #[cfg(test)]

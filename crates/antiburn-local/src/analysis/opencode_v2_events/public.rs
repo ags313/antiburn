@@ -27,6 +27,7 @@ pub(super) struct PublicState {
     cycle: Option<Cycle>,
     unavailable: bool,
     output_omitted: bool,
+    request_history_incomplete: bool,
 }
 
 #[derive(Debug)]
@@ -104,6 +105,7 @@ impl PublicState {
         self.calls.clear();
         self.cycle = None;
         self.unavailable = true;
+        self.request_history_incomplete = true;
     }
 
     pub(super) fn invalidate_cycle(&mut self) {
@@ -184,6 +186,7 @@ impl PublicState {
         let kind = event["type"].as_str().unwrap_or("");
         let data = &event["data"];
         let live = self.baseline.is_none_or(|baseline| sequence > baseline);
+        self.request_history_incomplete |= joiner.request_history_gap || !joiner.gaps.is_empty();
         let safe = session.len() <= EVIDENCE_STRING_CAP
             && !joiner
                 .gaps
@@ -606,6 +609,15 @@ impl PublicState {
                     && !cycle.requests.is_empty()
                     && let Some(status) = status
                 {
+                    let prefix = users(joiner, session);
+                    let history_complete = !self.request_history_incomplete
+                        && joiner
+                            .users
+                            .as_ref()
+                            .is_some_and(|history| history.len == prefix.len())
+                        && prefix.iter().all(|message| {
+                            message.completeness == UserMessageCompleteness::Complete
+                        });
                     facts.push(NativeEvidenceFact::ResponseCycle(
                         ResponseCycleObservation {
                             source_format: SourceFormat::OpenCodeSqliteV2,
@@ -630,17 +642,8 @@ impl PublicState {
                             context: NativeEventContext {
                                 first_eligible_position: position(sequence),
                                 main_session: true,
-                                complete_through_event: true,
-                                user_messages: cycle
-                                    .messages
-                                    .iter()
-                                    .filter_map(|message| match message {
-                                        NativeMessageObservation::User(user) => {
-                                            Some(user.message.clone())
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect(),
+                                complete_through_event: history_complete,
+                                user_messages: prefix,
                             },
                             messages: cycle.messages,
                         },

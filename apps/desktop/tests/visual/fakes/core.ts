@@ -3,7 +3,14 @@ import { emitFixtureEvent } from "./event"
 import { fixtureDetailMap, fixtureIsland, fixtureTokenMap } from "./hud"
 import { hasRemoteFixture, remoteFixtureCommand, remoteFixtureIds } from "./remote"
 import { fixtureCheckAvailability, fixtureChecksReport, setFixtureCheckEnabled } from "./checks"
-import { fixtureProviderSettings } from "./providers"
+import {
+  fixtureProviderCommand,
+  openFixtureCheckDirectory,
+  readFixtureCheckDirectories,
+  readFixtureProviderSettings,
+  readFixtureSettingsAvailability,
+  setFixtureModelChecksEnabled,
+} from "./providers"
 
 declare global {
   interface Window {
@@ -474,9 +481,24 @@ function dataFor(command: string, args: Record<string, unknown> | undefined): un
     case "get_burn_check_remediation_progress":
       return { attempts: [] }
     case "get_check_availability":
-      return fixtureCheckAvailability()
+      return readFixtureSettingsAvailability(fixtureCheckAvailability())
     case "get_system_one_settings":
-      return fixtureProviderSettings()
+      return readFixtureProviderSettings()
+    case "test_system_one_connection":
+    case "save_system_one_connection":
+    case "switch_system_one_connection":
+    case "remove_system_one_credential":
+    case "remove_system_one_connection":
+    case "retry_system_one_connection_operation":
+    case "remove_typesafe_api_key":
+    case "list_ollama_models":
+      return fixtureProviderCommand(command, args)
+    case "list_installed_check_directories":
+      return readFixtureCheckDirectories()
+    case "open_installed_check_directory":
+      return openFixtureCheckDirectory(args)
+    case "set_smart_burn_checks_enabled":
+      return setFixtureModelChecksEnabled(fixtureCheckAvailability(), args)
     case "set_check_enabled":
       return setFixtureCheckEnabled(args)
     case "get_latest_session_activity":
@@ -539,6 +561,16 @@ export function isTauri(): boolean {
 }
 
 export async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (
+    command.includes("system_one") ||
+    command === "list_ollama_models" ||
+    command === "remove_typesafe_api_key"
+  ) {
+    window.__ANTIBURN_VISUAL_PROVIDER_CALLS__ ??= []
+    window.__ANTIBURN_VISUAL_PROVIDER_CALLS__.push(command)
+    window.__ANTIBURN_VISUAL_PROVIDER_REQUESTS__ ??= []
+    window.__ANTIBURN_VISUAL_PROVIDER_REQUESTS__.push({ command, args })
+  }
   if (["open_settings_window", "set_settings", "set_interface_scale"].includes(command)) {
     window.__ANTIBURN_VISUAL_SETTINGS_CALLS__ ??= []
     window.__ANTIBURN_VISUAL_SETTINGS_CALLS__.push({ command, args })

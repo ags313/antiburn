@@ -539,7 +539,7 @@ test("routes Burn Check documentation changes to the validator", () => {
 });
 
 test("validates canonical repository checks as well as their Rust readers", () => {
-  const outputs = plan("ready", [".antiburn/checks/failed-retry-loop.yml"]);
+  const outputs = plan("ready", [".antiburn/checks/fast-mode-value.yml"]);
   assert.equal(outputs.engine_workspaces, "checks");
   assert.equal(desktopWorkspaces(outputs), "shell");
   assert.equal(outputs.run_validator, "true");

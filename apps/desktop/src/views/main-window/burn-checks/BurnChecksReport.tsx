@@ -53,6 +53,7 @@ import { RemindLaterAction } from "./RemindLaterAction"
 type ReportUiState = {
   reportKey: string
   searchRequest: string | null
+  pendingSearch: boolean
   selectedId: CheckId | null
   deliberateIds: ReadonlySet<CheckId>
   passedPreference: boolean | null
@@ -556,6 +557,7 @@ export function BurnChecksReport({
   const [ui, setUi] = useState<ReportUiState>(() => ({
     reportKey,
     searchRequest: null,
+    pendingSearch: false,
     selectedId: initialId,
     deliberateIds: new Set(),
     passedPreference: null,
@@ -566,8 +568,10 @@ export function BurnChecksReport({
     setUi((value) => ({
       ...value,
       reportKey,
+      pendingSearch:
+        value.pendingSearch && !checks.some((check) => check.id === value.selectedId),
       selectedId:
-        value.selectedId === focusedCheck ||
+        (value.pendingSearch && value.selectedId === focusedCheck) ||
         checks.some((check) => check.id === value.selectedId)
           ? value.selectedId
           : initialId,
@@ -584,6 +588,7 @@ export function BurnChecksReport({
     setUi((value) => ({
       ...value,
       searchRequest,
+      pendingSearch: !checks.some((check) => check.id === focusedCheck),
       selectedId: focusedCheck,
       deliberateIds: new Set([...value.deliberateIds, focusedCheck]),
       passedPreference: activeWins.some((check) => check.id === focusedCheck)
@@ -607,6 +612,7 @@ export function BurnChecksReport({
   ]
   const unavailableSelected =
     focusedCheck &&
+    ui.pendingSearch &&
     ui.selectedId === focusedCheck &&
     !checkRows(report).some((check) => check.id === focusedCheck)
   const selectedVisibleId = unavailableSelected
@@ -620,7 +626,9 @@ export function BurnChecksReport({
         (snoozedOpen ? snoozedChecks[0]?.id : null) ??
         null)
   const rowRefs = useRef(new Map<CheckId, HTMLButtonElement>())
+  const collectionRef = useRef<HTMLElement>(null)
   const focusedRow = useRef<HTMLButtonElement | null>(null)
+  const focusedDetail = useRef<HTMLElement | null>(null)
   const passedTriggerRef = useRef<HTMLButtonElement>(null)
   const unassessedTriggerRef = useRef<HTMLButtonElement>(null)
   const snoozedTriggerRef = useRef<HTMLButtonElement>(null)
@@ -721,6 +729,23 @@ export function BurnChecksReport({
     rowRefs.current.get(next.id)?.focus()
   }
 
+  const restoreCollectionFocus = (removed: HTMLElement) => {
+    if (removed.isConnected) return
+    const currentFocus = document.activeElement
+    if (
+      currentFocus !== document.body &&
+      currentFocus?.isConnected &&
+      !removed.contains(currentFocus)
+    )
+      return
+    const rows = [...rowRefs.current.values()].filter((row) => !row.closest("[hidden]"))
+    const target =
+      rows.find((row) => row.getAttribute("aria-pressed") === "true") ??
+      rows[0] ??
+      collectionRef.current
+    target?.focus({ preventScroll: true })
+  }
+
   const renderCheck = (check: CheckRow) => {
     const snooze = snoozed.find((item) => item.detector === check.id)
     return (
@@ -770,6 +795,7 @@ export function BurnChecksReport({
             else if (hiddenGroup?.id === "burn-checks-unassessed-body")
               unassessedTriggerRef.current?.focus()
             else if (replacement && !hiddenGroup) replacement.focus({ preventScroll: true })
+            else if (!replacement) restoreCollectionFocus(removed)
           })
         }}
         onClick={() => selectCheck(check.id)}
@@ -786,6 +812,8 @@ export function BurnChecksReport({
     <div className="burn-checks-report">
       <div className="burn-checks-layout">
         <section
+          ref={collectionRef}
+          tabIndex={-1}
           className="main-window-collection burn-checks-collection"
           aria-label="Burn check collection"
           onBlurCapture={(event) => {
@@ -991,6 +1019,20 @@ export function BurnChecksReport({
           </ScrollPane>
         </section>
         <section
+          ref={(node) => {
+            const removed = focusedDetail.current
+            if (node && removed && !removed.isConnected) {
+              focusedDetail.current = null
+              queueMicrotask(() => restoreCollectionFocus(removed))
+            }
+          }}
+          onFocusCapture={(event) => {
+            focusedDetail.current = event.target.closest<HTMLElement>(".burn-check-detail")
+          }}
+          onBlurCapture={(event) => {
+            if (event.target.isConnected && !event.currentTarget.contains(event.relatedTarget))
+              focusedDetail.current = null
+          }}
           className="main-window-detail burn-checks-detail-pane"
           aria-label="Burn check details"
         >

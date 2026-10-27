@@ -48,7 +48,7 @@ frozen request context through production claim-fenced Store publication,
 `StorePublishedEvidenceReader`, `FileEventSource`, core replay, and
 `StoreCheckStore`. Each case gets a temporary Store and replay activation.
 `RunScope::Replay` and `SequentialReplay` retain isolated, sequential prefix
-acceptance. Burn Checks use the experimental `v1-prealpha` draft, not a
+acceptance. Burn Checks use the experimental `v1-alpha` draft, not a
 standardized or backward-compatible language.
 
 The six cases cover repeated failure, recovery, requested polling, uncertainty

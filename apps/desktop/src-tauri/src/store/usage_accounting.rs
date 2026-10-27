@@ -8,7 +8,9 @@ use super::Store;
 pub(super) const USAGE_LEDGER_KEY: &str = "internal:burnCheckUsageLedgerV1";
 pub(super) const MAX_USAGE_AGGREGATES: usize = 8;
 pub(super) const PINNED_PRICE_VERSION: &str = "typesafe-model-catalog-2026-09-25";
-const PINNED_INPUT_NANODOLLARS_PER_TOKEN: u64 = 42;
+const JEV_1_14_PRICE_VERSION: &str = "typesafe-model-catalog-2026-10-26";
+const INPUT_NANODOLLARS_PER_TOKEN: u64 = 42;
+const MAX_USAGE_CHECK_ID_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -148,16 +150,23 @@ pub(super) fn record_confirmed_usage(
     output_tokens: u64,
     at_epoch: i64,
 ) {
-    let price_version = (identity.provider == "typesafe-systemone"
-        && identity.model == antiburn_local::analysis::jev::PINNED_MODEL)
-        .then(|| PINNED_PRICE_VERSION.to_owned());
+    // https://docs.typesafe.ai/models.md, read 2026-10-26. Output is free.
+    let price_version = if identity.provider == "typesafe-systemone" {
+        match identity.model {
+            "jev-1.13.0" => Some(PINNED_PRICE_VERSION.to_owned()),
+            "jev-1.14.0" => Some(JEV_1_14_PRICE_VERSION.to_owned()),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let local = identity.provider == "ollama-systemone";
     let cost = if local {
         Some(0)
     } else {
         price_version
             .as_ref()
-            .map(|_| input_tokens.saturating_mul(PINNED_INPUT_NANODOLLARS_PER_TOKEN))
+            .map(|_| input_tokens.saturating_mul(INPUT_NANODOLLARS_PER_TOKEN))
     };
     let existing = summary.aggregates.iter().position(|aggregate| {
         aggregate.provider == identity.provider
@@ -166,7 +175,9 @@ pub(super) fn record_confirmed_usage(
             && aggregate.price_version == price_version
     });
     let index = existing.or_else(|| {
-        if summary.aggregates.len() >= MAX_USAGE_AGGREGATES {
+        if summary.aggregates.len() >= MAX_USAGE_AGGREGATES
+            || identity.check_id.len() > MAX_USAGE_CHECK_ID_BYTES
+        {
             return None;
         }
         summary.aggregates.push(ModelUsageAggregate {
@@ -245,11 +256,37 @@ mod tests {
     }
 
     #[test]
+    fn concrete_versions_keep_distinct_sourced_prices_and_count_free_output() {
+        let mut summary = UsageLedgerSummary::default();
+        for model in ["jev-1.13.0", "jev-1.14.0"] {
+            record_confirmed_usage(&mut summary, &identity(model), 1_000_000, u64::MAX, 50);
+        }
+        assert_eq!(summary.aggregates.len(), 2);
+        for (aggregate, price) in summary
+            .aggregates
+            .iter()
+            .zip([PINNED_PRICE_VERSION, JEV_1_14_PRICE_VERSION])
+        {
+            assert_eq!(aggregate.price_version.as_deref(), Some(price));
+            assert_eq!(aggregate.estimated_cost_nanos, Some(42_000_000));
+            assert_eq!(aggregate.output_tokens, u64::MAX);
+        }
+        assert!(!summary.unpriced_usage);
+    }
+
+    #[test]
     fn unknown_model_usage_has_no_estimated_dollar_value() {
         let mut summary = UsageLedgerSummary::default();
-        record_confirmed_usage(&mut summary, &identity("jev-new-model"), 100, 0, 50);
+        for model in ["jev-new-model", "jev-latest", "unknown"] {
+            record_confirmed_usage(&mut summary, &identity(model), 100, 0, 50);
+        }
         assert!(summary.unpriced_usage);
-        assert_eq!(summary.aggregates[0].estimated_cost_nanos, None);
+        assert_eq!(summary.unknown_outcomes, 0);
+        assert_eq!(summary.aggregates.len(), 3);
+        for aggregate in summary.aggregates {
+            assert_eq!(aggregate.estimated_cost_nanos, None);
+            assert_eq!(aggregate.confirmed_calls, 1);
+        }
     }
 
     #[test]
@@ -278,5 +315,34 @@ mod tests {
         assert_eq!(summary.aggregates[0].output_tokens, 4);
         assert_eq!(summary.aggregates[0].estimated_cost_nanos, Some(0));
         assert!(!summary.unpriced_usage);
+    }
+
+    #[test]
+    fn version_and_identifier_overflow_keeps_saturating_token_and_call_totals() {
+        let mut summary = UsageLedgerSummary::default();
+        for version in 0..MAX_USAGE_AGGREGATES + 3 {
+            record_confirmed_usage(
+                &mut summary,
+                &identity(&format!("jev-future-{version}")),
+                u64::MAX,
+                u64::MAX,
+                50,
+            );
+        }
+        assert_eq!(summary.aggregates.len(), MAX_USAGE_AGGREGATES);
+        assert_eq!(summary.overflow_confirmed_calls, 3);
+        assert_eq!(summary.overflow_input_tokens, u64::MAX);
+        assert_eq!(summary.overflow_output_tokens, u64::MAX);
+
+        let mut summary = UsageLedgerSummary::default();
+        let mut usage = identity("jev-1.14.0");
+        let check_id = "x".repeat(MAX_USAGE_CHECK_ID_BYTES + 1);
+        usage.check_id = &check_id;
+        record_confirmed_usage(&mut summary, &usage, 123, 4, 50);
+        assert!(summary.aggregates.is_empty());
+        assert_eq!(summary.overflow_confirmed_calls, 1);
+        assert_eq!(summary.overflow_input_tokens, 123);
+        assert_eq!(summary.overflow_output_tokens, 4);
+        assert!(summary.unpriced_usage);
     }
 }

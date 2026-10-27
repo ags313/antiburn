@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    capabilities, json_count, limit_as_usize, valid_probability, validate_probability_sum,
+    NATIVE_MODEL_ALIAS, capabilities, json_count, limit_as_usize, valid_probability,
+    valid_response_model, validate_probability_sum,
 };
 
 /// Sanitized failures shared by request preparation, TypeSafe transport, and
@@ -186,10 +187,20 @@ pub struct JevUsage {
     pub output_tokens: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JevResponseObservation {
+    pub usage: JevUsage,
+    pub served_model: Option<String>,
+}
+
 pub fn validate_jev_response(response: &JevResponse, request: &JevRequest) -> Result<(), JevError> {
     if response.model != request.model {
         return Err(JevError::ResponseModelMismatch);
     }
+    validate_jev_answers(response, request)
+}
+
+fn validate_jev_answers(response: &JevResponse, request: &JevRequest) -> Result<(), JevError> {
     if response.answers.len() != request.questions.len() {
         return Err(JevError::ResponseAnswerCountMismatch);
     }
@@ -272,6 +283,30 @@ pub fn validate_jev_response_with_capabilities(
     request: &JevRequest,
     capabilities: &capabilities::ModelCapabilities,
 ) -> Result<(), JevError> {
+    validate_response_capabilities(request, capabilities)?;
+    validate_jev_response(response, request)
+}
+
+/// Accept a safe served identifier only for an explicit native alias request.
+pub fn validate_native_jev_response_with_capabilities(
+    response: &JevResponse,
+    request: &JevRequest,
+    capabilities: &capabilities::ModelCapabilities,
+) -> Result<(), JevError> {
+    validate_response_capabilities(request, capabilities)?;
+    if request.model != NATIVE_MODEL_ALIAS {
+        return validate_jev_response(response, request);
+    }
+    if !valid_response_model(&response.model) {
+        return Err(JevError::ResponseModelMismatch);
+    }
+    validate_jev_answers(response, request)
+}
+
+fn validate_response_capabilities(
+    request: &JevRequest,
+    capabilities: &capabilities::ModelCapabilities,
+) -> Result<(), JevError> {
     if request.model != capabilities.model
         || u32::try_from(request.questions.len()).unwrap_or(u32::MAX)
             > capabilities.questions_per_request.value.unwrap_or_default()
@@ -282,7 +317,7 @@ pub fn validate_jev_response_with_capabilities(
     {
         return Err(JevError::QuestionLimitExceeded);
     }
-    validate_jev_response(response, request)
+    Ok(())
 }
 
 /// Use the distribution to select an option when the returned choice disagrees.
@@ -305,6 +340,13 @@ pub fn highest_probability_choice<'a>(
 
 pub fn validate_jev_request(request: &JevRequest) -> Result<usize, JevError> {
     validate_jev_request_with_capabilities(request, &capabilities::ModelCapabilities::jev_default())
+}
+
+/// Estimate the complete serialized request without the rendering reserve.
+pub fn estimate_jev_request_tokens(request: &JevRequest) -> Result<u64, JevError> {
+    json_count(request, usize::MAX)
+        .map(|measured| measured.estimate.tokens())
+        .map_err(|_| JevError::RequestSerialization)
 }
 
 pub fn validate_jev_request_with_capabilities(

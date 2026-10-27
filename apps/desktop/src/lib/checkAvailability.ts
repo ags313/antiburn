@@ -9,7 +9,7 @@ import type {
 } from "./insightsIpc"
 import { CHECK_DEFINITIONS } from "./presentation/checkDefinitions"
 
-type CheckUsageSummary = {
+export type CheckUsageSummary = {
   inputTokens: number
   outputTokens: number
   confirmedCalls: number

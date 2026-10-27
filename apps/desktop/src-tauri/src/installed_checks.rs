@@ -44,6 +44,7 @@ use execution::{AppRuntime, InstalledDecisionEvaluator, SelectedJobRuntime};
 
 mod current_context;
 pub(crate) mod diagnostics;
+pub(crate) mod directories;
 mod execution;
 mod loader;
 pub(crate) mod opener;
@@ -60,6 +61,7 @@ const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 #[derive(Default)]
 pub(crate) struct InstalledChecks {
     metadata: RwLock<Vec<InstalledCheckDefinition>>,
+    directories: Arc<directories::DirectoryInventory>,
     capabilities: RwLock<Option<execution::CapabilityState>>,
     wake: Notify,
     completed: Notify,
@@ -347,18 +349,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
     fn reconcile(&mut self, admission: &Admission) -> Result<()> {
         let _phase = diagnostics::SlowPhase::start("reconcile");
         let scopes = live_projects(&self.store)?;
-        let repositories = self
-            .store
-            .repositories()?
-            .into_iter()
-            .filter(|repository| repository.wsl_distro.is_none())
-            .filter_map(|repository| {
-                repository
-                    .repo_root
-                    .map(|root| (PathBuf::from(root), repository.enabled))
-            })
-            .filter(|(root, _)| root.is_absolute())
-            .collect::<BTreeMap<_, _>>();
+        let repositories = native_repositories(self.store.repositories()?);
         let mut granted = self.store.granted_dirs()?;
         let mut directories = BTreeMap::new();
         let mut errors = diagnostics::DiagnosticBatch::new();
@@ -955,9 +946,10 @@ impl EvaluationJob<InstalledDecisionEvaluator> {
             diagnostics::RuntimeStage::Clock,
             runtime.now_unix_ms(),
         )?;
-        let due = crate::jev::worker::run_blocking_preparation(move || {
-            store.has_due_candidate(&activation, i64::try_from(now / 1000)?)
-        })
+        let due = crate::jev::worker::run_blocking_preparation(
+            crate::jev::worker::BlockingPreparationStage::WorkProbe,
+            move || store.has_due_candidate(&activation, i64::try_from(now / 1000)?),
+        )
         .await;
         let due =
             diagnostics::job_result(&trace_activation, diagnostics::RuntimeStage::WorkProbe, due)?;
@@ -987,17 +979,20 @@ impl EvaluationJob<InstalledDecisionEvaluator> {
             diagnostics::RuntimeStage::Clock,
             runtime.now_unix_ms(),
         )?;
-        let outcome = crate::jev::worker::run_blocking_preparation(move || {
-            let branches = self.store.initialized_branches(&self.activation)?;
-            self.engine
-                .start_one_due_for_branches_with_evaluator(
-                    &self.activation,
-                    now,
-                    &branches,
-                    evaluator,
-                )
-                .map_err(anyhow::Error::from)
-        })
+        let outcome = crate::jev::worker::run_blocking_preparation(
+            crate::jev::worker::BlockingPreparationStage::PreparationStart,
+            move || {
+                let branches = self.store.initialized_branches(&self.activation)?;
+                self.engine
+                    .start_one_due_for_branches_with_evaluator(
+                        &self.activation,
+                        now,
+                        &branches,
+                        evaluator,
+                    )
+                    .map_err(anyhow::Error::from)
+            },
+        )
         .await;
         let outcome = diagnostics::job_result(
             &trace_activation,
@@ -1075,6 +1070,34 @@ impl<E: DecisionEvaluator> EvaluationJob<E> {
             StartOutcome::Stale | StartOutcome::NotDue => Ok(None),
         }
     }
+}
+
+fn native_repositories(
+    repositories: Vec<crate::store::RepositoryRecord>,
+) -> BTreeMap<PathBuf, bool> {
+    repositories
+        .into_iter()
+        .filter_map(|repository| {
+            native_repository(
+                repository.repo_root,
+                repository.wsl_distro,
+                repository.enabled,
+            )
+        })
+        .collect()
+}
+
+fn native_repository(
+    root: Option<String>,
+    wsl_distro: Option<String>,
+    enabled: bool,
+) -> Option<(PathBuf, bool)> {
+    if wsl_distro.is_some() {
+        return None;
+    }
+    root.map(PathBuf::from)
+        .filter(|root| root.is_absolute())
+        .map(|root| (root, enabled))
 }
 
 fn live_projects(store: &Store) -> Result<Vec<ActivationScope>> {

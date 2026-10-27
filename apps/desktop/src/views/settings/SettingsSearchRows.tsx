@@ -1,12 +1,29 @@
-import type { ComponentProps, ReactNode } from "react"
+import { useId, type ComponentProps, type ReactNode } from "react"
 import { Row } from "../../components/ui/Row"
 import { ToggleRow } from "../../components/ui/ToggleRow"
 import { SectionGroup } from "../../components/ui/SectionGroup"
-import { Disclosure } from "../../components/ui/Disclosure"
 import { detectPlatform } from "../../lib/platform"
 import { settingsControlLabel, type SettingsControlId } from "../../lib/settingsSearchTargets"
 
 type SearchRowProps = { searchId: SettingsControlId; label?: string }
+
+export function SettingsField({
+  searchId,
+  children,
+}: {
+  searchId: SettingsControlId
+  children: (id: string) => ReactNode
+}) {
+  const id = useId()
+  return (
+    <div data-settings-control={searchId} tabIndex={-1} className="min-w-0 space-y-2">
+      <label htmlFor={id} className="block type-body text-label">
+        {settingsControlLabel(searchId, detectPlatform())}
+      </label>
+      {children(id)}
+    </div>
+  )
+}
 
 export function SettingsRow({
   searchId,
@@ -53,35 +70,5 @@ export function SettingsSectionGroup({
       data-settings-control={searchId}
       tabIndex={-1}
     />
-  )
-}
-
-export function SettingsField({
-  searchId,
-  children,
-}: {
-  searchId: SettingsControlId
-  children: ReactNode
-}) {
-  return (
-    <label
-      className="block type-footnote text-label-secondary"
-      data-settings-control={searchId}
-      tabIndex={-1}
-    >
-      <span>{settingsControlLabel(searchId, detectPlatform())}</span>
-      {children}
-    </label>
-  )
-}
-
-export function SettingsDisclosure({
-  searchId,
-  ...props
-}: Omit<ComponentProps<typeof Disclosure>, "label"> & { searchId: SettingsControlId }) {
-  return (
-    <div data-settings-control={searchId} tabIndex={-1}>
-      <Disclosure {...props} label={settingsControlLabel(searchId, detectPlatform())} />
-    </div>
   )
 }

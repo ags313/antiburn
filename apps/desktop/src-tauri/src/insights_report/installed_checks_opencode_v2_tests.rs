@@ -388,7 +388,7 @@ fn v2_mixed_live_history_and_current_failures_report_only_current_unavailability
         .push(crate::installed_checks::diagnostics::payload(
             "provider-authentication",
             InstalledCheckDiagnosticSeverity::Error,
-            "Reconnect the assessment provider",
+            "Reconnect the check provider",
             "Update the selected connection in Settings → Checks.",
             None,
             Vec::new(),
@@ -586,4 +586,420 @@ fn v2_missing_capture_and_expired_capture_do_not_wait_for_metric_work() {
     assert_eq!(expired[0].diagnostics[0].code, "opencode-v2-capture-gap");
     assert_eq!(expired[0].waiting_for_data_count, 0);
     assert!(expired[0].waiting_for_events.is_none());
+}
+
+#[test]
+fn inactive_v2_capture_errors_do_not_alert_or_add_unassessed_sessions() {
+    for status in [
+        OpenCodeV2SourceStatus::ServiceUnavailable,
+        OpenCodeV2SourceStatus::AuthenticationRejected,
+        OpenCodeV2SourceStatus::SourceMismatch,
+        OpenCodeV2SourceStatus::VersionUnsupported,
+        OpenCodeV2SourceStatus::CaptureGap,
+        OpenCodeV2SourceStatus::SourceLimit,
+    ] {
+        let store = store();
+        let definition = definition("/workspace/demo");
+        activate(&store, &definition);
+        let old = v2_session(&store, "inactive");
+        store
+            .set_opencode_v2_source_status(&[old], status, 100)
+            .unwrap();
+        capture(&store, true);
+        let mut request = request();
+        request.computed_at_epoch = 400;
+        let changes = store.lock().total_changes();
+
+        let report = read_installed_checks_in_window(&store, &[definition], &request).unwrap();
+
+        assert!(report[0].diagnostics.is_empty(), "{status:?}");
+        assert_eq!(
+            (report[0].finding, report[0].clean, report[0].unavailable),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            (
+                report[0].checking_count,
+                report[0].waiting_for_results_count
+            ),
+            (0, 0)
+        );
+        assert!(report[0].waiting_for_events.is_none());
+        assert_eq!(store.lock().total_changes(), changes);
+    }
+}
+
+#[test]
+fn inactive_v2_errors_do_not_hide_a_live_session_or_a_current_failure() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    let records = [
+        v2_session(&store, "inactive"),
+        v2_session(&store, "live"),
+        v2_session(&store, "current-failure"),
+    ];
+    store
+        .set_opencode_v2_source_status(&records, OpenCodeV2SourceStatus::CaptureGap, 100)
+        .unwrap();
+    capture(&store, true);
+    store
+        .lock()
+        .execute_batch(
+            "UPDATE opencode_v2_capture SET lease_expires_at_epoch = 500 WHERE session_id = 'live';
+         UPDATE session SET updated_at_epoch = 190 WHERE session_id = 'current-failure';",
+        )
+        .unwrap();
+    let mut request = request();
+    request.computed_at_epoch = 300;
+
+    let report = read_installed_checks_in_window(&store, &[definition], &request).unwrap();
+
+    assert_eq!(report[0].diagnostics.len(), 1);
+    assert_eq!(report[0].diagnostics[0].code, "opencode-v2-capture-gap");
+    assert_eq!(report[0].diagnostics[0].affected_session_count, 1);
+    assert_eq!(report[0].waiting_for_results_count, 1);
+    assert_eq!(
+        (report[0].finding, report[0].clean, report[0].unavailable),
+        (0, 0, 2)
+    );
+}
+
+#[test]
+fn inactive_v2_session_with_unfinished_work_keeps_its_capture_error() {
+    for state in ["pending", "claimed", "dispatching", "answered"] {
+        let store = store();
+        let definition = definition("/workspace/demo");
+        activate(&store, &definition);
+        queue(&store, &definition, "unfinished", 1);
+        let record = v2_session(&store, "unfinished");
+        store.lock().execute_batch(
+        "UPDATE session SET cwd = '/workspace/other' WHERE agent = 'claude-code';
+         UPDATE burn_check_candidate SET session_key_json = json_array('native', 'opencode', 'unfinished');",
+    ).unwrap();
+        store
+            .set_opencode_v2_source_status(&[record], OpenCodeV2SourceStatus::CaptureGap, 100)
+            .unwrap();
+        capture(&store, true);
+        store
+            .lock()
+            .execute("UPDATE burn_check_candidate SET state = ?1", [state])
+            .unwrap();
+        let mut request = request();
+        request.computed_at_epoch = 400;
+
+        let report = read_installed_checks_in_window(&store, &[definition], &request).unwrap();
+
+        assert_eq!(report[0].diagnostics.len(), 1);
+        assert_eq!(report[0].diagnostics[0].affected_session_count, 1);
+        assert_eq!(report[0].unavailable, 1);
+        assert_eq!(report[0].checking_count, 0);
+        assert_eq!(report[0].clean, 0);
+    }
+}
+
+#[test]
+fn real_idle_detach_publication_does_not_alert_before_or_after_consumption() {
+    use crate::published_evidence_reader::StorePublishedEvidenceReader;
+    use antiburn_checks::engine::CheckEngine;
+    use antiburn_checks::source::{PublicationCursor, PublishedEvidenceSource, SourceEvent};
+    use antiburn_local::analysis::{
+        NativeEventContext, NativeEvidenceBatch, NativeEvidenceEvent, NativeEvidenceFact,
+        NativeMessageObservation, NativeRequestAttribution, PublicMessageObservation,
+        PublicMessagePayload, SourceFormat, ToolResultChange, ToolResultCompleteness,
+        ToolResultPosition, UserMessagePart,
+    };
+
+    let (store, adapter, activation, mut definition) = local::local_fixture_with_source(
+        "name: Idle detach report\non:\n  assistant_message:\n  cooldown: 0s\nactions:\n  - type: status\n    input: {result: failure}\n",
+    );
+    definition.trigger = Some(InstalledCheckTrigger {
+        event: InstalledCheckEvent::AssistantMessage,
+        minimum: 1,
+    });
+    let engine = CheckEngine::new(adapter.clone(), Arc::new(local::NoModel));
+    let record = v2_session(&store, "idle-detach");
+    let source = OpenCodeV2AdmittedSource {
+        database_path: Path::new(env!("CARGO_MANIFEST_DIR")).join("synthetic/opencode.db"),
+        file_identity: "synthetic-database-identity".into(),
+    };
+    let cursor = format!(
+        "opencode-admission-v2:{}",
+        serde_json::to_string(&(
+            &source.database_path,
+            &record.key.session_id,
+            &source.file_identity,
+            "synthetic-scope",
+        ))
+        .unwrap()
+    );
+    store
+        .lock()
+        .execute("UPDATE session SET activity_cursor = ?1", [cursor])
+        .unwrap();
+    let start = OpenCodeV2CaptureStart {
+        key: record.key,
+        incarnation: crate::store::Incarnation(7),
+        source_generation: 0,
+        source_label: record.source_label,
+        cwd: "/workspace/demo".into(),
+        admitted_source: source,
+        baseline_sequence: Some(4),
+    };
+    let claim = store
+        .start_opencode_v2_capture_epoch(&[start], "idle", 100, 400)
+        .unwrap()
+        .unwrap()
+        .remove(0);
+    let position = ToolResultPosition::OpenCodeV2Event {
+        sequence: 5,
+        item_index: 0,
+    };
+    assert!(
+        store
+            .advance_opencode_v2_evidence(
+                &claim,
+                5,
+                &NativeEvidenceBatch {
+                    source_format: SourceFormat::OpenCodeSqliteV2,
+                    history_complete: false,
+                    events: vec![NativeEvidenceEvent {
+                        live_eligible: true,
+                        fact: NativeEvidenceFact::Message(NativeMessageObservation::Public(
+                            PublicMessageObservation {
+                                source_format: SourceFormat::OpenCodeSqliteV2,
+                                session_id: claim.key.session_id.clone(),
+                                record_id: "public-assistant".into(),
+                                part_id: Some("text".into()),
+                                call_id: None,
+                                position,
+                                revision: 5,
+                                change: ToolResultChange::Update,
+                                eligible: true,
+                                completeness: ToolResultCompleteness::Complete,
+                                context: Some(NativeEventContext {
+                                    first_eligible_position: position,
+                                    main_session: true,
+                                    complete_through_event: false,
+                                    user_messages: Vec::new(),
+                                }),
+                                payload: PublicMessagePayload::AssistantText {
+                                    parts: vec![UserMessagePart {
+                                        item_index: 0,
+                                        native_part_id: Some("text".into()),
+                                        text: "The synthetic input is ready.".into(),
+                                    }],
+                                    generator: NativeRequestAttribution::default(),
+                                },
+                            },
+                        )),
+                    }],
+                },
+                101,
+                400,
+            )
+            .unwrap()
+    );
+    let source = PublishedEvidenceSource::new(
+        StorePublishedEvidenceReader::for_live_project(&store, "native", "/workspace/demo")
+            .with_activation(&activation.id),
+        20,
+    )
+    .unwrap();
+    let initial_page = source.read_batch(PublicationCursor(0)).unwrap();
+    assert!(!initial_page.has_more);
+    let initial = engine
+        .apply_source_page(&activation, &initial_page)
+        .unwrap();
+    assert_eq!((initial.observations, initial.candidates), (1, 1));
+    local::start_and_accept(&engine, &activation, 101_000);
+    let validity = || {
+        store
+            .lock()
+            .query_row(
+                "SELECT h.evidence_valid, s.evidence_valid FROM burn_check_assessment_history h
+               JOIN burn_check_current_status s USING(assessment_id)
+              WHERE h.check_id = ?1 AND h.activation_scope_key = ?2",
+                params![definition.check_id, definition.activation_scope_key],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(validity(), (1, 1));
+    let accepted = rows(&store, std::slice::from_ref(&definition));
+    assert_eq!((accepted[0].finding, accepted[0].clean), (1, 0));
+    let branch = BranchId(claim.key.to_identity_json());
+    let before = adapter.load_source_progress(&activation).unwrap();
+    assert_eq!(before.publication_cursor, initial_page.next);
+    assert_eq!(before.selection.branches[&branch].results.len(), 1);
+    let frozen: (String, String) = store.lock().query_row(
+        "SELECT frozen_input_json, input_fingerprint FROM burn_check_candidate WHERE state = 'accepted'",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    let (last_activity, unfinished): (i64, i64) = store.lock().query_row(
+        "SELECT updated_at_epoch, (SELECT COUNT(*) FROM burn_check_candidate
+           WHERE state IN ('pending', 'claimed', 'dispatching', 'answered'))
+           FROM session WHERE environment_key = 'native' AND agent = 'opencode' AND session_id = 'idle-detach'",
+        [], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert!(last_activity < 400 - antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS);
+    assert_eq!(unfinished, 0);
+    assert_eq!(
+        store
+            .mark_opencode_v2_capture_gap(std::slice::from_ref(&claim), "source-detached", 400)
+            .unwrap(),
+        1
+    );
+    assert_eq!(validity(), (0, 0));
+    let publications = store.native_tool_result_publications_after(0, 20).unwrap();
+    let detached_cursor = PublicationCursor(
+        u64::try_from(
+            publications
+                .iter()
+                .find(|publication| publication.gap_reason.as_deref() == Some("source-detached"))
+                .unwrap()
+                .publication_sequence,
+        )
+        .unwrap(),
+    );
+    assert!(detached_cursor > before.publication_cursor);
+    let mut request = request();
+    request.computed_at_epoch = 400;
+    let assert_no_current_failure = || {
+        let report =
+            read_installed_checks_in_window(&store, std::slice::from_ref(&definition), &request)
+                .unwrap();
+        assert!(report[0].diagnostics.is_empty());
+        assert_eq!((report[0].finding, report[0].clean), (0, 0));
+        assert_eq!(report[0].unavailable, 1);
+        assert_eq!(report[0].checking_count, 0);
+        assert!(report[0].waiting_for_events.is_none());
+    };
+    assert_no_current_failure();
+    assert_eq!(
+        adapter
+            .load_source_progress(&activation)
+            .unwrap()
+            .publication_cursor,
+        before.publication_cursor
+    );
+    let page = source.read_batch(before.publication_cursor).unwrap();
+    assert!(!page.has_more);
+    assert_eq!(page.next, detached_cursor);
+    assert!(page.events.iter().any(|event| matches!(
+        event,
+        SourceEvent::SegmentReset { cursor, branch: reset_branch, .. }
+            if *cursor == detached_cursor && reset_branch == &branch
+    )));
+    let consumed = engine.apply_source_page(&activation, &page).unwrap();
+    assert_eq!((consumed.observations, consumed.candidates), (0, 0));
+    let after = adapter.load_source_progress(&activation).unwrap();
+    assert_eq!(after.publication_cursor, detached_cursor);
+    assert_eq!(after.observation_position, before.observation_position);
+    assert!(after.selection.branches[&branch].results.is_empty());
+    assert!(!after.selection.branches[&branch].coverage_complete);
+    assert_eq!(validity(), (0, 0));
+    assert_eq!(store.lock().query_row(
+        "SELECT frozen_input_json, input_fingerprint FROM burn_check_candidate WHERE state = 'accepted'",
+        [], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    ).unwrap(), frozen);
+    assert_eq!(
+        store.native_tool_result_publications_after(0, 20).unwrap(),
+        publications
+    );
+    assert_no_current_failure();
+}
+
+#[test]
+fn capture_failure_is_current_at_the_activity_window_boundary_only() {
+    let store = store();
+    let definition = definition("/workspace/demo");
+    activate(&store, &definition);
+    let record = v2_session(&store, "boundary");
+    store
+        .set_opencode_v2_source_status(&[record], OpenCodeV2SourceStatus::CaptureGap, 100)
+        .unwrap();
+    let mut request = request();
+    request.computed_at_epoch = 100 + antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS;
+    assert_eq!(
+        read_installed_checks_in_window(&store, std::slice::from_ref(&definition), &request)
+            .unwrap()[0]
+            .diagnostics
+            .len(),
+        1
+    );
+    request.computed_at_epoch += 1;
+    assert!(
+        read_installed_checks_in_window(&store, &[definition], &request).unwrap()[0]
+            .diagnostics
+            .is_empty()
+    );
+}
+
+#[test]
+fn report_trace_dedup_uses_closed_diagnostic_categories_not_only_the_count() {
+    use crate::store::burn_checks::trace_capture::LogCapture;
+    let store = store();
+    let definition = definition("/workspace/demo");
+    let mut row = rows(&store, &[definition]).remove(0);
+    row.effective_id = "PRIVATE_DIAGNOSTIC_CATEGORY_REPORT".into();
+    row.diagnostics = vec![storage_diagnostic()];
+    row.diagnostics[0].code = "opencode-v2-capture-gap".into();
+    row.diagnostics[0].message = "PRIVATE_DIAGNOSTIC_MESSAGE".into();
+    let captured = LogCapture::default();
+    tracing::subscriber::with_default(captured.clone(), || {
+        for _ in 0..100 {
+            trace_report(&row);
+        }
+        row.diagnostics[0].code = "provider-authentication".into();
+        for _ in 0..100 {
+            trace_report(&row);
+        }
+        row.diagnostics[0].message = "PRIVATE_REVISED_MESSAGE".into();
+        for _ in 0..100 {
+            trace_report(&row);
+        }
+    });
+    let events = captured.events("installed_check_report_state");
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0].fields["diagnostics"],
+        events[1].fields["diagnostics"]
+    );
+    assert_ne!(
+        events[0].fields["diagnostic_categories"],
+        events[1].fields["diagnostic_categories"]
+    );
+    let allowed = [
+        "event",
+        "report_ref",
+        "check_ref",
+        "reason",
+        "finding",
+        "clean",
+        "unavailable",
+        "diagnostics",
+        "diagnostic_categories",
+        "review_failed",
+        "checking",
+        "waiting_for_data",
+        "waiting_for_results",
+        "remaining_events",
+        "catching_up",
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+    let expected = allowed
+        .difference(&["check_ref", "remaining_events"].into_iter().collect())
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        events[0]
+            .fields
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected
+    );
+    assert!(!captured.text().contains("PRIVATE_"));
 }

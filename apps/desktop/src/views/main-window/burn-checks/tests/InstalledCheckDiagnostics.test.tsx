@@ -79,7 +79,7 @@ describe("installed check diagnostics", () => {
     )
     const panel = within(screen.getByRole("region", { name: diagnostic.title }))
     expect(panel.getByText(diagnostic.message)).toBeVisible()
-    expect(panel.getByText("3 affected sessions")).not.toBeVisible()
+    expect(panel.queryByText("3 affected sessions")).toBeNull()
     expect(panel.getByText(/retries.yaml · Line 18, column 5/)).toBeVisible()
     expect(panel.getByRole("button", { name: "Open check file" })).toBeEnabled()
     expect(screen.queryByText("This check has not checked any sessions yet.")).toBeNull()
@@ -98,7 +98,7 @@ describe("installed check diagnostics", () => {
         diagnosticReport({
           finding: result === "failure" ? 1 : 0,
           clean: result === "pass" ? 1 : 0,
-          explanation: "The saved assessment found no repeated failures.",
+          explanation: "The saved check found no repeated failures.",
           targets: result === "failure" ? installed.targets : [],
         }),
       )
@@ -118,7 +118,7 @@ describe("installed check diagnostics", () => {
         screen.getByText(
           result === "failure"
             ? "Review the recorded work."
-            : "The saved assessment found no repeated failures.",
+            : "The saved check found no repeated failures.",
         ),
       ).toBeVisible()
     },
@@ -131,7 +131,7 @@ describe("installed check diagnostics", () => {
       checkingCount: 0,
       targets: [],
       diagnostics: [],
-      explanation: "The saved assessment found no concern.",
+      explanation: "The saved check found no concern.",
     }
     const error = {
       ...diagnostic,
@@ -231,6 +231,7 @@ describe("installed check diagnostics", () => {
           unavailable: 1,
           targets: [],
           waitingForEvents: null,
+          explanation: "The saved check found no concern.",
           diagnostics: [
             { ...diagnostic, code: "opencode-v2-service-unavailable", source: null },
           ],
@@ -247,6 +248,22 @@ describe("installed check diagnostics", () => {
         }),
       ).toContainElement(row)
       if (clean === 0) expect(row).not.toHaveTextContent("Passed")
+      fireEvent.click(row)
+      const detail = document.getElementById(`burn-check-${installed.effectiveId}-detail`)!
+      const error = within(detail).getByRole("region", { name: diagnostic.title })
+      const status = within(detail).getByRole("region", { name: "Check status" })
+      expect(
+        error.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy()
+      expect(within(status).getByRole("heading", { name: "Checking" })).toBeVisible()
+      expect(status.querySelector(".text-burn-check-pass-fill")).toBeNull()
+      if (clean > 0) {
+        expect(within(status).getByText("Saved check result")).toBeVisible()
+        expect(within(detail).getAllByText("The saved check found no concern.")).toHaveLength(1)
+      } else {
+        expect(within(status).getByText("No check result yet.")).toBeVisible()
+        expect(within(detail).queryByText("The saved check found no concern.")).toBeNull()
+      }
     },
   )
 
@@ -290,7 +307,7 @@ describe("installed check diagnostics", () => {
     expect(within(notice).queryByRole("button", { name: "Open check file" })).toBeNull()
   })
 
-  it("keeps grouped counts, distinct files, and distinct decisions readable", async () => {
+  it("keeps distinct files and decisions without repeating session counts", async () => {
     setup(
       null,
       false,
@@ -326,7 +343,7 @@ describe("installed check diagnostics", () => {
     expect(panels[2]!).not.toBeVisible()
     fireEvent.click(technical)
     expect(panels).toHaveLength(3)
-    expect(within(panels[0]!).getByText("3 affected sessions")).toBeVisible()
+    expect(within(panels[0]!).getByText(diagnostic.code)).toBeVisible()
     expect(panels[1]!).not.toBeVisible()
     expect(panels[2]!).not.toBeVisible()
     fireEvent.click(technical)
@@ -339,13 +356,50 @@ describe("installed check diagnostics", () => {
     expect(panels[1]!).toBeVisible()
     expect(panels[2]!).toBeVisible()
     expect(technical.closest("details")).not.toHaveAttribute("open")
-    expect(within(panels[1]!).getByText("1 affected session")).not.toBeVisible()
+    expect(screen.queryByText(/affected sessions?/)).toBeNull()
     expect(
       within(panels[1]!).getByText("/workspace/other/.antiburn/checks/retries.yaml"),
     ).toBeVisible()
     fireEvent.click(within(panels[2]!).getByText("Technical details"))
-    expect(within(panels[2]!).getByText("2 affected sessions")).toBeVisible()
+    expect(within(panels[2]!).getByText(diagnostic.code)).toBeVisible()
     expect(within(panels[2]!).getByText("recovery")).toBeVisible()
+  })
+
+  it("shows compact identifiers and readable limits without repeated copy", async () => {
+    const limit = "8192 estimated tokens; local limit 4096 estimated tokens"
+    setup(
+      null,
+      false,
+      { wins: [] },
+      diagnosticReport({
+        diagnostics: [
+          {
+            ...diagnostic,
+            details: [
+              ...diagnostic.details,
+              { label: "Field", value: "decisions.retry.input" },
+              { label: "Estimated request size", value: limit },
+              { label: "Reason", value: diagnostic.message },
+              { label: "Stored analysis", value: "Unrelated stored-analysis explanation." },
+              { label: "Diagnostic code", value: diagnostic.code },
+            ],
+          },
+        ],
+      }),
+    )
+    const panel = await screen.findByRole("region", { name: diagnostic.title })
+    const technical = within(panel).getByText("Technical details")
+    expect(technical.closest("details")).not.toHaveAttribute("open")
+    fireEvent.click(technical)
+    expect(within(panel).getByText("decisions.retry.input").tagName).toBe("CODE")
+    const prose = within(panel).getByText(limit)
+    expect(prose.tagName).toBe("DD")
+    expect(prose.closest("code, .font-mono")).toBeNull()
+    expect(within(panel).getAllByText(diagnostic.message)).toHaveLength(1)
+    expect(within(panel).getAllByText(diagnostic.code)).toHaveLength(1)
+    expect(within(panel).queryByText("Diagnostic code")).toBeNull()
+    expect(within(panel).queryByText("Stored analysis")).toBeNull()
+    expect(within(panel).queryByText(/affected sessions?/)).toBeNull()
   })
 
   it.each([false, true])(
@@ -561,7 +615,7 @@ describe("installed check diagnostics", () => {
     expect(disclosure.tagName).toBe("SUMMARY")
     expect(disclosure.closest("details")).not.toHaveAttribute("open")
     expect(within(info).getByText(/This check shortened selected input/)).not.toBeVisible()
-    expect(within(info).getByText("3 affected sessions")).not.toBeVisible()
+    expect(within(info).queryByText("3 affected sessions")).toBeNull()
     expect(within(info).getByRole("button", { name: "Open check file" })).not.toBeVisible()
     expect(within(info).getByText("8192 bytes")).not.toBeVisible()
     fireEvent.click(disclosure)

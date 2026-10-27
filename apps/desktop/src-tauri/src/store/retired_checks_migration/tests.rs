@@ -552,8 +552,11 @@ fn dispatched_unknown_usage_settles_once_without_changing_known_or_overflow_tota
         ('second-identity', 'expired-dispatched', 1), ('orphan-known', 'pruned-known', 1);",
         )
         .unwrap();
-    connection.execute("INSERT INTO burn_check_decision_usage VALUES ('yaml-known:1', 1), ('yaml-unknown:1', 0)", []).unwrap();
-    let markers = rows(&connection, "burn_check_decision_usage");
+    connection.execute("INSERT INTO burn_check_decision_usage (attempt_id, usage_known) VALUES ('yaml-known:1', 1), ('yaml-unknown:1', 0)", []).unwrap();
+    let mut markers = rows(&connection, "burn_check_decision_usage");
+    for marker in &mut markers {
+        marker.push(SqlValue::Null);
+    }
     let before = time::OffsetDateTime::now_utc().unix_timestamp();
     let store = upgrade(&directory, connection);
     let mut expected = original;
@@ -623,7 +626,7 @@ fn missing_ledger_records_only_backed_dispatched_usage_and_keeps_yaml_dedup_usab
     .unwrap();
     connection
         .execute(
-            "INSERT INTO burn_check_decision_usage VALUES (?1, 0)",
+            "INSERT INTO burn_check_decision_usage (attempt_id, usage_known) VALUES (?1, 0)",
             [format!("{candidate}:1")],
         )
         .unwrap();
@@ -959,7 +962,7 @@ fn seed_live_runtime(connection: &Connection) {
             '["native","claude-code","session"]', 'claude_jsonl', 1, 'version-1', 0, 'payload-digest');
         INSERT INTO burn_check_cooldown VALUES ('scope-creep', 'repo', 1, 'session', 999);
         INSERT INTO burn_check_evaluation_attempt VALUES ('unknown:1', 'unknown', 1, 'dispatch_intent', NULL, NULL, 2);
-        INSERT INTO burn_check_decision_usage VALUES ('unknown:1', 0), ('accepted:1', 1);
+        INSERT INTO burn_check_decision_usage (attempt_id, usage_known) VALUES ('unknown:1', 0), ('accepted:1', 1);
         INSERT INTO burn_check_assessment_history VALUES ('assessment', 'accepted', 'scope-creep',
             'repo', 1, 'session', 1, 'assessed', '{"label":"bad"}', '[]', 1, 1);
         INSERT INTO burn_check_current_status VALUES ('scope-creep', 'repo', 'session', 1,
@@ -1041,7 +1044,7 @@ fn live_yaml_state_is_preserved_and_legacy_unknown_work_cannot_resume() {
                     row.extend([SqlValue::Text("tool_result".into()), SqlValue::Null]);
                 }
             }
-            "native_file_delivery" => {
+            "native_file_delivery" | "burn_check_decision_usage" => {
                 for row in &mut before {
                     row.push(SqlValue::Null);
                 }

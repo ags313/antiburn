@@ -193,7 +193,7 @@ export function isPureEngineReleaseChange(files, readAtRef) {
  * Rust sources and compares the result with this map.
  */
 export const CROSS_WORKSPACE_INPUTS = {
-  ".antiburn/checks/failed-retry-loop.yml": ["checks", "shell"],
+  ".agents/skills/antiburn-checks/SKILL.md": ["checks"],
   ".antiburn/checks/fast-mode-value.yml": ["checks", "shell"],
   ".antiburn/checks/ignored-instructions.yml": ["checks"],
   ".antiburn/checks/over-exploring.yml": ["checks", "shell"],

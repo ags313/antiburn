@@ -26,6 +26,8 @@ mod local;
 mod multi;
 #[path = "installed_checks_opencode_v2_tests.rs"]
 mod opencode_v2;
+#[path = "installed_checks_served_model_tests.rs"]
+mod served_models;
 
 const REPORT_CHECK: &str = "name: Report fixture\non:\n  tool_result:\ndecisions:\n  review:\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    input: {result: failure}\n";
 
@@ -664,9 +666,7 @@ fn rust_facade_matches_frontend_fixture_and_retains_the_actual_failure_write() {
         "Original source: requested task"
     );
     assert!(evidence.items.iter().all(|item| {
-        item.limitation
-            .as_deref()
-            .is_some_and(|text| text.contains("Exact assessed input was not saved"))
+        item.limitation.as_deref() == Some("Exact assessed input was not saved for this check. This is original source evidence; it does not show which values were sent to the model.")
     }));
 }
 
@@ -1144,19 +1144,63 @@ fn set_latest_failure(
 #[test]
 fn typed_runtime_failures_group_sessions_without_exposing_internal_detail() {
     use antiburn_checks::engine::EvaluationFailureCode::*;
-    for (failure, code) in [
-        (AuthenticationRejected, "provider-authentication"),
-        (RateLimited, "provider-rate-limited"),
-        (ProviderOverloaded, "provider-overloaded"),
-        (ProviderUnavailable, "provider-unavailable"),
-        (DeliveryUnknown, "provider-delivery-unknown"),
-        (InvalidResponse, "provider-invalid-response"),
-        (InvalidDecision, "provider-invalid-response"),
-        (ContextRejected, "provider-context-rejected"),
-        (InvalidRequest, "provider-invalid-request"),
-        (Cancelled, "assessment-cancelled"),
-        (StorageFailure, "storage-failed"),
-        (ActionFailed, "action-failed"),
+    for (failure, code, title) in [
+        (
+            AuthenticationRejected,
+            "provider-authentication",
+            "Reconnect the check provider",
+        ),
+        (
+            RateLimited,
+            "provider-rate-limited",
+            "Provider rate limit reached",
+        ),
+        (
+            ProviderOverloaded,
+            "provider-overloaded",
+            "The check provider is busy",
+        ),
+        (
+            ProviderUnavailable,
+            "provider-unavailable",
+            "The check provider is unavailable",
+        ),
+        (
+            DeliveryUnknown,
+            "provider-delivery-unknown",
+            "The check did not finish",
+        ),
+        (
+            InvalidResponse,
+            "provider-invalid-response",
+            "The provider returned an invalid response",
+        ),
+        (
+            InvalidDecision,
+            "provider-invalid-response",
+            "The provider returned an invalid response",
+        ),
+        (
+            ContextRejected,
+            "provider-context-rejected",
+            "The provider rejected the input size",
+        ),
+        (
+            InvalidRequest,
+            "provider-invalid-request",
+            "Correct the decision request",
+        ),
+        (Cancelled, "assessment-cancelled", "The check stopped"),
+        (
+            StorageFailure,
+            "storage-failed",
+            "The check result could not be saved",
+        ),
+        (
+            ActionFailed,
+            "action-failed",
+            "The status action could not run",
+        ),
     ] {
         let store = store();
         let definition = definition("/workspace/demo");
@@ -1173,6 +1217,15 @@ fn typed_runtime_failures_group_sessions_without_exposing_internal_detail() {
         let report = rows(&store, &[definition]);
         assert_eq!(report[0].diagnostics.len(), 1, "{failure:?}");
         assert_eq!(report[0].diagnostics[0].code, code);
+        assert_eq!(report[0].diagnostics[0].title, title);
+        assert!(!report[0].diagnostics[0].message.contains("assessment"));
+        assert!(!report[0].diagnostics[0].message.contains("assessing"));
+        if failure == DeliveryUnknown {
+            assert_eq!(
+                report[0].diagnostics[0].message,
+                "The connection ended before the provider confirmed a response. This can include a timeout. The request may have reached the provider, so antiburn will not resend it automatically."
+            );
+        }
         if failure == ActionFailed {
             assert_eq!(
                 report[0].diagnostics[0].message,
@@ -1265,6 +1318,10 @@ fn shortened_input_is_informational_without_copying_prepared_content() {
     let diagnostic = &report[0].diagnostics[0];
     assert_eq!(diagnostic.code, "input-shortened");
     assert_eq!(diagnostic.title, "Input shortened");
+    assert_eq!(
+        diagnostic.message,
+        "Fitting rules shortened this check's input. Session evidence is unchanged."
+    );
     assert_eq!(diagnostic.severity, InstalledCheckDiagnosticSeverity::Info);
     assert_eq!(diagnostic.affected_session_count, 1);
     assert_eq!(
@@ -1363,6 +1420,10 @@ fn fitted_evidence_uses_the_status_assessment_input_without_original_or_later_co
     assert_eq!(evidence.items[0].reference, "assessed-input");
     assert_eq!(evidence.items[0].source_label, "Assessed input");
     assert_eq!(
+        evidence.items[0].explanation,
+        "These are the decision input values used for this check."
+    );
+    assert_eq!(
         serde_json::from_str::<serde_json::Value>(&evidence.items[0].excerpt).unwrap(),
         input
     );
@@ -1459,8 +1520,16 @@ fn evidence_and_failure_details_use_the_saved_connection_not_current_settings() 
         .find(|item| item.reference == "decision-connection")
         .unwrap();
     let value: serde_json::Value = serde_json::from_str(&provenance.excerpt).unwrap();
+    assert_eq!(
+        provenance.explanation,
+        "This saved connection identifies the requested model. Usage observations identify served models for each decision and attempt, not one release for the whole check. Missing observations and alias echoes leave the served release unknown. Current Settings can use a different connection."
+    );
     assert_eq!(value["provider"], "Cloudflare");
-    assert_eq!(value["model"], "clef");
+    assert_eq!(value["requestedModel"], "clef");
+    assert_eq!(
+        value["usageObservations"],
+        json!({"attempts":[], "truncated":false})
+    );
     assert_eq!(value["connectionRevision"], 7);
     let serialized = serde_json::to_string(&evidence).unwrap();
     for private in ["SECRET_CANARY", "syntheticaccount", "api.cloudflare.com"] {

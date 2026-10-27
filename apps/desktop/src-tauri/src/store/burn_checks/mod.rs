@@ -10,8 +10,7 @@ mod runtime;
 #[cfg(test)]
 pub(crate) mod test_hooks;
 #[cfg(test)]
-#[path = "trace_capture_tests.rs"]
-pub(crate) mod trace_capture;
+pub(crate) use crate::trace_capture;
 pub(crate) mod trace_failure;
 pub(crate) mod trace_refs;
 mod usage;

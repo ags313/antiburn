@@ -1,6 +1,7 @@
 import { useRef, useState, useSyncExternalStore } from "react"
 
 import { Card } from "../../../../components/ui/Card"
+import { PushButton } from "../../../../components/ui/PushButton"
 import { SectionGroup } from "../../../../components/ui/SectionGroup"
 import {
   emptyCheckAvailability,
@@ -16,31 +17,49 @@ import { CHECK_DEFINITIONS } from "../../../../lib/presentation/checkDefinitions
 import { SettingsToggleRow } from "../../../settings/SettingsSearchRows"
 
 import { CheckProviderSettings } from "../../../settings/CheckProviderSettings"
+import { CheckFilesSettings } from "../../../settings/CheckFilesSettings"
+import { CheckModelUsage, hasCurrentCheckUsage } from "../../../settings/CheckModelUsage"
 import { providerErrorMessage } from "../../../settings/ProviderSettingsSession"
 
-const initial = emptyCheckAvailability
+type ChecksSettingsSnapshot = {
+  availability: CheckAvailability
+  hasSnapshot: boolean
+  refreshError: string | null
+  subscriptionFailed: boolean
+  refreshing: boolean
+}
+
+const initial: ChecksSettingsSnapshot = {
+  availability: emptyCheckAvailability,
+  hasSnapshot: false,
+  refreshError: null,
+  subscriptionFailed: false,
+  refreshing: false,
+}
 let snapshot = initial
 const listeners = new Set<() => void>()
 let stop: (() => void) | undefined
 let revision = 0
 let generation = 0
-let refreshError: string | null = null
 
 function notify() {
   listeners.forEach((listener) => listener())
 }
 
 function publish(value: CheckAvailability) {
-  if (value.revision < snapshot.revision) return
+  if (value.revision < snapshot.availability.revision) return
   revision++
-  snapshot = value
-  refreshError = null
+  snapshot = { ...snapshot, availability: value, hasSnapshot: true, refreshError: null }
   notify()
 }
 
 function publishRefreshError() {
-  refreshError = "Could not refresh check status. The displayed values may be out of date."
-  snapshot = { ...snapshot }
+  snapshot = {
+    ...snapshot,
+    refreshError: snapshot.hasSnapshot
+      ? "Could not refresh check status. The displayed values may be out of date."
+      : "Could not load check status. Try again.",
+  }
   notify()
 }
 
@@ -49,28 +68,47 @@ function publishAvailabilityEvent(event: CheckAvailabilityEvent) {
   else publishRefreshError()
 }
 
+async function refreshAvailability() {
+  if (snapshot.refreshing) return
+  const currentGeneration = generation
+  const request = revision
+  snapshot = { ...snapshot, refreshing: true }
+  notify()
+  try {
+    if (!stop) {
+      const unsubscribe = await onCheckAvailabilityChanged((event) => {
+        if (generation === currentGeneration && listeners.size) publishAvailabilityEvent(event)
+      })
+      if (generation !== currentGeneration || !listeners.size) {
+        unsubscribe()
+        return
+      }
+      stop = unsubscribe
+      snapshot = { ...snapshot, subscriptionFailed: false }
+      notify()
+    }
+    const value = await getCheckAvailability()
+    if (generation === currentGeneration && revision === request) publish(value)
+  } catch {
+    if (generation === currentGeneration) {
+      if (!stop) {
+        snapshot = { ...snapshot, subscriptionFailed: true }
+        notify()
+      } else if (revision === request) publishRefreshError()
+    }
+  } finally {
+    if (generation === currentGeneration) {
+      snapshot = { ...snapshot, refreshing: false }
+      notify()
+    }
+  }
+}
+
 function subscribe(listener: () => void) {
   listeners.add(listener)
   if (listeners.size === 1) {
-    const currentGeneration = ++generation
-    const current = ++revision
-    void onCheckAvailabilityChanged(publishAvailabilityEvent)
-      .then((unsubscribe) => {
-        if (generation === currentGeneration && listeners.size) stop = unsubscribe
-        else unsubscribe()
-        if (!listeners.size) return
-        const request = revision
-        void getCheckAvailability()
-          .then((value) => {
-            if (revision === request) publish(value)
-          })
-          .catch(() => {
-            if (revision === request) publishRefreshError()
-          })
-      })
-      .catch(() => {
-        if (revision === current) publishRefreshError()
-      })
+    generation++
+    void refreshAvailability()
   }
   return () => {
     listeners.delete(listener)
@@ -78,6 +116,7 @@ function subscribe(listener: () => void) {
       generation++
       stop?.()
       stop = undefined
+      snapshot = { ...snapshot, refreshing: false }
     }
   }
 }
@@ -89,12 +128,20 @@ export function ChecksStepSettings({
   control?: string | null | undefined
   targetRevision?: number | undefined
 }) {
-  const state = useSyncExternalStore(
+  const loadState = useSyncExternalStore(
     subscribe,
     () => snapshot,
     () => initial,
   )
+  const state = loadState.availability
+  const usage = loadState.hasSnapshot ? state.usage : null
+  const usageStale = Boolean(loadState.refreshError || loadState.subscriptionFailed)
+  const usageSearchFallback =
+    control === "checkModelUsage" &&
+    !hasCurrentCheckUsage(usage, loadState.refreshing, usageStale)
   const [busy, setBusy] = useState(false)
+  const [hasSelectedConnection, setHasSelectedConnection] = useState<boolean | null>(null)
+  const [hasPendingConnectionOperation, setHasPendingConnectionOperation] = useState(false)
   const pending = useRef(new Set<BurnCheckDetectorId>())
   const [pendingChecks, setPendingChecks] = useState<ReadonlySet<BurnCheckDetectorId>>(
     new Set(),
@@ -105,6 +152,7 @@ export function ChecksStepSettings({
   const [error, setError] = useState<string | null>(null)
 
   async function toggleChecks(enabled: boolean) {
+    if (busy) return
     setBusy(true)
     setError(null)
     try {
@@ -141,6 +189,11 @@ export function ChecksStepSettings({
 
   const enabledById = new Map(state.checks.map((check) => [check.id, check.enabled]))
   const localChecks = checkRows()
+  const refreshError = loadState.subscriptionFailed
+    ? loadState.hasSnapshot
+      ? "Could not refresh check status. The displayed values may be out of date."
+      : "Could not load check status. Try again."
+    : loadState.refreshError
 
   function renderCheck(id: keyof typeof CHECK_SEARCH_IDS) {
     const definition = CHECK_DEFINITIONS[id]
@@ -159,11 +212,6 @@ export function ChecksStepSettings({
 
   return (
     <div className="space-y-6">
-      {refreshError && (
-        <p role="alert" className="type-footnote text-system-red-text">
-          {refreshError}
-        </p>
-      )}
       <SectionGroup title="Local checks">
         <Card>{localChecks.map(({ id }) => renderCheck(id))}</Card>
         {Object.entries(checkErrors).map(
@@ -176,47 +224,71 @@ export function ChecksStepSettings({
         )}
       </SectionGroup>
 
-      <SectionGroup title="Model-based checks">
+      <SectionGroup
+        title="Model-based checks"
+        data-settings-control={usageSearchFallback ? "checkModelUsage" : undefined}
+        data-settings-focus-self={usageSearchFallback || undefined}
+        tabIndex={usageSearchFallback ? -1 : undefined}
+      >
         <Card>
-          <SettingsToggleRow
-            searchId="smartChecksEnabled"
-            description="Run installed checks on new session activity."
-            checked={state.yamlEnabled}
-            disabled={busy}
-            aria-busy={busy}
-            onChange={(enabled) => void toggleChecks(enabled)}
+          <div>
+            <SettingsToggleRow
+              searchId="smartChecksEnabled"
+              description="Each check file defines which session data the check sends to your provider."
+              checked={state.yamlEnabled}
+              disabled={busy || (!state.yamlEnabled && !hasSelectedConnection)}
+              aria-busy={busy}
+              onChange={(enabled) => void toggleChecks(enabled)}
+            />
+            {hasSelectedConnection === false && !hasPendingConnectionOperation && (
+              <p className="px-4 pb-3 type-footnote text-label-secondary">
+                Add and select a connection before running checks.
+              </p>
+            )}
+            {[...new Set([error, state.error])].map(
+              (message) =>
+                message && (
+                  <p
+                    key={message}
+                    role="alert"
+                    className="px-4 pb-3 type-footnote text-system-red-text"
+                  >
+                    {message}
+                  </p>
+                ),
+            )}
+          </div>
+          <CheckProviderSettings
+            control={control}
+            targetRevision={targetRevision}
+            legacyKeySaved={state.savedKey}
+            onSelectionChange={setHasSelectedConnection}
+            onPendingChange={setHasPendingConnectionOperation}
+          />
+          <CheckFilesSettings control={control} targetRevision={targetRevision} />
+          <CheckModelUsage
+            usage={usage}
+            control={control}
+            targetRevision={targetRevision}
+            loading={loadState.refreshing}
+            stale={usageStale}
           />
         </Card>
-        <div className="space-y-2 px-1 type-footnote text-label-secondary">
-          <p>
-            {state.installedChecks?.length ?? 0} installed{" "}
-            {state.installedChecks?.length === 1 ? "check" : "checks"}. To install a check, put
-            a <code>.yaml</code> or <code>.yml</code> file directly in either folder:
-          </p>
-          <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2">
-            <dt>This device</dt>
-            <dd className="min-w-0">
-              <code className="wrap-anywhere">~/.antiburn/checks/</code>
-            </dd>
-            <dt>Known project</dt>
-            <dd className="min-w-0">
-              <code className="wrap-anywhere">.antiburn/checks/</code>
-            </dd>
-          </dl>
-          <p>Project folders must belong to known native projects.</p>
+        <div className="mt-2 px-4">
+          {refreshError && (
+            <div className="space-y-2 pb-3">
+              <p role="alert" className="type-footnote text-system-red-text">
+                {refreshError}
+              </p>
+              <PushButton
+                disabled={loadState.refreshing}
+                onClick={() => void refreshAvailability()}
+              >
+                {loadState.refreshing ? "Loading check status…" : "Retry loading check status"}
+              </PushButton>
+            </div>
+          )}
         </div>
-        {(error || state.error) && (
-          <p role="alert" className="px-1 type-footnote text-system-red-text">
-            {error || state.error}
-          </p>
-        )}
-
-        <CheckProviderSettings
-          control={control}
-          targetRevision={targetRevision}
-          legacyKeySaved={state.savedKey}
-          usage={state.usage}
-        />
       </SectionGroup>
     </div>
   )

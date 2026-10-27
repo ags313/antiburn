@@ -402,7 +402,7 @@ pub enum ToolResultCompleteness {
     UnsafeOwnership,
 }
 
-/// Admission for a pre-alpha result, independent of available result content.
+/// Admission for a result, independent of available result content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolResultAdmission {
     Admitted,

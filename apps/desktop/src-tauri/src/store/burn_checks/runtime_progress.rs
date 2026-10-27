@@ -119,8 +119,80 @@ impl StoreCheckStore {
         claim: &BurnCheckCandidateClaim,
         activation: &EffectiveActivation,
     ) -> Result<bool> {
-        let current: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM burn_check_candidate c
+        Self::claim_is_current_for_scope_in(
+            connection,
+            claim,
+            activation,
+            &self.activation_scope_key,
+        )
+    }
+
+    pub(crate) fn provider_dispatch_claim(
+        store: &Store,
+        activation: &EffectiveActivation,
+        candidate: &FrozenCandidate,
+        attempt: &DecisionAttempt,
+    ) -> Result<Option<BurnCheckCandidateClaim>> {
+        ensure!(
+            candidate.activation == activation.id,
+            "dispatch activation changed"
+        );
+        attempt.validate()?;
+        let candidate_id = hex(&candidate.fingerprint);
+        let connection = store.lock();
+        let saved = connection
+            .query_row(
+                "SELECT c.claim_owner, c.claim_fence, c.frozen_input_json
+             FROM burn_check_candidate c JOIN burn_check_evaluation_attempt a USING(candidate_id)
+             WHERE c.candidate_id = ?1 AND c.state = 'dispatching' AND c.claim_owner IS NOT NULL
+               AND a.attempt_id = ?2 AND a.state = 'dispatch_intent'",
+                params![candidate_id, attempt_id(&candidate.fingerprint, attempt)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((owner, fence, frozen)) = saved else {
+            return Ok(None);
+        };
+        ensure!(
+            serde_json::from_str::<FrozenCandidate>(&frozen)? == *candidate,
+            "provider dispatch does not match the frozen candidate"
+        );
+        let claim = BurnCheckCandidateClaim {
+            candidate_id,
+            owner,
+            fence,
+        };
+        let scope = Self::activation_scope_key(&activation.id.scope);
+        Ok(
+            Self::claim_is_current_for_scope_in(&connection, &claim, activation, &scope)?
+                .then_some(claim),
+        )
+    }
+
+    pub(crate) fn provider_dispatch_is_current(
+        store: &Store,
+        activation: &EffectiveActivation,
+        claim: &BurnCheckCandidateClaim,
+    ) -> Result<bool> {
+        let scope = Self::activation_scope_key(&activation.id.scope);
+        Self::claim_is_current_for_scope_in(&store.lock(), claim, activation, &scope)
+    }
+
+    fn claim_is_current_for_scope_in(
+        connection: &Connection,
+        claim: &BurnCheckCandidateClaim,
+        activation: &EffectiveActivation,
+        scope: &str,
+    ) -> Result<bool> {
+        let current: bool = connection
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM burn_check_candidate c
              JOIN burn_check_activation a USING(check_id, activation_scope_key)
              WHERE c.candidate_id = ?1 AND c.claim_owner = ?2 AND c.claim_fence = ?3
                AND c.check_id = ?5 AND c.activation_scope_key = ?6 AND c.generation = ?7
@@ -130,18 +202,20 @@ impl StoreCheckStore {
                AND NOT EXISTS(SELECT 1 FROM burn_check_acceptance_watermark w
                  WHERE w.check_id = c.check_id AND w.activation_scope_key = c.activation_scope_key
                    AND w.branch_key = c.branch_key AND w.generation = c.generation
-                   AND w.position >= c.trigger_position))",
-            params![
-                claim.candidate_id,
-                claim.owner,
-                claim.fence,
-                hex(&activation.revision),
-                activation.id.definition_id,
-                self.activation_scope_key,
-                integer(activation.id.generation.0)?
-            ],
-            |row| row.get(0),
-        )?;
+                    AND w.position >= c.trigger_position))",
+            )?
+            .query_row(
+                params![
+                    claim.candidate_id,
+                    claim.owner,
+                    claim.fence,
+                    hex(&activation.revision),
+                    activation.id.definition_id,
+                    scope,
+                    integer(activation.id.generation.0)?
+                ],
+                |row| row.get(0),
+            )?;
         if !current {
             return Ok(false);
         }
@@ -156,7 +230,7 @@ impl StoreCheckStore {
         )? {
             return Ok(false);
         }
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare_cached(
             "SELECT d.source_format, COALESCE(d.native_revision, -1), d.evidence_version, d.removed,
                 d.payload_sha256, o.source_format, COALESCE(o.native_revision, -1), o.evidence_version,
                 o.removed, o.payload_json
@@ -169,7 +243,7 @@ impl StoreCheckStore {
         let mut rows = statement.query(params![
             claim.candidate_id,
             activation.id.definition_id,
-            self.activation_scope_key
+            scope
         ])?;
         while let Some(row) = rows.next()? {
             let expected_hash: String = row.get(4)?;

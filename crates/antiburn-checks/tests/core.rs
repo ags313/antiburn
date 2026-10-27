@@ -17,7 +17,7 @@ use support::{choice_for_check, choice_labels};
 
 fn valid_check() -> &'static str {
     r#"
-name: Failed retry loop
+name: Synthetic retry review
 description: Detect repeated attempts at an unresolved failure.
 on:
   tool_result:
@@ -53,12 +53,8 @@ actions:
 }
 
 #[test]
-fn compiles_all_six_canonical_definitions() {
+fn compiles_all_five_canonical_definitions() {
     let definitions = [
-        (
-            "Failed retry loop",
-            include_str!("../../../.antiburn/checks/failed-retry-loop.yml"),
-        ),
         (
             "Over-exploring",
             include_str!("../../../.antiburn/checks/over-exploring.yml"),
@@ -89,34 +85,35 @@ fn compiles_all_six_canonical_definitions() {
 }
 
 #[test]
-fn maintained_rules_write_success_unless_the_failure_label_meets_its_gate() {
+fn maintained_rules_write_only_when_their_authored_status_gates_match() {
     let examples = [
-        (
-            include_str!("../../../.antiburn/checks/failed-retry-loop.yml"),
-            &["stuck"][..],
-        ),
         (
             include_str!("../../../.antiburn/checks/over-exploring.yml"),
             &["likely_excess"][..],
+            None,
         ),
         (
             include_str!("../../../.antiburn/checks/scope-creep.yml"),
             &["unauthorized_extra"][..],
+            None,
         ),
         (
             include_str!("../../../.antiburn/checks/ignored-instructions.yml"),
             &["recorded_correction_conflict", "current_file_mismatch"][..],
+            Some("no_conflict"),
         ),
         (
             include_str!("../../../.antiburn/checks/skill-opportunities.yml"),
             &["actionable_help"][..],
+            None,
         ),
         (
             include_str!("../../../.antiburn/checks/fast-mode-value.yml"),
             &["try_standard_mode"][..],
+            None,
         ),
     ];
-    for (source, failure_labels) in examples {
+    for (source, failure_labels, success_label) in examples {
         let check = compile(source).unwrap();
         let labels = choice_labels(&check);
         for output in &labels {
@@ -134,9 +131,11 @@ fn maintained_rules_write_success_unless_the_failure_label_meets_its_gate() {
                     .collect::<BTreeMap<_, _>>();
                 let choice = choice_for_check(&check, output, Some(probabilities)).unwrap();
                 let expected = if failure_labels.contains(&output.as_str()) && probability >= 0.95 {
-                    StatusResult::Failure
+                    Some(StatusResult::Failure)
+                } else if success_label.is_none_or(|label| output == label && probability >= 0.95) {
+                    Some(StatusResult::Success)
                 } else {
-                    StatusResult::Success
+                    None
                 };
                 for prior in [
                     None,
@@ -148,7 +147,7 @@ fn maintained_rules_write_success_unless_the_failure_label_meets_its_gate() {
                             .unwrap();
                     assert_eq!(
                         plan.current_status,
-                        Some(expected),
+                        expected.or(prior),
                         "{}: {output} at {probability}, prior {prior:?}",
                         check.name
                     );
@@ -160,8 +159,8 @@ fn maintained_rules_write_success_unless_the_failure_label_meets_its_gate() {
                                 ActionOutcomeKind::Applied { .. }
                             ))
                             .count(),
-                        1,
-                        "{} must write exactly one status",
+                        usize::from(expected.is_some()),
+                        "{} must write only when an authored status gate matches",
                         check.name
                     );
                 }
@@ -427,7 +426,7 @@ fn standard_non_specific_tag_keeps_a_plain_scalar_as_string() {
 #[test]
 fn compiles_a_typed_check_with_rolling_window_and_choice_probabilities() {
     let check = compile(valid_check()).expect("valid supported check");
-    assert_eq!(check.name, "Failed retry loop");
+    assert_eq!(check.name, "Synthetic retry review");
     assert_eq!(
         check.trigger.window,
         Some(RollingWindow {
@@ -616,8 +615,8 @@ fn compiles_partial_source_quality_and_native_context_fields() {
 #[test]
 fn reports_structural_fields_and_missing_requirements() {
     let unknown = valid_check().replace(
-        "name: Failed retry loop",
-        "name: Failed retry loop\nextra: true",
+        "name: Synthetic retry review",
+        "name: Synthetic retry review\nextra: true",
     );
     assert_eq!(
         diagnostic(&unknown).code,

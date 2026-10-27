@@ -36,9 +36,9 @@ use crate::{
     store::SessionRecord,
 };
 
-const FAILED_RETRY: &str = include_str!(concat!(
+const SYNTHETIC_RETRY: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../.antiburn/checks/failed-retry-loop.yml"
+    "/../../../crates/antiburn-checks/tests/fixtures/retry-review.yml"
 ));
 const OVER_EXPLORING: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -758,9 +758,9 @@ fn activity_contents(input: &Value) -> Vec<&str> {
 }
 
 #[test]
-fn maintained_failed_retry_yaml_runs_in_native_terminal_order_with_partial_requests() {
+fn synthetic_retry_yaml_runs_in_native_terminal_order_with_partial_requests() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = Runtime::new(directory.path(), FAILED_RETRY);
+    let runtime = Runtime::new(directory.path(), SYNTHETIC_RETRY);
     let mut capture = Capture::start(&runtime.store, &["ses_retry"], Some(0));
     assert_eq!(runtime.sync(), 0);
     assert_eq!(runtime.count("burn_check_session_attachment"), 1);
@@ -822,9 +822,9 @@ fn maintained_failed_retry_yaml_runs_in_native_terminal_order_with_partial_reque
 }
 
 #[test]
-fn failed_retry_success_survives_v2_quality_gaps_continuity_resets_and_restart() {
+fn synthetic_success_survives_v2_quality_gaps_continuity_resets_and_restart() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = Runtime::new(directory.path(), FAILED_RETRY);
+    let runtime = Runtime::new(directory.path(), SYNTHETIC_RETRY);
     *runtime.evaluator.selected.lock().unwrap() = Some("clear".into());
     let session = "ses_saved_success";
     let mut capture = Capture::start(&runtime.store, &[session], Some(0));
@@ -1262,7 +1262,7 @@ fn cold_empty_attachment_survives_restart_before_any_result() {
 #[test]
 fn fresh_activation_does_not_replay_prior_captured_results() {
     let directory = tempfile::tempdir().unwrap();
-    let mut runtime = Runtime::new(directory.path(), FAILED_RETRY);
+    let mut runtime = Runtime::new(directory.path(), SYNTHETIC_RETRY);
     let mut capture = Capture::start(&runtime.store, &["ses_seed"], Some(0));
     capture.request(&runtime.store, "ses_seed", "msg_user", "Fix the build.");
     capture.step(&runtime.store, "ses_seed", "msg_step");
@@ -1434,7 +1434,7 @@ fn live_results_attach_before_the_first_read_and_drain_future_work_once() {
 #[test]
 fn expired_admitted_session_recovers_while_healthy_lease_and_window_continue() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = Runtime::new(directory.path(), FAILED_RETRY);
+    let runtime = Runtime::new(directory.path(), SYNTHETIC_RETRY);
     let mut capture = Capture::start(&runtime.store, &["ses_gap", "ses_other"], Some(0));
     runtime.sync();
     for session in ["ses_gap", "ses_other"] {

@@ -1,10 +1,21 @@
 # Burn Checks architecture
 
-Burn Checks reuse native source readers, a shared engine, selected-connection
-gates, SQLite persistence, and the existing Checks UI. Model checks use the
-selected System One provider; local checks evaluate status actions without it. The
-[authoring guide](authoring.md#supported-subset) states supported capabilities;
-[session coverage](../session-coverage.md#burn-check-source-facts) owns source limits.
+Burn Checks turn frozen source evidence into a saved status and explanation in
+the existing Checks UI. Native readers supply evidence, the shared engine runs
+the check, and the desktop owns connection gates and SQLite persistence. Model
+checks use the selected System One provider. Local checks send no model request
+but still require the selected configuration and base runtime gates.
+
+This document covers ownership, execution, and recovery. Use the
+[authoring guide](authoring.md#supported-subset) for supported language features,
+[session coverage](../session-coverage.md#burn-check-source-facts) for source
+limits, and [provider contracts](provider-contracts.md) for accepted wire shapes.
+Passing one boundary does not prove the next.
+
+The draft label is `v1-alpha`: experimental, not yet standardized, and open to
+breaking changes without a backward compatibility promise. Beta and stable scope
+are not set. Missing features are unassigned future work, not available behavior
+or a promise from the broader draft.
 
 ## Ownership and dataflow
 
@@ -203,9 +214,11 @@ lets known entries remain useful beside missing scopes. The current expression
 syntax cannot build a selected-field object while omitting unavailable fields.
 These inputs can therefore also contain the other inventory in that scope.
 Each question limits which inventory it uses. The canonical
-[Ignored instructions](../../.antiburn/checks/ignored-instructions.yml) and
-[Skill opportunities](../../.antiburn/checks/skill-opportunities.yml) definitions preserve the whole
-scopes without fitting them; an oversized scope can reject preparation.
+[Ignored instructions](../../.antiburn/checks/ignored-instructions.yml) definition
+can truncate only unused skill descriptions inside those scopes. It preserves
+instructions, metadata, names, paths, requests, and arguments.
+[Skill opportunities](../../.antiburn/checks/skill-opportunities.yml) preserves its
+inventory unchanged. Large protected input can still reject preparation.
 
 OpenCode request construction excludes synthetic text in snapshot and journal
 paths. A mixed message retains its real text. A generated-only message or
@@ -362,7 +375,7 @@ contains the provider, endpoint digest, model/revision, connection revision, and
 response mode. It contains no credential or raw endpoint. The decision policy
 includes every block name, input template/AST, ordered fit rules, named question,
 type, and ordered criteria.
-This is an internal recovery identifier, separate from the `v1-prealpha` draft.
+This is an internal recovery identifier, separate from the `v1-alpha` draft.
 Recovery also checks exact constructed JSON, including framing, unknown fields,
 input, and omission metadata. It does not refit dispatched work under changed
 connections, limits, or policy. Unknown delivery still cannot authorize a resend.
@@ -458,8 +471,10 @@ preparation uses the bounded blocking-preparation path rather than the async
 coordinator. Credentials stay in memory or secure storage and never enter saved
 preparation, diagnostics, or analytics.
 
-[Settings transitions](../../apps/desktop/src-tauri/src/jev/settings.rs) suspend
-new admission before the Store [durably cancels unfinished candidates](../../apps/desktop/src-tauri/src/store/burn_checks/connection_changes.rs).
+[Settings transitions](../../apps/desktop/src-tauri/src/jev/settings.rs) that
+change or remove the selected connection, or explicitly select another connection,
+suspend new admission before the Store [durably cancels unfinished candidates](../../apps/desktop/src-tauri/src/store/burn_checks/connection_changes.rs).
+Inactive connection edits and removals leave active work unchanged.
 A cancellation failure keeps admission suspended. Definition identity,
 activation, source checkpoints, observations, attachment, windows, and accepted
 status remain intact. Returning from connection A to B and then A does not revive
@@ -586,16 +601,32 @@ See [source delivery](../session-coverage.md#burn-check-source-facts).
 Committed source publication wakes definition-based checks. Native journal
 readiness and YAML report evidence do not depend on legacy metric freshness.
 
-The master **Run model-based checks** setting controls YAML check activation. It
-defaults to enabled only when no preference was saved; explicit saved off remains
+The master **Run checks** setting under Model-based checks controls YAML check activation. It
+preserves existing saved preferences. A fresh setup without a connection stays
 off, and malformed or unreadable storage disables execution. Discovered global
 or repository definitions supply check cards and navigation. Without a discovered
 definition, these surfaces and placeholder errors stay absent; the Settings
 master toggle and connection setup remain available. A discovered check without
 a configured System One provider gets an actionable setup diagnostic in its detail.
-The provider controls under **Model-based checks** select the saved System One connection; editing,
-testing, or refreshing a draft does not activate it. Native save selects the
-saved connection, and an explicit switch selects an unchanged saved profile.
+The connection list under **Model-based checks** separates saved configuration
+from selection. Native save takes an explicit create or update intent. Updates
+require an existing profile and matching revision, so a stale editor cannot
+recreate a removed profile. Creating the first profile selects it without
+enabling checks. Other saves preserve selection, including a confirmed null
+selection. **Use** explicitly selects an unchanged saved profile. Removing the
+selected profile pauses checks and clears selection without choosing a
+replacement. Empty profiles and null selection persist across restart. Inactive
+edits and removals preserve active work and shared credential references.
+The settings snapshot exposes a safe pending-operation descriptor and native-owned
+display numbers. The private journal retains before/after settings, revisions,
+and credential-slot references, never secret values. Explicit Retry binds to a
+unique native operation token. A separate renderer request tag binds Save
+completion to its originating draft; matching model fields alone are not proof.
+Reads expose recovery state without completing it. Retry returns a typed completed
+or rolled-back outcome, restores the correct selected runtime from current
+durable enablement and authentication state, and preserves unknown-delivery
+protection. Native display-number allocation keeps concurrent Add labels distinct
+without changing model connection data or frozen requests.
 Partial fields, truncated text, and source gaps are frozen as explicit quality
 facts; available evidence remains eligible. Missing expression values can make
 one candidate not assessable, without blocking later session results. For model
@@ -619,8 +650,10 @@ No-write retains the original status-write assessment,
 time, explanation, and evidence. A valid no-write assessment still advances the
 accepted watermark atomically with its history and skipped action outcomes.
 The engine does not create fallback success for uncertainty or below-threshold
-answers. Maintained examples explicitly write success when their failure
-condition does not match. A branch success cannot clear another branch's failure.
+answers. Four maintained examples explicitly write success when their failure
+condition does not match. Ignored instructions instead requires `no_conflict`
+with label probability at least 0.95. Its uncertain answers leave the saved result
+unchanged. A branch success cannot clear another branch's failure.
 The desktop shows Not assessed until an accepted status action writes success or
 failure. Queued or running work adds Checking beside the last saved result,
 without a separate group. Waiting progress belongs in detail. These progress

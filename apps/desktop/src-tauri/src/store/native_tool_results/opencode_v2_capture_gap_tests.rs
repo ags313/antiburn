@@ -310,6 +310,492 @@ fn evidence_validity(store: &Store) -> (i64, i64) {
         .unwrap()
 }
 
+fn publish_sse_event(
+    store: &Store,
+    claim: &OpenCodeV2CaptureClaim,
+    joiner: &mut opencode_v2_events::OpenCodeV2EventJoiner,
+    sequence: &mut u64,
+    kind: &str,
+    mut data: serde_json::Value,
+) {
+    *sequence += 1;
+    data["sessionID"] = json!(claim.key.session_id);
+    let version = if kind == "session.tool.success" { 2 } else { 1 };
+    let event = json!({
+        "id": format!("event-{sequence}"), "type": kind,
+        "durable": {"aggregateID": claim.key.session_id, "seq": sequence, "version": version},
+        "created": 101_000,
+        "data": data,
+    });
+    let frame = format!("event: message\ndata: {event}\n\n");
+    let mut bytes = frame.as_bytes();
+    let decoded = crate::opencode_live::SseDecoder::new(16 * 1024)
+        .next_event(&mut bytes)
+        .unwrap()
+        .unwrap();
+    assert!(bytes.is_empty());
+    let batch = joiner.observe_evidence(&decoded.data);
+    assert!(joiner.gaps().is_empty(), "{kind}: {:?}", joiner.gaps());
+    assert!(
+        store
+            .advance_opencode_v2_evidence(claim, *sequence, &batch, 101, 60)
+            .unwrap(),
+        "{kind}"
+    );
+}
+
+fn saved_rows(store: &Store, query: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    store
+        .lock()
+        .prepare(query)
+        .unwrap()
+        .query_map([], |row| {
+            (0..row.as_ref().column_count())
+                .map(|index| row.get(index))
+                .collect()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn publish_stored_v2_metrics(store: &Store, path: &std::path::Path) {
+    assert!(publish_stored_v2_metrics_with_batch(store, path, None).unwrap());
+}
+
+fn publish_stored_v2_metrics_with_batch(
+    store: &Store,
+    path: &std::path::Path,
+    override_batch: Option<&ToolResultBatch>,
+) -> anyhow::Result<bool> {
+    source_database(path);
+    let pending = store
+        .source_fingerprint_snapshot(&SessionKey::new("native", "opencode", "native-session"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .complete_source_fingerprint(&pending, "synthetic-strict", 101)
+            .unwrap()
+    );
+    let claim = store
+        .claim_next_evidence(&["opencode"], 101, 60)
+        .unwrap()
+        .unwrap();
+    let session = store.session(&claim.key).unwrap().unwrap();
+    let mut pass = crate::analysis::evidence_pass_with_turn_rows(
+        &[SessionInput {
+            agent: "opencode".into(),
+            session_id: claim.key.session_id.clone(),
+            source: RawSource::Sqlite(path.to_path_buf()),
+            source_format: SourceFormat::OpenCodeSqliteV2,
+            fork_parent_session_id: None,
+        }],
+        &|| false,
+        Some(MemoryTurnRowStore::new("opencode", &claim.key.session_id)),
+    );
+    assert_eq!(pass.outcome, crate::analysis::PassOutcome::Published);
+    assert!(pass.tool_result_observations.is_empty());
+    assert!(!pass.tool_result_observations_complete);
+    pass.analysis.analyzed_generation = claim.source_generation;
+    pass.analysis.fingerprint = session.source_fingerprint.clone().unwrap_or_default();
+    let evidence = pass.evidence.unwrap();
+    let mut record = pass.analysis.record(&claim.key).unwrap();
+    record.pricing_generation = 733;
+    let batch = ToolResultBatch {
+        source_format: pass.native_tool_result_source_format.unwrap(),
+        results: pass.tool_result_observations,
+        complete: pass.tool_result_observations_complete,
+    };
+    store.publish_projections_with_native_tool_results(
+        &record,
+        None,
+        &crate::store::EvidenceCompletion {
+            claim_fence: claim.claim_fence,
+            status: crate::store::PublishedEvidence::Ready,
+            evidence_schema_revision: evidence.schema_revision,
+            evidence_json: serde_json::to_string(&evidence).unwrap(),
+        },
+        &[],
+        &pass.source_outcomes,
+        crate::store::ToolResultPublishOptions {
+            source_fingerprint: session.source_fingerprint.as_deref(),
+            batch: Some(override_batch.unwrap_or(&batch)),
+        },
+    )
+}
+
+#[test]
+fn public_stored_v2_metrics_preserve_live_evidence_for_all_batch_shapes() {
+    use crate::store::burn_checks::trace_capture::LogCapture;
+    for shape in ["empty_incomplete", "empty_complete", "conflicting_complete"] {
+        for already_invalid in [false, true] {
+            let (directory, store, _journal, start) = setup();
+            let store = Arc::new(store);
+            let mut runtime = Runtime::new(store.clone(), "assistant_message", false);
+            let claim = started(&store, &start);
+            publish_public_cycle(&store, &claim);
+            assert!(
+                store
+                    .advance_opencode_v2_capture(&claim, 9, Some(&result(9, false)), 101, 60)
+                    .unwrap()
+            );
+            assert_eq!(runtime.sync(&store), 1);
+            runtime.accept(101_000);
+            store.lock().execute_batch(
+                "INSERT INTO burn_check_cooldown
+                   SELECT check_id, activation_scope_key, generation, branch_key, 700
+                     FROM burn_check_candidate WHERE state = 'accepted';
+                 INSERT INTO burn_check_evaluation_attempt
+                   (attempt_id, candidate_id, decision_name, attempt_number, state, outcome, updated_at_epoch)
+                   SELECT 'synthetic-attempt', candidate_id, 'review', 1, 'settled', 'answer', 101
+                     FROM burn_check_candidate WHERE state = 'accepted';",
+            ).unwrap();
+            let candidate_id: String = store
+                .lock()
+                .query_row(
+                    "SELECT candidate_id FROM burn_check_candidate WHERE state = 'accepted'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            store
+                .record_burn_check_decision_usage(
+                    &candidate_id,
+                    &DecisionAttempt::new("review", 1).unwrap(),
+                    "capture-gap",
+                    ("custom-systemone", "synthetic-model"),
+                    Some(antiburn_local::analysis::jev::JevUsage {
+                        input_tokens: 7,
+                        output_tokens: 3,
+                    }),
+                    101,
+                )
+                .unwrap();
+            if already_invalid {
+                store
+                    .mark_opencode_v2_capture_gap(
+                        std::slice::from_ref(&claim),
+                        "source-detached",
+                        102,
+                    )
+                    .unwrap();
+                runtime.sync(&store);
+                assert_eq!(evidence_validity(&store), (0, 0));
+            }
+            let tables = [
+                "native_tool_result_current",
+                "native_tool_result_publication",
+                "opencode_v2_capture",
+                "burn_check_candidate",
+                "burn_check_candidate_dependency",
+                "burn_check_observation",
+                "burn_check_assessment_history",
+                "burn_check_current_status",
+                "burn_check_evaluation_attempt",
+                "burn_check_activation",
+                "burn_check_acceptance_watermark",
+                "burn_check_cooldown",
+                "burn_check_decision_usage",
+            ];
+            let before = tables
+                .map(|table| saved_rows(&store, &format!("SELECT * FROM {table} ORDER BY rowid")));
+            let usage = store.burn_check_usage_summary().unwrap();
+            assert_eq!(usage.confirmed_calls, 1);
+            let mut conflicting = result(9, false);
+            conflicting.content = Some("PRIVATE_STORED_CONFLICT".into());
+            conflicting.revision += 1;
+            let batch = ToolResultBatch {
+                source_format: SourceFormat::OpenCodeSqliteV2,
+                complete: shape != "empty_incomplete",
+                results: if shape == "conflicting_complete" {
+                    vec![conflicting]
+                } else {
+                    vec![]
+                },
+            };
+            let captured = LogCapture::default();
+            tracing::subscriber::with_default(captured.clone(), || {
+                assert!(
+                    publish_stored_v2_metrics_with_batch(
+                        &store,
+                        &directory.path().join("metrics.sqlite"),
+                        Some(&batch)
+                    )
+                    .unwrap()
+                );
+            });
+            for (table, before) in tables.into_iter().zip(before) {
+                assert_eq!(
+                    saved_rows(&store, &format!("SELECT * FROM {table} ORDER BY rowid")),
+                    before,
+                    "{shape}/{already_invalid}/{table}"
+                );
+            }
+            assert_eq!(store.burn_check_usage_summary().unwrap(), usage);
+            assert_eq!(
+                store
+                    .lock()
+                    .query_row(
+                        "SELECT pricing_generation FROM session_analysis",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                733
+            );
+            let metrics = captured.events("stored_metrics_committed");
+            assert_eq!(metrics.len(), 1);
+            assert_eq!(
+                metrics[0].fields["publication_origin"],
+                "\"stored_metrics\""
+            );
+            assert_eq!(metrics[0].fields["live_evidence_ownership"], "\"excluded\"");
+            assert_eq!(
+                metrics[0].fields["metrics_claim_fence"],
+                claim.claim_fence.to_string()
+            );
+            assert!(
+                captured
+                    .events("native_evidence_transition_committed")
+                    .is_empty()
+            );
+            assert!(!captured.text().contains("PRIVATE_STORED_CONFLICT"));
+        }
+    }
+}
+
+#[test]
+fn failed_metrics_write_has_no_projection_or_success_trace() {
+    use crate::store::burn_checks::trace_capture::LogCapture;
+    let (directory, store, _journal, start) = setup();
+    let claim = started(&store, &start);
+    publish_public_cycle(&store, &claim);
+    let publications = store.native_evidence_publications_after(0, 100).unwrap();
+    store
+        .lock()
+        .execute_batch(
+            "CREATE TRIGGER reject_metrics BEFORE INSERT ON session_analysis
+        BEGIN SELECT RAISE(ABORT, 'PRIVATE_METRICS_ERROR'); END;",
+        )
+        .unwrap();
+    let captured = LogCapture::default();
+    tracing::subscriber::with_default(captured.clone(), || {
+        assert!(
+            publish_stored_v2_metrics_with_batch(
+                &store,
+                &directory.path().join("metrics.sqlite"),
+                None
+            )
+            .is_err()
+        );
+    });
+    assert!(captured.events("stored_metrics_committed").is_empty());
+    assert_eq!(
+        store.native_evidence_publications_after(0, 100).unwrap(),
+        publications
+    );
+    assert!(saved_rows(&store, "SELECT * FROM session_analysis").is_empty());
+    assert!(!captured.text().contains("PRIVATE_METRICS_ERROR"));
+}
+
+#[test]
+fn ordinary_sse_append_preserves_accepted_evidence_and_frozen_input() {
+    for selector in [
+        "user_message",
+        "assistant_message",
+        "tool_call",
+        "tool_result",
+        "turn_end",
+    ] {
+        let (directory, store, _journal, start) = setup();
+        let store = Arc::new(store);
+        let mut runtime = Runtime::new(store.clone(), selector, false);
+        let claim = started(&store, &start);
+        let mut joiner = opencode_v2_events::OpenCodeV2EventJoiner::new();
+        joiner.set_live_baseline(4);
+        let mut sequence = 4;
+        let mut publish = |kind, data| {
+            publish_sse_event(&store, &claim, &mut joiner, &mut sequence, kind, data);
+        };
+        publish("session.execution.started", json!({}));
+        publish(
+            "session.inbox.enqueued",
+            json!({"inboxID": "request", "item": {
+                "type": "user", "payload": {"text": "Inspect the synthetic input."}
+            }}),
+        );
+        publish("session.inbox.delivered", json!({"inboxID": "request"}));
+        publish(
+            "session.step.started",
+            json!({"assistantMessageID": "first-step"}),
+        );
+        publish(
+            "session.text.started",
+            json!({"assistantMessageID": "first-step", "ordinal": 0}),
+        );
+        publish(
+            "session.text.ended",
+            json!({"assistantMessageID": "first-step", "ordinal": 0, "text": "Inspecting the input."}),
+        );
+        publish(
+            "session.tool.input.started",
+            json!({"assistantMessageID": "first-step", "id": "first-call", "name": "read"}),
+        );
+        publish(
+            "session.tool.called",
+            json!({"assistantMessageID": "first-step", "id": "first-call", "input": {"path": "sample.rs"}, "executed": false}),
+        );
+        publish(
+            "session.tool.success",
+            json!({"assistantMessageID": "first-step", "id": "first-call", "content": [{"type": "text", "text": "sample"}], "executed": false}),
+        );
+        publish(
+            "session.step.ended",
+            json!({"assistantMessageID": "first-step", "finish": "tool-calls"}),
+        );
+        publish("session.execution.succeeded", json!({}));
+        assert_eq!(runtime.sync(&store), 1, "{selector}");
+        runtime.accept(101_000);
+        assert_eq!(evidence_validity(&store), (1, 1), "{selector}");
+        let before: (String, String, String) = store.lock().query_row(
+            "SELECT candidate_id, frozen_input_json, input_fingerprint FROM burn_check_candidate WHERE state = 'accepted'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        store
+            .record_burn_check_decision_usage(
+                &before.0,
+                &DecisionAttempt::new("review", 1).unwrap(),
+                "capture-gap",
+                ("custom-systemone", "synthetic-model"),
+                Some(antiburn_local::analysis::jev::JevUsage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                }),
+                101,
+            )
+            .unwrap();
+        let usage = store.burn_check_usage_summary().unwrap();
+        assert_eq!(usage.confirmed_calls, 1);
+        let accepted = saved_rows(
+            &store,
+            "SELECT * FROM burn_check_candidate WHERE state = 'accepted'",
+        );
+        let status = saved_rows(&store, "SELECT * FROM burn_check_current_status");
+        let history = saved_rows(&store, "SELECT * FROM burn_check_assessment_history");
+        let attempts = saved_rows(&store, "SELECT * FROM burn_check_evaluation_attempt");
+        publish("session.execution.started", json!({}));
+        publish(
+            "session.inbox.enqueued",
+            json!({"inboxID": "later-request", "item": {
+                "type": "user", "payload": {"text": "Inspect another synthetic input."}
+            }}),
+        );
+        publish(
+            "session.inbox.delivered",
+            json!({"inboxID": "later-request"}),
+        );
+        publish(
+            "session.step.started",
+            json!({"assistantMessageID": "later-step"}),
+        );
+        publish(
+            "session.tool.input.started",
+            json!({"assistantMessageID": "later-step", "id": "later-call", "name": "read"}),
+        );
+        publish(
+            "session.tool.called",
+            json!({"assistantMessageID": "later-step", "id": "later-call", "input": {"path": "later.rs"}, "executed": false}),
+        );
+        publish(
+            "session.tool.success",
+            json!({"assistantMessageID": "later-step", "id": "later-call", "content": [{"type": "text", "text": "later sample"}], "executed": false}),
+        );
+        publish(
+            "session.step.ended",
+            json!({"assistantMessageID": "later-step", "finish": "tool-calls"}),
+        );
+        publish("session.execution.succeeded", json!({}));
+        runtime.sync(&store);
+        assert_eq!(evidence_validity(&store), (1, 1), "{selector}");
+        let publications = store.native_evidence_publications_after(0, 100).unwrap();
+        publish_stored_v2_metrics(&store, &directory.path().join("metric-source.sqlite"));
+        runtime.sync(&store);
+        assert_eq!(
+            evidence_validity(&store),
+            (1, 1),
+            "{selector} metrics publication"
+        );
+        assert_eq!(
+            store.native_evidence_publications_after(0, 100).unwrap(),
+            publications
+        );
+        assert_eq!(store.lock().query_row(
+            "SELECT candidate_id, frozen_input_json, input_fingerprint FROM burn_check_candidate WHERE candidate_id = ?1", [&before.0],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        ).unwrap(), before, "{selector}");
+        assert_eq!(
+            saved_rows(
+                &store,
+                "SELECT * FROM burn_check_candidate WHERE state = 'accepted'"
+            ),
+            accepted,
+            "{selector}"
+        );
+        assert_eq!(
+            saved_rows(&store, "SELECT * FROM burn_check_current_status"),
+            status,
+            "{selector}"
+        );
+        assert_eq!(
+            saved_rows(&store, "SELECT * FROM burn_check_assessment_history"),
+            history,
+            "{selector}"
+        );
+        assert_eq!(
+            saved_rows(&store, "SELECT * FROM burn_check_evaluation_attempt"),
+            attempts,
+            "{selector}"
+        );
+        assert_eq!(
+            store.burn_check_usage_summary().unwrap(),
+            usage,
+            "{selector}"
+        );
+        publish(
+            "session.text.ended",
+            json!({"assistantMessageID": "first-step", "ordinal": 0, "text": "Corrected public text."}),
+        );
+        runtime.sync(&store);
+        assert_eq!(
+            evidence_validity(&store),
+            if matches!(selector, "assistant_message" | "turn_end") {
+                (0, 0)
+            } else {
+                (1, 1)
+            },
+            "{selector} correction"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT frozen_input_json FROM burn_check_candidate WHERE candidate_id = ?1",
+                    [&before.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            before.1,
+            "{selector} correction"
+        );
+        assert_eq!(
+            store.burn_check_usage_summary().unwrap(),
+            usage,
+            "{selector} correction"
+        );
+    }
+}
+
 fn source_database(path: &std::path::Path) -> rusqlite::Connection {
     let source = rusqlite::Connection::open(path).unwrap();
     source.execute_batch(
@@ -648,7 +1134,10 @@ fn capture_gap_preserves_an_accepted_idle_boundary() {
 
 #[test]
 fn capture_gap_fences_stale_claims_and_preserves_another_sessions_bindings() {
+    use crate::store::burn_checks::trace_capture::LogCapture;
     let (_directory, store, journal, start) = setup();
+    let store = Arc::new(store);
+    let mut runtime = Runtime::new(store.clone(), "assistant_message", false);
     let claim = started(&store, &start);
     let mut record = journal.record("/synthetic");
     record.key.session_id = "healthy-session".into();
@@ -671,6 +1160,10 @@ fn capture_gap_fences_stale_claims_and_preserves_another_sessions_bindings() {
         .remove(0);
     publish_public_cycle(&store, &claim);
     publish_public_cycle(&store, &other_claim);
+    assert_eq!(claim.claim_fence, other_claim.claim_fence);
+    assert_eq!(runtime.sync(&store), 2);
+    runtime.accept(101_000);
+    runtime.accept(101_000);
     let identity = evidence::message_payload(&public_messages("native-session").remove(1))
         .identity()
         .unwrap();
@@ -693,11 +1186,33 @@ fn capture_gap_fences_stale_claims_and_preserves_another_sessions_bindings() {
             .unwrap()
             .is_some()
     );
+    let captured = LogCapture::default();
+    tracing::subscriber::with_default(captured.clone(), || {
+        assert_eq!(
+            store
+                .mark_opencode_v2_capture_gap(&[claim], "capture-lost", 102)
+                .unwrap(),
+            1
+        )
+    });
+    let transitions = captured.events("native_evidence_transition_committed");
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(transitions[0].fields["accepted_evidence_revoked"], "1");
     assert_eq!(
-        store
-            .mark_opencode_v2_capture_gap(&[claim], "capture-lost", 102)
-            .unwrap(),
-        1
+        saved_rows(
+            &store,
+            "SELECT json_extract(c.session_key_json, '$[2]'), h.evidence_valid FROM burn_check_assessment_history h JOIN burn_check_candidate c USING(candidate_id) ORDER BY c.session_key_json"
+        ),
+        vec![
+            vec![
+                rusqlite::types::Value::Text("healthy-session".into()),
+                rusqlite::types::Value::Integer(1)
+            ],
+            vec![
+                rusqlite::types::Value::Text("native-session".into()),
+                rusqlite::types::Value::Integer(0)
+            ],
+        ]
     );
     assert!(
         evidence::current_binding_in(&store.lock(), &start.key, &identity)
@@ -748,6 +1263,7 @@ fn recovered_or_expired_capture_cannot_keep_old_generic_bindings() {
 
 #[test]
 fn gap_publication_failure_rolls_back_generic_invalidation() {
+    use crate::store::burn_checks::trace_capture::LogCapture;
     let (_directory, store, _journal, start) = setup();
     let claim = started(&store, &start);
     publish_public_cycle(&store, &claim);
@@ -759,11 +1275,20 @@ fn gap_publication_failure_rolls_back_generic_invalidation() {
           BEGIN SELECT RAISE(ABORT, 'synthetic gap failure'); END;",
         )
         .unwrap();
+    let captured = LogCapture::default();
+    tracing::subscriber::with_default(captured.clone(), || {
+        assert!(
+            store
+                .mark_opencode_v2_capture_gap(std::slice::from_ref(&claim), "capture-lost", 102)
+                .is_err()
+        )
+    });
     assert!(
-        store
-            .mark_opencode_v2_capture_gap(std::slice::from_ref(&claim), "capture-lost", 102)
-            .is_err()
+        captured
+            .events("native_evidence_transition_committed")
+            .is_empty()
     );
+    assert!(captured.events("opencode_v2_capture_gap").is_empty());
     assert_eq!(
         store
             .lock()
@@ -780,6 +1305,230 @@ fn gap_publication_failure_rolls_back_generic_invalidation() {
             .renew_opencode_v2_capture_epoch(&[claim], 103, 60)
             .unwrap()
     );
+}
+
+#[test]
+fn gap_trace_counts_revocations_and_stale_work_once_not_matched_invalid_rows() {
+    use crate::store::burn_checks::trace_capture::LogCapture;
+    let (_directory, store, _journal, start) = setup();
+    let store = Arc::new(store);
+    let mut runtime = Runtime::new(store.clone(), "assistant_message", false);
+    let claim = started(&store, &start);
+    publish_public_cycle(&store, &claim);
+    assert_eq!(runtime.sync(&store), 1);
+    runtime.accept(101_000);
+    let NativeMessageObservation::Public(mut later) =
+        public_messages(&claim.key.session_id).remove(1)
+    else {
+        unreachable!()
+    };
+    later.record_id = "PRIVATE_LATER_RECORD".into();
+    later.position = position(9);
+    later.revision = 9;
+    later.context = Some(context(9));
+    assert!(
+        store
+            .advance_opencode_v2_evidence(
+                &claim,
+                9,
+                &NativeEvidenceBatch {
+                    source_format: SourceFormat::OpenCodeSqliteV2,
+                    history_complete: false,
+                    events: vec![NativeEvidenceEvent {
+                        live_eligible: true,
+                        fact: NativeEvidenceFact::Message(NativeMessageObservation::Public(later))
+                    }],
+                },
+                101,
+                60
+            )
+            .unwrap()
+    );
+    assert_eq!(runtime.sync(&store), 1);
+    let captured = LogCapture::default();
+    tracing::subscriber::with_default(captured.clone(), || {
+        for _ in 0..100 {
+            store
+                .mark_opencode_v2_capture_gap(std::slice::from_ref(&claim), "source-detached", 102)
+                .unwrap();
+        }
+    });
+    let transitions = captured.events("native_evidence_transition_committed");
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(transitions[0].fields["accepted_evidence_revoked"], "1");
+    assert_eq!(transitions[0].fields["current_status_revoked"], "1");
+    assert_eq!(transitions[0].fields["unfinished_stale"], "1");
+    assert_eq!(transitions[0].fields["reason"], "\"source_detached\"");
+    assert_eq!(captured.events("opencode_v2_capture_gap").len(), 1);
+    assert_eq!(evidence_validity(&store), (0, 0));
+    assert!(!captured.text().contains("PRIVATE_"));
+}
+
+#[test]
+fn correction_failure_does_not_commit_revocations_or_a_success_summary() {
+    use crate::store::burn_checks::trace_capture::LogCapture;
+    let (_directory, store, _journal, start) = setup();
+    let store = Arc::new(store);
+    let mut runtime = Runtime::new(store.clone(), "assistant_message", false);
+    let claim = started(&store, &start);
+    publish_public_cycle(&store, &claim);
+    assert_eq!(runtime.sync(&store), 1);
+    runtime.accept(101_000);
+    let mut correction = public_messages(&claim.key.session_id).remove(1);
+    let NativeMessageObservation::Public(message) = &mut correction else {
+        unreachable!()
+    };
+    message.position = position(9);
+    message.revision = 9;
+    message.payload = PublicMessagePayload::AssistantText {
+        parts: vec![UserMessagePart {
+            item_index: 0,
+            native_part_id: None,
+            text: "PRIVATE_CORRECTION".into(),
+        }],
+        generator: Default::default(),
+    };
+    store.lock().execute_batch("CREATE TRIGGER reject_correction BEFORE INSERT ON native_tool_result_publication
+        WHEN NEW.event_kind = 'assistant_message' AND NEW.native_revision = 9 BEGIN SELECT RAISE(ABORT, 'PRIVATE_CORRECTION_ERROR'); END;").unwrap();
+    let before = store.native_evidence_publications_after(0, 100).unwrap();
+    let captured = LogCapture::default();
+    tracing::subscriber::with_default(captured.clone(), || {
+        assert!(
+            store
+                .advance_opencode_v2_evidence(
+                    &claim,
+                    9,
+                    &NativeEvidenceBatch {
+                        source_format: SourceFormat::OpenCodeSqliteV2,
+                        history_complete: false,
+                        events: vec![NativeEvidenceEvent {
+                            live_eligible: true,
+                            fact: NativeEvidenceFact::Message(correction)
+                        }],
+                    },
+                    101,
+                    60
+                )
+                .is_err()
+        );
+    });
+    assert_eq!(evidence_validity(&store), (1, 1));
+    assert_eq!(
+        store.native_evidence_publications_after(0, 100).unwrap(),
+        before
+    );
+    assert!(
+        captured
+            .events("native_evidence_transition_committed")
+            .is_empty()
+    );
+    assert!(
+        captured
+            .events("burn_check_evidence_transition_committed")
+            .is_empty()
+    );
+    assert!(!captured.text().contains("PRIVATE_"));
+}
+
+#[test]
+fn selected_live_message_edits_and_removals_revoke_only_once_and_keep_frozen_input() {
+    use crate::store::burn_checks::trace_capture::LogCapture;
+    for (selector, index) in [
+        ("user_message", 0),
+        ("assistant_message", 1),
+        ("tool_call", 2),
+        ("turn_end", 1),
+    ] {
+        for remove in [false, true] {
+            let (_directory, store, _journal, start) = setup();
+            let store = Arc::new(store);
+            let mut runtime = Runtime::new(store.clone(), selector, false);
+            let claim = started(&store, &start);
+            publish_public_cycle(&store, &claim);
+            assert_eq!(runtime.sync(&store), 1);
+            runtime.accept(101_000);
+            let frozen = saved_rows(
+                &store,
+                "SELECT frozen_input_json, input_fingerprint FROM burn_check_candidate WHERE state = 'accepted'",
+            );
+            let mut message = public_messages(&claim.key.session_id).remove(index);
+            let owner = match &mut message {
+                NativeMessageObservation::User(message) => {
+                    message.message.position = UserMessagePosition::OpenCodeV2Event { sequence: 9 };
+                    message.revision = 9;
+                    message.message.parts[0].text = "PRIVATE_USER_CORRECTION".into();
+                    message.message.message_id.clone()
+                }
+                NativeMessageObservation::Public(message) => {
+                    message.position = position(9);
+                    message.revision = 9;
+                    match &mut message.payload {
+                        PublicMessagePayload::AssistantText { parts, .. } => {
+                            parts[0].text = "PRIVATE_TEXT_CORRECTION".into()
+                        }
+                        PublicMessagePayload::ToolCall { input, .. } => {
+                            *input = Some(NativeToolInput::Text("PRIVATE_INPUT_CORRECTION".into()))
+                        }
+                    }
+                    message.record_id.clone()
+                }
+                NativeMessageObservation::ToolResult(_) => unreachable!(),
+            };
+            let fact = if remove {
+                NativeEvidenceFact::MessageRemoval(NativeMessageRemoval {
+                    source_format: SourceFormat::OpenCodeSqliteV2,
+                    session_id: claim.key.session_id.clone(),
+                    message_id: owner,
+                    position: position(9),
+                    revision: 9,
+                })
+            } else {
+                NativeEvidenceFact::Message(message)
+            };
+            let captured = LogCapture::default();
+            tracing::subscriber::with_default(captured.clone(), || {
+                assert!(
+                    store
+                        .advance_opencode_v2_evidence(
+                            &claim,
+                            9,
+                            &NativeEvidenceBatch {
+                                source_format: SourceFormat::OpenCodeSqliteV2,
+                                history_complete: false,
+                                events: vec![NativeEvidenceEvent {
+                                    live_eligible: true,
+                                    fact
+                                }],
+                            },
+                            102,
+                            60
+                        )
+                        .unwrap()
+                );
+                runtime.sync(&store);
+            });
+            assert_eq!(evidence_validity(&store), (0, 0), "{selector}/{remove}");
+            assert_eq!(
+                saved_rows(
+                    &store,
+                    "SELECT frozen_input_json, input_fingerprint FROM burn_check_candidate WHERE state = 'accepted'"
+                ),
+                frozen
+            );
+            let revoked: usize = captured
+                .events("native_evidence_transition_committed")
+                .into_iter()
+                .chain(captured.events("burn_check_evidence_transition_committed"))
+                .map(|event| {
+                    event.fields["accepted_evidence_revoked"]
+                        .parse::<usize>()
+                        .unwrap()
+                })
+                .sum();
+            assert_eq!(revoked, 1, "{selector}/{remove}");
+            assert!(!captured.text().contains("PRIVATE_"));
+        }
+    }
 }
 
 #[test]

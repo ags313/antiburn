@@ -19,7 +19,7 @@ accepted native shapes and [check coverage](../check-coverage.md) for product li
 - Record the agent versions, connection profiles, request limit, and cost cap in
   ignored local notes. Keep notes and captures under `.agent-artifacts/reviews/`.
   Do not commit credentials or real session content.
-- Turn off **Run model-based checks** before setting up the test. Saved connections
+- Turn off **Run checks** under Model-based checks before setting up the test. Saved connections
   remain available. Enabling checks in a repository with model-based definitions
   can send requests. The app's usage estimate is not a spending cap.
 - Run providers one at a time. Load credentials into the approved shell
@@ -66,6 +66,12 @@ capabilities, errors, and reported usage. Missing usage stays unknown. A valid
 answer proves that request's protocol path, not model accuracy or calibration.
 Stop after an error or unknown outcome. Do not automatically repeat the request.
 
+For native Jev, distinguish the requested `jev-latest` alias from the response's
+served model. The native route enables long context; Custom presets do not
+inherit its header or limits. An alias echo does not prove a concrete release.
+A future or unknown served model can have confirmed tokens without a cost
+estimate. Do not retry a valid response to obtain a known model or price.
+
 ## Check native events without model calls
 
 Use an isolated test OS account with only approved sources and local probe
@@ -77,7 +83,7 @@ does not isolate source discovery or global definitions. If you cannot verify
 this isolation, stop before enabling the master switch.
 
 A local check has no `decisions` block and makes no model request. It still
-requires **Run model-based checks** to be enabled and a configured, selected
+requires **Run checks** to be enabled and a configured, selected
 connection. Do not use **Test connection** during this no-model procedure.
 Record prior enablement and pause settings so you can restore them afterward.
 
@@ -98,7 +104,7 @@ actions:
 
 Use separate probe files for `assistant_message`, `tool_call`, `tool_result`,
 `turn_end`, `session_start`, and `session_idle`. Select one event per file. These
-forms use the experimental `v1-prealpha` draft, which has no compatibility promise.
+forms use the experimental `v1-alpha` draft, which has no compatibility promise.
 Do not add a YAML version field.
 
 For each approved agent session:
@@ -148,14 +154,19 @@ Within that separate approved budget:
   activation or historical skill use.
 - Check fast-mode advice against the recorded source qualifier. Requested-tier
   preferences and model-name hints do not prove served tier, speed, or savings.
-- In **Settings → Checks**, save and select each approved connection. Editing,
-  refreshing limits, or testing a draft must not select it. **Test connection**
+- In **Settings → Checks**, save and select each approved connection. Editing
+  or testing a draft must not select it. **Test connection**
   itself sends synthetic input and can incur charges.
 - Open checks through navigation and search. Confirm that source/setup errors
   give a useful next action and that no action points to a retired Smart check.
 - Confirm that a no-write assessment keeps the prior status-writing evidence.
   After a connection switch, accepted results and source progress must remain.
   Do not induce paid unknown-delivery failures as a retry experiment.
+- For approved OpenCode V2 work, record a newly accepted assessment, then allow
+  the ordinary stored metrics refresh. Verify that the same acceptance remains
+  valid. A real correction to selected evidence can still invalidate it. An idle
+  detach alone must not create a current capture alert, before or after its
+  publication is consumed. Do not restore old invalid evidence for this check.
 
 The [replay guide](../../apps/desktop/src-tauri/eval/replay/README.md) provides a
 separate bounded synthetic replay. Its state must remain isolated from live

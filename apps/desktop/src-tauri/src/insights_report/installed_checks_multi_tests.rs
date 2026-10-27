@@ -227,7 +227,7 @@ fn multiple_inputs_keep_exact_status_provenance_after_settings_no_write_and_prun
     );
     let provenance = value(&evidence, "decision-connection");
     assert_eq!(provenance["provider"], "Cloudflare");
-    assert_eq!(provenance["model"], "clef");
+    assert_eq!(provenance["requestedModel"], "clef");
     assert_eq!(provenance["connectionRevision"], 7);
     let snapshot = || {
         store.lock().query_row(

@@ -125,6 +125,49 @@ fn publish(
 }
 
 #[test]
+fn duplicate_stored_v2_metrics_completions_do_not_repeat_success_traces() {
+    use crate::store::burn_checks::trace_capture::LogCapture;
+    let store = store();
+    let (record, claim) = claim_and_record(&store);
+    let batch = ToolResultBatch {
+        source_format: SourceFormat::OpenCodeSqliteV2,
+        results: vec![],
+        complete: false,
+    };
+    let captured = LogCapture::default();
+    tracing::subscriber::with_default(captured.clone(), || {
+        assert!(publish(&store, &record, &claim, &batch));
+        for _ in 0..100 {
+            assert!(!publish(&store, &record, &claim, &batch));
+        }
+    });
+    let events = captured.events("stored_metrics_committed");
+    assert_eq!(events.len(), 1);
+    let allowed = [
+        "event",
+        "publication_origin",
+        "live_evidence_ownership",
+        "metrics_claim_fence",
+        "metrics_source_generation",
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        events[0]
+            .fields
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        allowed
+    );
+    assert!(
+        captured
+            .events("native_evidence_transition_committed")
+            .is_empty()
+    );
+}
+
+#[test]
 fn v2_event_positions_use_the_v2_baseline_for_live_eligibility() {
     let store = store();
     let (_record, claim) = claim_and_record(&store);
@@ -154,6 +197,7 @@ fn v2_event_positions_use_the_v2_baseline_for_live_eligibility() {
         claim.claim_fence,
         &batch,
         super::PublicationPolicy {
+            invalidation_effects: None,
             baseline: Some(7),
             history_complete: None,
             gap_reason: None,

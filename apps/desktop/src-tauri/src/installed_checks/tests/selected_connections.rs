@@ -293,6 +293,14 @@ impl Harness {
             .unwrap();
         fixture.index("native", "main", 0);
         fixture.publish("main", 0);
+        Self::with_profiles(fixture, a, b)
+    }
+
+    fn in_memory(a: &Server, b: &Server) -> Self {
+        Self::with_profiles(Fixture::new(), a, b)
+    }
+
+    fn with_profiles(fixture: Fixture, a: &Server, b: &Server) -> Self {
         std::fs::write(fixture.global.join("failed-retry-loop.yml"), SOURCE).unwrap();
         headless::setup_keyless_profiles(
             &fixture.store,
@@ -573,6 +581,291 @@ impl Drop for AdmissionBlockers {
             gate.open();
         }
     }
+}
+
+fn pending_candidate(harness: &Harness) -> String {
+    harness
+        .fixture
+        .store
+        .lock()
+        .query_row(
+            "SELECT candidate_id FROM burn_check_candidate WHERE state = 'pending'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn queued_job(
+    harness: &mut Harness,
+    candidate: &str,
+    gate: Arc<Gate>,
+) -> tokio::task::JoinHandle<Result<Option<RunSettlement>, StoreError>> {
+    let job = harness.host.evaluation_jobs(1).pop().unwrap();
+    let runtime: Arc<dyn SelectedJobRuntime> = harness.runtime.clone();
+    let fingerprint = std::array::from_fn(|index| {
+        u8::from_str_radix(&candidate[index * 2..index * 2 + 2], 16).unwrap()
+    });
+    tokio::spawn(crate::jev::dispatch::test_hooks::with_request_slot_pending(
+        antiburn_checks::decision::attempt_id(
+            &fingerprint,
+            &DecisionAttempt::new("review", 1).unwrap(),
+        ),
+        move || gate.signal(),
+        job.run_selected(runtime),
+    ))
+}
+
+fn publish_native_change(harness: &Harness, event: antiburn_local::analysis::NativeEvidenceFact) {
+    use crate::store::native_tool_results::{evidence, publications::PublicationPolicy};
+    use antiburn_local::analysis::{NativeEvidenceBatch, NativeEvidenceEvent};
+
+    let mut connection = harness.fixture.store.lock();
+    let tx = connection.transaction().unwrap();
+    let generation: i64 = tx.query_row(
+        "SELECT source_generation FROM session WHERE environment_key = 'native' AND agent = 'pi' AND session_id = 'main'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert!(
+        evidence::reconcile_evidence_in(
+            &tx,
+            &SessionKey::new("native", "pi", "main"),
+            generation,
+            0,
+            &NativeEvidenceBatch {
+                source_format: SourceFormat::PiV3Jsonl,
+                events: vec![NativeEvidenceEvent {
+                    live_eligible: true,
+                    fact: event
+                }],
+                history_complete: true,
+            },
+            PublicationPolicy {
+                suppress_coverage: true,
+                ..Default::default()
+            },
+            i64::try_from(harness.runtime.clock.load(Ordering::Acquire)).unwrap(),
+        )
+        .unwrap()
+    );
+    tx.commit().unwrap();
+}
+
+fn assert_stale_attempt(harness: &Harness, candidate: &str, expected: &str) {
+    let connection = harness.fixture.store.lock();
+    let (state, outcome, valid, attempts, attempt_outcome, statuses): (String, String, bool, u64, String, u64) = connection.query_row(
+        "SELECT c.state, h.outcome, h.evidence_valid,
+            (SELECT COUNT(*) FROM burn_check_evaluation_attempt WHERE candidate_id = c.candidate_id),
+            a.outcome, (SELECT COUNT(*) FROM burn_check_current_status)
+         FROM burn_check_candidate c JOIN burn_check_assessment_history h USING(candidate_id)
+         JOIN burn_check_evaluation_attempt a USING(candidate_id) WHERE c.candidate_id = ?1",
+        [candidate], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+    ).unwrap();
+    assert_eq!(
+        (state.as_str(), outcome.as_str(), valid),
+        ("stale", "stale", false)
+    );
+    assert_eq!(
+        (attempts, attempt_outcome.as_str(), statuses),
+        (1, expected, 0)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_idle_activity_cancels_queued_requests_and_keeps_sent_delivery_unknown() {
+    use crate::store::native_tool_results::observers;
+    use antiburn_local::analysis::{
+        NativeActivityObservation, NativeEvidenceFact, ToolResultPosition,
+    };
+
+    for already_sent in [false, true] {
+        let (a, b) = (Server::new(), Server::new());
+        let mut harness = Harness::in_memory(&a, &b);
+        let source = SOURCE
+            .replace("  tool_result:", "  session_idle:")
+            .replace("message.tool.result", "session.idle_seconds");
+        std::fs::write(harness.fixture.global.join("failed-retry-loop.yml"), source).unwrap();
+        harness.host.reconcile(&Admission::Ready).unwrap();
+        publish_metadata(&harness.runtime.installed, &harness.host.definitions);
+        harness.host.catch_up().unwrap();
+        let deadline = harness
+            .fixture
+            .store
+            .next_session_idle_deadline()
+            .unwrap()
+            .unwrap();
+        {
+            let mut connection = harness.fixture.store.lock();
+            let tx = connection.transaction().unwrap();
+            observers::frontier_in(
+                &tx,
+                &SessionKey::new("native", "pi", "main"),
+                "{}",
+                true,
+                deadline,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        harness
+            .runtime
+            .clock
+            .store(u64::try_from(deadline).unwrap(), Ordering::Release);
+        harness.host.catch_up().unwrap();
+        let candidate = pending_candidate(&harness);
+        let generation = harness
+            .runtime
+            .worker
+            .execution_snapshot()
+            .unwrap()
+            .generation;
+        let gate = Arc::new(Gate::default());
+        let _release = ReleaseGate(Arc::clone(&gate));
+        let blockers = if already_sent {
+            None
+        } else {
+            Some(AdmissionBlockers::start(&harness).await)
+        };
+        a.reply("clear", already_sent.then(|| Arc::clone(&gate)));
+        let task = if already_sent {
+            harness.job()
+        } else {
+            queued_job(&mut harness, &candidate, Arc::clone(&gate))
+        };
+        gate.wait().await;
+        let (frozen, prepared, revision): (String, String, u64) = harness.fixture.store.lock().query_row(
+            "SELECT frozen_input_json, preparation_json,
+                (SELECT activity_revision FROM burn_check_session_attachment WHERE observer_epoch IS NOT NULL)
+             FROM burn_check_candidate WHERE candidate_id = ?1 AND state = 'dispatching'",
+            [&candidate], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert!(!task.is_finished());
+        harness.runtime.clock.fetch_add(1000, Ordering::AcqRel);
+        publish_native_change(
+            &harness,
+            NativeEvidenceFact::Activity(NativeActivityObservation {
+                source_format: SourceFormat::PiV3Jsonl,
+                session_id: "main".into(),
+                position: ToolResultPosition::Jsonl {
+                    record_index: 10,
+                    item_index: 0,
+                },
+                token: "new-native-work".into(),
+                native_at_ms: Some(deadline + 1000),
+            }),
+        );
+        let changed: (String, u64) = harness.fixture.store.lock().query_row(
+            "SELECT state, (SELECT activity_revision FROM burn_check_session_attachment WHERE observer_epoch IS NOT NULL)
+             FROM burn_check_candidate WHERE candidate_id = ?1",
+            [&candidate], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(changed, ("stale".into(), revision + 1));
+        assert!(harness.runtime.worker.key_is_current(generation));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect(
+                    "source cancellation must finish while permits or the response remain blocked"
+                )
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .outcome,
+            RunOutcome::Stale
+        );
+        gate.open();
+        if let Some(blockers) = blockers {
+            blockers.finish().await;
+        }
+        assert_stale_attempt(
+            &harness,
+            &candidate,
+            if already_sent { "unknown" } else { "permanent" },
+        );
+        let retained: (String, String) = harness.fixture.store.lock().query_row(
+            "SELECT frozen_input_json, preparation_json FROM burn_check_candidate WHERE candidate_id = ?1",
+            [&candidate], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(retained, (frozen, prepared));
+        let usage = harness.fixture.store.burn_check_usage_summary().unwrap();
+        assert_eq!(
+            (usage.confirmed_calls, usage.unknown_outcomes),
+            (0, u64::from(already_sent))
+        );
+        harness.host.catch_up().unwrap();
+        assert!(harness.job().await.unwrap().unwrap().is_none());
+        assert_stale_attempt(
+            &harness,
+            &candidate,
+            if already_sent { "unknown" } else { "permanent" },
+        );
+        assert_eq!((a.count(), b.count()), (usize::from(already_sent), 0));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_source_correction_cancels_a_queued_request_without_switching_connections() {
+    use antiburn_local::analysis::{
+        NativeEvidenceFact, NativeMessageObservation, ToolResultObservation,
+    };
+
+    let (a, b) = (Server::new(), Server::new());
+    let mut harness = Harness::in_memory(&a, &b);
+    harness.publish(1);
+    let candidate = pending_candidate(&harness);
+    let blockers = AdmissionBlockers::start(&harness).await;
+    let gate = Arc::new(Gate::default());
+    a.reply("clear", None);
+    let task = queued_job(&mut harness, &candidate, Arc::clone(&gate));
+    gate.wait().await;
+    let generation = harness
+        .runtime
+        .worker
+        .execution_snapshot()
+        .unwrap()
+        .generation;
+    let payload: String = harness.fixture.store.lock().query_row(
+        "SELECT payload_json FROM native_tool_result_current WHERE event_kind = 'tool_result' AND is_removed = 0",
+        [], |row| row.get(0),
+    ).unwrap();
+    let mut corrected: ToolResultObservation = serde_json::from_str(&payload).unwrap();
+    corrected.revision += 1;
+    corrected.content = Some("Corrected synthetic result: parser tests passed.".into());
+    publish_native_change(
+        &harness,
+        NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(corrected)),
+    );
+    assert_eq!(
+        harness
+            .fixture
+            .store
+            .lock()
+            .query_row(
+                "SELECT state FROM burn_check_candidate WHERE candidate_id = ?1",
+                [&candidate],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "stale"
+    );
+    assert!(harness.runtime.worker.key_is_current(generation));
+    blockers.finish().await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .outcome,
+        RunOutcome::Stale
+    );
+    assert_stale_attempt(&harness, &candidate, "permanent");
+    harness.host.catch_up().unwrap();
+    assert!(harness.job().await.unwrap().unwrap().is_none());
+    assert_eq!((a.count(), b.count()), (0, 0));
+    let usage = harness.fixture.store.burn_check_usage_summary().unwrap();
+    assert_eq!((usage.confirmed_calls, usage.unknown_outcomes), (0, 0));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

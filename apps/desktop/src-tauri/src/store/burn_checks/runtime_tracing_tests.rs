@@ -5,6 +5,349 @@ use std::collections::BTreeSet;
 const SECRET: &str = "PRIVATE_TRACE_CANARY";
 
 #[test]
+fn rejected_preparation_traces_keep_typed_size_facts_and_preserve_absent_detail() {
+    use antiburn_checks::fit::{
+        NoFitReason, PreparationBudget, PreparationBudgetKind, PreparationFailureCode,
+        PreparationFailureContext,
+    };
+    for reason in [
+        None,
+        Some(NoFitReason::NoRules),
+        Some(NoFitReason::NoMatchingTargets),
+        Some(NoFitReason::TargetsAtMinimum),
+        Some(NoFitReason::ReductionsExhausted),
+    ] {
+        for kind in [
+            PreparationBudgetKind::RequestBytes,
+            PreparationBudgetKind::EstimatedTokens,
+            PreparationBudgetKind::ResidentBytes,
+        ] {
+            let (store, adapter, active) = fixture();
+            let candidate = apply(&adapter, &active, &event(&store, 1, SECRET, SECRET, 1));
+            let claimed = claim(&adapter, &candidate);
+            let failure = PreparationFailure {
+                code: PreparationFailureCode::NoFit,
+                detail: SECRET.into(),
+                report: None,
+                context: Box::new(PreparationFailureContext {
+                    decision: Some(SECRET.into()),
+                    field: Some(SECRET.into()),
+                    input_path: Some(SECRET.into()),
+                    no_fit_reason: reason,
+                    budget: Some(PreparationBudget {
+                        kind,
+                        observed: 32641,
+                        maximum: 28672,
+                    }),
+                }),
+            };
+            let captured = LogCapture::default();
+            tracing::subscriber::with_default(captured.clone(), || {
+                for _ in 0..100 {
+                    adapter
+                        .record_preparation(&claimed, &PreparationRecord::Rejected(failure.clone()))
+                        .unwrap();
+                }
+                adapter
+                    .record_preparation_rejection(&claimed, &failure)
+                    .unwrap();
+            });
+            let preparations = captured.events("burn_check_preparation_committed");
+            assert_eq!(preparations.len(), 1);
+            let settled = captured.events("burn_check_candidate_settled");
+            assert_eq!(settled.len(), 1);
+            for event in [preparations.first().unwrap(), settled.first().unwrap()] {
+                assert_eq!(event.fields["no_fit_reason"], format!("{reason:?}"));
+                assert_eq!(event.fields["budget_kind"], format!("{:?}", Some(kind)));
+                assert_eq!(event.fields["budget_observed"], "32641");
+                assert_eq!(event.fields["budget_maximum"], "28672");
+            }
+            let allowed = [
+                "event",
+                "activation_ref",
+                "candidate_ref",
+                "generation",
+                "claim_fence",
+                "status",
+                "preparation_failure_code",
+                "no_fit_reason",
+                "budget_kind",
+                "budget_observed",
+                "budget_maximum",
+                "elapsed_ms",
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+            assert_eq!(
+                preparations[0]
+                    .fields
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+                allowed
+            );
+            assert!(!captured.text().contains(SECRET));
+            assert_eq!(
+                store
+                    .lock()
+                    .query_row(
+                        "SELECT COUNT(*) FROM burn_check_evaluation_attempt",
+                        [],
+                        |row| row.get::<_, usize>(0)
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+    }
+    for code in [
+        PreparationFailureCode::NoFit,
+        PreparationFailureCode::PreparationResourceLimit,
+        PreparationFailureCode::ProviderUnavailable,
+    ] {
+        let (store, adapter, active) = fixture();
+        let candidate = apply(&adapter, &active, &event(&store, 1, SECRET, SECRET, 1));
+        let claimed = claim(&adapter, &candidate);
+        let failure = PreparationFailure {
+            code,
+            detail: SECRET.into(),
+            report: None,
+            context: Default::default(),
+        };
+        let captured = LogCapture::default();
+        tracing::subscriber::with_default(captured.clone(), || {
+            adapter
+                .record_preparation_rejection(&claimed, &failure)
+                .unwrap();
+        });
+        let event = captured.events("burn_check_candidate_settled").remove(0);
+        assert_eq!(
+            event.fields["preparation_reason"],
+            format!("{:?}", Some(code))
+        );
+        assert_eq!(event.fields["no_fit_reason"], "None");
+        assert_eq!(event.fields["budget_kind"], "None");
+        assert!(!event.fields.contains_key("budget_observed"));
+        assert!(!event.fields.contains_key("budget_maximum"));
+        assert!(!captured.text().contains(SECRET));
+    }
+}
+
+#[test]
+fn preparation_write_failure_does_not_log_a_committed_preparation_or_settlement() {
+    let (store, adapter, active) = fixture();
+    let candidate = apply(&adapter, &active, &event(&store, 1, SECRET, SECRET, 1));
+    let claimed = claim(&adapter, &candidate);
+    let failure = PreparationFailure {
+        code: antiburn_checks::fit::PreparationFailureCode::NoFit,
+        detail: SECRET.into(),
+        report: None,
+        context: Default::default(),
+    };
+    store.lock().execute_batch("CREATE TRIGGER reject_preparation BEFORE UPDATE OF preparation_json ON burn_check_candidate
+        BEGIN SELECT RAISE(ABORT, 'PRIVATE_PREPARATION_ERROR'); END;").unwrap();
+    let captured = LogCapture::default();
+    tracing::subscriber::with_default(captured.clone(), || {
+        for _ in 0..100 {
+            assert!(
+                adapter
+                    .record_preparation(&claimed, &PreparationRecord::Rejected(failure.clone()))
+                    .is_err()
+            );
+        }
+        assert!(
+            adapter
+                .record_preparation_rejection(&claimed, &failure)
+                .is_err()
+        );
+    });
+    assert!(
+        captured
+            .events("burn_check_preparation_committed")
+            .is_empty()
+    );
+    assert!(captured.events("burn_check_candidate_settled").is_empty());
+    assert_eq!(
+        store
+            .lock()
+            .query_row(
+                "SELECT state, preparation_json FROM burn_check_candidate",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            )
+            .unwrap(),
+        ("claimed".into(), None)
+    );
+    assert_eq!(
+        store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_assessment_history",
+                [],
+                |row| row.get::<_, usize>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert!(!captured.text().contains("PRIVATE_"));
+}
+
+#[test]
+fn source_page_transition_counts_actual_revocations_and_logs_only_after_commit() {
+    let (store, adapter, active) = fixture();
+    let candidate = apply(&adapter, &active, &event(&store, 1, SECRET, SECRET, 1));
+    let assessment = answer(&adapter, &active, claim(&adapter, &candidate), 0.99);
+    assert_eq!(
+        adapter.accept(&assessment).unwrap(),
+        AcceptanceOutcome::Accepted
+    );
+    let engine = CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator));
+    let correction = event(&store, 2, SECRET, SECRET, 2);
+    store.lock().execute_batch("CREATE TRIGGER reject_page_revocation BEFORE UPDATE OF evidence_valid ON burn_check_assessment_history
+        WHEN OLD.evidence_valid = 1 AND NEW.evidence_valid = 0 BEGIN SELECT RAISE(ABORT, 'PRIVATE_PAGE_REVOCATION_ERROR'); END;").unwrap();
+    let captured = LogCapture::default();
+    tracing::subscriber::with_default(captured.clone(), || {
+        for _ in 0..100 {
+            assert!(engine.apply_source_page(&active, &correction).is_err());
+        }
+        assert!(
+            captured
+                .events("burn_check_evidence_transition_committed")
+                .is_empty()
+        );
+        assert_eq!(
+            adapter
+                .load_source_progress(&active)
+                .unwrap()
+                .publication_cursor,
+            PublicationCursor(1)
+        );
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT evidence_valid FROM burn_check_assessment_history",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        store
+            .lock()
+            .execute_batch("DROP TRIGGER reject_page_revocation")
+            .unwrap();
+        engine.apply_source_page(&active, &correction).unwrap();
+        let empty = SourceBatch {
+            events: vec![],
+            next: PublicationCursor(2),
+            has_more: false,
+        };
+        for _ in 0..100 {
+            engine.apply_source_page(&active, &empty).unwrap();
+        }
+    });
+    let transitions = captured.events("burn_check_evidence_transition_committed");
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(
+        transitions[0].fields["publication_origin"],
+        "\"runtime_source_page\""
+    );
+    assert_eq!(transitions[0].fields["publication_after_cursor"], "1");
+    assert_eq!(transitions[0].fields["publication_through_cursor"], "2");
+    assert_eq!(transitions[0].fields["accepted_evidence_revoked"], "1");
+    assert_eq!(transitions[0].fields["current_status_revoked"], "1");
+    assert_eq!(transitions[0].fields["unfinished_stale"], "0");
+    let allowed = [
+        "event",
+        "publication_origin",
+        "reason",
+        "activation_ref",
+        "generation",
+        "publication_after_cursor",
+        "publication_through_cursor",
+        "accepted_evidence_revoked",
+        "current_status_revoked",
+        "unfinished_stale",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(
+        transitions[0]
+            .fields
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        allowed
+    );
+    assert!(!captured.text().contains("PRIVATE_"));
+}
+
+#[test]
+fn source_page_revocation_stays_in_its_activation_scope_with_equal_candidate_fences() {
+    let (store, first_adapter, first) = fixture();
+    let mut second = first.clone();
+    second.id.scope.session_cwd = "/PRIVATE_SECOND_REPO".into();
+    second.project_root = Some("/PRIVATE_SECOND_REPO".into());
+    let second_adapter = Arc::new(
+        StoreCheckStore::new(
+            store.clone(),
+            "PRIVATE_SECOND_OWNER".into(),
+            second.id.scope.clone(),
+        )
+        .unwrap(),
+    );
+    second_adapter
+        .activate(
+            &second.id.definition_id,
+            &LifecycleTransition::Activated(second.clone()),
+            Some(&second),
+        )
+        .unwrap();
+    let first_candidate = apply(
+        &first_adapter,
+        &first,
+        &event(&store, 1, "PRIVATE_FIRST_ID", "PRIVATE_FIRST_SESSION", 1),
+    );
+    let second_page = event(&store, 2, "PRIVATE_SECOND_ID", "PRIVATE_SECOND_SESSION", 1);
+    store.lock().execute("UPDATE session SET cwd = '/PRIVATE_SECOND_REPO' WHERE session_id = 'PRIVATE_SECOND_SESSION'", []).unwrap();
+    let second_candidate = apply(&second_adapter, &second, &second_page);
+    let first_claim = claim(&first_adapter, &first_candidate);
+    let second_claim = claim(&second_adapter, &second_candidate);
+    assert_eq!(first_claim.fence, second_claim.fence);
+    for (adapter, active, claimed) in [
+        (&first_adapter, &first, first_claim),
+        (&second_adapter, &second, second_claim),
+    ] {
+        let assessment = answer(adapter, active, claimed, 0.99);
+        assert_eq!(
+            adapter.accept(&assessment).unwrap(),
+            AcceptanceOutcome::Accepted
+        );
+    }
+    let correction = event(&store, 3, "PRIVATE_FIRST_ID", "PRIVATE_FIRST_SESSION", 2);
+    let captured = LogCapture::default();
+    tracing::subscriber::with_default(captured.clone(), || {
+        CheckEngine::new(first_adapter.clone(), Arc::new(NoEvaluator))
+            .apply_source_page(&first, &correction)
+            .unwrap();
+    });
+    let events = captured.events("burn_check_evidence_transition_committed");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].fields["activation_ref"],
+        format!(
+            "{:?}",
+            crate::store::burn_checks::trace_refs::activation_ref(&first.id)
+        )
+    );
+    assert_eq!(events[0].fields["accepted_evidence_revoked"], "1");
+    let valid: i64 = store.lock().query_row("SELECT evidence_valid FROM burn_check_assessment_history WHERE activation_scope_key = ?1", [&second_adapter.activation_scope_key], |row| row.get(0)).unwrap();
+    assert_eq!(valid, 1);
+    assert!(!captured.text().contains("PRIVATE_"));
+}
+
+#[test]
 fn tracing_records_committed_stages_without_content_or_repeated_preparation_and_recovery() {
     let (store, adapter, active) = fixture();
     let captured = LogCapture::default();

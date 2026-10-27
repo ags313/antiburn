@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 
 #[path = "opencode_public_events/merge.rs"]
 mod merge;
+#[path = "opencode_public_events/request_history.rs"]
+mod request_history;
 #[path = "opencode_public_events/review.rs"]
 mod review;
 #[path = "opencode_public_events/v2_tool_facts.rs"]

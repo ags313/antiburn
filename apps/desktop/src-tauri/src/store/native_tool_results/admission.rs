@@ -64,7 +64,7 @@ pub(crate) fn invalidate_in(
     tx: &Transaction<'_>,
     session: &SessionKey,
     reason: &str,
-) -> Result<()> {
+) -> Result<super::trace_effects::InvalidationEffects> {
     tx.execute(
         "UPDATE native_file_delivery SET last_error = ?4
         WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
@@ -75,20 +75,20 @@ pub(crate) fn invalidate_in(
             reason
         ],
     )?;
-    super::observers::break_continuity_in(tx, session)?;
+    let mut effects = super::observers::break_continuity_in(tx, session)?;
     let branch = session.to_identity_json();
-    tx.execute(
+    effects.unfinished_stale += tx.execute(
         "UPDATE burn_check_candidate SET state = 'stale' WHERE session_key_json = ?1
         AND state IN ('pending', 'claimed', 'dispatching', 'answered')",
         [&branch],
     )?;
-    tx.execute("UPDATE burn_check_assessment_history SET evidence_valid = 0 WHERE candidate_id IN (
+    effects.accepted_evidence_revoked += tx.execute("UPDATE burn_check_assessment_history SET evidence_valid = 0 WHERE evidence_valid = 1 AND candidate_id IN (
         SELECT c.candidate_id FROM burn_check_candidate c JOIN burn_check_candidate_dependency d USING(candidate_id)
         WHERE c.session_key_json = ?1 AND d.native_revision IS NOT NULL)", [&branch])?;
-    tx.execute("UPDATE burn_check_current_status SET evidence_valid = 0 WHERE assessment_id IN (
+    effects.current_status_revoked += tx.execute("UPDATE burn_check_current_status SET evidence_valid = 0 WHERE evidence_valid = 1 AND assessment_id IN (
         SELECT assessment_id FROM burn_check_assessment_history WHERE evidence_valid = 0 AND candidate_id IN (
           SELECT candidate_id FROM burn_check_candidate WHERE session_key_json = ?1))", [&branch])?;
-    Ok(())
+    Ok(effects)
 }
 
 pub(crate) fn candidate_current_in(connection: &Connection, candidate: &str) -> Result<bool> {

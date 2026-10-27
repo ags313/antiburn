@@ -95,6 +95,81 @@ fn selection_budget(cases: &[cases::Case]) -> Result<(usize, usize)> {
     Ok((evaluations, attempts))
 }
 
+#[tokio::test]
+async fn replay_snapshot_keeps_observed_models_per_attempt_and_preserves_preparations() -> Result<()>
+{
+    use antiburn_checks::decision::DecisionAttempt;
+    use antiburn_local::analysis::jev::{JevResponseObservation, JevUsage, NATIVE_MODEL_ALIAS};
+
+    let case = cases::cases()
+        .into_iter()
+        .find(|case| case.id == "rolling-recovery")
+        .context("two-assessment fixture")?;
+    let mut session = SessionReplay::for_case(&case)?;
+    let evaluator = Arc::new(CheckedEvaluator::new(
+        &case,
+        ScriptedEvaluator::new(case.expected),
+    ));
+    session.run(evaluator, limits(&case), || false).await?;
+    let saved = session.store.lock().prepare(
+        "SELECT candidate_id, preparation_json FROM burn_check_candidate ORDER BY trigger_position",
+    )?.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(saved.len() == 2, "fixture must retain two preparations");
+    for ((candidate, preparation), model) in saved.iter().zip(["jev-1.13.0", "future/jev-2"]) {
+        let prepared: Value = serde_json::from_str(preparation)?;
+        ensure!(
+            prepared["decisions"][0]["request"]["model"] == NATIVE_MODEL_ALIAS,
+            "prepared request must keep the native alias"
+        );
+        session.store.record_burn_check_decision_observation(
+            candidate,
+            &DecisionAttempt::new("review", 1)?,
+            &session.activation.id.definition_id,
+            ("typesafe-systemone", NATIVE_MODEL_ALIAS),
+            Some(JevResponseObservation {
+                usage: JevUsage {
+                    input_tokens: 100,
+                    output_tokens: 4,
+                },
+                served_model: Some(model.into()),
+            }),
+            100,
+        )?;
+    }
+    let snapshot = session.snapshot()?;
+    for ((candidate, preparation), model) in saved.iter().zip(["jev-1.13.0", "future/jev-2"]) {
+        let attempt = snapshot["attempts"]
+            .as_array()
+            .context("attempts")?
+            .iter()
+            .find(|attempt| attempt["candidate_id"] == *candidate)
+            .context("stored attempt")?;
+        ensure!(
+            attempt["served_model"] == model && attempt["usage_known"] == true,
+            "snapshot lost per-attempt identity"
+        );
+        let retained: String = session.store.lock().query_row(
+            "SELECT preparation_json FROM burn_check_candidate WHERE candidate_id = ?1",
+            [candidate],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            retained == *preparation,
+            "observation changed immutable preparation"
+        );
+    }
+    ensure!(
+        snapshot["usage"]["confirmedCalls"] == 2 && snapshot["usage"]["unknownOutcomes"] == 0,
+        "known unpriced usage must stay confirmed"
+    );
+    ensure!(
+        snapshot["usage"]["estimatedUsd"].is_null(),
+        "future observed model must stay unpriced"
+    );
+    Ok(())
+}
+
 #[test]
 fn entire_registry_fits_live_budget() -> Result<()> {
     let cases = cases::cases();
@@ -188,13 +263,13 @@ async fn live_case(case: &cases::Case, client: &TypeSafeClient) -> Value {
             .with_cancellation(move || Instant::now() >= cancel_at)
             .with_usage(Arc::new(move |candidate, attempt, usage| {
                 usage_store
-                    .record_burn_check_decision_usage(
+                    .record_burn_check_decision_observation(
                         candidate,
                         attempt,
                         &check_id,
                         (
                             "typesafe-systemone",
-                            antiburn_local::analysis::jev::PINNED_MODEL,
+                            antiburn_local::analysis::jev::NATIVE_MODEL_ALIAS,
                         ),
                         usage,
                         time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -220,7 +295,8 @@ async fn live_case(case: &cases::Case, client: &TypeSafeClient) -> Value {
         (Ok(Ok(report)), Ok(stored)) => {
             row["report"] = support::report_value(&report);
             row["report"]["provider"] = json!("typesafe-systemone");
-            row["report"]["model"] = json!(antiburn_local::analysis::jev::PINNED_MODEL);
+            row["report"]["requested_model"] =
+                json!(antiburn_local::analysis::jev::NATIVE_MODEL_ALIAS);
             check_integrity(case, &report, stored).and_then(|()| {
                 let calls = stored["usage"]["confirmedCalls"]
                     .as_u64()

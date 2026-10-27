@@ -9,6 +9,8 @@
 //! an entry that has shipped: an installed database has already run it.
 
 mod compatibility;
+#[cfg(test)]
+mod usage_observation_tests;
 pub(super) use compatibility::{prepare_source_metadata, repair_branch_version};
 
 /// Every migration, in order. The index of an entry plus one is the
@@ -103,7 +105,16 @@ pub const MIGRATIONS: &[&str] = &[
     V87,
     V88,
     V89,
+    V90,
 ];
+
+const V90: &str = r#"
+ALTER TABLE burn_check_decision_usage ADD COLUMN served_model TEXT
+    CHECK (served_model IS NULL OR (usage_known = 1
+        AND length(served_model) BETWEEN 1 AND 128
+        AND instr(served_model, char(0)) = 0
+        AND served_model NOT GLOB '*[^A-Za-z0-9._:/-]*'));
+"#;
 
 const V89: &str = concat!(
     r#"
@@ -2247,7 +2258,7 @@ mod decision_migration_tests {
                 .unwrap();
             connection
                 .execute(
-                    "INSERT INTO burn_check_decision_usage VALUES (?1, ?2)",
+                    "INSERT INTO burn_check_decision_usage (attempt_id, usage_known) VALUES (?1, ?2)",
                     params![format!("{state}:1"), state != "dispatching"],
                 )
                 .unwrap();

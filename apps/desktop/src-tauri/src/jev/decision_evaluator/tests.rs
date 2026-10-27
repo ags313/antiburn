@@ -13,6 +13,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "native_tests.rs"]
+mod native_tests;
+
 const SOURCE: &str = "name: Selected provider\non:\n  tool_result:\n  window: {size: 3, min: 1}\ndecisions:\n  review:\n    input: {rows: '${{ window.messages }}'}\n    fit: {rows: recent}\n    output:\n      verdict:\n        type: choice\n        question: Does the evidence show a concern?\n        criteria: {concern: Concern., clear: Clear.}\nactions:\n  - type: status\n    if: decisions.review.details.verdict.probabilities.concern > 0.9\n    input: {result: failure}\n";
 
 fn activation() -> EffectiveActivation {
@@ -142,6 +145,9 @@ fn accept(listener: &TcpListener) -> TcpStream {
     }
 }
 fn read_request(socket: &mut TcpStream) -> Vec<u8> {
+    read_request_with_headers(socket).1
+}
+fn read_request_with_headers(socket: &mut TcpStream) -> (String, Vec<u8>) {
     let mut received = Vec::new();
     loop {
         let mut chunk = [0; 4096];
@@ -160,7 +166,10 @@ fn read_request(socket: &mut TcpStream) -> Vec<u8> {
                 })
                 .unwrap();
             if received.len() >= end + 4 + length {
-                return received[end + 4..end + 4 + length].to_vec();
+                return (
+                    headers.into_owned(),
+                    received[end + 4..end + 4 + length].to_vec(),
+                );
             }
         }
     }
@@ -455,6 +464,7 @@ fn raw_typed_results_keep_labels_scores_probabilities_and_independent_confidence
         serde_json::from_value(valid_response(true)).unwrap(),
         &evaluator.capabilities,
         2,
+        SystemOneProvider::Custom,
     )
     .unwrap();
     let values = serde_json::to_value(&result).unwrap();
@@ -656,7 +666,12 @@ async fn invalid_answers_keep_usage_and_callback_errors_win_without_resending() 
             }
         );
         assert_eq!(
-            *calls.lock().unwrap(),
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|observation| observation.as_ref().map(|observation| observation.usage))
+                .collect::<Vec<_>>(),
             [Some(JevUsage {
                 input_tokens: 12,
                 output_tokens: 3
@@ -746,6 +761,7 @@ fn optional_probability_and_confidence_details_follow_independent_verified_flags
             serde_json::from_value(valid_response(false)).unwrap(),
             &evaluator.capabilities,
             1,
+            SystemOneProvider::Custom,
         )
         .unwrap();
         let QuestionResult::Choice(answer) = result.answers()[0].result() else {
@@ -836,6 +852,7 @@ fn authentication_and_failure_classification_remain_typed() {
             Err(error.clone()),
             &evaluator.capabilities,
             2,
+            SystemOneProvider::Custom,
         );
         let called = Arc::new(AtomicBool::new(false));
         let captured = called.clone();

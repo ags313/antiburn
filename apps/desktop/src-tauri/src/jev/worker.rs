@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
+use std::time::Duration;
 
 #[cfg(test)]
 use crate::jev::client::TypeSafeClient;
@@ -10,7 +11,51 @@ use crate::store::Store;
 
 const PREPARATION_WORKERS: usize = 4;
 
+#[derive(Clone, Copy)]
+pub(crate) enum BlockingPreparationStage {
+    WorkProbe,
+    PreparationStart,
+}
+
+impl BlockingPreparationStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkProbe => "work_probe",
+            Self::PreparationStart => "preparation_start",
+        }
+    }
+}
+
+fn trace_blocking_preparation(
+    stage: BlockingPreparationStage,
+    slot_wait: Duration,
+    elapsed: Duration,
+    succeeded: bool,
+) {
+    let stage = stage.as_str();
+    let slot_wait_ms = slot_wait.as_millis();
+    let elapsed_ms = elapsed.as_millis();
+    if slot_wait >= Duration::from_secs(1) || elapsed >= Duration::from_secs(1) {
+        ::tracing::debug!(
+            event = "burn_check_blocking_preparation",
+            stage,
+            slot_wait_ms,
+            elapsed_ms,
+            succeeded,
+        );
+    } else {
+        ::tracing::trace!(
+            event = "burn_check_blocking_preparation",
+            stage,
+            slot_wait_ms,
+            elapsed_ms,
+            succeeded,
+        );
+    }
+}
+
 pub(crate) async fn run_blocking_preparation<T: Send + 'static>(
+    stage: BlockingPreparationStage,
     prepare: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> anyhow::Result<T> {
     let waiting = std::time::Instant::now();
@@ -19,17 +64,12 @@ pub(crate) async fn run_blocking_preparation<T: Send + 'static>(
         .get_or_init(|| tokio::sync::Semaphore::new(PREPARATION_WORKERS))
         .acquire()
         .await?;
-    let slot_wait_ms = waiting.elapsed().as_millis();
+    let slot_wait = waiting.elapsed();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let started = std::time::Instant::now();
         let result = prepare();
-        ::tracing::debug!(
-            event = "burn_check_blocking_preparation",
-            slot_wait_ms,
-            elapsed_ms = started.elapsed().as_millis(),
-            succeeded = result.is_ok(),
-        );
+        trace_blocking_preparation(stage, slot_wait, started.elapsed(), result.is_ok());
         result
     })
     .await?

@@ -330,7 +330,7 @@ pub(super) fn definition_diagnostic(
         ),
         CompileUnsupportedFeature => (
             "Use a supported check feature",
-            "This feature is not supported in v1-prealpha. Update the definition to the supported authoring format.",
+            "This feature is not supported in v1-alpha. Update the definition to the supported authoring format.",
         ),
         CompileInvalidExpression => (
             "Fix the expression",
@@ -463,7 +463,7 @@ impl SafeDiagnostic {
             ConfigUnknownField => "This field is not supported.",
             ConfigInvalidType => "The field has an incorrect type.",
             ConfigInvalidValue => "The field has an invalid value.",
-            CompileUnsupportedFeature => "Burn Checks do not support this feature in pre-alpha.",
+            CompileUnsupportedFeature => "Burn Checks do not support this feature in v1-alpha.",
             CompileInvalidExpression => "The expression syntax is invalid.",
             CompileUnknownReference => "The expression references an unavailable field.",
             CompileInvalidWindow => "Window size must be 1 through 40, with 1 <= min <= size.",

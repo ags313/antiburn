@@ -24,19 +24,30 @@ server, or backend.
   eligibility. See [source coverage](../../docs/session-coverage.md) for limits.
   OpenCode 2 releases are admitted by default. Required data shapes and source
   identity checks, not an exact release allowlist, control reader eligibility.
-- **Model-based checks:** YAML checks default to enabled. Settings → Checks can
-  turn them off, and a saved off setting stays off. Check cards and navigation
+- **Model-based checks:** A fresh setup without a connection stays off. Settings →
+  Checks preserves the saved master setting. Check cards and navigation
   appear only for discovered definitions; Settings controls stay available.
-  The provider controls under **Model-based checks** select Jev, compatible
-  Ollama, Cloudflare, or Custom. Custom supports direct System One and
-  Cloudflare-envelope responses, not arbitrary chat APIs. Credentials use native
+  The connection list under **Model-based checks** supports Jev, compatible
+  Ollama, Cloudflare, or Custom. Add and edit use a connection dialog. Inactive
+  rows keep **Use** visible. Each row puts **Edit** and **Remove** in its actions menu.
+  **Use** selects a saved connection. Saving an inactive connection does not select it.
+  Removing the selected connection turns checks off and clears selection, even
+  when other connections remain. Saved results and usage remain available. The app
+  manages supported model limits; unknown Custom limits block execution.
+  Custom supports direct System One and Cloudflare-envelope responses, not arbitrary chat APIs. Credentials use native
   credential storage or memory. Requests contain selected tool results and
   available user-slot text, current instruction text, and declared skill
   descriptions, not full transcripts. Skill inventory inputs contain declared
   metadata, not full bodies; selected tool results can still contain file text. Current-file inputs
   remain frozen for delayed decisions and retries. Partial fields, truncated
   text, and source gaps are identified for the model; missing images are not analyzed.
-  Provider usage charges can apply.
+  Native Jev uses the saved TypeSafe credential with `jev-latest` and long
+  context enabled. New Jev releases do not require profile migrations. Requests
+  retain the alias; observed served models and known prices are per attempt.
+  Provider usage charges can apply. Check files shows only enabled folders with
+  confirmed files and reloads when you revisit Checks settings. Model usage shows
+  recorded values and omits absent estimates and unknown counts. The app retains
+  the full local accounting records.
 - **Model prices:** The app downloads public prices from models.dev at startup
   and once an hour while it runs. The request contains no session data or
   credentials.
@@ -183,13 +194,25 @@ payload schema. `cargo-deny` rejects known telemetry dependencies in the local
 engine. Release and dependency checks run through the required CI gate.
 
 YAML Burn Checks use the active System One connection, separate from analytics.
-Hosted requests can incur charges. In **Settings → Checks**, make sure
-**Run model-based checks** is enabled, choose a provider under **Model-based checks**, enter its
-required fields, and select **Save and use**. **Test connection** is optional;
-it sends synthetic input and can incur charges. Editing a draft or refreshing
-its limits does not make it active. Saved-profile selection restores from the
-saved active connection. See [decision connections](../../docs/burn-check/authoring.md#decision-connections)
+Hosted requests can incur charges. In **Settings → Checks → Model-based checks**,
+turn **Run checks** off while configuring the connection. Choose **Add
+connection**, enter its fields, and select **Add connection** in the dialog.
+The first connection becomes selected without enabling checks. For another saved
+connection, select **Use**, then enable **Run checks** when ready. **Edit** and
+**Save** change its configuration without selecting another connection. Saving a
+change to the selected connection updates that connection; turn checks off first
+to avoid starting work with the saved change. A test sends synthetic input and
+can incur charges. **Remove** deletes a saved connection, not its past results.
+**Check files** and **Model usage** are accordions inside the card. **Check files** lists
+actual container folders with file counts and a native open action. **Model
+usage** shows recorded device-wide requests and estimated cost. See
+[decision connections](../../docs/burn-check/authoring.md#decision-connections)
 for required fields and capability limits.
+
+If a connection operation needs recovery, use its explicit retry action. That
+action remains available even when removal has already deleted the connection
+row. Reading settings does not finish a pending operation. Keep typed changes
+until recovery confirms completion or you choose to discard them.
 
 Settings owns decision routing. A YAML decision `model` field is rejected as
 unknown; the app does not rewrite the definition. Observed coding-agent model
@@ -295,9 +318,9 @@ Settings teardown, and the memory rules behind those policies.
   companion and warms the popover's hidden renderer for the first click.
 - **Settings.** An ordinary decorated window, created on demand and destroyed
   on close. A source list on the left, one pane on the right; ordinary preference
-  controls write through immediately. Decision-provider drafts use **Save and
-  use** or an explicit saved-profile selection. Testing and limit refresh do not
-  save or select a draft. Remote-host connection forms save explicitly after
+  controls write through immediately. Decision-provider drafts save explicitly;
+  **Use** selects a saved connection. Saving an inactive connection preserves
+  selection. Testing does not save or select a draft. Remote-host connection forms save explicitly after
   validation; canceling a form preserves the existing host configuration.
   General → Application controls the menu-bar or system-tray icon. macOS also
   controls Dock visibility and always keeps at least one entry point visible.

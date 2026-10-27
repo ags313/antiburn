@@ -6,6 +6,7 @@ import type * as InsightsIpcModule from "../../../../lib/insightsIpc"
 import type * as IpcModule from "../../../../lib/ipc"
 import { BurnChecksView } from "../../BurnChecksView"
 import { searchApp } from "../../../../lib/appSearch"
+import { installedCheckFixture } from "./installedCheckFixture"
 
 import {
   report,
@@ -222,5 +223,37 @@ describe("BurnChecksView search", { timeout: 15_000 }, () => {
     expect(
       screen.queryByText("This check has not checked any sessions yet."),
     ).not.toBeInTheDocument()
+  })
+
+  it("settles an unknown installed search when its row arrives, then closes it on removal", async () => {
+    HTMLElement.prototype.scrollIntoView = vi.fn()
+    const { adapter, session, view } = setup(target, false, aggregate, report)
+    await screen.findByRole("button", { name: /Old model usage/ })
+    view.rerender(
+      <BurnChecksView
+        active
+        session={session}
+        focusedCheck={installedCheckFixture.effectiveId}
+        focusRevision={1}
+      />,
+    )
+    expect(screen.getByRole("heading", { name: "failed-retry-loop" })).toBeVisible()
+    vi.mocked(adapter.getReport).mockResolvedValueOnce({
+      ...report,
+      installedChecks: [installedCheckFixture],
+    })
+    await act(async () => session.refresh())
+    const row = screen.getByRole("button", { name: /Failed retry loop, / })
+    expect(row).toHaveAttribute("aria-pressed", "true")
+    expect(row).toHaveFocus()
+
+    vi.mocked(adapter.getReport).mockResolvedValueOnce(report)
+    await act(async () => session.refresh())
+    expect(screen.queryByRole("heading", { name: "failed-retry-loop" })).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("This check has not checked any sessions yet."),
+    ).not.toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: "Old model usage" })).toBeVisible()
+    expect(screen.getByRole("button", { name: /Old model usage, / })).toHaveFocus()
   })
 })

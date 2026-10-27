@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use antiburn_checks::actions::{ActionOutcomeKind, plan_status_actions};
+use antiburn_checks::actions::{ActionOutcomeKind, ActionPlan, plan_status_actions};
 use antiburn_checks::compiler::{StatusResult, ToolCategory, ToolResultStatus};
 use antiburn_checks::definition_lifecycle::EffectiveActivation;
 use antiburn_checks::discovery::DefinitionScope;
@@ -18,7 +18,12 @@ pub mod support;
 use canonical_support::{DEFINITIONS, check, context, input};
 use support::{choice_for_check, choice_labels};
 
-fn scripted_status(id: &str, label: &str) -> (StatusResult, Option<String>) {
+fn scripted_plan(
+    id: &str,
+    label: &str,
+    probability: f64,
+    prior_status: Option<StatusResult>,
+) -> ActionPlan {
     let check = check(id);
     let labels = choice_labels(&check);
     let probabilities = labels
@@ -27,15 +32,19 @@ fn scripted_status(id: &str, label: &str) -> (StatusResult, Option<String>) {
             (
                 name.clone(),
                 if name == label {
-                    0.98
+                    probability
                 } else {
-                    0.02 / (labels.len() - 1) as f64
+                    (1.0 - probability) / (labels.len() - 1) as f64
                 },
             )
         })
         .collect::<BTreeMap<_, _>>();
     let answer = choice_for_check(&check, label, Some(probabilities)).unwrap();
-    let plan = plan_status_actions(&check.actions, &json!({}), &answer, None).unwrap();
+    plan_status_actions(&check.actions, &json!({}), &answer, prior_status).unwrap()
+}
+
+fn scripted_status(id: &str, label: &str) -> (StatusResult, Option<String>) {
+    let plan = scripted_plan(id, label, 0.98, None);
     let message = plan
         .outcomes
         .iter()
@@ -49,15 +58,15 @@ fn scripted_status(id: &str, label: &str) -> (StatusResult, Option<String>) {
 }
 
 #[test]
-fn all_six_definitions_keep_bounded_selection_and_probability_requirements() {
-    for ((id, _), size, minimum) in [
-        (DEFINITIONS[0], 5, 3),
-        (DEFINITIONS[1], 20, 10),
-        (DEFINITIONS[2], 20, 5),
-        (DEFINITIONS[3], 20, 3),
-        (DEFINITIONS[4], 20, 3),
-        (DEFINITIONS[5], 5, 3),
-    ] {
+fn all_five_definitions_keep_bounded_selection_and_probability_requirements() {
+    for (id, _) in DEFINITIONS {
+        let (size, minimum) = match id {
+            "over-exploring" => (20, 10),
+            "scope-creep" => (20, 5),
+            "ignored-instructions" | "skill-opportunities" => (20, 3),
+            "fast-mode-value" => (5, 3),
+            _ => panic!("missing canonical window expectation: {id}"),
+        };
         let check = check(id);
         let window = check.trigger.window.unwrap();
         assert_eq!((window.size, window.minimum), (size, minimum), "{id}");
@@ -76,10 +85,18 @@ fn all_six_definitions_keep_bounded_selection_and_probability_requirements() {
                 .any(|label| label == "uncertain")
         );
         assert!(check.trigger.models.is_none(), "{id}");
-        assert_eq!(
-            scripted_status(id, "uncertain"),
-            (StatusResult::Success, None)
-        );
+        if id == "ignored-instructions" {
+            assert_eq!(check.trigger.cooldown.as_secs(), 60);
+            assert_eq!(
+                scripted_plan(id, "uncertain", 0.98, None).current_status,
+                None
+            );
+        } else {
+            assert_eq!(
+                scripted_status(id, "uncertain"),
+                (StatusResult::Success, None)
+            );
+        }
     }
     let over = check("over-exploring");
     assert_eq!(
@@ -93,57 +110,65 @@ fn all_six_definitions_keep_bounded_selection_and_probability_requirements() {
 }
 
 #[test]
+fn ignored_instructions_scripted_actions_require_supported_labels_and_probability() {
+    // Scripted answers test action routing, not model judgment quality.
+    for label in [
+        "recorded_correction_conflict",
+        "current_file_mismatch",
+        "no_conflict",
+        "uncertain",
+    ] {
+        for probability in [0.949, 0.95, 0.98] {
+            let write = if probability < 0.95 || label == "uncertain" {
+                None
+            } else if label == "no_conflict" {
+                Some((2, StatusResult::Success))
+            } else {
+                Some((
+                    usize::from(label == "current_file_mismatch"),
+                    StatusResult::Failure,
+                ))
+            };
+            for prior in [
+                None,
+                Some(StatusResult::Failure),
+                Some(StatusResult::Success),
+            ] {
+                let plan = scripted_plan("ignored-instructions", label, probability, prior);
+                assert_eq!(
+                    plan.current_status,
+                    write.map(|(_, status)| status).or(prior)
+                );
+                assert_eq!(plan.outcomes.len(), 3);
+                for outcome in &plan.outcomes {
+                    match write {
+                        Some((index, expected)) if outcome.index == index => {
+                            let ActionOutcomeKind::Applied { result, message } = &outcome.outcome
+                            else {
+                                panic!("Expected a status write for {label} at {probability}");
+                            };
+                            assert_eq!(*result, expected);
+                            if expected == StatusResult::Success {
+                                assert_eq!(
+                                    message.as_deref(),
+                                    Some(
+                                        "The supplied rules and corrections show no direct conflict in the selected work. This does not assess missing evidence or past instruction activation."
+                                    )
+                                );
+                            }
+                        }
+                        _ => assert_eq!(outcome.outcome, ActionOutcomeKind::SkippedConditionFalse),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn scripted_task_cases_preserve_inputs_and_write_only_the_authored_policy() {
     // Scripted labels test input and action contracts, not model judgment quality.
     for (id, case, request, result, label, expected) in [
-        (
-            "failed-retry-loop",
-            "repeated-unresolved",
-            "Fix the parser failure.",
-            "parse_empty FAILED: expected [], got null",
-            "stuck",
-            StatusResult::Failure,
-        ),
-        (
-            "failed-retry-loop",
-            "relevant-recovery",
-            "Fix the parser failure.",
-            "Fixed parse_empty. Parser tests: 12 passed.",
-            "clear",
-            StatusResult::Success,
-        ),
-        (
-            "failed-retry-loop",
-            "unrelated-success",
-            "Fix the parser failure.",
-            "Parser still fails; unrelated formatter succeeded.",
-            "stuck",
-            StatusResult::Failure,
-        ),
-        (
-            "failed-retry-loop",
-            "requested-polling",
-            "Poll the startup service three times. Temporary failures are expected.",
-            "Service not ready: HTTP 503.",
-            "clear",
-            StatusResult::Success,
-        ),
-        (
-            "failed-retry-loop",
-            "unfinished-fix",
-            "Fix the parser failure.",
-            "Corrective command started in background; result is not known.",
-            "uncertain",
-            StatusResult::Success,
-        ),
-        (
-            "failed-retry-loop",
-            "omitted-output",
-            "Fix the parser failure.",
-            "Failure detail [... omitted ...] outcome is unknown.",
-            "uncertain",
-            StatusResult::Success,
-        ),
         (
             "over-exploring",
             "separate-purpose",

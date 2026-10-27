@@ -98,17 +98,24 @@ accepted shape, safe identity/order/ownership, source baseline, and exact live
 activation. The [public source contracts](session-coverage.md#public-messages-and-live-event-eligibility)
 give producer commits, finality, correction, and bounded-history limits.
 
-| Native route                     | `user_message`                 | `assistant_message`                                | `tool_call`                                       | `turn_end`                                              | `session_start` / `session_idle`           |
-| -------------------------------- | ------------------------------ | -------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------- | ------------------------------------------ |
-| Claude Code CLI 2.1.278          | Accepted user slot             | Unavailable                                        | Complete explicit `tool_use`                      | Unavailable                                             | Host `attached` / observed 120-second idle |
-| Codex 0.160.1                    | Retained user proof            | Completed `AgentMessage` plus exact raw projection | Characterized explicit calls                      | Exact complete task interval                            | Host `attached` / observed 120-second idle |
-| OpenCode V1 1.18.35 journal      | Non-synthetic user text        | Final text-end plus completed assistant header     | Full running call in observed assistant lifecycle | Unavailable                                             | Host `attached` / observed 120-second idle |
-| Pi 0.84.4 core V3                | Accepted user slot and lineage | Characterized persisted `stop` / `toolUse`         | Complete explicit `toolCall`                      | Unavailable                                             | Host `attached` / observed 120-second idle |
-| OpenCode V2 v2.0.32 live capture | Inbox delivery, not enqueue    | Final text slots plus successful `step.ended`      | Full call with exact step/name join               | Verified baseline and later complete execution interval | Host `attached` / observed 120-second idle |
+| Native route                     | `user_message`                 | `assistant_message`                                | `tool_call`                                       | `tool_result`                                    | `turn_end`                                              | `session_start`      | `session_idle`               |
+| -------------------------------- | ------------------------------ | -------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------ | ------------------------------------------------------- | -------------------- | ---------------------------- |
+| Claude Code CLI 2.1.278          | Accepted user slot             | Unavailable                                        | Complete explicit `tool_use`                      | Terminal result with exact call binding          | Unavailable                                             | Host `attached` only | Observed 120-second boundary |
+| Codex 0.160.1                    | Retained user proof            | Completed `AgentMessage` plus exact raw projection | Characterized explicit calls                      | Terminal result with exact call binding          | Exact complete task interval                            | Host `attached` only | Observed 120-second boundary |
+| OpenCode V1 1.18.35 journal      | Non-synthetic user text        | Final text-end plus completed assistant header     | Full running call in observed assistant lifecycle | Terminal result with exact call binding          | Unavailable                                             | Host `attached` only | Observed 120-second boundary |
+| Pi 0.84.4 core V3                | Accepted user slot and lineage | Characterized persisted `stop` / `toolUse`         | Complete explicit `toolCall`                      | Terminal result with exact call binding          | Unavailable                                             | Host `attached` only | Observed 120-second boundary |
+| OpenCode V2 v2.0.32 live capture | Inbox delivery, not enqueue    | Final text slots plus successful `step.ended`      | Full call with exact step/name join               | Captured terminal result with exact native joins | Verified baseline and later complete execution interval | Host `attached` only | Observed 120-second boundary |
 
 Existing terminal-result support remains under its result contracts. Stored
 snapshots, exports, remote/WSL copies, and other source formats do not inherit
 these live events. User-slot admission does not prove human origin or approval.
+OpenCode capture alerts cover current activity and unfinished checks. A saved
+error or expired capture on an inactive session does not add an alert or count as
+new unassessed work. This does not restore missing evidence or accepted results.
+An unapplied detach publication alone does not establish current alert relevance;
+the runtime still consumes it and applies its evidence-validity rules.
+Stored OpenCode V2 metrics cannot revoke live-check evidence. Verified capture
+updates still invalidate results when their selected evidence changes.
 Private reasoning and unfinished streams do not become public assistant
 messages. Source-specific synthetic, summary, and UI projections still need the
 stated finality proof. A public assistant completion does not itself prove a
@@ -156,15 +163,17 @@ quality-only gaps.
 
 Native file and journal checks follow committed source publication. Their report
 readiness uses the committed delivery receipt and current scope, not
-legacy metric freshness. **Run model-based checks** controls YAML check
+legacy metric freshness. **Run checks** under Model-based checks controls YAML check
 activation; the provider controls under **Model-based checks** select the active Jev, compatible
 Ollama, Cloudflare, or Custom System One connection. Custom supports direct and
 Cloudflare-envelope response modes. Settings owns routing, not a YAML decision
 `model` field. Observed coding-agent model fields remain evidence.
 
-The master setting defaults to enabled only when no preference was saved.
-Explicit saved off remains off; malformed or unreadable storage disables
-execution. YAML check cards and navigation require a discovered global or
+Fresh setup without a connection stays off. Existing saved master preferences
+remain in place; malformed or unreadable storage disables execution. Saving an
+inactive connection does not select it. Removing the selected connection turns
+checks off and clears selection without deleting accepted results, evidence, or
+usage. The empty selection persists across restart. YAML check cards and navigation require a discovered global or
 repository definition. Settings keeps its master toggle and decision-model setup
 available without definitions. A discovered check with no configured System One
 provider shows an actionable setup error in its detail pane; without definitions,
@@ -182,7 +191,7 @@ restore scheduling without changing the definition. This adds no session source,
 producer version, or native detector support. See
 [decision connections](burn-check/authoring.md#decision-connections).
 
-Maintained probability-gated examples, including Failed retry loop, cannot run
+Maintained probability-gated examples, including Fast mode value, cannot run
 on a label-only Choice route. A route's selected label does not establish a
 probability distribution. Missing probabilities stay unavailable rather than
 receiving invented values or confidence substitutions.
@@ -443,29 +452,26 @@ shows a YAML check as Not assessed until an accepted status action writes succes
 or failure. Cards stay in their last saved result group while queued or running
 work adds Checking. A known event countdown can appear in detail after catch-up.
 These progress states do not write engine status or add a clean session.
-Failed retry loop selects no assistant-message context
-from the session. Provider framing and explicit omission metadata are separate
+The maintained examples select tool-result windows, not assistant-message
+context from the session. Provider framing and explicit omission metadata are separate
 from the selected session evidence.
 
-Maintained YAML examples explicitly pass every valid answer that does not meet
-their failure condition. Failed retry loop requires `stuck` with a label
+Most maintained YAML examples explicitly pass every valid answer that does not meet
+their failure condition. Ignored instructions instead requires `no_conflict`
+with label probability at least 0.95 to write success. Uncertain and
+below-threshold answers write no new result, so an earlier valid finding can
+remain visible. Fast mode value requires `try_standard_mode` with a label
 probability of at least 0.95 to fail; uncertainty and a lower label probability
 write success. Such success
 does not prove repair or whole-session correctness. Missing evidence, failed
 execution, and invalid answers do not receive automatic success. A status write
 without `input.message` clears the previous message for that branch.
 
-Failed retry loop selects the latest five results and requires at least three
-attempts at the same failing operation and failure, unresolved at the trigger.
-Requested retries and expected polling do not qualify. Relevant successful
-recovery resets the earlier failure pattern; unrelated success does not. Missing
-records, truncated fields, or unfinished corrective work can limit selected
-evidence. Terminal state does not prove complete source history or content.
-The model still receives available results and request text with quality limits.
-A required field read that is unavailable can make that candidate not assessable;
-later results in the same session remain eligible. The check can say only that
-no corrective change is recorded in its selected results and requests; it cannot
-prove that no external change occurred.
+Missing records, truncated fields, or unfinished work can limit selected evidence.
+Terminal state does not prove complete source history or content. A required
+field read that is unavailable can make that candidate not assessable; later
+results in the same session remain eligible. No definition can prove that an
+unrecorded external change did not occur.
 
 Over-exploring selects completed `read` and `search` results, not every shell
 command. The pinned Codex single-file numbered shell slice supplies category
@@ -492,6 +498,10 @@ evidence. A request prefix through the trigger does not prove that every request
 preceded every earlier window result. Unavailable instruction scopes do not
 prevent an independent recorded-correction comparison.
 
+It retains a 20-result window and all available request history. Success covers
+only the supported comparison in the retained selected work, not omitted
+evidence, past rule activation, or whole-session correctness.
+
 Skill opportunities suggests reviewing the supplied configured descriptions for
 useful next-step guidance. Its result stays at inventory level and points to the
 saved assessment input. It does not name an unbound specific skill, claim that a
@@ -503,9 +513,13 @@ The two inventory definitions select whole current `global` and `repo` scopes
 to retain useful entries when an array is absent. The current expression language
 cannot build a selective object that safely omits that unavailable array. As a
 result, the other inventory in each scope can also enter the selected input; the
-questions ignore it. All inventory fields, task text, and approvals remain
-protected from fitting, so an oversized unrelated inventory can reject the
-assessment rather than silently shrink required evidence. See
+questions ignore it. Ignored instructions permits only unused skill descriptions
+to shrink, through `current_global_scope.skills[*].description` and
+`current_repo_scope.skills[*].description`. Instruction text and limits, skill
+names and paths, task text, approvals, request history, and selected arguments
+remain intact. Skill opportunities preserves its inventory fields. Both permit
+selected result-content truncation. Large protected input can still reject
+preparation rather than silently shrink required evidence. See
 [current-file source limits](session-coverage.md#yaml-current-file-inputs).
 
 ### Decision-input fitting limits
@@ -527,7 +541,7 @@ paths, and overlap are errors. See the
 [authoring limits](burn-check/authoring.md#fit-large-inputs) and the
 [deployed preparation bounds](burn-check/authoring.md#preparation-limits).
 
-The maintained Failed retry loop and Fast mode value definitions permit only
+The maintained Fast mode value definition permits only
 `activity[*].tool.result.content: truncate`. Result records, linked arguments,
 status, and request/authorization text remain intact. Source-reader bounds can
 already omit evidence before fitting; fitting cannot recover that evidence or
@@ -565,7 +579,7 @@ records without preparation are explicitly labeled original source with the
 limit that exact assessed input was not saved. Current definition, activation,
 scope/ownership, source-validity, and report-cohort gates still apply.
 Saved **Decision connection** evidence identifies that assessment's provider and
-model, not the current Settings connection or the coding-agent model. It omits
+requested model, not the current Settings connection or the coding-agent model. It omits
 endpoints and credentials. Missing legacy provenance stays unavailable.
 Choice and Score require at least two criteria. Selected-route admission checks
 each type's verified interval and required details, including indirect and
@@ -574,6 +588,19 @@ permits at most 26 criteria; Score has its own limit. Neither is a language-wide
 or universal upstream maximum. See the [pinned provider contracts](burn-check/provider-contracts.md).
 Deterministic request-shape failures
 remain separate from fitting and connection failures.
+
+Native Jev requests use `jev-latest` and the native long-context header. Both
+local context ceilings are 262,000 estimated tokens before the 4,096-token
+reserve; serialized requests also have a 384 KiB body guard and an 832 KiB
+resident request-charge guard. Automatic route limits and shared preparation
+limits still apply; new work does not use saved manual overrides. This does not
+establish tokenizer-level capacity or make every
+candidate assessable. Custom, Cloudflare, and Ollama do not inherit these bounds.
+Observed served models belong to individual attempts, not saved credentials or
+the immutable request alias. Unknown served models retain confirmed usage but
+remain unpriced. Incompatible old preparation stops without another send, and
+unknown delivery remains terminal. No source or clean-result support follows
+from a larger provider context.
 
 Definition and execution diagnostics appear in the normal check detail with the
 available file location and a default-application **Open check file** action.
@@ -591,8 +618,10 @@ filename-stem ID after resolving project overrides. No-write preserves the
 original status explanation, time, and evidence. When no action of a definition
 matches, the accepted assessment advances its watermark without a status write.
 A branch with no prior write remains unassessed; there is no engine fallback
-success. Failed retry loop's complement action writes success for uncertainty
-and below-0.95 answers. One branch's success cannot clear another's
+success. Fast mode value's complement action writes success for uncertainty
+and below-0.95 answers. Ignored instructions writes success only for
+`no_conflict` at probability 0.95 or above; its uncertain answers preserve the
+previous status. One branch's success cannot clear another's
 valid failure. Explicit success covers assessed work only, not whole-session
 cleanliness, repair, or savings. YAML definitions provide status/explanations,
 without native fix prompts, Auto Fix, verification watches, burn estimates, or

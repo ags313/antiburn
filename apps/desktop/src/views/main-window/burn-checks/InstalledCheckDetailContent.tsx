@@ -14,7 +14,6 @@ import {
 import { CheckTargetHeading } from "./BurnCheckTargetDetail"
 import { InstalledCheckEvidence } from "./InstalledCheckEvidence"
 import { FailedSessions } from "./BurnCheckTargetPresentation"
-import { PassedCheckDetail } from "./BurnCheckDetailBody"
 import { InstalledCheckDiagnostics } from "./InstalledCheckDiagnostics"
 import { CheckDetailPanel } from "./CheckDetailPanel"
 
@@ -40,39 +39,82 @@ export function InstalledCheckDetailContent({
     check.clean === 0
   const waiting = installed.waitingForEvents
   const emptyMessage = installed.hasStarted
-    ? "No assessed sessions are in the current window."
+    ? "No check results in the current window."
     : "This check has not checked any sessions yet."
+  const hasSavedResult = check.finding > 0 || check.clean > 0
+  const savedExplanation = check.finding === 0 ? installed.explanation : null
+  const savedResultSummary =
+    check.finding === 0 && check.clean === 1
+      ? savedExplanation
+        ? "Saved check result"
+        : "Saved check result: no concern found."
+      : `Saved check results: ${[
+          check.finding > 0 ? `${check.finding} failed` : null,
+          check.clean > 0 ? `${check.clean} passed` : null,
+        ]
+          .filter(Boolean)
+          .join(", ")}.`
   let progressMessage: string | null = null
+  let eventWait: string | null = null
   let eventLimit: string | null = null
-  if (!snoozed && !hasError && installed.availability.status === "available") {
+  if (!snoozed && installed.availability.status === "available") {
     if (check.checking) {
-      progressMessage = showEmptyState
-        ? "This check is queued or running. No assessment result is available yet."
-        : "This check is queued or running."
+      progressMessage = "Checking"
     } else if (waiting?.catchingUp || installed.waitingForDataCount > 0) {
-      progressMessage = showEmptyState
-        ? "Session activity is still being processed. No assessment result is available yet."
-        : "Session activity is still being processed."
+      progressMessage = "Processing session activity."
     } else if (waiting && waiting.count > 0) {
-      progressMessage = `This check is waiting for new ${installedCheckEventLabel(waiting.event, 2)}. It needs ${waiting.count} more ${installedCheckEventLabel(waiting.event, waiting.count)} before it can assess session activity.`
+      progressMessage = "Waiting for new activity."
+      eventWait = `Needs ${waiting.count} more ${installedCheckEventLabel(waiting.event, waiting.count)}.`
       eventLimit = installedCheckEventLimit(waiting.event)
     }
   }
+  const showNoWrite =
+    !snoozed &&
+    !hasError &&
+    installed.availability.status === "available" &&
+    check.reviewFailed === 0 &&
+    check.reviewedWithoutStatus > 0 &&
+    !hasSavedResult
   return (
     <div className="space-y-3">
       {hasError && <InstalledCheckDiagnostics diagnostics={diagnostics} active={active} />}
       {!hasError && <InstalledCheckStateDetail installed={installed} />}
-      {(showEmptyState || progressMessage) && (
-        <CheckDetailPanel variant="info">
-          <p>{progressMessage ?? emptyMessage}</p>
-          {eventLimit && <p className="mt-2">{eventLimit}</p>}
-        </CheckDetailPanel>
+      {(showEmptyState || progressMessage || showNoWrite) && (
+        <section aria-label="Check status">
+          <CheckDetailPanel variant="info">
+            {progressMessage ? (
+              <>
+                <h3 className="type-callout font-semibold! text-label">{progressMessage}</h3>
+                {eventWait && <p className="mt-2">{eventWait}</p>}
+                <p className="mt-2">
+                  {hasSavedResult
+                    ? savedResultSummary
+                    : showNoWrite && eventWait
+                      ? "The check finished without a new result."
+                      : "No check result yet."}
+                </p>
+                {hasSavedResult && savedExplanation && (
+                  <p className="mt-2">{savedExplanation}</p>
+                )}
+              </>
+            ) : (
+              <p>{showNoWrite ? "The check finished without a new result." : emptyMessage}</p>
+            )}
+            {eventLimit && <p className="mt-2">{eventLimit}</p>}
+          </CheckDetailPanel>
+        </section>
       )}
       {showEmptyState || check.lifecycle == null ? null : check.lifecycle === "passing" ? (
-        check.clean > 0 && (
-          <PassedCheckDetail>
-            {installed.explanation ?? "No concern in this assessment."}
-          </PassedCheckDetail>
+        check.clean > 0 &&
+        !progressMessage && (
+          <CheckDetailPanel variant="success">
+            <p>
+              {check.clean === 1 && !savedExplanation
+                ? "No concern found in the saved check result."
+                : savedResultSummary}
+            </p>
+            {savedExplanation && <p className="mt-2">{savedExplanation}</p>}
+          </CheckDetailPanel>
         )
       ) : (
         <div className="burn-check-target-list">
@@ -110,7 +152,7 @@ function InstalledCheckStateDetail({ installed }: { installed: InstalledCheckRep
     default:
       if (installed.reviewFailed === 0) return null
       title = "Could not check"
-      message = "This check could not complete the latest assessment."
+      message = "A recent check could not finish."
   }
   return (
     <CheckDetailPanel variant="error">

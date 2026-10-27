@@ -1,4 +1,4 @@
-//! Bounded pre-alpha delivery from an immutable SQLite journal snapshot.
+//! Bounded delivery from an immutable SQLite journal snapshot.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -98,7 +98,7 @@ impl std::fmt::Display for OpenCodeJournalReadError {
 
 impl std::error::Error for OpenCodeJournalReadError {}
 
-/// Read the next pre-alpha page without changing the source database.
+/// Read the next page without changing the source database.
 /// Reject a rewritten, removed, or reset prefix. A caller must not advance its
 /// persisted cursor until its result publication commits.
 pub fn read_opencode_tool_result_page(

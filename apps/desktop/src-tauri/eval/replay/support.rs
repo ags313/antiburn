@@ -335,8 +335,8 @@ impl SessionReplay {
                 let answer = antiburn_checks::results::decode_results(answer.as_bytes())?.validate_for_declarations(&self.activation.compiled.decisions, &self.activation.compiled.question_requirements())?;
                 Ok(json!({"id":id, "trigger":trigger, "answer":answer, "actions":serde_json::from_str::<Value>(&actions)?}))
             }).collect::<Result<Vec<_>>>()?;
-        let attempts = connection.prepare("SELECT attempt_number, state, outcome, decision_name FROM burn_check_evaluation_attempt ORDER BY candidate_id, decision_name, attempt_number")?
-            .query_map([], |row| Ok(json!({"attempt":row.get::<_, u8>(0)?, "state":row.get::<_, String>(1)?, "outcome":row.get::<_, Option<String>>(2)?, "decision":row.get::<_, String>(3)?})))?
+        let attempts = connection.prepare("SELECT a.attempt_number, a.state, a.outcome, a.decision_name, u.served_model, u.usage_known, a.candidate_id FROM burn_check_evaluation_attempt a LEFT JOIN burn_check_decision_usage u USING(attempt_id) ORDER BY a.candidate_id, a.decision_name, a.attempt_number")?
+            .query_map([], |row| Ok(json!({"attempt":row.get::<_, u8>(0)?, "state":row.get::<_, String>(1)?, "outcome":row.get::<_, Option<String>>(2)?, "decision":row.get::<_, String>(3)?, "served_model":row.get::<_, Option<String>>(4)?, "usage_known":row.get::<_, Option<bool>>(5)?, "candidate_id":row.get::<_, String>(6)?})))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let other_activations: usize = connection.query_row(
             "SELECT COUNT(*) FROM burn_check_activation WHERE activation_scope_key != ?1",

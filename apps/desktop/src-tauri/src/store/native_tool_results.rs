@@ -7,6 +7,7 @@ pub(crate) mod opencode_v2_status;
 pub(crate) mod publications;
 pub(crate) mod request_origin;
 pub(crate) mod source_delivery;
+pub(crate) mod trace_effects;
 
 pub use publications::{
     ToolResultBatch, ToolResultPublication, ToolResultPublicationOutcome, ToolResultPublishOptions,

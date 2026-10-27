@@ -17,8 +17,8 @@ use antiburn_checks::results::{
     ChoiceResult, DecisionResult, NamedAnswer, NoulResult, QuestionResult, ScoreResult,
 };
 use antiburn_local::analysis::jev::{
-    JevAnswer, JevError, JevRequest, JevResponse, JevUsage, MAX_RESPONSE_BYTES,
-    capabilities::ModelCapabilities, validate_jev_request_with_capabilities,
+    JevAnswer, JevError, JevRequest, JevResponse, JevResponseObservation, JevUsage,
+    MAX_RESPONSE_BYTES, capabilities::ModelCapabilities, validate_jev_request_with_capabilities,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,6 +34,7 @@ pub(crate) use preparation::{
 };
 
 const MAX_RESIDENT_REQUEST_BYTES: usize = 512 * 1024;
+const NATIVE_MAX_RESIDENT_REQUEST_BYTES: usize = 832 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct DecisionProvenance {
@@ -44,8 +45,11 @@ pub(crate) struct DecisionProvenance {
 }
 
 /// Records one candidate and named attempt before answer validation.
-pub(crate) type DecisionUsageRecorder =
-    Arc<dyn Fn(&str, &DecisionAttempt, Option<JevUsage>) -> Result<(), String> + Send + Sync>;
+pub(crate) type DecisionUsageRecorder = Arc<
+    dyn Fn(&str, &DecisionAttempt, Option<JevResponseObservation>) -> Result<(), String>
+        + Send
+        + Sync,
+>;
 
 pub(crate) struct TypeSafeDecisionEvaluator {
     transport: super::dispatch::DecisionTransport,
@@ -61,7 +65,7 @@ pub(crate) struct TypeSafeDecisionEvaluator {
 impl TypeSafeDecisionEvaluator {
     #[cfg(test)]
     pub(crate) fn new(client: super::client::TypeSafeClient) -> Self {
-        let capabilities = ModelCapabilities::jev_default();
+        let capabilities = ModelCapabilities::jev_native();
         Self {
             transport: super::dispatch::DecisionTransport::Jev {
                 client,
@@ -120,6 +124,18 @@ impl TypeSafeDecisionEvaluator {
 
     pub(crate) fn with_usage(mut self, recorder: DecisionUsageRecorder) -> Self {
         self.usage = Some(recorder);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_native_test_endpoint(mut self, endpoint: String) -> Self {
+        let super::dispatch::DecisionTransport::Jev {
+            endpoint: selected, ..
+        } = &mut self.transport
+        else {
+            panic!("A native loopback endpoint requires the native transport");
+        };
+        *selected = endpoint;
         self
     }
 
@@ -419,12 +435,21 @@ pub(crate) fn validate_response(
     response: JevResponse,
     capabilities: &ModelCapabilities,
     attempts: u8,
+    provider: super::config::SystemOneProvider,
 ) -> Result<DecisionResult, JevError> {
-    antiburn_local::analysis::jev::validate_jev_response_with_capabilities(
-        &response,
-        request,
-        capabilities,
-    )?;
+    if provider == super::config::SystemOneProvider::Jev {
+        antiburn_local::analysis::jev::validate_native_jev_response_with_capabilities(
+            &response,
+            request,
+            capabilities,
+        )?;
+    } else {
+        antiburn_local::analysis::jev::validate_jev_response_with_capabilities(
+            &response,
+            request,
+            capabilities,
+        )?;
+    }
     let mut raw = response.answers;
     let mut answers = Vec::with_capacity(declaration.outputs.len());
     for output in &declaration.outputs {
@@ -512,6 +537,7 @@ pub(crate) fn classify_outcome(
     result: Result<JevResponse, JevError>,
     capabilities: &ModelCapabilities,
     attempts: u8,
+    provider: super::config::SystemOneProvider,
 ) -> AttemptOutcome {
     match result {
         Ok(response) => {
@@ -527,6 +553,7 @@ pub(crate) fn classify_outcome(
                 response,
                 capabilities,
                 attempts,
+                provider,
             ) {
                 Ok(result) => AttemptOutcome::Answer(SuccessfulAttempt { result, usage }),
                 Err(error) => AttemptOutcome::Failed {
@@ -561,7 +588,7 @@ async fn evaluate_attempt(
     transport: &super::dispatch::DecisionTransport,
     prepared: AttemptRequest<'_>,
     is_cancelled: impl Fn() -> bool + Sync,
-    record_usage: impl Fn(Option<JevUsage>) -> Result<(), JevError> + Sync,
+    record_usage: impl Fn(Option<JevResponseObservation>) -> Result<(), JevError> + Sync,
 ) -> AttemptOutcome {
     let AttemptRequest {
         declaration,
@@ -571,7 +598,7 @@ async fn evaluate_attempt(
         attempt,
         request_id,
     } = prepared;
-    let request_resident_bytes = match resident_bytes(request, capabilities) {
+    let request_resident_bytes = match resident_bytes(request, capabilities, transport.provider()) {
         Ok(bytes) => bytes,
         Err(error) => {
             return AttemptOutcome::Failed {
@@ -590,8 +617,8 @@ async fn evaluate_attempt(
         request_id,
         is_cancelled,
         |usage| {
-            if let Some(usage) = usage {
-                *known_usage.lock().expect("usage mutex is not poisoned") = Some(usage);
+            if let Some(observation) = &usage {
+                *known_usage.lock().expect("usage mutex is not poisoned") = Some(observation.usage);
             }
             record_usage(usage)
         },
@@ -604,6 +631,7 @@ async fn evaluate_attempt(
         result,
         capabilities,
         attempt.number,
+        transport.provider(),
     );
     if let AttemptOutcome::Failed { usage, .. } = &mut outcome {
         *usage = usage.or(*known_usage.lock().expect("usage mutex is not poisoned"));
@@ -614,6 +642,7 @@ async fn evaluate_attempt(
 pub(crate) fn resident_bytes(
     request: &JevRequest,
     capabilities: &ModelCapabilities,
+    provider: super::config::SystemOneProvider,
 ) -> Result<usize, JevError> {
     let request_bytes = validate_jev_request_with_capabilities(request, capabilities)?;
     let response_bytes = capabilities
@@ -624,11 +653,13 @@ pub(crate) fn resident_bytes(
     let bytes = request_bytes
         .saturating_mul(2)
         .saturating_add(response_bytes);
-    if bytes > MAX_RESIDENT_REQUEST_BYTES {
-        return Err(JevError::RequestTooLarge {
-            bytes,
-            maximum: MAX_RESIDENT_REQUEST_BYTES,
-        });
+    let maximum = if provider == super::config::SystemOneProvider::Jev {
+        NATIVE_MAX_RESIDENT_REQUEST_BYTES
+    } else {
+        MAX_RESIDENT_REQUEST_BYTES
+    };
+    if bytes > maximum {
+        return Err(JevError::RequestTooLarge { bytes, maximum });
     }
     Ok(bytes)
 }
