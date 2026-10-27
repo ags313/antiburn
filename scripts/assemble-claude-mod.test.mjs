@@ -126,7 +126,7 @@ test('marketplace pin matches authoritative sources at its release commit', (t) 
 })
 
 test('candidate plugin icon is a compact 512px PNG without metadata or trailing content', () => {
-  function image(bytes, allowMetadata = false) {
+  function image(bytes) {
     assert.deepEqual(bytes.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
     const data = []
     let header
@@ -135,9 +135,7 @@ test('candidate plugin icon is a compact 512px PNG without metadata or trailing 
       const length = bytes.readUInt32BE(offset)
       const name = bytes.toString('ascii', offset + 4, offset + 8)
       const body = bytes.subarray(offset + 8, offset + 8 + length)
-      assert.ok(
-        ['IHDR', 'IDAT', 'IEND', 'sRGB'].includes(name) || (allowMetadata && name === 'eXIf'),
-      )
+      assert.ok(['IHDR', 'IDAT', 'IEND', 'sRGB'].includes(name))
       if (name === 'IHDR') header = body
       if (name === 'IDAT') data.push(body)
       offset += length + 12
@@ -149,16 +147,62 @@ test('candidate plugin icon is a compact 512px PNG without metadata or trailing 
     }
     assert.fail('PNG has no end chunk')
   }
+  function pixels(header, scanlines) {
+    const width = header.readUInt32BE(0)
+    const height = header.readUInt32BE(4)
+    const bytesPerPixel = 4
+    const rowLength = width * bytesPerPixel
+    assert.equal(scanlines.length, (rowLength + 1) * height)
+    const output = Buffer.alloc(rowLength * height)
+    let inputOffset = 0
+    for (let row = 0; row < height; row += 1) {
+      const filter = scanlines[inputOffset]
+      inputOffset += 1
+      const rowOffset = row * rowLength
+      for (let column = 0; column < rowLength; column += 1) {
+        const left = column >= bytesPerPixel ? output[rowOffset + column - bytesPerPixel] : 0
+        const up = row > 0 ? output[rowOffset - rowLength + column] : 0
+        const upperLeft =
+          row > 0 && column >= bytesPerPixel
+            ? output[rowOffset - rowLength + column - bytesPerPixel]
+            : 0
+        const paethBase = left + up - upperLeft
+        const paethLeft = Math.abs(paethBase - left)
+        const paethUp = Math.abs(paethBase - up)
+        const paethUpperLeft = Math.abs(paethBase - upperLeft)
+        const predictor = [
+          0,
+          left,
+          up,
+          Math.floor((left + up) / 2),
+          paethLeft <= paethUp && paethLeft <= paethUpperLeft
+            ? left
+            : paethUp <= paethUpperLeft
+              ? up
+              : upperLeft,
+        ][filter]
+        assert.notEqual(predictor, undefined, `Unsupported PNG filter: ${filter}`)
+        output[rowOffset + column] = (scanlines[inputOffset] + predictor) & 0xff
+        inputOffset += 1
+      }
+    }
+    return output
+  }
   const plugin = readFileSync(join(root, 'plugins/antiburn-live/assets/icon.png'))
   assert.ok(
     plugin.length < 256 * 1024,
     'The entire PNG must fit below the printable-text limit',
   )
-  const { header } = image(plugin)
+  const { header, scanlines } = image(plugin)
   assert.equal(header.readUInt32BE(0), 512)
   assert.equal(header.readUInt32BE(4), 512)
   assert.equal(header[8], 8)
   assert.equal(header[9], 6)
+  const rgba = pixels(header, scanlines)
+  assert.ok(
+    rgba.some((value, index) => index % 4 === 3 && value < 255),
+    'The icon must contain at least one transparent pixel',
+  )
 })
 
 test('tree verification rejects stale, omitted, and unexpected files without writing', (t) => {
