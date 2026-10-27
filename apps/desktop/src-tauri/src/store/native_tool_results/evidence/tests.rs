@@ -505,7 +505,7 @@ fn activity_dependency_fails_immediately_without_selector_consumption() {
 }
 
 #[test]
-fn v88_and_v89_preserve_result_bytes_sequences_high_water_and_foreign_keys() {
+fn v88_through_v90_preserve_result_bytes_sequences_high_water_and_foreign_keys() {
     let connection = Connection::open_in_memory().unwrap();
     connection
         .pragma_update(None, "foreign_keys", true)
@@ -535,16 +535,6 @@ fn v88_and_v89_preserve_result_bytes_sequences_high_water_and_foreign_keys() {
             )
             .unwrap(),
         "partial"
-    );
-    assert_eq!(
-        connection
-            .query_row(
-                "SELECT session_selection_json FROM native_tool_result_publication",
-                [],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .unwrap(),
-        None
     );
     let row: (i64, String, String, String) = connection
         .query_row(
@@ -596,6 +586,46 @@ fn v88_and_v89_preserve_result_bytes_sequences_high_water_and_foreign_keys() {
         )
         .unwrap();
     assert_eq!(connection.last_insert_rowid(), 43);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('native_tool_result_publication')
+                 WHERE name = 'session_selection_json'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    connection
+        .execute_batch(crate::store::schema::MIGRATIONS[89])
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM native_tool_result_publication
+                 WHERE session_selection_json IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    let retained: (String, i64, i64) = connection
+        .query_row(
+            "SELECT (SELECT payload_json FROM native_tool_result_publication
+                       WHERE publication_sequence = 7),
+                    (SELECT seq FROM sqlite_sequence
+                       WHERE name = 'native_tool_result_publication'),
+                    (SELECT COUNT(*) FROM pragma_foreign_key_check)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        retained,
+        ("{ \"record_id\" : \"owner\", \"value\" : 1 }".into(), 43, 0)
+    );
 }
 
 #[test]
@@ -780,4 +810,645 @@ fn continuity_recovery_starts_a_fresh_period_and_rollback_does_not_reset_activit
             .unwrap(),
         None
     );
+}
+
+fn publication_binding_fixture() -> (
+    Store,
+    SessionKey,
+    ActivationId,
+    NativeCurrentBinding,
+    NativeCurrentBinding,
+) {
+    let (store, key, activation) = fixture();
+    let target = user(1, "Original target.");
+    let healthy = named_user("healthy", "Unchanged input.");
+    let identities = [&target, &healthy].map(|event| {
+        let NativeEvidenceFact::Message(message) = &event.fact else {
+            unreachable!()
+        };
+        message_payload(message).identity().unwrap()
+    });
+    publish(&store, &key, vec![target, healthy], 2000);
+    let [target, healthy] = identities.map(|identity| {
+        current_binding_in(&store.lock(), &key, &identity)
+            .unwrap()
+            .unwrap()
+    });
+    (store, key, activation, target, healthy)
+}
+
+fn named_user(id: &str, text: &str) -> NativeEvidenceEvent {
+    let mut event = user(1, text);
+    let NativeEvidenceFact::Message(NativeMessageObservation::User(message)) = &mut event.fact
+    else {
+        unreachable!()
+    };
+    message.message.message_id = id.into();
+    message.message.position = UserMessagePosition::Jsonl { record_index: 10 };
+    message.context.first_eligible_position = ToolResultPosition::Jsonl {
+        record_index: 10,
+        item_index: 0,
+    };
+    event
+}
+
+fn saved_candidate(
+    store: &Store,
+    key: &SessionKey,
+    activation: &ActivationId,
+    id: &str,
+    state: &str,
+) -> SessionObserverKey {
+    let mut activation = activation.clone();
+    activation.definition_id = id.into();
+    attach(store, key, &activation, 1000);
+    let connection = store.lock();
+    let scope = crate::check_store::StoreCheckStore::activation_scope_key(&activation.scope);
+    connection
+        .execute(
+            "INSERT INTO burn_check_candidate(candidate_id, check_id, activation_scope_key,
+        generation, branch_key, session_key_json, trigger_position, selected_publication_head,
+        dependencies_json, frozen_input_json, input_fingerprint, state, claim_owner, claim_fence,
+        created_at_epoch, updated_at_epoch)
+        VALUES (?1, ?1, ?2, 1, ?3, ?3, 1,
+            (SELECT MAX(publication_sequence) FROM native_tool_result_publication), '{}',
+            '{\"saved\":\"input\"}', ?1, ?4, 'owner', 1, 1, 1)",
+            params![id, scope, key.to_identity_json(), state],
+        )
+        .unwrap();
+    if state == "accepted" {
+        connection
+            .execute(
+                "INSERT INTO burn_check_evaluation_attempt(attempt_id, candidate_id,
+            decision_name, attempt_number, state, outcome, response_json, updated_at_epoch)
+            VALUES (?1, ?1, 'review', 1, 'settled', 'answer', '{\"paid\":\"answer\"}', 1)",
+                [id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO burn_check_decision_usage(attempt_id, usage_known, served_model)
+            VALUES (?1, 1, 'fixture-model')",
+                [id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO burn_check_assessment_history(assessment_id, candidate_id,
+            check_id, activation_scope_key, generation, branch_key, trigger_position, outcome,
+            answer_json, actions_json, evidence_valid, accepted_at_epoch)
+            VALUES (?1, ?1, ?1, ?2, 1, ?3, 1, 'assessed', '{\"paid\":\"answer\"}',
+                '{\"status\":\"failure\"}', 1, 1)",
+                params![id, scope, key.to_identity_json()],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO burn_check_current_status(check_id, activation_scope_key,
+            branch_key, generation, status, assessment_id, position, evidence_valid, updated_at_epoch)
+            VALUES (?1, ?2, ?3, 1, 'failure', ?1, 1, 1, 1)",
+            params![id, scope, key.to_identity_json()]).unwrap();
+    }
+    let (attachment_epoch, incarnation) = connection.query_row(
+        "SELECT observer_epoch, incarnation FROM burn_check_session_attachment WHERE check_id = ?1",
+        [id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    SessionObserverKey {
+        activation,
+        branch: BranchId(key.to_identity_json()),
+        incarnation,
+        attachment_epoch,
+    }
+}
+
+fn saved_binding(
+    store: &Store,
+    key: &SessionKey,
+    candidate: &str,
+    observation: &str,
+    json: &str,
+    native: Option<&NativeCurrentBinding>,
+    kind: EvidenceEventKind,
+) {
+    store.lock().execute("INSERT INTO burn_check_candidate_dependency(candidate_id, observation_id,
+        session_key_json, source_format, native_revision, evidence_version, removed, payload_sha256,
+        event_kind, dependency_binding_json) VALUES (?1, ?2, ?3, ?4, ?5, 'saved-version', 0, ?6, ?7, ?8)",
+        params![candidate, observation, key.to_identity_json(),
+            native.map_or("\"claude_jsonl\"", |binding| binding.source_format.as_str()),
+            native.map(|binding| binding.revision),
+            native.map_or("saved-host-hash", |binding| binding.payload_sha256.as_str()),
+            kind.name(), json]).unwrap();
+}
+
+fn native_binding_json(binding: &NativeCurrentBinding) -> String {
+    serde_json::to_string(&super::super::observers::DependencyBinding::NativeCurrent(
+        binding.clone(),
+    ))
+    .unwrap()
+}
+
+fn assert_saved_evidence(store: &Store, candidate: &str, valid: bool) {
+    let state: (String, bool, bool) = store
+        .lock()
+        .query_row(
+            "SELECT c.state, h.evidence_valid, s.evidence_valid FROM burn_check_candidate c
+         JOIN burn_check_assessment_history h USING(candidate_id)
+         JOIN burn_check_current_status s USING(assessment_id) WHERE c.candidate_id = ?1",
+            [candidate],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, ("accepted".into(), valid, valid), "{candidate}");
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SavedPaidRow {
+    candidate_id: String,
+    state: String,
+    outcome: String,
+    response_json: String,
+    usage_known: bool,
+    served_model: String,
+    answer_json: String,
+    actions_json: String,
+}
+
+fn saved_paid_rows(store: &Store) -> Vec<SavedPaidRow> {
+    let connection = store.lock();
+    let mut statement = connection
+        .prepare(
+            "SELECT a.candidate_id, a.state, a.outcome, a.response_json,
+        u.usage_known, u.served_model, h.answer_json, h.actions_json
+        FROM burn_check_evaluation_attempt a JOIN burn_check_decision_usage u USING(attempt_id)
+        JOIN burn_check_assessment_history h USING(candidate_id) ORDER BY a.candidate_id",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| {
+            Ok(SavedPaidRow {
+                candidate_id: row.get(0)?,
+                state: row.get(1)?,
+                outcome: row.get(2)?,
+                response_json: row.get(3)?,
+                usage_known: row.get(4)?,
+                served_model: row.get(5)?,
+                answer_json: row.get(6)?,
+                actions_json: row.get(7)?,
+            })
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+#[test]
+fn native_correction_and_removal_isolate_bad_bindings_and_keep_paid_rows() {
+    for removal in [false, true] {
+        let (store, key, activation, target, healthy) = publication_binding_fixture();
+        for id in ["healthy", "partial", "mixed"] {
+            saved_candidate(&store, &key, &activation, id, "accepted");
+        }
+        saved_candidate(&store, &key, &activation, "pending", "dispatching");
+        saved_binding(
+            &store,
+            &key,
+            "healthy",
+            "native",
+            &native_binding_json(&healthy),
+            Some(&healthy),
+            healthy.event_kind,
+        );
+        let partial = serde_json::json!({"NativeCurrent":{"identity":target.identity}}).to_string();
+        for id in ["partial", "pending"] {
+            saved_binding(
+                &store,
+                &key,
+                id,
+                "native",
+                &partial,
+                Some(&target),
+                target.event_kind,
+            );
+        }
+        saved_binding(
+            &store,
+            &key,
+            "mixed",
+            "z-native",
+            &native_binding_json(&target),
+            Some(&target),
+            target.event_kind,
+        );
+        saved_binding(
+            &store,
+            &key,
+            "mixed",
+            "a-corrupt",
+            "{bad",
+            Some(&healthy),
+            healthy.event_kind,
+        );
+        for id in ["partial", "mixed", "pending"] {
+            assert!(
+                super::super::observers::typed_dependencies_current_in(&store.lock(), id).is_err()
+            );
+        }
+        let paid = saved_paid_rows(&store);
+        let change = if removal {
+            NativeEvidenceEvent {
+                live_eligible: true,
+                fact: NativeEvidenceFact::MessageRemoval(NativeMessageRemoval {
+                    source_format: SourceFormat::ClaudeJsonl,
+                    session_id: key.session_id.clone(),
+                    message_id: "user-one".into(),
+                    position: ToolResultPosition::Jsonl {
+                        record_index: 20,
+                        item_index: 0,
+                    },
+                    revision: 2,
+                }),
+            }
+        } else {
+            user(2, "Corrected target.")
+        };
+        let fresh = named_user("fresh", "New healthy publication.");
+        let NativeEvidenceFact::Message(fresh_message) = &fresh.fact else {
+            unreachable!()
+        };
+        let fresh_identity = message_payload(fresh_message).identity().unwrap();
+        publish(&store, &key, vec![change, fresh], 3000);
+        assert!(
+            current_binding_in(&store.lock(), &key, &fresh_identity)
+                .unwrap()
+                .is_some()
+        );
+        let current = current_binding_in(&store.lock(), &key, &target.identity).unwrap();
+        assert_eq!(current.is_none(), removal);
+        if let Some(current) = current {
+            assert_eq!(current.revision, 2);
+        }
+        for id in ["partial", "mixed"] {
+            assert_saved_evidence(&store, id, false);
+        }
+        assert_saved_evidence(&store, "healthy", true);
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT state FROM burn_check_candidate WHERE candidate_id = 'pending'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "stale"
+        );
+        assert_eq!(saved_paid_rows(&store), paid);
+        assert!(
+            super::super::observers::typed_dependencies_current_in(&store.lock(), "partial")
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn continuity_loss_isolates_bad_json_and_keeps_valid_host_and_activity_history() {
+    use super::super::observers::{DependencyBinding, typed_dependencies_current_in};
+
+    let (store, key, activation, _, healthy) = publication_binding_fixture();
+    saved_candidate(&store, &key, &activation, "healthy", "accepted");
+    saved_binding(
+        &store,
+        &key,
+        "healthy",
+        "native",
+        &native_binding_json(&healthy),
+        Some(&healthy),
+        healthy.event_kind,
+    );
+    for (id, activity) in [("host", false), ("activity", true)] {
+        let observer = saved_candidate(&store, &key, &activation, id, "accepted");
+        let binding = if activity {
+            DependencyBinding::SessionActivity {
+                observer,
+                activity_revision: 0,
+            }
+        } else {
+            DependencyBinding::HostObservation { observer }
+        };
+        saved_binding(
+            &store,
+            &key,
+            id,
+            "host",
+            &serde_json::to_string(&binding).unwrap(),
+            None,
+            if activity {
+                EvidenceEventKind::SessionIdle
+            } else {
+                EvidenceEventKind::SessionStart
+            },
+        );
+        assert!(typed_dependencies_current_in(&store.lock(), id).unwrap());
+    }
+    let bad = [
+        "{bad",
+        "null",
+        "[]",
+        "{}",
+        "{\"Unknown\":{}}",
+        "{\"NativeCurrent\":{}}",
+        "{\"HostObservation\":{}}",
+        "{\"SessionActivity\":{}}",
+    ];
+    for (index, json) in bad.iter().enumerate() {
+        let id = format!("bad-{index}");
+        saved_candidate(&store, &key, &activation, &id, "accepted");
+        saved_binding(
+            &store,
+            &key,
+            &id,
+            "invalid",
+            json,
+            Some(&healthy),
+            healthy.event_kind,
+        );
+        assert!(typed_dependencies_current_in(&store.lock(), &id).is_err());
+    }
+    let paid = saved_paid_rows(&store);
+    {
+        let mut connection = store.lock();
+        let tx = connection.transaction().unwrap();
+        let effects = super::super::observers::break_continuity_in(&tx, &key).unwrap();
+        assert_eq!(effects.accepted_evidence_revoked, bad.len());
+        assert_eq!(effects.current_status_revoked, bad.len());
+        assert_eq!(effects.unfinished_stale, 0);
+        tx.commit().unwrap();
+    }
+    for index in 0..bad.len() {
+        assert_saved_evidence(&store, &format!("bad-{index}"), false);
+    }
+    for id in ["healthy", "host", "activity"] {
+        assert_saved_evidence(&store, id, true);
+    }
+    assert!(typed_dependencies_current_in(&store.lock(), "healthy").unwrap());
+    assert!(typed_dependencies_current_in(&store.lock(), "host").unwrap());
+    assert!(!typed_dependencies_current_in(&store.lock(), "activity").unwrap());
+    assert_eq!(saved_paid_rows(&store), paid);
+    assert_eq!(
+        store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_session_attachment WHERE continuity_eligible = 1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn native_publication_rolls_back_when_revocation_hits_a_database_error() {
+    let (store, key, activation, target, healthy) = publication_binding_fixture();
+    saved_candidate(&store, &key, &activation, "healthy", "accepted");
+    saved_binding(
+        &store,
+        &key,
+        "healthy",
+        "native",
+        &native_binding_json(&healthy),
+        Some(&healthy),
+        healthy.event_kind,
+    );
+    saved_candidate(&store, &key, &activation, "partial", "accepted");
+    let partial = serde_json::json!({"NativeCurrent":{"identity":target.identity}}).to_string();
+    saved_binding(
+        &store,
+        &key,
+        "partial",
+        "native",
+        &partial,
+        Some(&target),
+        target.event_kind,
+    );
+    let paid = saved_paid_rows(&store);
+    {
+        let mut connection = store.lock();
+        let tx = connection.transaction().unwrap();
+        tx.execute_batch("ALTER TABLE native_tool_result_current RENAME TO unavailable_current")
+            .unwrap();
+        let error = publication_dependencies_current_in(&tx, "healthy").unwrap_err();
+        assert!(error.downcast_ref::<rusqlite::Error>().is_some());
+        tx.rollback().unwrap();
+    }
+    let head: i64 = store
+        .lock()
+        .query_row(
+            "SELECT MAX(publication_sequence) FROM native_tool_result_publication",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    store
+        .lock()
+        .execute_batch(
+            "CREATE TEMP TRIGGER reject_evidence_revocation
+        BEFORE UPDATE OF evidence_valid ON burn_check_assessment_history
+        BEGIN SELECT RAISE(ABORT, 'injected database error'); END;",
+        )
+        .unwrap();
+    let fresh = named_user("rolled-back", "This publication must roll back.");
+    let NativeEvidenceFact::Message(fresh_message) = &fresh.fact else {
+        unreachable!()
+    };
+    let fresh_identity = message_payload(fresh_message).identity().unwrap();
+    {
+        let mut connection = store.lock();
+        let tx = connection.transaction().unwrap();
+        let error = reconcile_evidence_in(
+            &tx,
+            &key,
+            1,
+            1,
+            &NativeEvidenceBatch {
+                source_format: SourceFormat::ClaudeJsonl,
+                history_complete: true,
+                events: vec![fresh, user(2, "This correction must roll back.")],
+            },
+            PublicationPolicy {
+                suppress_coverage: true,
+                ..Default::default()
+            },
+            3000,
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<rusqlite::Error>().is_some());
+        tx.rollback().unwrap();
+    }
+    assert_eq!(
+        current_binding_in(&store.lock(), &key, &target.identity).unwrap(),
+        Some(target)
+    );
+    assert!(
+        current_binding_in(&store.lock(), &key, &fresh_identity)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .lock()
+            .query_row(
+                "SELECT MAX(publication_sequence) FROM native_tool_result_publication",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        head
+    );
+    assert_saved_evidence(&store, "partial", true);
+    assert_saved_evidence(&store, "healthy", true);
+    assert_eq!(saved_paid_rows(&store), paid);
+}
+
+#[test]
+fn pending_binding_corruption_does_not_abort_activity_rebind_or_continuity() {
+    use super::super::observers::{self, DependencyBinding};
+
+    for change in ["activity", "rebind", "continuity"] {
+        let (store, key, activation, _, _) = publication_binding_fixture();
+        saved_candidate(&store, &key, &activation, "pending-bad", "pending");
+        saved_binding(
+            &store,
+            &key,
+            "pending-bad",
+            "invalid",
+            "{bad",
+            None,
+            EvidenceEventKind::SessionIdle,
+        );
+        for (id, activity, state) in [
+            ("pending-activity", true, "pending"),
+            ("pending-host", false, "pending"),
+            ("accepted-activity", true, "accepted"),
+            ("accepted-host", false, "accepted"),
+        ] {
+            let observer = saved_candidate(&store, &key, &activation, id, state);
+            let binding = if activity {
+                DependencyBinding::SessionActivity {
+                    observer,
+                    activity_revision: 0,
+                }
+            } else {
+                DependencyBinding::HostObservation { observer }
+            };
+            saved_binding(
+                &store,
+                &key,
+                id,
+                "host",
+                &serde_json::to_string(&binding).unwrap(),
+                None,
+                if activity {
+                    EvidenceEventKind::SessionIdle
+                } else {
+                    EvidenceEventKind::SessionStart
+                },
+            );
+            assert!(observers::typed_dependencies_current_in(&store.lock(), id).unwrap());
+        }
+        assert!(observers::typed_dependencies_current_in(&store.lock(), "pending-bad").is_err());
+        let paid = saved_paid_rows(&store);
+        {
+            let mut connection = store.lock();
+            let tx = connection.transaction().unwrap();
+            let effects = match change {
+                "activity" => observers::activity_in(
+                    &tx,
+                    &key,
+                    &NativeActivityObservation {
+                        source_format: SourceFormat::ClaudeJsonl,
+                        session_id: key.session_id.clone(),
+                        position: ToolResultPosition::Jsonl {
+                            record_index: 20,
+                            item_index: 0,
+                        },
+                        token: "fresh-source-work".into(),
+                        native_at_ms: None,
+                    },
+                    3000,
+                )
+                .unwrap(),
+                "rebind" => {
+                    tx.execute(
+                        "UPDATE session SET source_label = '/synthetic/rebound.jsonl'",
+                        [],
+                    )
+                    .unwrap();
+                    observers::rebind_source_in(&tx, &key, SourceFormat::ClaudeJsonl).unwrap()
+                }
+                "continuity" => observers::break_continuity_in(&tx, &key).unwrap(),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                effects.unfinished_stale,
+                if change == "continuity" { 2 } else { 1 },
+                "{change}"
+            );
+            assert_eq!(effects.accepted_evidence_revoked, 0, "{change}");
+            assert_eq!(effects.current_status_revoked, 0, "{change}");
+            tx.commit().unwrap();
+        }
+        for (id, expected) in [
+            ("pending-activity", "stale"),
+            ("pending-host", "pending"),
+            (
+                "pending-bad",
+                if change == "continuity" {
+                    "stale"
+                } else {
+                    "pending"
+                },
+            ),
+        ] {
+            let state: String = store
+                .lock()
+                .query_row(
+                    "SELECT state FROM burn_check_candidate WHERE candidate_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, expected, "{change}: {id}");
+        }
+        let (revision, continuity, label, token): (i64, bool, String, Option<String>) = store
+            .lock()
+            .query_row(
+                "SELECT activity_revision, continuity_eligible, source_label, last_activity_token
+             FROM burn_check_session_attachment WHERE check_id = 'pending-bad'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(revision, 1, "{change}");
+        assert_eq!(continuity, change == "activity");
+        assert_eq!(
+            label,
+            if change == "rebind" {
+                "/synthetic/rebound.jsonl"
+            } else {
+                "/synthetic/session.jsonl"
+            }
+        );
+        assert_eq!(
+            token.as_deref(),
+            (change == "activity").then_some("fresh-source-work")
+        );
+        assert!(observers::typed_dependencies_current_in(&store.lock(), "pending-bad").is_err());
+        assert!(
+            !observers::typed_dependencies_current_in(&store.lock(), "pending-activity").unwrap()
+        );
+        assert!(observers::typed_dependencies_current_in(&store.lock(), "pending-host").unwrap());
+        for id in ["accepted-activity", "accepted-host"] {
+            assert_saved_evidence(&store, id, true);
+        }
+        assert_eq!(saved_paid_rows(&store), paid);
+    }
 }

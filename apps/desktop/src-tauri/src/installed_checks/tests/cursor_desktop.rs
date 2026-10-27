@@ -118,10 +118,41 @@ fn publish_cursor(fixture: &Fixture, count: usize) {
     );
 }
 
+fn assert_snapshot_attachment(store: &Store) {
+    let (attachments, observers): (i64, i64) = store
+        .lock()
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(observer_epoch IS NOT NULL), 0)
+         FROM burn_check_session_attachment
+         WHERE json_extract(branch_key, '$[1]') = 'cursor'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((attachments, observers), (1, 0));
+    for table in ["native_file_delivery", "opencode_journal_delivery"] {
+        assert_eq!(
+            store
+                .lock()
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE agent = 'cursor'"),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+}
+
 #[tokio::test]
 async fn cursor_desktop_startup_and_live_results_reach_one_assessment_without_replay() {
     for source_first in [false, true] {
         let fixture = Fixture::new();
+        fixture
+            .store
+            .delete_session(&SessionKey::new("native", "pi", "main"))
+            .unwrap();
         publish_cursor(&fixture, if source_first { 3 } else { 0 });
         let mut host = fixture.host();
         host.reconcile(&Admission::Ready).unwrap();
@@ -130,6 +161,7 @@ async fn cursor_desktop_startup_and_live_results_reach_one_assessment_without_re
             publish_cursor(&fixture, 3);
             drain(&mut host);
         }
+        assert_snapshot_attachment(&fixture.store);
         fixture.evaluator.answer("stuck");
         assert_eq!(
             host.evaluation_jobs(1)
@@ -166,6 +198,7 @@ async fn cursor_desktop_startup_and_live_results_reach_one_assessment_without_re
         let mut restarted = fixture.host();
         restarted.reconcile(&Admission::Ready).unwrap();
         drain(&mut restarted);
+        assert_snapshot_attachment(&fixture.store);
         assert!(
             restarted
                 .evaluation_jobs(1)
@@ -191,6 +224,7 @@ fn cursor_report_counts_only_the_native_desktop_root_route() {
     let mut host = fixture.host();
     host.reconcile(&Admission::Ready).unwrap();
     drain(&mut host);
+    assert_snapshot_attachment(&fixture.store);
     let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
     assert_eq!(report[0].waiting_for_results_count, 1);
     for sql in [
@@ -198,17 +232,27 @@ fn cursor_report_counts_only_the_native_desktop_root_route() {
         "UPDATE session SET source_label = 'cursor-desktop:cursor-main', source_kind = 'file' WHERE agent = 'cursor'",
         "UPDATE session SET source_kind = 'inline', wsl_distro = 'synthetic' WHERE agent = 'cursor'",
         "UPDATE session SET wsl_distro = NULL WHERE agent = 'cursor';
-         INSERT INTO session_relation VALUES ('native', 'cursor', 'cursor-main', 'parent', 'forkParent')",
+         INSERT INTO session_relation (environment_key, agent, session_id, kind, related_id)
+         VALUES ('native', 'cursor', 'cursor-main', 'forkParent', 'parent')",
         "DELETE FROM session_relation;
-         INSERT INTO session_relation VALUES ('native', 'cursor', 'parent', 'cursor-main', 'subagent')",
+         INSERT INTO session_relation (environment_key, agent, session_id, kind, related_id)
+         VALUES ('native', 'cursor', 'parent', 'subagent', 'cursor-main')",
     ] {
         fixture.store.lock().execute_batch(sql).unwrap();
         let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
         assert_eq!(report[0].waiting_for_results_count, 0, "{sql}");
         assert_eq!(report[0].waiting_for_data_count, 0, "{sql}");
-        assert!(antiburn_checks_store::read_session_checks(
-            &fixture.store.lock(), "native", "cursor", "cursor-main",
-        ).unwrap().is_empty(), "{sql}");
+        assert!(
+            antiburn_checks_store::read_session_checks(
+                &fixture.store.lock(),
+                "native",
+                "cursor",
+                "cursor-main",
+            )
+            .unwrap()
+            .is_empty(),
+            "{sql}"
+        );
     }
 }
 

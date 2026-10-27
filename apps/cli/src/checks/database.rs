@@ -414,7 +414,7 @@ mod tests {
     }
 
     fn create_database(path: &Path) -> Connection {
-        let connection = Connection::open(path).unwrap();
+        let connection = Connection::open(path).expect("open the synthetic test database");
         connection
             .execute_batch(
                 "CREATE TABLE session (
@@ -472,7 +472,7 @@ mod tests {
                     PRIMARY KEY (environment_key, agent, session_id, check_id)
                  );",
             )
-            .unwrap();
+            .expect("create the synthetic database schema");
         connection
     }
 
@@ -488,7 +488,7 @@ mod tests {
             max_request_context_tokens: ReportCatalogs::default().depth_cap_tokens + 1,
             top_depth_examples: Vec::new(),
         });
-        serde_json::to_string(&evidence).unwrap()
+        serde_json::to_string(&evidence).expect("serialize typed test evidence")
     }
 
     fn insert_session(connection: &Connection, environment: &str, agent: &str, id: &str) {
@@ -497,7 +497,7 @@ mod tests {
                 "INSERT INTO session (environment_key, agent, session_id) VALUES (?1, ?2, ?3)",
                 params![environment, agent, id],
             )
-            .unwrap();
+            .expect("insert the synthetic session");
     }
 
     fn database_path(directory: &Path, name: &str) -> PathBuf {
@@ -748,7 +748,7 @@ mod tests {
     #[test]
     fn present_malformed_legacy_json_is_an_error() {
         for (progress, result) in [("{bad", "{}"), ("{}", "{bad")] {
-            let temp = tempdir().unwrap();
+            let temp = tempdir().expect("create the test database directory");
             let path = database_path(temp.path(), "antiburn.sqlite3");
             let connection = create_database(&path);
             insert_session(&connection, "native", "pi", "session-a");
@@ -758,7 +758,7 @@ mod tests {
                      progress_json, result_json, request_count, created_at_epoch, updated_at_epoch)
                  VALUES ('native', 'pi', 'session-a', 'synthetic', 1, 'completed', ?1, ?2, 0, 1, 1)",
                 params![progress, result],
-            ).unwrap();
+            ).expect("insert the malformed legacy assessment fixture");
             drop(connection);
             let error = read_checks_from_paths("session-a", &[path]).unwrap_err();
             assert!(error.contains("invalid burn_check_assessment."));

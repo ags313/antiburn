@@ -46,6 +46,8 @@ mod preparation;
 mod recovery_validation;
 #[path = "runtime_selection_tests.rs"]
 mod selection;
+#[path = "runtime_snapshot_tests.rs"]
+mod snapshots;
 #[path = "runtime_unsafe_update_tests.rs"]
 mod unsafe_updates;
 
@@ -126,6 +128,18 @@ fn fixture_with_definition(
             Some(&active),
         )
         .unwrap();
+    antiburn_checks_store::replace_runtime_definitions(
+        &mut store.lock(),
+        &[antiburn_checks_store::RuntimeDefinition {
+            check_id: active.id.definition_id.clone(),
+            activation_scope_key: adapter.activation_scope_key.clone(),
+            generation: Some(active.id.generation.0.try_into().unwrap()),
+            definition_revision: hex(&active.revision),
+            name: active.compiled.name.clone(),
+            availability: antiburn_checks_store::DefinitionAvailability::Available,
+        }],
+    )
+    .unwrap();
     (store, adapter, active)
 }
 
@@ -1654,22 +1668,45 @@ fn non_window_overflow_is_durable_and_keeps_earlier_pending_events() {
 
 #[test]
 fn startup_admission_refills_oldest_eligible_sessions_after_the_cap() {
+    use antiburn_local::analysis::file_live::{NativeFileCursor, read_native_file_page};
+    use antiburn_local::analysis::{RawSource, SessionInput, SourceFormat};
+
     let (store, adapter, active) = fixture();
+    let directory = tempfile::tempdir().unwrap();
     for index in 0..130 {
         let session_id = format!("startup-{index:03}");
+        let path = directory.path().join(format!("{session_id}.jsonl"));
+        let header = json!({"type": "session", "version": 3, "id": session_id, "cwd": "/repo"});
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        let page = read_native_file_page(
+            &SessionInput {
+                agent: "pi".into(),
+                session_id: session_id.clone(),
+                source: RawSource::File(path.clone()),
+                source_format: SourceFormat::PiV3Jsonl,
+                fork_parent_session_id: None,
+            },
+            None,
+            &|| false,
+        )
+        .unwrap();
+        assert!(!page.has_more);
+        let cursor = NativeFileCursor::decode(&page.cursor.encode()).unwrap();
         store.lock().execute(
             "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
-                cwd, updated_at_epoch, first_seen_at, last_seen_at)
-             VALUES ('native', 'pi', ?1, 'file', ?2, '/repo', ?3, 'now', 'now')",
-            params![session_id, format!("/tmp/{session_id}.jsonl"), index],
+                cwd, updated_at_epoch, first_seen_at, last_seen_at, source_format)
+             VALUES ('native', 'pi', ?1, 'file', ?2, '/repo', ?3, 'now', 'now', ?4)",
+            params![session_id, path.to_string_lossy(), index,
+                serde_json::to_string(&SourceFormat::PiV3Jsonl).unwrap()],
         ).unwrap();
         store.lock().execute(
             "INSERT INTO native_file_delivery (environment_key, agent, session_id, incarnation,
                 source_label, cwd, parser_revision, cursor_json, observed_generation, pending, active_until_epoch)
-             SELECT environment_key, agent, session_id, incarnation, source_label, cwd, ?2, '{}',
+             SELECT environment_key, agent, session_id, incarnation, source_label, cwd, ?2, ?3,
                 source_generation, 0, 0 FROM session WHERE environment_key = 'native'
                 AND agent = 'pi' AND session_id = ?1",
-            params![session_id, antiburn_local::analysis::PARSER_REVISION],
+            params![session_id, antiburn_local::analysis::PARSER_REVISION,
+                serde_json::to_string(&cursor).unwrap()],
         ).unwrap();
     }
 

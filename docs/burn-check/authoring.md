@@ -143,11 +143,10 @@ or historical-only sources for new live checks. These features are not usable
 today; beta and stable scope are not set.
 
 The broader draft and schema retain some unsupported context and action forms.
-Schema acceptance is not compiler admission, source proof, or provider
-compatibility. The context has no measured activity partition. Status does not
-grant native fix prompts, Auto Fix, verification watches, burn estimates, or
-savings, and draft syntax does not commit to adding them. See the
-[example limits](README.md#examples).
+Schema acceptance, compiler admission, source proof, and provider compatibility
+are separate requirements. The context does not split elapsed time into
+model-active and tool-only periods. Draft syntax does not promise implementation
+of missing capabilities. See the [example limits](README.md#examples).
 
 ### Event selection
 
@@ -608,7 +607,8 @@ The Checks collection and search show one row per stem. Scoped activations and
 branches remain separate. Internal display/snooze identity is separate from
 native detector IDs; authors do not add detector enum values.
 
-For the repository definitions, follow the [dogfood setup](README.md#try-the-repository-dogfood-checks).
+For the repository definitions, follow the
+[repository example setup](README.md#try-the-repository-dogfood-checks).
 Fresh activation can seed a bounded recent tool-result window. It can assess the
 latest ready candidate once; it does not assess every older window. Retained
 earlier user messages can supply context with explicit history limits. Restart
@@ -625,8 +625,9 @@ selects at most 40 current terminal tool results within 4 MiB in native order.
 Your filters and condition select only the latest ready candidate, even without
 `on.window`. Empty receipts get a durable marker. Startup coverage stays partial,
 and existing observed work is not reseeded. Other attached sessions can continue
-while one initializes. Both native delivery routes continue productive pages
-immediately with durable fair rotation. Active sources poll at one second; idle
+while one initializes. Both native delivery routes schedule the next page
+immediately when the source reports more work. Saved claim order gives ready
+sources a turn, including after restart. Active sources poll at one second; idle
 attached dormant sources use a 30-second resume sweep.
 
 Bounded recent startup is the only automatic historical seed. Later corrections
@@ -866,10 +867,11 @@ input-shortening note. A shortened input cannot establish facts about the omitte
 middle text or dropped items. The question should account for this limit; use an
 uncertain answer when the remaining evidence cannot support its claim.
 
-If local request validation still fails after the permitted changes, the
-candidate is **Not assessed** with typed `NoFit`. The detail distinguishes no
-rules, no matching targets, targets at retention/marker limits, and exhausted
-reductions. A separate `PreparationResourceLimit` means preparation stops at a
+If local request validation still fails after the permitted changes, preparation
+stops with typed `NoFit` and writes no new status. Any earlier saved result stays
+unchanged. The detail distinguishes no rules, no matching targets, targets at
+retention/marker limits, and exhausted reductions. A separate
+`PreparationResourceLimit` means preparation stops at a
 local resource bound; it does not prove that further authorized reductions
 could not fit. Legacy no-fit records without a typed reason use a generic
 preparation-incomplete explanation.
@@ -1010,10 +1012,10 @@ claim.
 See [check coverage](../check-coverage.md#burn-check-definitions) for evidence limits.
 
 Finding evidence is bound to the assessment that wrote the displayed status.
-For each decision in saved model preparation, **Original input** shows the
-evaluated input, **Assessed input** shows the exact fitted input, and **Input omissions**
-with its omission report when nonempty. A later
-assessment does not replace that evidence. Original full tool output is not
+For each decision with saved model preparation, **Original input** shows the
+evaluated input. **Assessed input** shows the exact fitted input. **Input omissions**
+shows the omission report when it is nonempty. A later assessment that writes no
+status does not replace this evidence. Original full tool output is not
 substituted for shortened input. Historical accepted single-question preparation
 retains its saved fitted input, omissions, and available provenance without
 inventing an unsaved original input. Legacy assessments without saved preparation

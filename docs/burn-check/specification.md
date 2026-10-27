@@ -1,8 +1,9 @@
 # Burn Checks specification: v1-alpha
 
 Use this reference to write definitions, build parsers and compilers, or implement
-source adapters. MUST, MUST NOT, and SHOULD define requirements within this draft.
-They do not promise language stability or support for every capability.
+source adapters. MUST states a requirement. MUST NOT states a prohibition.
+SHOULD states a recommendation. These terms apply within this draft. They do not
+promise language stability or support for every capability.
 
 > **Experimental draft: `v1-alpha`.** Burn Checks are not yet standardized.
 > Syntax, semantics, and capabilities may change, including breaking changes.
@@ -647,10 +648,10 @@ It may have `model` or `fast_mode` only under the uniform-attribution rule.
 Turn messages use the same record shape as current messages and windows.
 Native terminal reasons and error codes do not enter the closed `turn` root.
 
-The language does not expose a measured activity partition. Transcript gaps,
-token counts, and tool durations cannot prove model occupancy, tool-only time,
-counterfactual duration, or savings. The separate 120-second `session_idle`
-policy records an observation and does not measure these durations.
+The context does not split elapsed time into model-active and tool-only periods.
+Transcript gaps, token counts, and tool durations cannot prove those periods, how
+long another setup would take, or savings. The separate 120-second `session_idle`
+policy records an observation; it does not measure these durations.
 
 ## 7. Decisions and provider results
 

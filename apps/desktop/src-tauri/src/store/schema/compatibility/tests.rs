@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rusqlite::types::Value;
+use rusqlite::{params, types::Value};
 
 use super::*;
 use crate::store::{Store, database_path};
@@ -284,10 +284,10 @@ fn pinned_histories_preserve_populated_state_through_disk_open_and_reopen() {
                 let store = Store::open(directory.path()).unwrap_or_else(|error| {
                     panic!("branch={branch}, version={version}: {error:#}")
                 });
-                assert_eq!(store.schema_version().unwrap(), 91);
+                assert_eq!(store.schema_version().unwrap(), 92);
                 store.migrate().unwrap();
                 let connection = store.lock();
-                assert_eq!(read_profile(&connection).unwrap(), Profile::canonical(91));
+                assert_eq!(read_profile(&connection).unwrap(), Profile::canonical(92));
                 for (table, (columns, expected)) in &before {
                     assert_eq!(
                         rows(&connection, table, columns),
@@ -338,7 +338,7 @@ fn branch_repair_maps_each_known_shape_and_canonical_profiles_are_no_ops() {
             expected
         );
     }
-    for version in 81..=91 {
+    for version in 81..=92 {
         let mut connection = Connection::open_in_memory().unwrap();
         for sql in &super::super::MIGRATIONS[..version] {
             connection.execute_batch(sql).unwrap();
@@ -371,6 +371,114 @@ fn branch_repair_maps_each_known_shape_and_canonical_profiles_are_no_ops() {
 }
 
 #[test]
+fn v92_indexes_preserve_v91_rows_and_roll_back_failed_creation() {
+    const INDEXES: [&str; 3] = [
+        "burn_check_candidate_dependency_native_identity",
+        "burn_check_observation_native_identity",
+        "native_evidence_publication_correction",
+    ];
+    for fail_creation in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = Connection::open(database_path(directory.path())).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        for migration in &super::super::MIGRATIONS[..91] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 91).unwrap();
+        seed(&connection);
+        for (id, binding) in [
+            ("invalid-json", "{bad"),
+            ("empty-binding", "{}"),
+            (
+                "partial-binding",
+                r#"{"NativeCurrent":{"identity":"result"}}"#,
+            ),
+        ] {
+            assert_eq!(
+                connection
+                    .execute(
+                        "INSERT INTO burn_check_candidate_dependency
+                     (candidate_id, observation_id, session_key_json, source_format,
+                      native_revision, evidence_version, removed, payload_sha256,
+                      event_kind, dependency_binding_json)
+                     SELECT candidate_id, ?1, session_key_json, 'fixture', 1, 'saved',
+                            0, '', 'tool_result', ?2
+                       FROM burn_check_candidate WHERE candidate_id = 'accepted'",
+                        params![id, binding],
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+        let before = snapshot(&connection);
+        let mut store = Store::open_in_memory(directory.path()).unwrap();
+        *store.lock() = connection;
+        if fail_creation {
+            store.lock().execute_batch(
+                "CREATE TABLE burn_check_candidate_dependency_native_identity (synthetic INTEGER)",
+            ).unwrap();
+            let failed_before = snapshot(&store.lock());
+            assert!(store.migrate().is_err());
+            assert_eq!(store.schema_version().unwrap(), 91);
+            assert_eq!(snapshot(&store.lock()), failed_before);
+            assert_eq!(
+                store
+                    .lock()
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index'
+                       AND name IN (?1, ?2, ?3)",
+                        params![INDEXES[0], INDEXES[1], INDEXES[2]],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+            store
+                .lock()
+                .execute_batch("DROP TABLE burn_check_candidate_dependency_native_identity")
+                .unwrap();
+        }
+        store.migrate().unwrap();
+        for _ in 0..2 {
+            assert_eq!(store.schema_version().unwrap(), 92);
+            {
+                let connection = store.lock();
+                assert_eq!(read_profile(&connection).unwrap(), Profile::canonical(92));
+                for (table, (columns, expected)) in &before {
+                    assert_eq!(rows(&connection, table, columns), *expected, "{table}");
+                }
+                let mut statement = connection
+                    .prepare(
+                        "SELECT name FROM sqlite_schema WHERE type = 'index'
+                       AND name IN (?1, ?2, ?3) ORDER BY name",
+                    )
+                    .unwrap();
+                let indexes = statement
+                    .query_map(params![INDEXES[0], INDEXES[1], INDEXES[2]], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(indexes, INDEXES.map(str::to_owned));
+                assert_eq!(
+                    connection
+                        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap(),
+                    0
+                );
+            }
+            drop(store);
+            store = Store::open(directory.path()).unwrap();
+        }
+    }
+}
+
+#[test]
 fn pre_registry_branch_versions_keep_populated_state_through_open_and_reopen() {
     for version in 86..=90 {
         let directory = tempfile::tempdir().unwrap();
@@ -395,7 +503,7 @@ fn pre_registry_branch_versions_keep_populated_state_through_open_and_reopen() {
         for _ in 0..2 {
             let store = Store::open(directory.path()).unwrap();
             let connection = store.lock();
-            assert_eq!(read_profile(&connection).unwrap(), Profile::canonical(91));
+            assert_eq!(read_profile(&connection).unwrap(), Profile::canonical(92));
             for (table, (columns, expected)) in &before {
                 assert_eq!(
                     rows(&connection, table, columns),
@@ -442,7 +550,7 @@ fn main_registry_rows_and_initialization_survive_retirement_and_reopen() {
             let (columns, expected) = &before[table];
             assert_eq!(rows(&connection, table, columns), *expected);
         }
-        assert_eq!(read_profile(&connection).unwrap(), Profile::canonical(91));
+        assert_eq!(read_profile(&connection).unwrap(), Profile::canonical(92));
     }
 }
 
@@ -856,7 +964,7 @@ fn failed_evidence_migration_rolls_back_temporary_work_and_keeps_the_version() {
         .execute_batch("DROP TABLE current_evidence_copy")
         .unwrap();
     store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 91);
+    assert_eq!(store.schema_version().unwrap(), 92);
 }
 
 #[test]
@@ -1150,7 +1258,7 @@ fn interrupted_untyped_upgrade_keeps_its_boundary_and_preserves_newer_typed_gaps
         drop(connection);
         for _ in 0..2 {
             let store = Store::open(directory.path()).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 91);
+            assert_eq!(store.schema_version().unwrap(), 92);
             assert_eq!(gap_kind(&store.lock(), old_gap), "partial");
             assert_eq!(gap_kind(&store.lock(), new_gap), "invalidated");
             assert!(store.internal_value(UNTYPED_GAP_HEAD_KEY).is_none());

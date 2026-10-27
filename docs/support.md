@@ -309,18 +309,20 @@ connection, then enable **Run checks** when ready. **Edit** and **Save** update 
 connection without selecting another one. **Remove** can delete any connection;
 removing the selected connection turns checks off and clears selection. Saved
 results and usage remain. **Test connection** in the dialog is optional, sends synthetic input,
-and can incur provider charges. Compatible models and output capabilities are
-required; an arbitrary chat endpoint is not supported. Custom supports direct
-System One and Cloudflare-envelope responses, but unknown limits block execution.
+and can incur provider charges. Ollama requires an endpoint that supports System
+One. Compatible models and output capabilities are required; an arbitrary chat
+endpoint is not supported. Custom supports direct System One and
+Cloudflare-envelope responses, but unknown limits block execution.
 The app manages supported limits without manual overrides. See
 [decision connections](burn-check/authoring.md#decision-connections) for the
 provider-specific fields and limits. The selected Settings connection owns
 routing; decision-level YAML `model` is rejected as an unknown field.
-Local status checks send no model request but keep master enablement, selected
-configuration, credential/authentication, source, and runtime gates. With **Run
-checks** off, the app still reads and parses bounded local YAML definitions and
-watches their directories, including at cold startup. This supplies names,
-diagnostics, paused cards, and file counts. It does not restore provider
+Local status checks send no model request. They still require **Run checks** to
+be on and a configured connection to be selected. The connection's credential
+and authentication rules, and the source and runtime requirements, still apply.
+With **Run checks** off, the app still reads and parses bounded local YAML
+definitions and watches their directories, including at cold startup. This
+supplies names, diagnostics, paused cards, and file counts. It does not restore provider
 configuration, discover model capabilities, catch up session sources, or run
 assessments.
 Partial history and fields are identified; missing images are not analyzed.

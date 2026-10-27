@@ -627,6 +627,94 @@ test("busy Save blocks dismissal, then failed Save can close while Retry stays r
   await expect(pane.getByRole("button", { name: "Add connection", exact: true })).toBeFocused()
 })
 
+test("incoming outside search waits for the native connection modal and keeps Save recovery", async ({
+  page,
+}) => {
+  await page.goto("/tests/visual/?surface=settings&providerSave=loading")
+  const pane = await openChecks(page)
+  const baseline = await readOnlyBaseline(page)
+  await connectionAction(page, "Jev", "Edit")
+  const dialog = page.getByRole("dialog", { name: "Edit Jev connection", exact: true })
+  await dialog.getByRole("button", { name: "Change", exact: true }).click()
+  const key = dialog.getByLabel("Jev API key", { exact: true })
+  await key.fill("synthetic-search-secret")
+  await page.evaluate(() =>
+    window.__ANTIBURN_VISUAL_EMIT__?.("settings:pane", "checks#checkDirectories"),
+  )
+  await expect(key).toBeFocused()
+  await expect(key).toHaveValue("synthetic-search-secret")
+  expect(await dialog.evaluate((node) => node.matches(":modal"))).toBe(true)
+  expect(await providerCalls(page)).toEqual(baseline)
+  expect(await page.evaluate(() => window.__ANTIBURN_VISUAL_CONFIRMATIONS__ ?? [])).toEqual([])
+
+  await dialog.getByRole("button", { name: "Save", exact: true }).click()
+  await page.evaluate(() =>
+    window.__ANTIBURN_VISUAL_EMIT__?.("settings:pane", "checks#checkModelUsage"),
+  )
+  await page.keyboard.press("Escape")
+  await expect(dialog.getByRole("button", { name: "Cancel", exact: true })).toBeDisabled()
+  expect(await dialog.evaluate((node) => node.matches(":modal"))).toBe(true)
+  await page.evaluate(() => window.__ANTIBURN_VISUAL_RELEASE_PROVIDER_OPERATION__?.())
+  await expect(
+    dialog.getByRole("button", { name: "Retry connection operation", exact: true }),
+  ).toBeEnabled()
+  await expect(key).toHaveValue("synthetic-search-secret")
+  await key.fill("synthetic-later-search-secret")
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+  const usage = pane.getByRole("button", { name: "Model usage", exact: true })
+  await expect(usage).toBeFocused()
+  await expect(usage).toHaveAttribute("aria-expanded", "true")
+  await expect(
+    pane.getByRole("button", { name: "Retry connection operation", exact: true }),
+  ).toBeEnabled()
+  const files = pane.getByRole("button", { name: "Check files", exact: true })
+  await files.focus()
+  await page.keyboard.press("Space")
+  await expect(files).toBeFocused()
+  await connectionAction(page, "Jev", "Edit")
+  await expect(key).toHaveValue("synthetic-later-search-secret")
+  expect(await dialog.evaluate((node) => node.matches(":modal"))).toBe(true)
+  expect(await providerCalls(page)).toEqual([
+    ...baseline,
+    "save_system_one_connection",
+    "get_system_one_settings",
+  ])
+  expect(await page.evaluate(() => window.__ANTIBURN_VISUAL_CONFIRMATIONS__ ?? [])).toEqual([])
+})
+
+test("incoming current-pane search waits for compact Settings navigation to close", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 640, height: 720 })
+  await page.goto("/tests/visual/?surface=settings")
+  const pane = await openChecks(page)
+  const baseline = await readOnlyBaseline(page)
+  const opener = page.getByRole("button", { name: "Open Settings navigation", exact: true })
+  const navigation = page.getByRole("dialog", { name: "Settings navigation", exact: true })
+  const files = pane.getByRole("button", { name: "Check files", exact: true })
+  for (const action of ["Escape", "Close navigation"]) {
+    await opener.click()
+    await expect(navigation).toBeVisible()
+    await page.evaluate(() =>
+      window.__ANTIBURN_VISUAL_EMIT__?.("settings:pane", "checks#checkDirectories"),
+    )
+    expect(await navigation.evaluate((node) => node.matches(":modal"))).toBe(true)
+    expect(await navigation.evaluate((node) => node.contains(document.activeElement))).toBe(
+      true,
+    )
+    if (action === "Escape") await page.keyboard.press("Escape")
+    else await navigation.getByRole("button", { name: "Close navigation", exact: true }).click()
+    await expect(navigation).toBeHidden()
+    await expect(files).toBeFocused()
+    await expect(files).toHaveAttribute("aria-expanded", "true")
+    const run = pane.getByRole("switch", { name: "Run checks", exact: true })
+    await run.focus()
+    await expect(run).toBeFocused()
+  }
+  expect(await providerCalls(page)).toEqual(baseline)
+})
+
 for (const action of ["Cancel", "Escape"] as const) {
   test(`pending Add returns focus to global Retry after ${action} and keeps its draft`, async ({
     page,

@@ -193,6 +193,16 @@ impl RequestHistory {
         self.root && !self.unsafe_identity
     }
 
+    pub(super) fn admission_failure(&self) -> Option<crate::analysis::ToolResultCompleteness> {
+        if self.unsafe_identity {
+            Some(crate::analysis::ToolResultCompleteness::UnsafeIdentity)
+        } else if !self.root {
+            Some(crate::analysis::ToolResultCompleteness::UnsafeOwnership)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn tool_facts(
         &self,
         session: &str,

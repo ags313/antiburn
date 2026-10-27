@@ -147,6 +147,24 @@ enum InventoryEvent {
     Report,
 }
 
+struct CheckDirectoryReadFailure {
+    directories: BTreeMap<PathBuf, loader::DirectoryChecks>,
+}
+
+impl std::fmt::Display for CheckDirectoryReadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("one or more installed check folders could not be read")
+    }
+}
+
+impl std::fmt::Debug for CheckDirectoryReadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl std::error::Error for CheckDirectoryReadFailure {}
+
 fn publish_inventory(
     state: &InstalledChecks,
     store: &Store,
@@ -215,7 +233,40 @@ fn finish_inventory_update<E>(
     };
     state.delivery_ready.store(false, Ordering::Release);
     let mut failure = diagnostics::RuntimeFailure::classify(stage, &error);
-    if let Err(error) = pause_saved_inventory(state, &host.store, &mut emit) {
+    let paused = pause_saved_inventory(state, &host.store, &mut emit).and_then(|()| {
+        if let Some(failure) = error.downcast_ref::<CheckDirectoryReadFailure>() {
+            // Report folder failures without replacing the saved discovery snapshot.
+            let mut definitions = state
+                .metadata
+                .read()
+                .expect("installed metadata lock")
+                .clone();
+            let mut folders = Vec::new();
+            attach_directory_diagnostics(&mut folders, &failure.directories)?;
+            let diagnostics = folders
+                .iter()
+                .flat_map(|folder| folder.diagnostics.clone())
+                .collect::<Vec<_>>();
+            if definitions.is_empty() {
+                let mut folder = folders.into_iter().next().expect("unreadable check folder");
+                folder.diagnostics = diagnostics;
+                definitions.push(folder);
+            } else {
+                for definition in &mut definitions {
+                    definition
+                        .diagnostics
+                        .retain(|diagnostic| diagnostic.code != "discovery-directory-unavailable");
+                    definition.diagnostics.extend(diagnostics.iter().cloned());
+                }
+            }
+            if publish_metadata(state, &definitions) {
+                emit(InventoryEvent::Availability);
+                emit(InventoryEvent::Report);
+            }
+        }
+        Ok(())
+    });
+    if let Err(error) = paused {
         failure.trace_if_changed(previous_failure, "installed_check_update_failed");
         failure = diagnostics::RuntimeFailure::classify(stage, &error);
     }
@@ -246,6 +297,29 @@ fn finish_app_inventory_update<E>(
             }
         },
     )
+}
+
+fn update_delivery_readiness<E>(
+    state: &InstalledChecks,
+    host: &InstalledCheckHost<E>,
+    provider_ready: bool,
+) {
+    // Capability retries need the source to keep producing eligible work.
+    let definitions_ready = host.inventory_ready
+        && host
+            .projects
+            .values()
+            .any(|project| !project.active.is_empty());
+    state.delivery_ready.store(
+        state.credentials_restored.load(Ordering::Acquire)
+            && live_delivery_permitted(
+                &host.store,
+                definitions_ready,
+                state.stopping.load(Ordering::Acquire),
+                provider_ready,
+            ),
+        Ordering::Release,
+    );
 }
 
 pub(crate) fn wake(app: &tauri::AppHandle) {
@@ -710,6 +784,10 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                     .map(|(root, enabled)| (root.join(".antiburn/checks"), *enabled)),
             )
         {
+            // The global folder keeps its access policy when a repository shares its path.
+            if directories.contains_key(&directory) {
+                continue;
+            }
             let checks = if enabled {
                 loader::load_directory(&self.store, &directory, &granted)
             } else {
@@ -726,10 +804,20 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             diagnostics::collect(errors, checks.error.as_slice());
             directories.insert(directory, checks);
         }
-        ensure!(
-            !incomplete,
-            "one or more installed check folders could not be read"
-        );
+        if incomplete {
+            return Err(CheckDirectoryReadFailure {
+                directories: directories
+                    .into_iter()
+                    .filter(|(_, checks)| {
+                        checks
+                            .error
+                            .as_ref()
+                            .is_some_and(|error| error.code == DiagnosticCode::DiscoveryReadFailed)
+                    })
+                    .collect(),
+            }
+            .into());
+        }
         Ok(directories)
     }
 
@@ -1493,6 +1581,9 @@ fn definition_files(
     }
     if let Some(root) = &config.project_root {
         let directory = root.join(".antiburn/checks");
+        if config.global_checks_directory.as_ref() == Some(&directory) {
+            return files;
+        }
         let ids = previous_ids
             .iter()
             .cloned()
@@ -2287,14 +2378,10 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
             continue;
         }
         if reconciled {
-            state.delivery_ready.store(
-                current_admission == Admission::Ready
-                    && admission(app) == Admission::Ready
-                    && crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>())
-                    && host.definitions.iter().any(|definition| {
-                        definition.availability == InstalledCheckAvailability::Available
-                    }),
-                Ordering::Release,
+            update_delivery_readiness(
+                &state,
+                &host,
+                current_admission == Admission::Ready && admission(app) == Admission::Ready,
             );
             let summary = (
                 host.definitions.len(),

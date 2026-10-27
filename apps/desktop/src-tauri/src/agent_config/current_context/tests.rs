@@ -1,6 +1,7 @@
 use super::*;
 use std::fs;
 
+mod protected_case_aliases;
 mod review;
 
 struct Fixture {

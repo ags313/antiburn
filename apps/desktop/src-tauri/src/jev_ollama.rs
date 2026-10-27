@@ -201,16 +201,18 @@ impl OllamaClient {
         capabilities: &ModelCapabilities,
         record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
     ) -> Result<JevResponse, JevError> {
-        self.evaluate_with_usage_cancellable(request, capabilities, || false, record_usage)
+        self.evaluate_with_usage_cancellable(request, capabilities, || false, || {}, record_usage)
             .await
     }
 
     /// Checks cancellation only before HTTP send.
+    /// Reports possible delivery after local admission and the final cancellation check.
     pub(crate) async fn evaluate_with_usage_cancellable(
         &self,
         request: &JevRequest,
         capabilities: &ModelCapabilities,
         is_cancelled: impl Fn() -> bool,
+        on_send: impl FnOnce(),
         record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
     ) -> Result<JevResponse, JevError> {
         if is_cancelled() {
@@ -226,6 +228,7 @@ impl OllamaClient {
         if is_cancelled() {
             return Err(JevError::Cancelled);
         }
+        on_send();
         let bytes = Self::send_evaluation(builder, capabilities)
             .await
             .map_err(jev_error)?;
@@ -1605,6 +1608,10 @@ mod tests {
 
     #[tokio::test]
     async fn ready_discovery_uses_inference_slots_and_releases_them_on_cancellation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
         use tokio::io::AsyncReadExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1619,18 +1626,23 @@ mod tests {
                 ..ModelCapabilities::jev_default()
             },
         };
-        let permits = inference_slots()
-            .acquire_many(u32::try_from(DEFAULT_LOCAL_CONCURRENCY).unwrap())
-            .await
-            .unwrap();
+        let permits = test_hooks::hold_inference_slots().await;
+        let pending = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&pending);
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(20),
-                client.discover_ready(discovered.clone()),
+                test_hooks::with_inference_slot_pending(
+                    move || {
+                        observed.fetch_add(1, Ordering::AcqRel);
+                    },
+                    client.discover_ready(discovered.clone()),
+                ),
             )
             .await
             .is_err()
         );
+        assert_eq!(pending.load(Ordering::Acquire), 1);
         assert!(
             tokio::time::timeout(Duration::from_millis(20), listener.accept())
                 .await

@@ -27,9 +27,10 @@ server, or backend.
 - **Model-based checks:** A fresh setup without a connection stays off. Settings →
   Checks preserves the saved master setting. Check cards and navigation
   appear only for discovered definitions; Settings controls stay available.
-  The connection list under **Model-based checks** supports Jev, compatible
-  Ollama, Cloudflare, or Custom. Add and edit use a connection dialog. Inactive
-  rows keep **Use** visible. Each row puts **Edit** and **Remove** in its actions menu.
+  The connection list under **Model-based checks** supports Jev, Ollama endpoints
+  that support System One, Cloudflare, or Custom. Add and edit use a connection
+  dialog. Inactive rows keep **Use** visible. Each row puts **Edit** and **Remove**
+  in its actions menu.
   **Use** selects a saved connection. Saving an inactive connection does not select it.
   Removing the selected connection turns checks off and clears selection, even
   when other connections remain. Saved results and usage remain available. The app
@@ -38,8 +39,10 @@ server, or backend.
   credential storage or memory. Model requests contain the definition's selected
   public messages, tool calls/results, response-cycle or session facts, current
   instruction text, and declared skill descriptions, not automatic full
-  transcripts. Local status checks send no model request but keep the selected
-  configuration, credential/authentication, and runtime gates. Skill inventory inputs contain declared
+  transcripts. Local status checks send no model request. They still require
+  **Run checks** to be on and a configured connection to be selected. The
+  connection's credential and authentication rules, and the source and runtime
+  requirements, still apply. Skill inventory inputs contain declared
   metadata, not full bodies; selected tool results can still contain file text. Current-file inputs
   remain frozen for delayed decisions and retries. Partial fields, truncated
   text, and source gaps are identified for the model; missing images are not analyzed.

@@ -317,6 +317,7 @@ pub(crate) fn reconcile_borrowed_with_policy(
         )?;
     }
     let mut present_by_format = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let mut changed = std::collections::BTreeSet::new();
     for result in batch.results {
         ensure!(
             result.session_id == session.session_id,
@@ -429,6 +430,7 @@ pub(crate) fn reconcile_borrowed_with_policy(
                 source_generation, claim_fence, result.record_id,
             ],
         )?;
+        changed.insert((source_format, identity));
     }
 
     if batch.complete {
@@ -497,9 +499,20 @@ pub(crate) fn reconcile_borrowed_with_policy(
                     claim_fence
                 ],
             )?;
+            changed.insert((parent_format.clone(), identity));
         }
     }
 
+    for (format, identity) in changed {
+        super::evidence::invalidate_native_identity_dependents_in(
+            transaction,
+            session,
+            &format,
+            &identity,
+            super::evidence::EvidenceEventKind::ToolResult,
+        )?
+        .record(policy.invalidation_effects);
+    }
     if !policy.suppress_coverage && policy.history_complete.is_none() {
         publish_coverage_with_kind_in(
             transaction,

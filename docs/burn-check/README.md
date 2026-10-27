@@ -15,9 +15,10 @@ attention. A result covers the selected work, not the quality of a whole session
 
 1. Create `~/.antiburn/checks/` for global checks, or `.antiburn/checks/` inside a
    known native repository. The app watches these folders but does not create them.
-2. Put an immediate `.yml` or `.yaml` definition in that folder. A project file
-   replaces a global file with the same lowercase filename stem; files do not
-   merge. See [identity and installation](authoring.md#identity-and-installation)
+2. Save a `.yml` or `.yaml` definition directly in that folder. Subfolders are not
+   searched. A project file replaces a global file with the same lowercase
+   filename stem; files do not merge. See
+   [identity and installation](authoring.md#identity-and-installation)
    for naming, access, and invalid-override rules.
 3. Configure a connection and enable **Run checks** as described below. Local
    checks also need this setup, but do not send model requests.
@@ -171,9 +172,8 @@ prompts, Auto Fix, verification watches, burn estimates, or savings. A YAML name
 does not identify a native detector or grant its capabilities. Automatic history
 assessment is unavailable; developer replay uses explicit isolated state.
 
-Missing capabilities are future work with no assigned release. Beta and stable
-scope are not set. Draft syntax is not a promise to implement those capabilities,
-and missing features are not usable today.
+These capabilities have no assigned release. Beta and stable scope are not set.
+The broader draft does not promise implementation.
 
 ## Examples
 
@@ -185,8 +185,8 @@ documents state accepted sources, producer versions, and result limits.
 | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [Over-exploring](../../.antiburn/checks/over-exploring.yml)             | Clearly unrelated completed reads/searches. Plausible dependencies, tests, and verification remain allowed.                                                            |
 | [Scope creep](../../.antiburn/checks/scope-creep.yml)                   | Supported completed work on a separate objective. User approval stays separate from tool claims.                                                                       |
-| [Ignored instructions](../../.antiburn/checks/ignored-instructions.yml) | Separate current-file mismatch and recorded prior-correction conflict labels. Partial scopes remain explicit.                                                          |
-| [Skill opportunities](../../.antiburn/checks/skill-opportunities.yml)   | Inventory-level next-step advice from observed declared descriptions, without a specific skill pick or historical non-use claim.                                       |
+| [Ignored instructions](../../.antiburn/checks/ignored-instructions.yml) | Uses separate labels for current-file mismatches and conflicts with an earlier recorded correction. Keeps partial-scope limits explicit.                               |
+| [Skill opportunities](../../.antiburn/checks/skill-opportunities.yml)   | Suggests reviewing the configured skill descriptions in the saved input for useful next steps. Does not choose a specific skill or claim that it was never used.       |
 | [Fast mode value](../../.antiburn/checks/fast-mode-value.yml)           | Standard-mode trial advice for explicitly non-urgent work. Speed records, catalog mode, requested-tier preference, and name hints do not prove served tier or savings. |
 
 The instruction and skill checks select whole current scopes to preserve missing

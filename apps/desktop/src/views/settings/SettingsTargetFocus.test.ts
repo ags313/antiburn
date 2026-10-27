@@ -133,4 +133,104 @@ describe("settings search focus", () => {
     expect(other).toHaveFocus()
     stop()
   })
+  it("waits for the modal to close and applies only the latest search request", async () => {
+    const panel = document.createElement("div")
+    panel.innerHTML = `
+      <div data-settings-control="checkDirectories"><button>Check files</button></div>
+      <div data-settings-control="checkModelUsage"><button>Model usage</button></div>
+      <dialog open><input aria-label="Credential" /></dialog>
+    `
+    document.body.append(panel)
+    const files = panel.querySelector<HTMLButtonElement>("button")!
+    const usage = panel.querySelectorAll<HTMLButtonElement>("button")[1]!
+    for (const row of panel.querySelectorAll<HTMLElement>("[data-settings-control]"))
+      row.scrollIntoView = vi.fn()
+    const dialog = panel.querySelector("dialog")!
+    const credential = panel.querySelector("input")!
+    credential.focus()
+    const focus = new SettingsTargetFocus()
+    focus.attach(panel, "checks", "checkDirectories", 1)
+    const stop = focus.attach(panel, "checks", "checkModelUsage", 2)
+    expect(credential).toHaveFocus()
+    expect(files).not.toHaveFocus()
+    dialog.open = false
+    await Promise.resolve()
+    expect(usage).toHaveFocus()
+    files.focus()
+    focus.attach(panel, "checks", "checkModelUsage", 2)()
+    expect(files).toHaveFocus()
+    stop()
+  })
+  it.each(["close", "remove"])(
+    "keeps the latest request after stale cleanup and a sibling modal %s",
+    async (action) => {
+      const panel = document.createElement("div")
+      panel.innerHTML = `
+        <div data-settings-control="checkDirectories"><button>Check files</button></div>
+        <div data-settings-control="checkModelUsage"><button>Model usage</button></div>
+      `
+      const dialog = document.createElement("dialog")
+      dialog.open = true
+      const close = document.createElement("button")
+      dialog.append(close)
+      document.body.append(panel, dialog)
+      for (const row of panel.querySelectorAll<HTMLElement>("[data-settings-control]"))
+        row.scrollIntoView = vi.fn()
+      close.focus()
+      const focus = new SettingsTargetFocus()
+      const staleCleanup = focus.attach(panel, "checks", "checkDirectories", 1)
+      const stop = focus.attach(panel, "checks", "checkModelUsage", 2)
+      staleCleanup()
+      expect(close).toHaveFocus()
+      if (action === "close") dialog.open = false
+      else dialog.remove()
+      await Promise.resolve()
+      const usage = panel.querySelectorAll<HTMLButtonElement>("button")[1]!
+      expect(usage).toHaveFocus()
+      const files = panel.querySelector<HTMLButtonElement>("button")!
+      files.focus()
+      panel.setAttribute("aria-busy", "false")
+      await Promise.resolve()
+      expect(files).toHaveFocus()
+      stop()
+    },
+  )
+  it("does not consume a request when the target cannot receive focus", async () => {
+    const panel = document.createElement("div")
+    panel.innerHTML =
+      '<div data-settings-control="checkDirectories"><button>Files</button></div>'
+    document.body.append(panel)
+    const row = panel.firstElementChild as HTMLElement
+    row.scrollIntoView = vi.fn()
+    const button = panel.querySelector("button")!
+    const blockedFocus = vi.spyOn(button, "focus").mockImplementationOnce(() => undefined)
+    const stop = new SettingsTargetFocus().attach(panel, "checks", "checkDirectories", 1)
+    expect(button).not.toHaveFocus()
+    button.setAttribute("aria-disabled", "false")
+    await Promise.resolve()
+    expect(button).toHaveFocus()
+    expect(blockedFocus).toHaveBeenCalledTimes(2)
+    stop()
+  })
+  it("keeps a later user focus choice after the modal closes before the observer runs", async () => {
+    const panel = document.createElement("div")
+    panel.innerHTML = `
+      <div data-settings-control="checkDirectories"><button>Files</button></div>
+      <button id="later">Later choice</button>
+      <dialog open><input /></dialog>
+    `
+    document.body.append(panel)
+    const row = panel.firstElementChild as HTMLElement
+    row.scrollIntoView = vi.fn()
+    const later = panel.querySelector<HTMLButtonElement>("#later")!
+    const focus = new SettingsTargetFocus()
+    focus.attach(panel, "checks", "checkDirectories", 1)
+    panel.querySelector("dialog")!.open = false
+    later.dispatchEvent(new Event("pointerdown", { bubbles: true }))
+    later.focus()
+    await Promise.resolve()
+    expect(later).toHaveFocus()
+    focus.attach(panel, "checks", "checkDirectories", 1)()
+    expect(later).toHaveFocus()
+  })
 })

@@ -831,6 +831,62 @@ it("defers a non-first search field while busy without extra native calls", asyn
   ])
 })
 
+it("keeps a dirty editor and its secret when a non-editor search arrives", async () => {
+  const session = new ProviderSettingsSession()
+  await session.refresh()
+  session.openEdit("jev")
+  session.edit({ ...saved.profiles.jev!, modelRevision: "draft" }, "keep-secret")
+  const before = session.getSnapshot()
+  session.revealTarget("checkDirectories", 1)
+  session.revealTarget("checkModelUsage", 2)
+  expect(session.getSnapshot()).toEqual(before)
+  expect(confirmRemoval).not.toHaveBeenCalled()
+  expect(invoke.mock.calls.map(([command]) => command)).toEqual(["get_system_one_settings"])
+})
+
+it("lets the latest non-editor search cancel a deferred provider target during Save", async () => {
+  const session = new ProviderSettingsSession()
+  await session.refresh()
+  session.openEdit("jev")
+  session.edit(saved.profiles.jev!, "keep-secret")
+  let finish!: () => void
+  invoke.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = () => resolve(saved)
+      }),
+  )
+  const saving = session.run("save")
+  session.revealTarget("ollamaModel", 1)
+  session.revealTarget("checkDirectories", 2)
+  expect(session.getSnapshot().editor).toBe("edit")
+  expect(session.getSnapshot().drafts.jev!.draft.credential).toBe("keep-secret")
+  finish()
+  await saving
+  expect(session.getSnapshot().editor).toBeNull()
+  expect(session.getSnapshot().selectedId).toBe("jev")
+  expect(confirmRemoval).not.toHaveBeenCalled()
+  expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+    "get_system_one_settings",
+    "save_system_one_connection",
+  ])
+})
+
+it("does not discard pending Save recovery or later secrets for a non-editor search", async () => {
+  const { session, id } = await submitPendingSave()
+  session.edit(
+    { ...session.getSnapshot().drafts[id]!.draft.connection, model: "later-model" },
+    "later-secret",
+  )
+  const before = session.getSnapshot()
+  session.revealTarget("checkDirectories", 1)
+  expect(session.getSnapshot()).toEqual(before)
+  expect(confirmRemoval).not.toHaveBeenCalled()
+  await session.closeEditor()
+  expect(session.getSnapshot().saved?.pendingOperation?.id).toBe("own-operation")
+  expect(session.getSnapshot().drafts[id]!.draft.credential).toBe("later-secret")
+})
+
 it("ignores a late saved-state read after a newer read", async () => {
   const session = new ProviderSettingsSession()
   let finish!: (settings: ProviderSettings) => void

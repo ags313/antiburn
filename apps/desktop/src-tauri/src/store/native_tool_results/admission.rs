@@ -9,6 +9,28 @@ use crate::store::SessionKey;
 pub(crate) const UNSAFE_REASONS_SQL: &str =
     "'native-unsafe-identity', 'native-unsafe-order', 'native-unsafe-ownership'";
 
+const SUPERSEDED_DEPENDENCY_SQL: &str = "SELECT EXISTS(
+    SELECT 1 FROM burn_check_candidate_dependency d
+    JOIN burn_check_candidate c USING(candidate_id)
+    JOIN burn_check_observation o ON o.check_id = c.check_id
+      AND o.activation_scope_key = c.activation_scope_key
+      AND o.observation_id = d.observation_id AND o.session_key_json = d.session_key_json
+    JOIN native_tool_result_publication p ON p.publication_sequence = o.publication_sequence
+    JOIN native_tool_result_publication newer ON newer.environment_key = p.environment_key
+      AND newer.agent = p.agent AND newer.session_id = p.session_id
+      AND newer.source_format = p.source_format AND newer.native_identity = p.native_identity
+      AND newer.event_kind = p.event_kind AND newer.publication_sequence > p.publication_sequence
+      AND (p.session_incarnation IS NULL OR (newer.session_incarnation IS p.session_incarnation
+        AND newer.project_cwd IS p.project_cwd))
+    WHERE d.candidate_id = ?1 AND d.dependency_binding_json IS NULL
+      AND d.native_revision IS NOT NULL AND d.event_kind = 'tool_result'
+      AND json_extract(c.activation_scope_key, '$.run') = 'Live'
+      AND newer.outcome IN ('update', 'removal')
+      AND newer.native_revision >= p.native_revision
+      AND (newer.outcome = 'removal' OR newer.native_revision > p.native_revision
+        OR newer.payload_json IS NOT p.payload_json
+        OR newer.native_position_json IS NOT p.native_position_json))";
+
 pub(crate) fn reason(reason: ToolResultCompleteness) -> Option<&'static str> {
     match reason {
         ToolResultCompleteness::UnsafeIdentity => Some("native-unsafe-identity"),
@@ -117,13 +139,150 @@ pub(crate) fn candidate_current_in(connection: &Connection, candidate: &str) -> 
           AND (p.session_incarnation IS NULL OR (u.session_incarnation IS p.session_incarnation AND u.project_cwd IS p.project_cwd))
         WHERE d.candidate_id = ?1 AND p.native_identity IS NOT NULL AND u.publication_sequence > p.publication_sequence
           AND u.outcome = 'coverage_gap' AND u.gap_reason IN ({UNSAFE_REASONS_SQL}))"), [candidate], |row| row.get(0))?;
-    Ok(!unsafe_dependency)
+    if unsafe_dependency {
+        return Ok(false);
+    }
+    // Tool-result observations can lag their native correction while a request waits.
+    let superseded_dependency: bool =
+        connection.query_row(SUPERSEDED_DEPENDENCY_SQL, [candidate], |row| row.get(0))?;
+    Ok(!superseded_dependency)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::Store;
+
+    #[test]
+    fn correction_lookup_uses_the_identity_and_sequence_index_for_updates_and_removals() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(directory.path()).unwrap();
+        let connection = store.lock();
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {SUPERSEDED_DEPENDENCY_SQL}"))
+            .unwrap();
+        let plan = statement
+            .query_map(["candidate"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| {
+                step.contains("SEARCH newer USING INDEX native_evidence_publication_correction")
+                    && step.contains("native_identity=?")
+                    && step.contains("event_kind=?")
+                    && step.contains("publication_sequence>?")
+            }),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn untyped_tool_result_fence_matches_exact_native_identity_and_scope_before_catch_up() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(directory.path()).unwrap();
+        let mut connection = store.lock();
+        connection.execute_batch(r#"
+            INSERT INTO native_tool_result_publication
+                (publication_sequence, outcome, environment_key, agent, session_id,
+                 source_format, native_identity, native_position_json, native_revision,
+                 payload_json, complete, source_generation, claim_fence, session_incarnation, project_cwd)
+            VALUES (1, 'update', 'native', 'pi', 'session', 'native-format', 'result', '{}',
+                2, '{"result":"original"}', 1, 1, 1, 7, '/repo');
+            INSERT INTO burn_check_candidate
+                (candidate_id, check_id, activation_scope_key, generation, branch_key, session_key_json,
+                 trigger_position, selected_publication_head, dependencies_json, frozen_input_json,
+                 input_fingerprint, state, claim_owner, claim_fence, created_at_epoch, updated_at_epoch)
+            VALUES ('candidate', 'check', '{"run":"Live"}', 1, 'branch', '["native","pi","session"]',
+                1, 1, '{}', '{}', 'fingerprint', 'dispatching', 'owner', 1, 1, 1);
+            INSERT INTO burn_check_observation
+                (check_id, activation_scope_key, observation_id, session_key_json, publication_sequence,
+                 source_format, native_identity, native_revision, evidence_version, removed, payload_json)
+            VALUES ('check', '{"run":"Live"}', 'observation', '["native","pi","session"]',
+                1, 'native-format', 'result', 2, 'version', 0, '{}');
+            INSERT INTO burn_check_candidate_dependency
+                (candidate_id, observation_id, session_key_json, source_format, native_revision,
+                 evidence_version, removed, payload_sha256)
+            VALUES ('candidate', 'observation', '["native","pi","session"]',
+                'native-format', 2, 'version', 0, 'normalized-hash');
+        "#).unwrap();
+        assert!(candidate_current_in(&connection, "candidate").unwrap());
+        for change in [
+            "environment",
+            "agent",
+            "session",
+            "format",
+            "identity",
+            "kind",
+            "incarnation",
+            "cwd",
+            "older",
+            "duplicate",
+            "revision",
+            "payload",
+            "position",
+            "removal",
+        ] {
+            let tx = connection.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO native_tool_result_publication
+                    (outcome, environment_key, agent, session_id, source_format, native_identity,
+                     native_position_json, native_revision, payload_json, complete, source_generation,
+                     claim_fence, session_incarnation, project_cwd, event_kind)
+                 SELECT CASE WHEN ?1 = 'removal' THEN 'removal' ELSE 'update' END,
+                    CASE WHEN ?1 = 'environment' THEN 'other' ELSE environment_key END,
+                    CASE WHEN ?1 = 'agent' THEN 'other' ELSE agent END,
+                    CASE WHEN ?1 = 'session' THEN 'other' ELSE session_id END,
+                    CASE WHEN ?1 = 'format' THEN 'other' ELSE source_format END,
+                    CASE WHEN ?1 = 'identity' THEN 'other' ELSE native_identity END,
+                    CASE WHEN ?1 = 'position' THEN '{\"position\":2}' ELSE native_position_json END,
+                    CASE WHEN ?1 = 'older' THEN 1 WHEN ?1 IN ('duplicate', 'payload', 'position', 'removal')
+                        THEN native_revision ELSE native_revision + 1 END,
+                    CASE WHEN ?1 = 'payload' THEN '{\"result\":\"corrected\"}' ELSE payload_json END,
+                    complete, source_generation, claim_fence,
+                    CASE WHEN ?1 = 'incarnation' THEN session_incarnation + 1 ELSE session_incarnation END,
+                    CASE WHEN ?1 = 'cwd' THEN '/other' ELSE project_cwd END,
+                    CASE WHEN ?1 = 'kind' THEN 'tool_call' ELSE event_kind END
+                 FROM native_tool_result_publication WHERE publication_sequence = 1",
+                [change],
+            ).unwrap();
+            assert_eq!(
+                candidate_current_in(&tx, "candidate").unwrap(),
+                !matches!(change, "revision" | "payload" | "position" | "removal"),
+                "{change}"
+            );
+            assert_eq!(
+                tx.query_row("SELECT state FROM burn_check_candidate", [], |row| row
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+                "dispatching"
+            );
+            let effects = super::super::evidence::invalidate_native_identity_dependents_in(
+                &tx,
+                &SessionKey::new("native", "pi", "session"),
+                "native-format",
+                "result",
+                super::super::evidence::EvidenceEventKind::ToolResult,
+            )
+            .unwrap();
+            let superseded = matches!(change, "revision" | "payload" | "position" | "removal");
+            assert_eq!(
+                effects.unfinished_stale,
+                usize::from(superseded),
+                "{change}"
+            );
+            let state: String = tx
+                .query_row("SELECT state FROM burn_check_candidate", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(state, if superseded { "stale" } else { "dispatching" });
+            tx.rollback().unwrap();
+            assert!(candidate_current_in(&connection, "candidate").unwrap());
+        }
+    }
 
     #[test]
     fn unsafe_publication_keeps_legacy_unbound_evidence_unusable_after_new_binding() {

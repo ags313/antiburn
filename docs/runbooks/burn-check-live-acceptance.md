@@ -143,7 +143,7 @@ If you cannot isolate or bound the paid work, do not run this section.
 
 Within that separate approved budget:
 
-- Test the six [canonical definitions](../../.antiburn/checks/) one at a time in
+- Test the five [canonical definitions](../../.antiburn/checks/) one at a time in
   the test repository. Enable an inventory definition only after approving its
   current global and repository inputs as described above. Allow enough admitted
   results for each authored window minimum.

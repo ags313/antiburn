@@ -6,9 +6,9 @@ use serde_json::json;
 
 use super::*;
 use crate::insights_worker::journal::tests::SyntheticJournal;
-
-#[path = "../main_64_preservation_tests.rs"]
-mod preservation;
+use crate::store::native_tool_results::{
+    ToolResultPublicationOutcome, main_64_preservation_tests as preservation,
+};
 
 fn next_live_page(
     store: &Store,
@@ -701,6 +701,7 @@ fn main_64_journal_fixture() -> (
             },
             PublicationPolicy {
                 live_eligible: Some(true),
+                gap_kind: PublicationGapKind::Partial,
                 ..Default::default()
             },
         )
@@ -953,15 +954,139 @@ fn append_main_64_journal_event(
     sequence
 }
 
+fn main_64_journal_attachment_targets(
+    store: &Store,
+    key: &SessionKey,
+) -> std::collections::BTreeSet<String> {
+    let connection = store.lock();
+    let rows = connection
+        .prepare(
+            "SELECT json_array(t.check_id,t.activation_scope_key,t.generation,
+             t.branch_key,t.incarnation,t.observer_epoch)
+         FROM burn_check_session_attachment t
+         WHERE t.branch_key=?1 ORDER BY t.check_id",
+        )
+        .unwrap()
+        .query_map([key.to_identity_json()], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    rows.into_iter().collect()
+}
+
+fn assert_main_64_journal_updates_unique(
+    store: &Store,
+    key: &SessionKey,
+    expected_attachments: &std::collections::BTreeSet<String>,
+) {
+    let format = serde_json::to_string(&SourceFormat::OpenCodeSqliteV1).unwrap();
+    assert_eq!(
+        main_64_journal_attachment_targets(store, key),
+        *expected_attachments
+    );
+    let connection = store.lock();
+    for (kind, expected, identities) in [
+        ("tool_result", 82, 42),
+        ("tool_call", 40, 40),
+        ("user_message", 1, 1),
+        ("assistant_message", 0, 0),
+        ("response_cycle", 0, 0),
+    ] {
+        let counts: (usize, usize, usize, usize) = connection
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT json_array(
+                 p.environment_key,p.agent,p.session_id,p.source_format,
+                  p.project_cwd,p.session_incarnation,p.event_kind,p.native_identity)),
+                COUNT(DISTINCT json_array(p.native_identity,p.native_revision)),
+               COALESCE(SUM(p.native_identity IS NOT NULL AND p.native_revision IS NOT NULL
+                 AND p.native_position_json IS NOT NULL AND p.target_check_id IS NULL
+                 AND p.source_format=?5 AND p.project_cwd IS s.cwd
+                 AND p.session_incarnation=s.incarnation),0)
+             FROM native_tool_result_publication p JOIN session s
+               USING(environment_key,agent,session_id)
+             WHERE p.environment_key=?1 AND p.agent=?2 AND p.session_id=?3
+               AND p.outcome='update' AND p.event_kind=?4",
+                params![key.environment_key, key.agent, key.session_id, kind, format],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (expected, identities, expected, expected), "{kind}");
+    }
+    let transitions = connection
+        .prepare(
+            "SELECT json_extract(payload_json,'$.call_id'),COUNT(*),
+             SUM(json_extract(payload_json,'$.finality')=1),
+             SUM(json_extract(payload_json,'$.finality')=0)
+         FROM native_tool_result_publication
+         WHERE environment_key=?1 AND agent=?2 AND session_id=?3
+           AND outcome='update' AND event_kind='tool_result'
+         GROUP BY native_identity ORDER BY json_extract(payload_json,'$.call_id')",
+        )
+        .unwrap()
+        .query_map(
+            params![key.environment_key, key.agent, key.session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (
+                        row.get::<_, usize>(1)?,
+                        row.get::<_, usize>(2)?,
+                        row.get::<_, usize>(3)?,
+                    ),
+                ))
+            },
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()
+        .unwrap();
+    assert_eq!(
+        transitions,
+        (0..42)
+            .map(|index| (
+                format!("call-{index}"),
+                if index < 2 { (1, 1, 0) } else { (2, 1, 1) }
+            ))
+            .collect()
+    );
+    let hosts: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM native_tool_result_publication
+         WHERE environment_key=?1 AND agent=?2 AND session_id=?3
+           AND outcome='update' AND event_kind IN ('session_start','session_idle')",
+            params![key.environment_key, key.agent, key.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(hosts, 0);
+    let total: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM native_tool_result_publication
+         WHERE environment_key=?1 AND agent=?2 AND session_id=?3 AND outcome='update'",
+            params![key.environment_key, key.agent, key.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(total, 82 + 40 + 1);
+}
+
 #[test]
 fn main_64_journal_partial_publication_rolls_back_and_restarts_with_a_frozen_public_frontier() {
     let (directory, store, path, source, saved, key) = main_64_journal_fixture();
     let paid = preservation::seed(&store);
+    let expected_attachments = main_64_journal_attachment_targets(&store, &key);
+    assert!(expected_attachments.is_empty());
     let accepted_results = store.native_tool_results_current(&key).unwrap();
+    let appended_assistant = "appended-assistant";
+    append_main_64_journal_event(
+        &source,
+        "message.updated.1",
+        &json!({"info":{"id":appended_assistant,"sessionID":"root","role":"assistant","parentID":"request"}}),
+    );
     append_main_64_journal_event(&source, "message.part.updated.1", &saved["completion"]);
     for index in 2..42 {
         let mut part = saved["completion"].clone();
         part["part"]["id"] = json!(format!("part-{index}"));
+        part["part"]["messageID"] = json!(appended_assistant);
         part["part"]["callID"] = json!(format!("call-{index}"));
         part["part"]["state"]["input"]["command"] = json!(format!("run-call-{index}"));
         part["part"]["state"]["status"] = json!("running");
@@ -981,6 +1106,7 @@ fn main_64_journal_partial_publication_rolls_back_and_restarts_with_a_frozen_pub
           VALUES ('coverage_gap',NEW.environment_key,NEW.agent,NEW.session_id,NEW.source_format,
             0,NEW.source_generation,NEW.claim_fence,NEW.project_cwd,NEW.session_incarnation,'test-page-budget','partial');
         END;").unwrap();
+    let before_conversion = publication_head(&store);
     let claim = store.claim_next_opencode_journal(101, 60).unwrap().unwrap();
     let page = read_opencode_live_tool_result_page(
         &path,
@@ -991,6 +1117,19 @@ fn main_64_journal_partial_publication_rolls_back_and_restarts_with_a_frozen_pub
     )
     .unwrap();
     let frontier = page.snapshot_end;
+    let result_baseline = saved["cursor"]["live"]["baseline"].as_u64().unwrap();
+    assert_eq!(page.cursor.live_baseline(), Some(result_baseline));
+    let assert_frontier = |store: &Store| {
+        preservation::assert_publication_frontier(
+            store,
+            before_conversion,
+            ToolResultPosition::OpenCodeEvent {
+                sequence: frontier,
+                item_index: 0,
+            },
+            result_baseline,
+        )
+    };
     let consumed = saved["cursor"]["through_sequence"].as_u64().unwrap();
     assert_eq!(page.cursor.public_baseline(), Some(frontier));
     assert!(
@@ -1004,6 +1143,15 @@ fn main_64_journal_partial_publication_rolls_back_and_restarts_with_a_frozen_pub
             .iter()
             .all(|result| result.call_id.as_deref() != Some("call-0"))
     );
+    assert!(page.evidence.events.iter().any(|event| matches!(
+        &event.fact,
+        antiburn_local::analysis::NativeEvidenceFact::Message(
+            antiburn_local::analysis::NativeMessageObservation::Public(call)
+        ) if call.call_id.as_deref() == Some("call-2")
+            && call.record_id == appended_assistant
+            && call.eligible
+            && !event.live_eligible
+    )));
     let receipt = || {
         store.lock().query_row("SELECT json_array(parser_revision,cursor_json,baseline_sequence,observed_generation,pending,claim_fence,lease_expires_at_epoch) FROM opencode_journal_delivery", [], |row| row.get::<_, String>(0)).unwrap()
     };
@@ -1065,6 +1213,7 @@ fn main_64_journal_partial_publication_rolls_back_and_restarts_with_a_frozen_pub
     assert!(partial.len() > 1 && partial.len() < 42);
     assert!(partial.contains(&accepted_results[0]));
     paid.assert_preserved(&store);
+    assert_frontier(&store);
     append_main_64_journal_event(
         &source,
         "message.updated.1",
@@ -1078,6 +1227,7 @@ fn main_64_journal_partial_publication_rolls_back_and_restarts_with_a_frozen_pub
     drop(store);
     let store = std::sync::Arc::new(Store::open(&directory.path().join("app")).unwrap());
     paid.assert_preserved(&store);
+    assert_frontier(&store);
     let mut finished = false;
     for now in 102..122 {
         let claim = store.claim_next_opencode_journal(now, 60).unwrap().unwrap();
@@ -1098,6 +1248,7 @@ fn main_64_journal_partial_publication_rolls_back_and_restarts_with_a_frozen_pub
             .publish_opencode_journal_page(&claim, &page, now)
             .unwrap();
         paid.assert_preserved(&store);
+        assert_frontier(&store);
         let current = store.native_tool_results_current(&key).unwrap();
         if page.results.iter().any(|result| {
             !current
@@ -1145,7 +1296,7 @@ fn main_64_journal_partial_publication_rolls_back_and_restarts_with_a_frozen_pub
             .collect::<std::collections::BTreeSet<_>>()
     );
     assert!(current.contains(&accepted_results[0]));
-    assert!(store.lock().query_row("SELECT COUNT(*) = COUNT(DISTINCT native_identity) FROM native_tool_result_publication WHERE outcome='update'", [], |row| row.get::<_, bool>(0)).unwrap());
+    assert_main_64_journal_updates_unique(&store, &key, &expected_attachments);
     assert!(store.lock().query_row("SELECT COUNT(*)=1 AND MIN(live_eligible)=1 FROM native_tool_result_publication
         WHERE event_kind='user_message' AND json_extract(payload_json, '$.message.message_id')='late-user'", [], |row| row.get::<_, bool>(0)).unwrap());
     let head = publication_head(&store);
@@ -1162,7 +1313,61 @@ fn main_64_journal_partial_publication_rolls_back_and_restarts_with_a_frozen_pub
     store
         .publish_opencode_journal_page(&claim, &idle, 122)
         .unwrap();
+    let metadata = store
+        .native_evidence_publications_after(head, 1000)
+        .unwrap();
+    // The budget trigger leaves test-only coverage metadata after each update.
+    assert_eq!(metadata.len(), 1);
+    let metadata = &metadata[0];
+    let complete = idle.history_complete
+        && idle.evidence.history_complete
+        && !claim.history_gap
+        && claim.main_session;
+    assert_eq!(metadata.session, key);
+    assert_eq!(
+        metadata.event_kind,
+        crate::store::native_tool_results::evidence::EvidenceEventKind::ToolResult
+    );
+    assert_eq!(metadata.complete, complete);
+    assert_eq!(
+        metadata.outcome,
+        if complete {
+            ToolResultPublicationOutcome::CoverageRestored
+        } else {
+            ToolResultPublicationOutcome::CoverageGap
+        }
+    );
+    assert_eq!(
+        metadata.gap_reason.as_deref(),
+        (!complete).then_some("journal-history-incomplete")
+    );
+    assert_eq!(metadata.gap_kind, PublicationGapKind::Partial);
+    assert!(
+        metadata.payload.is_none()
+            && metadata.native_identity.is_none()
+            && metadata.native_position.is_none()
+            && metadata.native_revision.is_none()
+            && metadata.live_eligible.is_none()
+            && metadata.target.is_none()
+    );
+    assert_eq!(store.native_tool_results_current(&key).unwrap(), current);
+    assert_main_64_journal_updates_unique(&store, &key, &expected_attachments);
+    let head = publication_head(&store);
+    let claim = store.claim_next_opencode_journal(123, 60).unwrap().unwrap();
+    let idle = read_opencode_live_tool_result_page(
+        &path,
+        "root",
+        claim.cursor().unwrap().as_ref(),
+        claim.baseline_sequence,
+        &|| false,
+    )
+    .unwrap();
+    assert!(idle.results.is_empty() && idle.evidence.events.is_empty());
+    store
+        .publish_opencode_journal_page(&claim, &idle, 123)
+        .unwrap();
     assert_eq!(publication_head(&store), head);
+    assert_frontier(&store);
     paid.assert_paid_fences(&store, false);
 }
 
@@ -1515,6 +1720,7 @@ fn unknown_parser_cannot_replay_a_removal_over_a_saved_later_correction() {
 
 #[test]
 fn live_window_and_incremental_state_commit_atomically_and_resume_after_restart() {
+    use crate::store::native_tool_results::ToolResultPublicationOutcome;
     use antiburn_local::analysis::{ToolResultAdmission, read_opencode_live_tool_result_page};
     let state = tempfile::tempdir().unwrap();
     let store = Store::open(state.path()).unwrap();
@@ -1562,22 +1768,89 @@ fn live_window_and_incremental_state_commit_atomically_and_resume_after_restart(
             .publish_opencode_journal_page(&claim, &page, 100)
             .unwrap()
     );
-    let published = store.native_tool_result_publications_after(0, 100).unwrap();
-    assert_eq!(published.len(), 40);
+    let expected_cursor = serde_json::to_string(&page.cursor).unwrap();
+    let mut now = 100;
+    let mut finished = false;
+    for _ in 0..3 {
+        let (cursor, pending): (Option<String>, bool) = store
+            .lock()
+            .query_row(
+                "SELECT cursor_json,pending FROM opencode_journal_delivery",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if cursor.as_deref() == Some(expected_cursor.as_str()) {
+            assert!(!pending);
+            finished = true;
+            break;
+        }
+        assert!(cursor.is_none() && pending);
+        let partial = store.native_tool_results_current(&claim.key).unwrap();
+        assert!(!partial.is_empty() && partial.len() < page.results.len());
+        now += 1;
+        let (retry, retry_page) = next_live_page(&store, &source, now);
+        assert!(retry.cursor().unwrap().is_none());
+        assert_eq!(retry_page.cursor, page.cursor);
+        assert_eq!(retry_page.results, page.results);
+        assert!(
+            store
+                .publish_opencode_journal_page(&retry, &retry_page, now)
+                .unwrap()
+        );
+    }
     assert!(
+        finished,
+        "the cold result window must finish bounded commits"
+    );
+    let publications = store.native_tool_result_publications_after(0, 100).unwrap();
+    let published: Vec<_> = publications
+        .iter()
+        .filter(|event| event.payload.is_some())
+        .collect();
+    assert_eq!(published.len(), 40);
+    assert!(published.iter().all(
+        |event| event.outcome == ToolResultPublicationOutcome::Update
+            && event.live_eligible == Some(true)
+    ));
+    assert_eq!(
+        store.native_tool_results_current(&claim.key).unwrap().len(),
+        40
+    );
+    assert_eq!(
         published
             .iter()
-            .all(|event| event.live_eligible == Some(true))
+            .map(|event| event.payload.as_ref().unwrap().result_id.clone().unwrap())
+            .collect::<std::collections::BTreeSet<_>>(),
+        (260..300)
+            .map(|index| format!("part-{index}"))
+            .collect::<std::collections::BTreeSet<_>>()
     );
+    let coverage: Vec<_> = publications
+        .iter()
+        .filter(|event| event.payload.is_none())
+        .collect();
+    assert_eq!(coverage.len(), 1);
+    assert_eq!(
+        coverage[0].outcome,
+        ToolResultPublicationOutcome::CoverageGap
+    );
+    assert_eq!(coverage[0].gap_kind, PublicationGapKind::Partial);
+    assert_eq!(
+        coverage[0].gap_reason.as_deref(),
+        Some("journal-history-incomplete")
+    );
+    assert_eq!(coverage[0].live_eligible, None);
     let frozen = published[30].payload.as_ref().unwrap().context.clone();
-    let head = published.last().unwrap().publication_sequence;
+    let head = publication_head(&store);
     drop(store);
     let store = Store::open(state.path()).unwrap();
     source.result(300);
     source.result(290);
     source.result(0);
     source.index(&store, "/synthetic");
-    let next = store.claim_next_opencode_journal(101, 60).unwrap().unwrap();
+    now += 1;
+    let next = store.claim_next_opencode_journal(now, 60).unwrap().unwrap();
     assert_eq!(next.cursor().unwrap(), Some(page.cursor.clone()));
     assert_eq!(next.baseline_sequence, page.cursor.live_baseline());
     let page = read_opencode_live_tool_result_page(
@@ -1591,12 +1864,12 @@ fn live_window_and_incremental_state_commit_atomically_and_resume_after_restart(
     assert_eq!(page.live_input_events, 3);
     assert!(
         store
-            .publish_opencode_journal_page(&next, &page, 101)
+            .publish_opencode_journal_page(&next, &page, now)
             .unwrap()
     );
     assert!(
         !store
-            .publish_opencode_journal_page(&next, &page, 101)
+            .publish_opencode_journal_page(&next, &page, now)
             .unwrap()
     );
     let events = store

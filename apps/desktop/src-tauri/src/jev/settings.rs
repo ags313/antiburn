@@ -1827,12 +1827,32 @@ pub(crate) mod headless {
             return Err("The test active profile is missing.");
         }
         for connection in profiles.values() {
-            if connection.provider != SystemOneProvider::Custom || connection.credential.is_some() {
-                return Err("The test profiles must use keyless Custom connections.");
+            if !matches!(
+                connection.provider,
+                SystemOneProvider::Custom | SystemOneProvider::Ollama
+            ) || connection.credential.is_some()
+            {
+                return Err(
+                    "The test profiles must use keyless Custom or local Ollama connections.",
+                );
             }
             connection
                 .validate()
                 .map_err(|_| "The test connection is invalid.")?;
+            if connection.provider == SystemOneProvider::Ollama {
+                let SystemOneEndpoint::BaseUrl(base) = &connection.endpoint else {
+                    return Err("The test Ollama endpoint is invalid.");
+                };
+                let endpoint =
+                    url::Url::parse(base).map_err(|_| "The test Ollama endpoint is invalid.")?;
+                if !endpoint.host().is_some_and(|host| match host {
+                    url::Host::Ipv4(address) => address.is_loopback(),
+                    url::Host::Ipv6(address) => address.is_loopback(),
+                    url::Host::Domain(_) => false,
+                }) {
+                    return Err("The test Ollama endpoint must use a loopback IP address.");
+                }
+            }
         }
         migrate_provider_state(store)?;
         save_profiles(

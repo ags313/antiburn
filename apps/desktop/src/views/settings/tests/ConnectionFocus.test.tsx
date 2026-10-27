@@ -4,11 +4,13 @@ import { defaultConnection, type ProviderSettings } from "../../../lib/smartChec
 import { CheckProviderSettings } from "../CheckProviderSettings"
 import { ConnectionActions } from "../ConnectionActions"
 import { ConnectionDialog } from "../ConnectionDialog"
+import { SettingsTargetFocus } from "../SettingsTargetFocus"
 import { providerSettingsFixture } from "./providerSettingsFixture"
 
 const invoke = vi.hoisted(() => vi.fn())
+const confirmDiscard = vi.hoisted(() => vi.fn())
 vi.mock("@tauri-apps/api/core", () => ({ invoke }))
-vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: vi.fn(async () => true) }))
+vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: confirmDiscard }))
 
 let saved: ProviderSettings
 
@@ -41,6 +43,35 @@ async function renderSettings() {
   return screen.getByRole("button", { name: "Check files" })
 }
 
+function searchSettings(focus: SettingsTargetFocus, control?: string, revision = 0) {
+  return (
+    <div ref={(node) => (node ? focus.attach(node, "checks", control, revision) : undefined)}>
+      <CheckProviderSettings control={control} targetRevision={revision} />
+      <div data-settings-control="checkDirectories" tabIndex={-1}>
+        <button type="button">Check files</button>
+      </div>
+      <div data-settings-control="checkModelUsage" tabIndex={-1}>
+        <button type="button">Model usage</button>
+      </div>
+    </div>
+  )
+}
+
+async function editWorkConnection(value: string | null = "keep-secret") {
+  const trigger = await screen.findByRole("button", { name: "More actions for Jev 2" })
+  await waitFor(() => expect(trigger).toBeEnabled())
+  trigger.focus()
+  fireEvent.keyDown(trigger, { key: "Enter" })
+  fireEvent.click(await screen.findByRole("menuitem", { name: "Edit" }))
+  const dialog = await screen.findByRole("dialog", { name: "Edit Jev 2 connection" })
+  const change = within(dialog).queryByRole("button", { name: "Change" })
+  if (change) fireEvent.click(change)
+  const credential = within(dialog).getByLabelText("Jev API key")
+  if (value !== null) fireEvent.change(credential, { target: { value } })
+  credential.focus()
+  return { dialog, credential }
+}
+
 beforeEach(() => {
   HTMLElement.prototype.scrollIntoView = vi.fn()
   HTMLDialogElement.prototype.showModal = function () {
@@ -57,10 +88,105 @@ beforeEach(() => {
     activeId: "personal",
     profiles: { personal: profile, work: profile },
   })
+  confirmDiscard.mockReset().mockResolvedValue(true)
   invoke.mockReset().mockImplementation(async (command) => {
     if (command === "get_system_one_settings") return saved
     throw new Error(`Unexpected command: ${command}`)
   })
+})
+
+it("defers the latest outside search while a dirty modal keeps its secret", async () => {
+  const focus = new SettingsTargetFocus()
+  const view = render(searchSettings(focus))
+  const { dialog, credential } = await editWorkConnection()
+  view.rerender(searchSettings(focus, "checkDirectories", 1))
+  expect(credential).toHaveFocus()
+  view.rerender(searchSettings(focus, "checkModelUsage", 2))
+  expect(dialog).toHaveAttribute("open")
+  expect(credential).toHaveValue("keep-secret")
+  expect(credential).toHaveFocus()
+  expect(confirmDiscard).not.toHaveBeenCalled()
+  confirmDiscard.mockResolvedValueOnce(false)
+  fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }))
+  await nextFrame()
+  expect(dialog).toHaveAttribute("open")
+  expect(credential).toHaveValue("keep-secret")
+  invoke.mockImplementationOnce(async (command, { draft }) => {
+    expect(command).toBe("save_system_one_connection")
+    expect(draft.credential).toBe("keep-secret")
+    saved = {
+      ...saved,
+      profiles: { ...saved.profiles, work: { ...draft.connection, revision: 2 } },
+    }
+    return saved
+  })
+  fireEvent.click(within(dialog).getByRole("button", { name: "Save" }))
+  const usage = screen.getByRole("button", { name: "Model usage" })
+  await waitFor(() => expect(usage).toHaveFocus())
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+  const files = screen.getByRole("button", { name: "Check files" })
+  files.focus()
+  view.rerender(searchSettings(focus, "checkModelUsage", 2))
+  await nextFrame()
+  expect(files).toHaveFocus()
+  expect(confirmDiscard).toHaveBeenCalledOnce()
+  expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+    "get_system_one_settings",
+    "save_system_one_connection",
+  ])
+})
+
+it("defers search through busy Save and keeps pending recovery and later secrets", async () => {
+  const focus = new SettingsTargetFocus()
+  const view = render(searchSettings(focus))
+  const { dialog, credential } = await editWorkConnection()
+  const operation = deferred<ProviderSettings>()
+  let requestId: string | undefined
+  invoke.mockImplementationOnce((command, args) => {
+    expect(command).toBe("save_system_one_connection")
+    requestId = args.requestId
+    return operation.promise
+  })
+  fireEvent.click(within(dialog).getByRole("button", { name: "Save" }))
+  view.rerender(searchSettings(focus, "checkDirectories", 1))
+  view.rerender(searchSettings(focus, "checkModelUsage", 2))
+  fireEvent(dialog, new Event("cancel", { cancelable: true }))
+  expect(dialog).toHaveAttribute("open")
+  expect(credential).toHaveValue("keep-secret")
+  expect(credential).toBeDisabled()
+  expect(confirmDiscard).not.toHaveBeenCalled()
+  saved = {
+    ...saved,
+    pendingOperation: {
+      id: "pending-save",
+      kind: "save",
+      connectionId: "work",
+      requestId: requestId!,
+    },
+  }
+  await act(async () =>
+    operation.reject(
+      new Error("Could not complete the connection operation. Use Retry in Settings → Checks."),
+    ),
+  )
+  await waitFor(() => expect(credential).toBeEnabled())
+  expect(dialog).toHaveAttribute("open")
+  expect(credential).toHaveValue("keep-secret")
+  expect(within(dialog).getByRole("button", { name: "Save" })).toBeDisabled()
+  fireEvent.change(credential, { target: { value: "later-secret" } })
+  fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }))
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+  await waitFor(() => expect(screen.getByRole("button", { name: "Model usage" })).toHaveFocus())
+  expect(screen.getByRole("button", { name: "Retry connection operation" })).toBeEnabled()
+  const reopened = await editWorkConnection(null)
+  expect(reopened.credential).toHaveValue("later-secret")
+  expect(saved.pendingOperation?.requestId).toBe(requestId)
+  expect(confirmDiscard).not.toHaveBeenCalled()
+  expect(invoke.mock.calls.map(([command]) => command)).toEqual([
+    "get_system_one_settings",
+    "save_system_one_connection",
+    "get_system_one_settings",
+  ])
 })
 
 it("keeps a row menu open through the full pointer click before Edit", async () => {

@@ -107,7 +107,24 @@ pub const MIGRATIONS: &[&str] = &[
     V89,
     V90,
     V91,
+    V92,
 ];
+
+const V92: &str = r#"
+CREATE INDEX native_evidence_publication_correction ON native_tool_result_publication
+    (environment_key, agent, session_id, source_format, native_identity, event_kind,
+     publication_sequence, session_incarnation, project_cwd)
+    WHERE outcome IN ('update', 'removal');
+CREATE INDEX burn_check_observation_native_identity ON burn_check_observation
+    (session_key_json, source_format, native_identity, event_kind);
+CREATE INDEX burn_check_candidate_dependency_native_identity ON burn_check_candidate_dependency
+    (session_key_json, source_format,
+     CASE WHEN json_valid(dependency_binding_json)
+         THEN json_extract(dependency_binding_json, '$.NativeCurrent.identity') END,
+     event_kind)
+    WHERE CASE WHEN json_valid(dependency_binding_json)
+        THEN json_type(dependency_binding_json, '$.NativeCurrent') = 'object' ELSE 0 END;
+"#;
 
 const V91: &str = r#"
 ALTER TABLE burn_check_decision_usage ADD COLUMN served_model TEXT

@@ -76,6 +76,7 @@ impl DecisionTransport {
         request: &JevRequest,
         capabilities: &ModelCapabilities,
         is_cancelled: &(impl Fn() -> bool + Sync),
+        delivery_possible: &AtomicBool,
         record_usage: impl Fn(JevResponseObservation) -> Result<(), JevError>,
     ) -> Result<JevResponse, JevError> {
         match self {
@@ -91,12 +92,18 @@ impl DecisionTransport {
             }
             Self::Ollama(client) => {
                 client
-                    .evaluate_with_usage_cancellable(request, capabilities, is_cancelled, |usage| {
-                        record_usage(JevResponseObservation {
-                            usage,
-                            served_model: None,
-                        })
-                    })
+                    .evaluate_with_usage_cancellable(
+                        request,
+                        capabilities,
+                        is_cancelled,
+                        || delivery_possible.store(true, Ordering::Release),
+                        |usage| {
+                            record_usage(JevResponseObservation {
+                                usage,
+                                served_model: None,
+                            })
+                        },
+                    )
                     .await
             }
             Self::Cloudflare(client) => {
@@ -470,30 +477,46 @@ pub(super) async fn dispatch_decision_attempt(
     }
 
     let usage_received = AtomicBool::new(false);
-    let call =
-        request_with_deadline(
-            transport.evaluate(request, capabilities, &is_cancelled, |usage| {
-                usage_received.store(true, Ordering::Relaxed);
-                provider_pacing(provider)
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .settle(&reservation_id, usage.usage.input_tokens);
-                record_usage(Some(usage))
-            }),
-        );
+    // Only Ollama reports the send boundary after local inference-slot admission.
+    let delivery_possible = AtomicBool::new(provider != SystemOneProvider::Ollama);
+    let call = request_with_deadline(transport.evaluate(
+        request,
+        capabilities,
+        &is_cancelled,
+        &delivery_possible,
+        |usage| {
+            usage_received.store(true, Ordering::Relaxed);
+            provider_pacing(provider)
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .settle(&reservation_id, usage.usage.input_tokens);
+            record_usage(Some(usage))
+        },
+    ));
     let result = wait_for_decision_response(call, &is_cancelled).await;
+    let delivery_possible = delivery_possible.load(Ordering::Acquire);
+    let result = match result {
+        Err(JevError::RequestOutcomeUnknown) if !delivery_possible => Err(if is_cancelled() {
+            JevError::Cancelled
+        } else {
+            JevError::ProviderUnavailable
+        }),
+        result => result,
+    };
     if let Err(error) = &result {
         {
             let mut pacing = provider_pacing(provider)
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             apply_provider_cooldown(&mut pacing, error, tokio::time::Instant::now());
-            if matches!(
-                error,
-                JevError::Cancelled
-                    | JevError::RateLimited { .. }
-                    | JevError::ProviderOverloaded { .. }
-            ) {
+            if !delivery_possible
+                || matches!(
+                    error,
+                    JevError::Cancelled
+                        | JevError::RateLimited { .. }
+                        | JevError::ProviderOverloaded { .. }
+                )
+            {
                 pacing.settle(&reservation_id, 0);
             }
         }

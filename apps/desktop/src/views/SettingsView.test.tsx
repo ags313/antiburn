@@ -1155,6 +1155,11 @@ describe("SettingsView", () => {
           ).not.toBeInTheDocument()
         } else expect(match.label, control).toBe(visibleLabel)
         seen.add(control!)
+        const dialog = screen.queryByRole("dialog")
+        if (dialog) {
+          fireEvent.click(within(dialog).getByRole("button", { name: /^Cancel$/ }))
+          await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+        }
       }
       expect([...seen].sort()).toEqual(
         controls.map(({ target }) => (target.kind === "setting" ? target.control! : "")).sort(),

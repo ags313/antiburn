@@ -519,6 +519,7 @@ struct BranchResult {
     branch: String,
     checking: bool,
     has_started: bool,
+    progress_data_invalid: bool,
     latest_outcome: Option<String>,
     latest_actions: Option<String>,
     latest_preparation: Option<String>,
@@ -1226,15 +1227,11 @@ fn current_branches(
     definition: &InstalledCheckDefinition,
     request: &ReportRequest,
 ) -> Result<Vec<BranchResult>> {
-    if !current_activation(connection, definition)? {
+    if !saved_activation_current(connection, definition)? {
         return Ok(Vec::new());
     }
+    let work_available = current_activation(connection, definition)?;
     let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key)?;
-    let local_starts = if definition.decision_name.is_none() {
-        local_started_branches(connection, definition, &scope)?
-    } else {
-        BTreeSet::new()
-    };
     let ready = source_ready_at_sql(6, 7, 8, "?11");
     let model_attempts = i32::from(definition.decision_name.is_some());
     let mut statement = connection.prepare(&format!(
@@ -1260,31 +1257,7 @@ fn current_branches(
                          WHEN {model_attempts} = 1 AND latest.outcome = 'assessed'
                            AND latest_candidate.frozen_input_json = '{{}}' THEN NULL
                          ELSE latest_candidate.preparation_json END, latest_candidate.diagnostic_json,
-                  EXISTS(SELECT 1 FROM burn_check_candidate started
-                    WHERE started.check_id = c.check_id AND started.activation_scope_key = c.activation_scope_key
-                      AND started.generation = c.generation AND started.branch_key = c.branch_key
-                      AND started.session_key_json = c.session_key_json
-                      AND started.state NOT IN ('stale', 'coalesced')
-                      AND (EXISTS(SELECT 1 FROM burn_check_assessment_history history
-                        WHERE history.candidate_id = started.candidate_id
-                          AND history.check_id = started.check_id
-                          AND history.activation_scope_key = started.activation_scope_key
-                          AND history.generation = started.generation AND history.branch_key = started.branch_key
-                          AND ((history.outcome = 'assessed' AND history.evidence_valid = 1)
-                            OR history.outcome IN ('execution_failed', 'not_assessed')))
-                        OR (NOT EXISTS(SELECT 1 FROM burn_check_assessment_history history
-                              WHERE history.candidate_id = started.candidate_id AND history.outcome <> 'cancelled')
-                           AND EXISTS(SELECT 1 FROM burn_check_evaluation_attempt attempt
-                             WHERE attempt.candidate_id = started.candidate_id
-                               AND {model_attempts} = 1
-                               AND attempt.state IN ('dispatch_intent', 'settled'))))
-                      AND NOT EXISTS(SELECT 1 FROM burn_check_candidate_dependency d
-                        LEFT JOIN burn_check_observation o ON o.check_id = started.check_id
-                          AND o.activation_scope_key = started.activation_scope_key
-                          AND o.observation_id = d.observation_id AND o.session_key_json = d.session_key_json
-                        WHERE d.candidate_id = started.candidate_id
-                          AND (o.source_format IS NOT d.source_format OR o.native_revision IS NOT d.native_revision
-                             OR o.evidence_version IS NOT d.evidence_version OR o.removed IS NOT 0 OR d.removed <> 0))),
+                   c.session_key_json,
                    ({ready}),
                    (SELECT attempt.decision_name FROM burn_check_evaluation_attempt attempt
                      WHERE attempt.candidate_id = latest_candidate.candidate_id
@@ -1311,7 +1284,7 @@ fn current_branches(
              AND (({ready}) OR ({OPENCODE_V2_SOURCE_SQL}))
           ORDER BY c.branch_key",
     ))?;
-    statement
+    let branches = statement
         .query_map(
             params![
                 definition.check_id,
@@ -1330,52 +1303,155 @@ fn current_branches(
                 let branch: String = row.get(0)?;
                 let agent: String = row.get(2)?;
                 let session_id: String = row.get(3)?;
-                let local_started = local_starts.contains(&(
-                    branch.clone(),
-                    scope.environment.clone(),
-                    agent.clone(),
-                    session_id.clone(),
-                ));
-                Ok(BranchResult {
-                    branch,
-                    checking: definition.availability == InstalledCheckAvailability::Available
-                        && if definition.decision_name.is_none() {
-                            local_started
-                        } else {
-                            row.get::<_, bool>(1)?
-                        },
-                    agent,
-                    session_id,
-                    incarnation: row.get(4)?,
-                    observed_epoch: row.get(5)?,
-                    status: row.get(6)?,
-                    assessment: row.get(7)?,
-                    actions: row.get(8)?,
-                    has_frozen: row.get(9)?,
-                    latest_outcome: row.get(10)?,
-                    latest_actions: row.get(11)?,
-                    latest_preparation: row.get(12)?,
-                    latest_diagnostic: row.get(13)?,
-                    has_started: row.get::<_, bool>(14)? || local_started,
-                    source_ready: row.get(15)?,
-                    latest_decision: row.get(16)?,
-                })
+                Ok((
+                    BranchResult {
+                        branch,
+                        checking: work_available
+                            && definition.decision_name.is_some()
+                            && row.get::<_, bool>(1)?,
+                        agent,
+                        session_id,
+                        incarnation: row.get(4)?,
+                        observed_epoch: row.get(5)?,
+                        status: row.get(6)?,
+                        assessment: row.get(7)?,
+                        actions: row.get(8)?,
+                        has_frozen: row.get(9)?,
+                        latest_outcome: row.get(10)?,
+                        latest_actions: row.get(11)?,
+                        latest_preparation: row.get(12)?,
+                        latest_diagnostic: row.get(13)?,
+                        has_started: false,
+                        progress_data_invalid: false,
+                        source_ready: row.get(15)?,
+                        latest_decision: row.get(16)?,
+                    },
+                    row.get::<_, String>(14)?,
+                ))
             },
         )?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    branches
+        .into_iter()
+        .map(|(mut branch, session)| {
+            if definition.decision_name.is_none() {
+                branch.has_started = local_branch_started(
+                    connection,
+                    definition,
+                    &scope,
+                    &branch.branch,
+                    &session,
+                    &mut branch.progress_data_invalid,
+                )?;
+                branch.checking = work_available && branch.has_started;
+            }
+            if !branch.has_started {
+                branch.has_started = history_started(
+                    connection,
+                    definition,
+                    &branch.branch,
+                    &session,
+                    &mut branch.progress_data_invalid,
+                )?;
+            }
+            Ok(branch)
+        })
+        .collect()
 }
 
-fn local_started_branches(
+fn history_started(
+    connection: &Connection,
+    definition: &InstalledCheckDefinition,
+    branch: &str,
+    session: &str,
+    saved_data_invalid: &mut bool,
+) -> Result<bool> {
+    let mut statement = connection.prepare_cached(
+        "SELECT started.candidate_id FROM burn_check_candidate started
+         WHERE started.check_id = ?1 AND started.activation_scope_key = ?2
+           AND started.generation = ?3 AND started.branch_key = ?4
+           AND started.session_key_json = ?5
+           AND started.state NOT IN ('stale', 'coalesced')
+           AND (EXISTS(SELECT 1 FROM burn_check_assessment_history history
+             WHERE history.candidate_id = started.candidate_id
+               AND history.check_id = started.check_id
+               AND history.activation_scope_key = started.activation_scope_key
+               AND history.generation = started.generation AND history.branch_key = started.branch_key
+               AND ((history.outcome = 'assessed' AND history.evidence_valid = 1)
+                 OR history.outcome IN ('execution_failed', 'not_assessed')))
+             OR (NOT EXISTS(SELECT 1 FROM burn_check_assessment_history history
+                   WHERE history.candidate_id = started.candidate_id AND history.outcome <> 'cancelled')
+               AND EXISTS(SELECT 1 FROM burn_check_evaluation_attempt attempt
+                 WHERE attempt.candidate_id = started.candidate_id AND ?6
+                   AND attempt.state IN ('dispatch_intent', 'settled'))))
+           AND NOT EXISTS(SELECT 1 FROM burn_check_candidate_dependency d
+             LEFT JOIN burn_check_observation o ON o.check_id = started.check_id
+               AND o.activation_scope_key = started.activation_scope_key
+               AND o.observation_id = d.observation_id AND o.session_key_json = d.session_key_json
+             WHERE d.candidate_id = started.candidate_id
+               AND (d.dependency_binding_json IS NULL
+                 OR CASE WHEN json_valid(d.dependency_binding_json)
+                   THEN json_type(d.dependency_binding_json, '$.HostObservation') = 'object'
+                   ELSE 0 END)
+               AND (o.source_format IS NOT d.source_format OR o.native_revision IS NOT d.native_revision
+                  OR o.evidence_version IS NOT d.evidence_version OR o.removed IS NOT 0 OR d.removed <> 0))
+         ORDER BY started.trigger_position DESC, started.candidate_id DESC",
+    )?;
+    let candidates = statement.query_map(
+        params![
+            definition.check_id,
+            definition.activation_scope_key,
+            definition.generation,
+            branch,
+            session,
+            definition.decision_name.is_some(),
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    for candidate in candidates {
+        if progress_dependencies_current(connection, &candidate?, saved_data_invalid)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn progress_dependencies_current(
+    connection: &Connection,
+    candidate: &str,
+    saved_data_invalid: &mut bool,
+) -> Result<bool> {
+    match crate::store::native_tool_results::observers::typed_dependencies_current_in(
+        connection, candidate,
+    ) {
+        Ok(current) => Ok(current),
+        // Saved JSON decode errors affect this candidate. Database errors still stop the read.
+        Err(error)
+            if error
+                .downcast_ref::<serde_json::Error>()
+                .is_some_and(|error| !error.is_io()) =>
+        {
+            *saved_data_invalid = true;
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn local_branch_started(
     connection: &Connection,
     definition: &InstalledCheckDefinition,
     scope: &ActivationScope,
-) -> Result<BTreeSet<(String, String, String, String)>> {
-    let mut statement = connection.prepare(
+    branch: &str,
+    session: &str,
+    saved_data_invalid: &mut bool,
+) -> Result<bool> {
+    let mut statement = connection.prepare_cached(
         "SELECT c.branch_key, c.trigger_position, c.frozen_input_json, c.preparation_json,
-                c.answer_json, c.session_key_json
+                c.answer_json, c.session_key_json, c.candidate_id
          FROM burn_check_candidate c
          WHERE c.check_id = ?1 AND c.activation_scope_key = ?2 AND c.generation = ?3
+           AND c.branch_key = ?4 AND c.session_key_json = ?5
            AND c.state = 'answered' AND c.claim_owner IS NOT NULL
            AND c.claim_owner <> '' AND c.claim_fence > 0
            AND NOT EXISTS(SELECT 1 FROM burn_check_evaluation_attempt a WHERE a.candidate_id = c.candidate_id)
@@ -1386,14 +1462,21 @@ fn local_started_branches(
                AND o.activation_scope_key = c.activation_scope_key
                AND o.observation_id = d.observation_id AND o.session_key_json = d.session_key_json
              WHERE d.candidate_id = c.candidate_id
+               AND (d.dependency_binding_json IS NULL
+                 OR CASE WHEN json_valid(d.dependency_binding_json)
+                   THEN json_type(d.dependency_binding_json, '$.HostObservation') = 'object'
+                   ELSE 0 END)
                AND (o.source_format IS NOT d.source_format OR o.native_revision IS NOT d.native_revision
-                 OR o.evidence_version IS NOT d.evidence_version OR o.removed IS NOT 0 OR d.removed <> 0))",
+                 OR o.evidence_version IS NOT d.evidence_version OR o.removed IS NOT 0 OR d.removed <> 0))
+         ORDER BY c.trigger_position DESC, c.candidate_id DESC",
     )?;
     let rows = statement.query_map(
         params![
             definition.check_id,
             definition.activation_scope_key,
-            definition.generation
+            definition.generation,
+            branch,
+            session,
         ],
         |row| {
             Ok((
@@ -1403,12 +1486,15 @@ fn local_started_branches(
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
             ))
         },
     )?;
-    let mut started = BTreeSet::new();
     for row in rows {
-        let (branch, position, frozen, preparation, answer, session) = row?;
+        let (branch, position, frozen, preparation, answer, session, candidate_id) = row?;
+        if !progress_dependencies_current(connection, &candidate_id, saved_data_invalid)? {
+            continue;
+        }
         let Some(preparation) = preparation else {
             continue;
         };
@@ -1451,9 +1537,9 @@ fn local_started_branches(
         {
             continue;
         }
-        started.insert((branch, environment, agent, session_id));
+        return Ok(true);
     }
-    Ok(started)
+    Ok(false)
 }
 
 #[derive(Deserialize)]
@@ -1512,6 +1598,38 @@ fn current_activation(
         definition.generation.unwrap_or_default(),
         &definition.definition_revision,
         definition.availability == InstalledCheckAvailability::Available,
+    )?)
+}
+
+fn saved_activation_current(
+    connection: &Connection,
+    definition: &InstalledCheckDefinition,
+) -> Result<bool> {
+    let Some(generation) = definition.generation.filter(|generation| *generation > 0) else {
+        return Ok(false);
+    };
+    if matches!(
+        definition.availability,
+        InstalledCheckAvailability::Invalid { .. }
+    ) || !antiburn_checks_store::runtime_snapshot_ready(connection)?
+    {
+        return Ok(false);
+    }
+    // A provider pause does not invalidate saved results from the same active definition.
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM burn_check_activation a
+          JOIN burn_check_runtime_definition d USING(check_id, activation_scope_key)
+          WHERE a.check_id = ?1 AND a.activation_scope_key = ?2 AND a.generation = ?3
+            AND a.definition_revision = ?4 AND a.enabled = 1
+            AND d.generation = a.generation AND d.definition_revision = a.definition_revision
+            AND d.availability IN ('available', 'paused', 'unsupported'))",
+        params![
+            definition.check_id,
+            definition.activation_scope_key,
+            generation,
+            definition.definition_revision
+        ],
+        |row| row.get(0),
     )?)
 }
 
@@ -1691,6 +1809,12 @@ fn read_row(
             let source_blocked =
                 blocked_sources.contains(&(branch.agent.clone(), branch.session_id.clone()));
             has_started |= branch.has_started && !source_blocked;
+            if branch.progress_data_invalid {
+                diagnostics.add(
+                    storage_diagnostic(),
+                    Some((branch.agent.clone(), branch.session_id.clone())),
+                )?;
+            }
             let runtime_diagnostics = runtime_diagnostics(definition, &branch).unwrap_or_else(|error| {
                 ::tracing::error!(event = "installed_check_diagnostic_read_failed", error = %error);
                 vec![storage_diagnostic()]
@@ -1704,8 +1828,6 @@ fn read_row(
             let counts = sessions
                 .entry((branch.agent.clone(), branch.session_id.clone()))
                 .or_default();
-            counts.finding |= branch.status.as_deref() == Some("failure");
-            counts.clean |= branch.source_ready && branch.status.as_deref() == Some("success");
             counts.checking |= branch.checking && !source_blocked;
             counts.review_failed |= matches!(
                 branch.latest_outcome.as_deref(),
@@ -1733,7 +1855,12 @@ fn read_row(
                 .as_deref()
                 .filter(|status| *status == "failure" || branch.source_ready)
             {
-                let message = match status_message(branch.actions.as_deref(), status) {
+                let message = match branch
+                    .actions
+                    .as_deref()
+                    .context("status assessment actions missing")
+                    .and_then(|actions| status_message(Some(actions), status))
+                {
                     Ok(message) => message,
                     Err(_) => {
                         diagnostics.add(
@@ -1743,6 +1870,8 @@ fn read_row(
                         continue;
                     }
                 };
+                counts.finding |= status == "failure";
+                counts.clean |= status == "success";
                 messages.insert((status == "failure", message.clone()));
                 if status == "failure" {
                     let locator = EvidenceTarget {
@@ -2056,7 +2185,7 @@ pub(crate) fn read_evidence(
     }
     let connection = store.lock();
     let transaction = connection.unchecked_transaction()?;
-    let Some(_branch) = current_branches(&transaction, definition, request)?
+    let Some(branch) = current_branches(&transaction, definition, request)?
         .into_iter()
         .find(|branch| {
             branch.branch == locator.branch
@@ -2066,6 +2195,13 @@ pub(crate) fn read_evidence(
     else {
         return Ok(unavailable());
     };
+    if branch
+        .actions
+        .as_deref()
+        .is_none_or(|actions| status_message(Some(actions), "failure").is_err())
+    {
+        return Ok(unavailable());
+    }
     let Some(frozen) = transaction
         .query_row(
             "SELECT c.frozen_input_json FROM burn_check_assessment_history h

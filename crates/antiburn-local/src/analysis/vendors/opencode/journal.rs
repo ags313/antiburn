@@ -707,6 +707,20 @@ struct LiveState {
     public_baseline: Option<u64>,
 }
 
+impl LiveState {
+    fn has_unsafe_ownership(&self) -> bool {
+        // Message removals use the same flag but have their own exact removal events.
+        self.parts.values().any(|part| {
+            part.unsafe_ownership
+                && part
+                    .state
+                    .identity
+                    .as_ref()
+                    .is_some_and(|(owner, _, _, _)| !self.requests.is_removed_message(owner))
+        })
+    }
+}
+
 /// Convert only the immediate result-only predecessor after source validation.
 fn convert_live_v4(mut live: LiveState, frontier: u64) -> LiveState {
     live.revision = LIVE_STATE_REVISION;
@@ -1005,6 +1019,7 @@ fn read_live(
     let mut message_removals = Vec::new();
     let mut output_bytes = 0;
     let mut evidence = Vec::new();
+    let mut unsafe_ownership = live.has_unsafe_ownership();
     for (index, event) in events.iter().enumerate() {
         ensure!(!cancel(), "OpenCode live read was cancelled");
         ensure!(
@@ -1078,6 +1093,7 @@ fn read_live(
             event_bytes = 0;
         }
         live = next_live;
+        unsafe_ownership |= live.has_unsafe_ownership();
         if !cold {
             output_bytes += event_bytes;
             evidence.extend(event_evidence);
@@ -1123,7 +1139,33 @@ fn read_live(
             })
             .collect();
     }
+    let admission_failure = if !metadata.root {
+        Some(ToolResultCompleteness::UnsafeOwnership)
+    } else {
+        live.requests
+            .admission_failure()
+            .or_else(|| (!live.history_safe).then_some(ToolResultCompleteness::UnsafeOrder))
+            .or_else(|| unsafe_ownership.then_some(ToolResultCompleteness::UnsafeOwnership))
+    };
+    let history_complete = history_complete && admission_failure.is_none();
     let evidence_history_complete = history_complete && live.public.history_complete();
+    if let Some(reason) = admission_failure {
+        // Unsafe admission replaces this page's unusable facts and always fits the output budget.
+        evidence = vec![crate::analysis::NativeEvidenceEvent {
+            fact: crate::analysis::NativeEvidenceFact::AdmissionFailure(
+                crate::analysis::NativeAdmissionFailure {
+                    source_format: SourceFormat::OpenCodeSqliteV1,
+                    session_id: session.to_owned(),
+                    position: ToolResultPosition::OpenCodeEvent {
+                        sequence: through,
+                        item_index: u32::MAX,
+                    },
+                    reason,
+                },
+            ),
+            live_eligible: true,
+        }];
+    }
     let cursor = OpenCodeJournalCursor {
         session_id: session.to_owned(),
         owner_id: metadata.owner,
@@ -1563,6 +1605,10 @@ fn valid_event(kind: &str, data: &Value, session: &str) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+#[path = "journal/admission_tests.rs"]
+mod admission_tests;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PartState {

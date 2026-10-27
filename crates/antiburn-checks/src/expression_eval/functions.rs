@@ -6,8 +6,8 @@ use crate::expression::{Expression, ExpressionFunction, PathSegment};
 
 use super::value::{RuntimeValue, ValueMetadata};
 use super::{
-    EvaluationError, EvaluationTrace, Evaluator, decimal_value, equal, invalid_error,
-    lowercase_chars, scalar_text,
+    EvaluationError, EvaluationTrace, Evaluator, decimal_value, equal, invalid_error, lowercase,
+    scalar_text,
 };
 
 impl<'a> Evaluator<'a, '_> {
@@ -65,7 +65,7 @@ impl<'a> Evaluator<'a, '_> {
                             (Some(left), Some(right)) => left.same(right),
                             _ => false,
                         };
-                        if equal(item, right, same_identity) {
+                        if equal(item, right, same_identity, self.budget)? {
                             result = true;
                             break;
                         }
@@ -74,8 +74,8 @@ impl<'a> Evaluator<'a, '_> {
                 } else {
                     let text = scalar_text(available(&values[0]), self.budget)?;
                     let needle = scalar_text(available(&values[1]), self.budget)?;
-                    let text = self.lowercase(&text)?;
-                    let needle = self.lowercase(&needle)?;
+                    let text = lowercase(&text, self.budget)?;
+                    let needle = lowercase(&needle, self.budget)?;
                     Ok(RuntimeValue::owned(
                         Value::Bool(text.contains(&needle)),
                         trace,
@@ -85,8 +85,8 @@ impl<'a> Evaluator<'a, '_> {
             ExpressionFunction::StartsWith | ExpressionFunction::EndsWith => {
                 let text = scalar_text(available(&values[0]), self.budget)?;
                 let part = scalar_text(available(&values[1]), self.budget)?;
-                let text = self.lowercase(&text)?;
-                let part = self.lowercase(&part)?;
+                let text = lowercase(&text, self.budget)?;
+                let part = lowercase(&part, self.budget)?;
                 let result = if function == ExpressionFunction::StartsWith {
                     text.starts_with(&part)
                 } else {
@@ -177,12 +177,6 @@ impl<'a> Evaluator<'a, '_> {
                 Ok(result)
             }
         }
-    }
-
-    fn lowercase(&mut self, text: &str) -> Result<String, EvaluationError> {
-        let bytes = lowercase_chars(text).map(char::len_utf8).sum();
-        self.budget.reserve_generated_bytes(bytes)?;
-        Ok(lowercase_chars(text).collect())
     }
 }
 

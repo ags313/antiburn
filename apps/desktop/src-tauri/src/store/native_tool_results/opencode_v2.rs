@@ -1005,13 +1005,21 @@ impl Store {
         let mut coverage_transition = false;
         let mut coverage_complete = !history_gap;
         if !admitted.events.is_empty() {
-            let complete = batch.history_complete
-                && (!results.is_empty() || !history_gap)
-                && results.iter().all(|result| {
-                    result.context.as_ref().is_some_and(|context| {
-                        context.main_session && context.complete_through_event
-                    })
-                });
+            // A partial capture needs explicit proof; tool-local limits do not break a complete capture.
+            let has_new_result = admitted.events.iter().any(|event| {
+                matches!(
+                    event.fact,
+                    NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(_))
+                )
+            });
+            let capture_proven = !history_gap
+                || (has_new_result
+                    && results.iter().all(|result| {
+                        result.context.as_ref().is_some_and(|context| {
+                            context.main_session && context.complete_through_event
+                        })
+                    }));
+            let complete = batch.history_complete && capture_proven;
             coverage_transition = history_gap == complete;
             coverage_complete = complete;
             let limit_message_history = |message: &mut NativeMessageObservation| match message {
@@ -1031,7 +1039,7 @@ impl Store {
                     NativeEvidenceFact::ResponseCycle(cycle) => {
                         cycle.context.complete_through_event &= complete;
                         for message in &mut cycle.messages {
-                            limit_message_history(message);
+                            restore_frozen_member_context_in(&tx, claim, message)?;
                         }
                     }
                     _ => {}
@@ -1174,6 +1182,64 @@ impl Store {
         }
         Ok(released)
     }
+}
+
+fn restore_frozen_member_context_in(
+    tx: &Transaction<'_>,
+    claim: &OpenCodeV2CaptureClaim,
+    message: &mut antiburn_local::analysis::NativeMessageObservation,
+) -> Result<()> {
+    use antiburn_local::analysis::{
+        NativeMessageObservation, PublicMessageObservation, UserMessageObservation,
+    };
+
+    let (identity, revision, kind) = {
+        let payload = super::super::evidence::message_payload(message);
+        (
+            payload.identity()?,
+            i64::try_from(payload.revision())?,
+            payload.kind(),
+        )
+    };
+    let stored: Option<String> = tx
+        .query_row(
+            "SELECT c.payload_json FROM native_tool_result_current c
+         JOIN native_tool_result_publication p USING(publication_sequence)
+         WHERE c.environment_key = ?1 AND c.agent = ?2 AND c.session_id = ?3
+           AND c.source_format = ?4 AND c.native_identity = ?5 AND c.native_revision = ?6
+           AND c.event_kind = ?7 AND c.is_removed = 0
+           AND p.session_incarnation = ?8 AND p.project_cwd IS ?9",
+            params![
+                claim.key.environment_key,
+                claim.key.agent,
+                claim.key.session_id,
+                serde_json::to_string(&SourceFormat::OpenCodeSqliteV2)?,
+                identity,
+                revision,
+                kind.name(),
+                claim.incarnation.0,
+                claim.cwd
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        // The evidence writer rejects missing or changed members.
+        return Ok(());
+    };
+    // Member contexts stay frozen at publication; the cycle owns its later request prefix.
+    match message {
+        NativeMessageObservation::User(message) => {
+            message.context = serde_json::from_str::<UserMessageObservation>(&stored)?.context;
+        }
+        NativeMessageObservation::Public(message) => {
+            message.context = serde_json::from_str::<PublicMessageObservation>(&stored)?.context;
+        }
+        NativeMessageObservation::ToolResult(message) => {
+            message.context = serde_json::from_str::<ToolResultObservation>(&stored)?.context;
+        }
+    }
+    Ok(())
 }
 
 fn result_identity(result: &ToolResultObservation) -> Result<String> {

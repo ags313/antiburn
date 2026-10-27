@@ -8,9 +8,11 @@ description: >-
 
 # Author Burn Checks
 
-Create one bounded assessment of recorded agent work. Deliver a check file, its
-evidence limits, and the checks that actually ran. Do not change Antiburn's engine
-to make an unsupported definition work.
+Write, review, or fix one check for a specific recorded behavior. For a review,
+report findings without changing the file. For a fix, preserve behavior outside
+the requested change. For a new check, deliver a draft file. Report the evidence
+limits and validation that actually ran. Do not change Antiburn's engine to make
+an unsupported definition work.
 
 This skill targets the experimental `v1-alpha` draft. Syntax, semantics, and
 capabilities can break without backward compatibility. Unsupported future work
@@ -50,10 +52,10 @@ Ask only for missing information, in one short batch:
    Ask for a small synthetic example if the recorded facts are unclear. Do not
    collect a private transcript or credential.
 3. What similar work is allowed? Include an example that must not fail.
-4. What should an uncertain valid answer do: explicitly write success or leave
-   the previous saved status unchanged? Explain that no write can leave an older
-   failure visible. Recommend no write when missing evidence could hide allowed
-   work, but get agreement before choosing the policy.
+4. If a valid answer is uncertain, should an action write `success`, or should no
+   action match? Explain that no matching action preserves the saved status and
+   can leave an earlier failure visible. Recommend no matching action when missing
+   evidence could hide allowed work, but get agreement before choosing the policy.
 
 Define a failure case, an allowed case, and an uncertain case before writing
 questions or conditions. Missing evidence is not proof that work did not happen.
@@ -234,7 +236,8 @@ an override can expose a global definition. Removing all effective definitions
 stops the check; it does not write success or erase saved assessments. Include
 this case in the user's test or removal plan.
 
-Finish with the file path, the bounded claim and limits, the source revision,
-validation results by layer, and whether installation or live/provider testing
-actually occurred. Do not promise native fix prompts, Auto Fix, verification
-watches, burn estimates, or savings from a YAML status check.
+Finish with the file path and the task result: a new draft, review findings, or
+a summary of the requested fixes. Include the bounded claim and limits, the
+source revision, validation results by layer, and whether installation or
+live/provider testing actually occurred. Do not promise native fix prompts,
+Auto Fix, verification watches, burn estimates, or savings from a YAML status check.

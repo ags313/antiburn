@@ -44,24 +44,28 @@ Each check has a docs page explaining what it measures and how to fix it. The [c
 
 [Burn Checks](docs/burn-check/README.md) let you define what to check in `.yml`
 files. Put a file in your project's `.antiburn/checks/` folder or use
-`~/.antiburn/checks/` for checks across projects. antiburn discovers the files
-and shows their results in Checks. The repository includes five examples for
+`~/.antiburn/checks/` for checks across projects. antiburn discovers the files,
+but does not run them until a configured connection is selected and **Run checks**
+is on. Check results appear in Checks. The repository includes five examples for
 exploration, task scope, instructions, skill guidance, and fast-mode advice.
 
 The `v1-alpha` runtime supports public user and assistant messages, tool calls
-and results, proven response-cycle endings, session attachment, and a fixed
-120-second idle observation. Support depends on the agent's recorded evidence;
-the app does not invent missing events. Use local status rules or ask a
-compatible model a bounded question. See the [supported subset](docs/burn-check/authoring.md#supported-subset)
-for exact events and limits.
+and results, and response-cycle endings that recorded evidence can prove. A
+check can also run when antiburn attaches to a session or observes 120 seconds
+without source activity. Available events depend on the agent's recorded
+evidence; the app does not invent missing events. A check can set status with
+local rules or ask a compatible model a bounded question. See the
+[supported subset](docs/burn-check/authoring.md#supported-subset) for exact events
+and limits.
 
 Open **Settings → Checks → Model-based checks**, choose **Add connection**, and
-configure Jev, compatible Ollama, Cloudflare, or Custom. The first connection
-becomes selected without enabling checks. Use **Use** to select another saved
-connection, then enable **Run checks**. An optional **Test connection** sends
-synthetic input. Model requests can incur provider charges. Selected public
-text, tool results, and referenced current files can contain private data and
-can leave your device. Private thinking stays excluded.
+configure a supported System One connection: Jev, an Ollama endpoint that supports
+System One, Cloudflare, or Custom. Ordinary chat endpoints are not supported.
+The first connection becomes selected without enabling checks. Select **Use**
+for another saved connection, then enable **Run checks**. An optional **Test
+connection** sends synthetic input. Model requests can incur provider charges.
+Selected public text, tool results, and referenced current files can contain
+private data and can leave your device. Private thinking stays excluded.
 
 Alpha is experimental and can introduce breaking changes. It does not support
 message actions, effective session skill inventories, `repo.branch`, or proof

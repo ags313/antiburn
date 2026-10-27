@@ -31,19 +31,22 @@ const availability: CheckAvailability = {
 }
 
 export function fixtureCheckAvailability(): CheckAvailability {
-  if (new URLSearchParams(window.location.search).get("checks") === "installed") {
+  const checks = new URLSearchParams(window.location.search).get("checks")
+  if (checks === "installed" || checks === "removed") {
     return {
       ...structuredClone(availability),
       yamlEnabled: true,
+      checks: availability.checks.map(({ id }) => ({ id, enabled: false })),
       configured: true,
-      installedChecks: installedChecks().map(
-        ({ effectiveId, name, aliases, availability }) => ({
-          effectiveId,
-          name,
-          aliases,
-          availability,
-        }),
-      ),
+      installedChecks:
+        checks === "installed"
+          ? installedChecks().map(({ effectiveId, name, aliases, availability }) => ({
+              effectiveId,
+              name,
+              aliases,
+              availability,
+            }))
+          : [],
     }
   }
   return structuredClone(availability)
@@ -64,7 +67,8 @@ export function setFixtureCheckEnabled(args?: Record<string, unknown>): CheckAva
 }
 
 export function fixtureChecksReport(): ChecksReportPayload {
-  if (new URLSearchParams(window.location.search).get("checks") === "installed") {
+  const checks = new URLSearchParams(window.location.search).get("checks")
+  if (checks === "installed" || checks === "removed") {
     return {
       evidenceSettled: true,
       windowSessions: 6,
@@ -72,7 +76,7 @@ export function fixtureChecksReport(): ChecksReportPayload {
       deferredEvidence: 0,
       estimatedTokenBurnBasisPoints: null,
       categories: [],
-      installedChecks: installedChecks(),
+      installedChecks: checks === "installed" ? installedChecks() : [],
     }
   }
   return {

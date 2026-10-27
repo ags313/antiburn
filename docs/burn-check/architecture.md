@@ -50,8 +50,9 @@ session active within 180 seconds. Compatible admitted work, including interrupt
 cold claims, continues after activity expires. Remote, WSL, known forks/subagents,
 unknown/empty CWD, and historical-only sources do not start new live work.
 
-Productive continuation is due immediately on both routes. Durable monotonic
-claim order rotates productive sources without a clock tick and across restart.
+When a source page reports more work, the worker schedules the next page
+immediately on both routes. It saves an increasing claim order to rotate ready
+sources without a clock tick, including after restart.
 Active sessions and changed cursors get a one-second poll. Idle attached dormant
 sources use a fair 30-second resume sweep without a discovery generation change.
 Disabled and ineligible cold sources do not create claims or idle wake loops.
@@ -188,6 +189,13 @@ unrelated appends do not invalidate a candidate. Project reads filter exact
 environment/session CWD before the page limit. Old payloads without context stay
 unavailable.
 
+Native publication cancels stale dependent work and marks its saved evidence
+invalid in the same transaction, before the engine reads the change. The same
+gate protects startup tool results with untyped observation bindings. Database
+migration 92 indexes correction updates, removals, and dependency identities
+without rewriting saved rows. Routine writes recheck changed identities. A loss
+of continuity still checks all native dependencies for that session.
+
 Definitions that reference current global or repository inventories request a
 bounded host snapshot during selection. The host binds the read to the native
 publication or host observation, agent, branch, exact stored CWD, trusted repository
@@ -254,8 +262,9 @@ admitted native activity moves the deadline to 120 seconds after local
 observation. Historical baseline facts, exact replay, selection changes, UI
 events, and notices do not. Optional native activity timestamps remain separate
 from the timer clock. Lost source continuity cancels unfinished idle work and
-requires a fresh interval after recovery. This is not a measured activity
-partition and does not change the native Fast mode overuse check.
+requires a fresh interval after recovery. This observation does not measure
+model-active or tool-only time and does not change the native Fast mode overuse
+check.
 
 An indexed next-deadline wake requests finite source catch-up, not one polling
 loop per attachment. Idle publication requires a usable frontier and rechecks the
@@ -311,9 +320,10 @@ prepared work. Invalid snapshots do not authorize a budget reset. Incompatible
 old pending preparations stop locally without inference or reconstruction. A
 bounded read-only legacy decoder preserves accepted historical input and
 provenance; it cannot authorize execution. Its prior-format bounds are 64 MiB,
-131,072 JSON values, and depth 72, derived from the previously reachable input,
-report, and request wrappers rather than the smaller new set limit. One malformed candidate does not stop
-unrelated recovery rows. Database errors still propagate.
+131,072 JSON values, and depth 72. These bounds cover the previously reachable
+input, report, and request wrappers, rather than the smaller current
+preparation-set limit. One malformed candidate does not stop unrelated recovery
+rows. Database errors still propagate.
 
 For local checks, the assessment budget covers action planning without a decision
 input or provider preparation step. Local recovery requires its saved budget.
@@ -584,10 +594,10 @@ public kinds use a separate future-only baseline and first-eligible publication.
 The named file-cursor-4 and journal-4 converters preserve committed progress,
 pending result joins, source bindings, and the original result baseline when
 upgrading to revision 5. They set a new-event frontier without replaying old
-result identities. Parser 66 accepts branch parser-63, parser-64, and parser-65
+result identities. Parser 66 accepts parser-63, parser-64, and parser-65
 cursor/state-5 receipts, and the named parser-62/cursor/state-4 predecessors
-through their exact converters. Separate converters accept main's parser-64
-file cursor 1 and V1 live state 2 from the pinned producer at
+through their exact converters. Separate converters accept parser-64
+file cursor 1 and V1 live state 2 only from producer commit
 `143d4b05681938cb362e828ecc27d2e082638176`. Actual old-encoder synthetic
 fixtures define the accepted shape, not a published release range. File conversion
 validates the original identity and hash anchors; V1 conversion requires matching

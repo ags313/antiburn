@@ -9,6 +9,10 @@ pub(crate) mod request_origin;
 pub(crate) mod source_delivery;
 pub(crate) mod trace_effects;
 
+#[cfg(test)]
+#[path = "native_tool_results/main_64_preservation_tests.rs"]
+mod main_64_preservation_tests;
+
 pub use publications::{
     ToolResultBatch, ToolResultPublication, ToolResultPublicationOutcome, ToolResultPublishOptions,
 };

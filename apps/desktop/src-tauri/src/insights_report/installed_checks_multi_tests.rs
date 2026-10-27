@@ -69,6 +69,7 @@ fn fixture() -> (
             Some(&activation),
         )
         .unwrap();
+    publish_runtime_definition(&store, &definition);
     let connection = SystemOneConnection {
         provider: SystemOneProvider::Cloudflare,
         endpoint: SystemOneEndpoint::CloudflareAccount("syntheticaccount".into()),
@@ -497,22 +498,159 @@ fn a_completed_sibling_does_not_stop_checking_before_the_candidate_settles() {
 }
 
 #[test]
-fn invalid_action_json_does_not_remove_another_branch_target() {
-    let (store, definition) = populated();
-    store.lock().execute("UPDATE burn_check_assessment_history SET actions_json = '{}' WHERE trigger_position = 2", []).unwrap();
-    let report = rows(&store, std::slice::from_ref(&definition));
-    assert_eq!((report[0].finding, report[0].clean), (1, 1));
-    assert_eq!(report[0].targets.len(), 1);
-    assert!(
-        report[0]
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "storage-failed")
-    );
-    assert_eq!(
-        read_evidence(&store, &[definition], &request(), &report[0].targets[0].id)
-            .unwrap()
-            .status,
-        BurnCheckEvidenceStatus::Available
-    );
+fn invalid_status_writing_actions_withhold_only_the_damaged_branch() {
+    for status in [StatusResult::Failure, StatusResult::Success] {
+        let opposite = match status {
+            StatusResult::Failure => StatusResult::Success,
+            StatusResult::Success => StatusResult::Failure,
+        };
+        for actions in [
+            json!({}),
+            json!({"current_status": opposite, "outcomes": [{"index": 0,
+                "outcome": {"Applied": {"result": status, "message": "DAMAGED_WRITER"}}}]}),
+            json!({"current_status": status, "outcomes": [{"index": 0,
+                "outcome": {"Applied": {"result": opposite, "message": "DAMAGED_WRITER"}}}]}),
+        ] {
+            let (store, definition) = populated();
+            let healthy = rows(&store, std::slice::from_ref(&definition)).remove(0);
+            accept_with_message(
+                &store,
+                &definition,
+                "damaged",
+                4,
+                Some(status),
+                Some("DAMAGED_WRITER"),
+            );
+            let valid = rows(&store, std::slice::from_ref(&definition));
+            assert_eq!(
+                valid[0].finding,
+                1 + u64::from(status == StatusResult::Failure)
+            );
+            assert_eq!(
+                valid[0].clean,
+                1 + u64::from(status == StatusResult::Success)
+            );
+            let damaged_target = valid[0]
+                .targets
+                .iter()
+                .find(|target| target.session.session_id == "damaged")
+                .map(|target| target.id.clone());
+            store.lock().execute(
+                "UPDATE burn_check_assessment_history SET actions_json = ?1 WHERE trigger_position = 4",
+                [actions.to_string()],
+            ).unwrap();
+
+            let changes = store.lock().total_changes();
+            let report = rows(&store, std::slice::from_ref(&definition)).remove(0);
+            assert_eq!(store.lock().total_changes(), changes);
+            assert_eq!(
+                (report.finding, report.clean, report.unavailable),
+                (1, 1, 1)
+            );
+            assert_eq!(report.explanation, healthy.explanation);
+            assert_eq!(report.targets.len(), 1);
+            assert_eq!(report.targets[0].id, healthy.targets[0].id);
+            assert_eq!(
+                report.targets[0].observation,
+                healthy.targets[0].observation
+            );
+            assert!(report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "storage-failed" && diagnostic.affected_session_count == 1
+            }));
+            assert!(
+                !serde_json::to_string(&report)
+                    .unwrap()
+                    .contains("DAMAGED_WRITER")
+            );
+            if let Some(target) = damaged_target {
+                assert_eq!(
+                    read_evidence(
+                        &store,
+                        std::slice::from_ref(&definition),
+                        &request(),
+                        &target
+                    )
+                    .unwrap()
+                    .status,
+                    BurnCheckEvidenceStatus::Unavailable
+                );
+            }
+            assert_eq!(
+                read_evidence(&store, &[definition], &request(), &report.targets[0].id)
+                    .unwrap()
+                    .status,
+                BurnCheckEvidenceStatus::Available
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_later_no_write_actions_preserve_the_valid_writer_and_other_branches() {
+    for status in [StatusResult::Failure, StatusResult::Success] {
+        let (store, definition) = populated();
+        accept_with_message(
+            &store,
+            &definition,
+            "retained",
+            4,
+            Some(status),
+            Some("Keep the valid writer."),
+        );
+        accept(&store, &definition, "retained", 5, None);
+        let before = rows(&store, std::slice::from_ref(&definition)).remove(0);
+        store.lock().execute(
+            "UPDATE burn_check_assessment_history SET actions_json = '{}' WHERE trigger_position = 5",
+            [],
+        ).unwrap();
+
+        let changes = store.lock().total_changes();
+        let report = rows(&store, std::slice::from_ref(&definition)).remove(0);
+        assert_eq!(store.lock().total_changes(), changes);
+        assert_eq!(
+            (report.finding, report.clean, report.unavailable),
+            (before.finding, before.clean, 0)
+        );
+        assert_eq!(report.explanation, before.explanation);
+        assert_eq!(
+            report
+                .targets
+                .iter()
+                .map(|target| &target.id)
+                .collect::<Vec<_>>(),
+            before
+                .targets
+                .iter()
+                .map(|target| &target.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            report
+                .targets
+                .iter()
+                .map(|target| &target.observation)
+                .collect::<Vec<_>>(),
+            before
+                .targets
+                .iter()
+                .map(|target| &target.observation)
+                .collect::<Vec<_>>()
+        );
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "storage-failed" && diagnostic.affected_session_count == 1
+        }));
+        for target in &report.targets {
+            assert_eq!(
+                read_evidence(
+                    &store,
+                    std::slice::from_ref(&definition),
+                    &request(),
+                    &target.id
+                )
+                .unwrap()
+                .status,
+                BurnCheckEvidenceStatus::Available
+            );
+        }
+    }
 }

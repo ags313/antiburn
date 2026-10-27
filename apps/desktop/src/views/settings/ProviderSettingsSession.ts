@@ -587,8 +587,7 @@ export class ProviderSettingsSession {
       })
       await this.readAfterError()
     } finally {
-      this.publish({ busy: false, action: null })
-      this.revealPendingTarget()
+      this.finishAction()
     }
   }
   private confirmForgetSharedKey() {
@@ -638,17 +637,12 @@ export class ProviderSettingsSession {
       this.publish({ status: "Connection removed." })
       return true
     } catch (error) {
-      this.publish({
-        error: providerErrorMessage(
-          error,
-          "Could not remove the connection. Reload connections and try again.",
-        ),
-      })
-      await this.readAfterError()
-      return false
+      return await this.reportConnectionError(
+        error,
+        "Could not remove the connection. Reload connections and try again.",
+      )
     } finally {
-      this.publish({ busy: false, action: null })
-      this.revealPendingTarget()
+      this.finishAction()
     }
   }
   private async readAfterError() {
@@ -658,6 +652,15 @@ export class ProviderSettingsSession {
     } catch {
       this.publish({ activeConfirmed: false, status: ACTIVE_CONNECTION_UNCONFIRMED })
     }
+  }
+  private async reportConnectionError(error: unknown, message: string) {
+    this.publish({ error: providerErrorMessage(error, message) })
+    await this.readAfterError()
+    return false
+  }
+  private finishAction() {
+    this.publish({ busy: false, action: null })
+    this.revealPendingTarget()
   }
   async run(action: "test" | "save" | "remove" | "switch") {
     if (
@@ -768,8 +771,7 @@ export class ProviderSettingsSession {
         await this.readAfterError()
       }
     } finally {
-      this.publish({ busy: false, action: null })
-      this.revealPendingTarget()
+      this.finishAction()
     }
   }
   async retryPendingOperation() {
@@ -873,17 +875,12 @@ export class ProviderSettingsSession {
       if (ownsSave) this.clearSaveSubmissions(operation.connectionId)
       return true
     } catch (error) {
-      this.publish({
-        error: providerErrorMessage(
-          error,
-          "Could not retry the connection operation. Reload connections and try again.",
-        ),
-      })
-      await this.readAfterError()
-      return false
+      return await this.reportConnectionError(
+        error,
+        "Could not retry the connection operation. Reload connections and try again.",
+      )
     } finally {
-      this.publish({ busy: false, action: null })
-      this.revealPendingTarget()
+      this.finishAction()
     }
   }
 }

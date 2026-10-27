@@ -783,7 +783,6 @@ pub(crate) fn reconcile_evidence_in(
                     tx.execute("UPDATE native_tool_result_current SET owner_message_id = ?6 WHERE environment_key = ?1
                         AND agent = ?2 AND session_id = ?3 AND source_format = ?4 AND native_identity = ?5",
                         params![session.environment_key, session.agent, session.session_id, format, payload.identity()?, payload.owner()])?;
-                    invalidate_native_dependents_in(tx, session)?.record(policy.invalidation_effects);
                 } else {
                     upsert_in(tx, session, &format, generation, fence, payload, live)?.record(policy.invalidation_effects);
                 }
@@ -988,7 +987,7 @@ fn upsert_in(
         first_eligible_publication = excluded.first_eligible_publication",
         params![session.environment_key, session.agent, session.session_id, format, identity, position, revision,
             encoded, payload.removed(), sequence, generation, fence, payload.kind().name(), first, payload.owner()])?;
-    invalidate_native_dependents_in(tx, session)
+    invalidate_native_identity_dependents_in(tx, session, format, &identity, payload.kind())
 }
 
 pub(crate) fn current_binding_in(
@@ -1084,25 +1083,77 @@ fn remove_current_in(
     tx.execute("UPDATE native_tool_result_current SET is_removed = 1, publication_sequence = ?6, native_revision = ?7,
         native_position_json = ?8, payload_json = ?9 WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3 AND source_format = ?4 AND native_identity = ?5",
         params![session.environment_key, session.agent, session.session_id, format, identity, sequence, i64::try_from(revision)?, serde_json::to_string(position)?, payload])?;
-    invalidate_native_dependents_in(tx, session)
+    invalidate_native_identity_dependents_in(
+        tx,
+        session,
+        format,
+        identity,
+        serde_json::from_value(serde_json::Value::String(kind))?,
+    )
+}
+
+const NATIVE_IDENTITY_DEPENDENTS_SQL: &str = "
+    SELECT d.candidate_id FROM burn_check_candidate_dependency d
+    JOIN burn_check_candidate c USING(candidate_id)
+    WHERE d.session_key_json = ?1 AND d.source_format = ?2
+      AND CASE WHEN json_valid(d.dependency_binding_json)
+        THEN json_type(d.dependency_binding_json, '$.NativeCurrent') = 'object' ELSE 0 END
+      AND CASE WHEN json_valid(d.dependency_binding_json)
+        THEN json_extract(d.dependency_binding_json, '$.NativeCurrent.identity') END = ?3
+      AND d.event_kind = ?4
+      AND c.state IN ('pending', 'claimed', 'dispatching', 'answered', 'accepted')
+    UNION
+    SELECT d.candidate_id FROM burn_check_observation o
+    JOIN burn_check_candidate_dependency d
+      ON d.observation_id = o.observation_id AND d.session_key_json = o.session_key_json
+    JOIN burn_check_candidate c ON c.candidate_id = d.candidate_id
+      AND c.check_id = o.check_id AND c.activation_scope_key = o.activation_scope_key
+    WHERE o.session_key_json = ?1 AND o.source_format = ?2 AND o.native_identity = ?3
+      AND o.event_kind = ?4 AND d.dependency_binding_json IS NULL
+      AND d.native_revision IS NOT NULL AND d.event_kind = 'tool_result'
+      AND c.state IN ('pending', 'claimed', 'dispatching', 'answered', 'accepted')";
+
+pub(crate) fn invalidate_native_identity_dependents_in(
+    tx: &Transaction<'_>,
+    session: &SessionKey,
+    format: &str,
+    identity: &str,
+    kind: EvidenceEventKind,
+) -> Result<super::trace_effects::InvalidationEffects> {
+    let mut stmt = tx.prepare(NATIVE_IDENTITY_DEPENDENTS_SQL)?;
+    let ids = stmt
+        .query_map(
+            params![session.to_identity_json(), format, identity, kind.name()],
+            |r| r.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    invalidate_candidates_in(tx, ids)
 }
 
 pub(crate) fn invalidate_native_dependents_in(
     tx: &Transaction<'_>,
     session: &SessionKey,
 ) -> Result<super::trace_effects::InvalidationEffects> {
-    let mut effects = super::trace_effects::InvalidationEffects::default();
     let mut stmt = tx.prepare(
         "SELECT DISTINCT d.candidate_id FROM burn_check_candidate_dependency d
         JOIN burn_check_candidate c USING(candidate_id) WHERE d.session_key_json = ?1
-        AND json_type(d.dependency_binding_json, '$.NativeCurrent') = 'object'
+        AND (d.dependency_binding_json IS NOT NULL
+          OR (d.native_revision IS NOT NULL AND d.event_kind = 'tool_result'))
         AND c.state IN ('pending', 'claimed', 'dispatching', 'answered', 'accepted')",
     )?;
     let ids = stmt
         .query_map([session.to_identity_json()], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    invalidate_candidates_in(tx, ids)
+}
+
+fn invalidate_candidates_in(
+    tx: &Transaction<'_>,
+    ids: Vec<String>,
+) -> Result<super::trace_effects::InvalidationEffects> {
+    let mut effects = super::trace_effects::InvalidationEffects::default();
     for id in ids {
-        if !super::observers::typed_dependencies_current_in(tx, &id)? {
+        if !publication_dependencies_current_in(tx, &id)? {
             effects.unfinished_stale += tx.execute(
                 "UPDATE burn_check_candidate SET state = 'stale' WHERE candidate_id = ?1
             AND state IN ('pending', 'claimed', 'dispatching', 'answered')",
@@ -1119,5 +1170,111 @@ pub(crate) fn invalidate_native_dependents_in(
     Ok(effects)
 }
 
+fn publication_dependencies_current_in(connection: &Connection, candidate: &str) -> Result<bool> {
+    use super::observers::DependencyBinding;
+
+    let mut statement = connection.prepare(
+        "SELECT session_key_json, native_revision, event_kind, dependency_binding_json
+         FROM burn_check_candidate_dependency WHERE candidate_id = ?1",
+    )?;
+    let rows = statement
+        .query_map([candidate], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut has_native = false;
+    for (session, revision, kind, json) in rows {
+        let Some(json) = json else {
+            has_native |= revision.is_some() && kind == "tool_result";
+            continue;
+        };
+        // Saved binding decode failures invalidate this candidate, not its source transaction.
+        let Ok(binding) = serde_json::from_str::<DependencyBinding>(&json) else {
+            return Ok(false);
+        };
+        if matches!(binding, DependencyBinding::NativeCurrent(_)) {
+            if serde_json::from_str::<(String, String, String)>(&session).is_err() {
+                return Ok(false);
+            }
+            has_native = true;
+        }
+    }
+    // Native continuity does not revoke valid host-only or activity-only history.
+    if !has_native {
+        return Ok(true);
+    }
+    let (session, scope): (String, String) = connection.query_row(
+        "SELECT session_key_json, activation_scope_key FROM burn_check_candidate
+         WHERE candidate_id = ?1",
+        [candidate],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if serde_json::from_str::<(String, String, String)>(&session).is_err()
+        || serde_json::from_str::<serde_json::Value>(&scope).is_err()
+    {
+        return Ok(false);
+    }
+    super::observers::typed_dependencies_current_in(connection, candidate)
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod invalidation_tests {
+    use super::*;
+
+    #[test]
+    fn native_identity_invalidation_uses_indexed_typed_and_observation_lookups() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(directory.path()).unwrap();
+        let connection = store.lock();
+        let mut statement = connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {NATIVE_IDENTITY_DEPENDENTS_SQL}"
+            ))
+            .unwrap();
+        let plan = statement
+            .query_map(
+                params!["session", "format", "identity", "tool_result"],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for (index, identity) in [
+            (
+                "burn_check_candidate_dependency_native_identity",
+                "<expr>=?",
+            ),
+            (
+                "burn_check_observation_native_identity",
+                "native_identity=?",
+            ),
+        ] {
+            assert!(
+                plan.iter().any(|step| {
+                    step.contains(index)
+                        && step.contains("session_key_json=?")
+                        && step.contains("source_format=?")
+                        && step.contains(identity)
+                        && step.contains("event_kind=?")
+                }),
+                "{plan:?}"
+            );
+        }
+        assert!(
+            plan.iter().any(|step| {
+                step.contains("burn_check_candidate_dependency_observation")
+                    && step.contains("observation_id=?")
+                    && step.contains("session_key_json=?")
+            }),
+            "{plan:?}"
+        );
+    }
+}

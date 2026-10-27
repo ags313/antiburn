@@ -441,7 +441,8 @@ pub(crate) fn activity_in(
         effects.unfinished_stale += tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3
             AND branch_key = ?4 AND state IN ('pending', 'claimed', 'dispatching', 'answered')
             AND EXISTS(SELECT 1 FROM burn_check_candidate_dependency d WHERE d.candidate_id = burn_check_candidate.candidate_id
-              AND json_type(d.dependency_binding_json, '$.SessionActivity') = 'object')",
+              AND CASE WHEN json_valid(d.dependency_binding_json)
+                THEN json_type(d.dependency_binding_json, '$.SessionActivity') = 'object' ELSE 0 END)",
             params![check, scope, generation, session.to_identity_json()])?;
     }
     Ok(effects)
@@ -481,7 +482,8 @@ pub(crate) fn rebind_source_in(
         effects.unfinished_stale += tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE check_id = ?1 AND activation_scope_key = ?2
             AND generation = ?3 AND branch_key = ?4 AND state IN ('pending', 'claimed', 'dispatching', 'answered')
             AND EXISTS(SELECT 1 FROM burn_check_candidate_dependency d WHERE d.candidate_id = burn_check_candidate.candidate_id
-              AND json_type(d.dependency_binding_json, '$.SessionActivity') = 'object')",
+              AND CASE WHEN json_valid(d.dependency_binding_json)
+                THEN json_type(d.dependency_binding_json, '$.SessionActivity') = 'object' ELSE 0 END)",
             params![check, scope, generation, session.to_identity_json()])?;
     }
     Ok(effects)
@@ -568,7 +570,8 @@ pub(crate) fn break_continuity_in(
     effects.unfinished_stale += tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE branch_key = ?1
         AND state IN ('pending', 'claimed', 'dispatching', 'answered') AND EXISTS(
           SELECT 1 FROM burn_check_candidate_dependency d WHERE d.candidate_id = burn_check_candidate.candidate_id
-            AND json_type(d.dependency_binding_json, '$.SessionActivity') = 'object')", [session.to_identity_json()])?;
+            AND CASE WHEN json_valid(d.dependency_binding_json)
+              THEN json_type(d.dependency_binding_json, '$.SessionActivity') = 'object' ELSE 0 END)", [session.to_identity_json()])?;
     effects += super::evidence::invalidate_native_dependents_in(tx, session)?;
     Ok(effects)
 }

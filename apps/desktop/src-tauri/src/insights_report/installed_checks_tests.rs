@@ -149,9 +149,13 @@ fn store() -> Arc<Store> {
     store
 }
 
-fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
+fn activate(
+    store: &Arc<Store>,
+    definition: &InstalledCheckDefinition,
+) -> (Arc<StoreCheckStore>, EffectiveActivation) {
     let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key).unwrap();
-    let adapter = StoreCheckStore::new(store.clone(), "test".into(), scope.clone()).unwrap();
+    let adapter =
+        Arc::new(StoreCheckStore::new(store.clone(), "test".into(), scope.clone()).unwrap());
     let activation = EffectiveActivation {
         id: ActivationId {
             scope: scope.clone(),
@@ -173,6 +177,11 @@ fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
             Some(&activation),
         )
         .unwrap();
+    publish_runtime_definition(store, definition);
+    (adapter, activation)
+}
+
+fn publish_runtime_definition(store: &Store, definition: &InstalledCheckDefinition) {
     let mut connection = store.lock();
     let mut runtime_definitions = connection
         .prepare(
@@ -209,7 +218,20 @@ fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
         generation: definition.generation,
         definition_revision: definition.definition_revision.clone(),
         name: definition.name.clone(),
-        availability: antiburn_checks_store::DefinitionAvailability::Available,
+        availability: match &definition.availability {
+            InstalledCheckAvailability::Available => {
+                antiburn_checks_store::DefinitionAvailability::Available
+            }
+            InstalledCheckAvailability::Paused { .. } => {
+                antiburn_checks_store::DefinitionAvailability::Paused
+            }
+            InstalledCheckAvailability::Invalid { .. } => {
+                antiburn_checks_store::DefinitionAvailability::Invalid
+            }
+            InstalledCheckAvailability::Unsupported { .. } => {
+                antiburn_checks_store::DefinitionAvailability::Unsupported
+            }
+        },
     });
     antiburn_checks_store::replace_runtime_definitions(&mut connection, &runtime_definitions)
         .unwrap();
@@ -380,27 +402,72 @@ fn seed_current_claude_origin(store: &Store, id: &str) -> i64 {
         .unwrap();
     transaction
         .execute(
-            "UPDATE burn_check_activation SET applied_sequence = MAX(applied_sequence, ?2)
-         WHERE json_extract(activation_scope_key, '$.environment') = 'native'
-           AND json_extract(activation_scope_key, '$.session_cwd') =
-             (SELECT cwd FROM session WHERE environment_key = 'native'
-                AND agent = 'claude-code' AND session_id = ?1)",
-            params![id, boundary],
-        )
-        .unwrap();
-    transaction
-        .execute(
-            "INSERT OR REPLACE INTO burn_check_session_attachment
+            "INSERT INTO burn_check_session_attachment
            (check_id, activation_scope_key, generation, branch_key, incarnation)
          SELECT a.check_id, a.activation_scope_key, a.generation, ?2, s.incarnation
            FROM burn_check_activation a JOIN session s
              ON s.cwd = json_extract(a.activation_scope_key, '$.session_cwd')
-          WHERE s.environment_key = 'native' AND s.agent = 'claude-code' AND s.session_id = ?1",
+           WHERE s.environment_key = 'native' AND s.agent = 'claude-code' AND s.session_id = ?1
+          ON CONFLICT(check_id, activation_scope_key, generation, branch_key) DO NOTHING",
             params![id, key.to_identity_json()],
         )
         .unwrap();
     transaction.commit().unwrap();
     boundary
+}
+
+fn publication_page(
+    store: &Store,
+    activation: &ActivationId,
+) -> antiburn_checks::source::SourceBatch {
+    let (checkpoint, applied_sequence): (String, u64) = store
+        .lock()
+        .query_row(
+            "SELECT checkpoint_json, applied_sequence FROM burn_check_activation
+         WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3",
+            params![
+                activation.definition_id,
+                serde_json::to_string(&activation.scope).unwrap(),
+                activation.generation.0
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let progress = antiburn_checks::check_store::SourceProgress::decode(&checkpoint).unwrap();
+    assert_eq!(progress.publication_cursor.0, applied_sequence);
+    antiburn_checks::source::PublishedEvidenceSource::new(
+        crate::published_evidence_reader::StorePublishedEvidenceReader::for_live_project(
+            store,
+            &activation.scope.environment,
+            &activation.scope.session_cwd,
+        )
+        .with_activation(activation),
+        40,
+    )
+    .unwrap()
+    .read_batch(progress.publication_cursor)
+    .unwrap()
+}
+
+fn apply_ready_publications(
+    store: &Store,
+    adapter: Arc<StoreCheckStore>,
+    activation: &EffectiveActivation,
+) {
+    let engine = antiburn_checks::engine::CheckEngine::new(adapter, Arc::new(local::NoModel));
+    loop {
+        let page = publication_page(store, &activation.id);
+        assert_eq!(
+            engine
+                .apply_source_page(activation, &page)
+                .unwrap()
+                .candidates,
+            0
+        );
+        if !page.has_more {
+            break;
+        }
+    }
 }
 
 fn accept(
@@ -692,6 +759,7 @@ fn has_started_distinguishes_cancelled_queue_from_a_dispatched_attempt() {
     let definition = definition("/workspace/demo");
     activate(&store, &definition);
     queue(&store, &definition, "cancelled", 1);
+    seed_current_claude_origin(&store, "cancelled");
     store
         .lock()
         .execute("UPDATE burn_check_candidate SET state = 'cancelled'", [])
@@ -786,8 +854,10 @@ fn rust_facade_matches_frontend_fixture_and_retains_the_actual_failure_write() {
 fn ready_session_without_a_candidate_waits_for_results_without_checking() {
     let store = store();
     let definition = definition("/workspace/demo");
-    activate(&store, &definition);
+    let (adapter, activation) = activate(&store, &definition);
     session(&store, "active-session", 190);
+    seed_current_claude_origin(&store, "active-session");
+    apply_ready_publications(&store, adapter, &activation);
     let report = rows(&store, std::slice::from_ref(&definition));
     assert_eq!(report[0].checking_count, 0);
     assert!(!report[0].has_started);
@@ -813,10 +883,12 @@ fn grouped_waiting_event_and_count_come_from_the_same_scope_in_both_orders() {
         minimum: 3,
     });
     for definition in [&calls, &users] {
-        activate(&store, definition);
+        let (adapter, activation) = activate(&store, definition);
         let scope: ActivationScope =
             serde_json::from_str(&definition.activation_scope_key).unwrap();
         session_in_project(&store, &scope.session_cwd, 190, &scope.session_cwd);
+        seed_current_claude_origin(&store, &scope.session_cwd);
+        apply_ready_publications(&store, adapter, &activation);
     }
     for definitions in [
         [calls.clone(), users.clone()],
@@ -833,7 +905,7 @@ fn grouped_waiting_event_and_count_come_from_the_same_scope_in_both_orders() {
     store
         .lock()
         .execute(
-            "UPDATE session_evidence SET status = 'pending' WHERE session_id = '/workspace/users'",
+            "UPDATE native_file_delivery SET pending = 1 WHERE session_id = '/workspace/users'",
             [],
         )
         .unwrap();
@@ -1090,6 +1162,190 @@ fn disabled_activation_exposes_no_status_checking_or_waiting_counts_with_old_met
         (0, 0, 0, 0, 0)
     );
     assert!(row.targets.is_empty());
+}
+
+#[test]
+fn capability_pauses_keep_saved_results_and_evidence_without_showing_new_work() {
+    for availability in [
+        InstalledCheckAvailability::Unsupported {
+            reason: Some("The selected model does not support choice questions.".into()),
+        },
+        InstalledCheckAvailability::Paused { reason: None },
+    ] {
+        let (store, mut definition) = populated();
+        queue(&store, &definition, "branch-a", 4);
+        let before = rows(&store, std::slice::from_ref(&definition)).remove(0);
+        assert_eq!(
+            (before.finding, before.clean, before.checking_count),
+            (1, 1, 1)
+        );
+        let target = &before.targets[0];
+        let evidence = read_evidence(
+            &store,
+            std::slice::from_ref(&definition),
+            &request(),
+            &target.id,
+        )
+        .unwrap();
+        assert_eq!(evidence.status, BurnCheckEvidenceStatus::Available);
+        let writer = || {
+            store
+                .lock()
+                .query_row(
+                    "SELECT assessment_id, position, status, evidence_valid, updated_at_epoch
+             FROM burn_check_current_status WHERE branch_key = 'branch-a'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, bool>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let accepted = writer();
+        definition.availability = availability;
+        publish_runtime_definition(&store, &definition);
+
+        let changes = store.lock().total_changes();
+        assert!(saved_activation_current(&store.lock(), &definition).unwrap());
+        assert!(!current_activation(&store.lock(), &definition).unwrap());
+        let report = rows(&store, std::slice::from_ref(&definition)).remove(0);
+        assert_eq!(report.availability, definition.availability);
+        assert_eq!(
+            (report.finding, report.clean, report.unavailable),
+            (1, 1, 0)
+        );
+        assert!(report.has_started);
+        assert_eq!(
+            (
+                report.checking_count,
+                report.waiting_for_data_count,
+                report.waiting_for_results_count
+            ),
+            (0, 0, 0),
+        );
+        assert!(report.waiting_for_events.is_none());
+        assert_eq!(report.explanation, before.explanation);
+        assert_eq!(report.targets.len(), 1);
+        assert_eq!(report.targets[0].id, target.id);
+        assert_eq!(report.targets[0].observation, target.observation);
+        assert_eq!(
+            read_evidence(
+                &store,
+                std::slice::from_ref(&definition),
+                &request(),
+                &target.id
+            )
+            .unwrap(),
+            evidence
+        );
+        let mut stale_metadata = definition.clone();
+        stale_metadata.availability = InstalledCheckAvailability::Available;
+        assert!(!current_activation(&store.lock(), &stale_metadata).unwrap());
+        let stale_report = rows(&store, &[stale_metadata]).remove(0);
+        assert_eq!(
+            (
+                stale_report.finding,
+                stale_report.clean,
+                stale_report.checking_count
+            ),
+            (1, 1, 0)
+        );
+        assert!(stale_report.waiting_for_events.is_none());
+        assert_eq!(writer(), accepted);
+        assert_eq!(store.lock().total_changes(), changes);
+
+        definition.availability = InstalledCheckAvailability::Available;
+        publish_runtime_definition(&store, &definition);
+        let changes = store.lock().total_changes();
+        let resumed = rows(&store, std::slice::from_ref(&definition)).remove(0);
+        assert_eq!(
+            (resumed.finding, resumed.clean, resumed.checking_count),
+            (1, 1, 1)
+        );
+        assert_eq!(resumed.targets[0].id, target.id);
+        assert_eq!(writer(), accepted);
+        assert_eq!(store.lock().total_changes(), changes);
+    }
+}
+
+#[test]
+fn paused_history_requires_the_exact_current_catalog_activation_and_source() {
+    for mutation in [
+        "metadata-revision",
+        "metadata-generation",
+        "metadata-missing-generation",
+        "metadata-scope",
+        "metadata-check-id",
+        "metadata-invalid",
+        "new-catalog-revision",
+        "new-catalog-generation",
+        "UPDATE burn_check_runtime_definition SET definition_revision = 'changed'",
+        "UPDATE burn_check_runtime_definition SET generation = 2",
+        "UPDATE burn_check_runtime_definition SET activation_scope_key = json_set(activation_scope_key, '$.session_cwd', '/workspace/other')",
+        "UPDATE burn_check_runtime_definition SET check_id = 'removed-check'",
+        "UPDATE burn_check_runtime_definition SET availability = 'invalid'",
+        "DELETE FROM burn_check_runtime_definition",
+        "UPDATE burn_check_runtime_definition_state SET initialized = 0",
+        "UPDATE burn_check_activation SET definition_revision = 'changed'",
+        "UPDATE burn_check_activation SET generation = 2",
+        "UPDATE burn_check_activation SET enabled = 0",
+        "UPDATE native_file_delivery SET incarnation = incarnation + 1",
+    ] {
+        let (store, mut definition) = populated();
+        let target = rows(&store, std::slice::from_ref(&definition))[0].targets[0]
+            .id
+            .clone();
+        definition.availability = InstalledCheckAvailability::Unsupported { reason: None };
+        publish_runtime_definition(&store, &definition);
+        match mutation {
+            "metadata-revision" => definition.definition_revision = "changed".into(),
+            "metadata-generation" => definition.generation = Some(2),
+            "metadata-missing-generation" => definition.generation = None,
+            "metadata-scope" => {
+                definition.activation_scope_key =
+                    serde_json::to_string(&scope("/workspace/other")).unwrap()
+            }
+            "metadata-check-id" => definition.check_id = "removed-check".into(),
+            "metadata-invalid" => {
+                definition.availability = InstalledCheckAvailability::Invalid { reason: None }
+            }
+            "new-catalog-revision" => {
+                definition.definition_revision = "changed".into();
+                publish_runtime_definition(&store, &definition);
+            }
+            "new-catalog-generation" => {
+                definition.generation = Some(2);
+                publish_runtime_definition(&store, &definition);
+            }
+            sql => {
+                store.lock().execute(sql, []).unwrap();
+            }
+        }
+
+        let changes = store.lock().total_changes();
+        let report = rows(&store, std::slice::from_ref(&definition)).remove(0);
+        assert_eq!(
+            (report.finding, report.clean, report.checking_count),
+            (0, 0, 0),
+            "{mutation}"
+        );
+        assert!(!report.has_started, "{mutation}");
+        assert!(report.targets.is_empty(), "{mutation}");
+        assert_eq!(
+            read_evidence(&store, &[definition], &request(), &target)
+                .unwrap()
+                .status,
+            BurnCheckEvidenceStatus::Unavailable,
+            "{mutation}",
+        );
+        assert_eq!(store.lock().total_changes(), changes, "{mutation}");
+    }
 }
 
 #[test]
@@ -2019,14 +2275,13 @@ fn a_current_scope_success_is_not_overridden_by_a_previous_project_failure() {
 
 #[test]
 fn trigger_counts_exclude_old_moved_stale_and_missing_checkpoint_sessions() {
-    use antiburn_checks::check_store::SourceProgress;
     use antiburn_checks::domain::{EvidenceVersion, NativeOrderKey};
     use antiburn_checks::selection::{BranchSelection, SelectedMessage};
     let store = store();
     let mut definition = definition("/workspace/demo");
     definition.trigger.as_mut().unwrap().minimum = 3;
-    activate(&store, &definition);
-    let mut progress = SourceProgress::default();
+    let (adapter, activation) = activate(&store, &definition);
+    let mut branches = BTreeMap::new();
     for (id, epoch, project, count) in [
         ("old-full-window", 89, "/workspace/demo", 5),
         ("future-full-window", 200, "/workspace/demo", 5),
@@ -2036,8 +2291,9 @@ fn trigger_counts_exclude_old_moved_stale_and_missing_checkpoint_sessions() {
         ("new-needs-two", 100, "/workspace/demo", 1),
     ] {
         session_in_project(&store, id, epoch, project);
+        seed_current_claude_origin(&store, id);
         let branch = BranchId(SessionKey::new("native", "claude-code", id).to_identity_json());
-        progress.selection.branches.insert(
+        branches.insert(
             branch,
             BranchSelection {
                 results: (0..count)
@@ -2057,6 +2313,9 @@ fn trigger_counts_exclude_old_moved_stale_and_missing_checkpoint_sessions() {
             },
         );
     }
+    apply_ready_publications(&store, adapter.clone(), &activation);
+    let mut progress = adapter.load_source_progress(&activation).unwrap();
+    progress.selection.branches = branches;
     store
         .lock()
         .execute(
@@ -2132,8 +2391,10 @@ fn missing_initial_receipt_reports_catchup_without_a_result_countdown() {
 fn publication_catchup_is_bound_to_activation_scope_and_current_incarnation() {
     let store = store();
     let definition = definition("/workspace/demo");
-    activate(&store, &definition);
+    let (adapter, activation) = activate(&store, &definition);
     session(&store, "starting", 100);
+    seed_current_claude_origin(&store, "starting");
+    apply_ready_publications(&store, adapter.clone(), &activation);
     let publish = |cwd: &str, incarnation: i64| {
         store
             .lock()
@@ -2141,9 +2402,14 @@ fn publication_catchup_is_bound_to_activation_scope_and_current_incarnation() {
                 "INSERT INTO native_tool_result_publication
                 (outcome, environment_key, agent, session_id, source_format, complete,
                  source_generation, claim_fence, project_cwd, session_incarnation)
-             VALUES ('coverage_complete', 'native', 'claude-code', 'starting', 'ClaudeJsonl',
-                1, 0, 1, ?1, ?2)",
-                params![cwd, incarnation],
+             VALUES ('coverage_complete', 'native', 'claude-code', 'starting', ?3,
+                 1, 0, 1, ?1, ?2)",
+                params![
+                    cwd,
+                    incarnation,
+                    serde_json::to_string(&antiburn_local::analysis::SourceFormat::ClaudeJsonl)
+                        .unwrap()
+                ],
             )
             .unwrap();
     };
@@ -2160,14 +2426,7 @@ fn publication_catchup_is_bound_to_activation_scope_and_current_incarnation() {
     assert_eq!(catching_up[0].waiting_for_results_count, 0);
     assert_eq!((catching_up[0].finding, catching_up[0].clean), (0, 0));
 
-    store
-        .lock()
-        .execute(
-            "UPDATE burn_check_activation SET applied_sequence =
-            (SELECT MAX(publication_sequence) FROM native_tool_result_publication)",
-            [],
-        )
-        .unwrap();
+    apply_ready_publications(&store, adapter, &activation);
     let ready = rows(&store, &[definition]);
     assert!(!ready[0].waiting_for_events.unwrap().catching_up);
     assert_eq!(ready[0].waiting_for_data_count, 0);
@@ -2213,7 +2472,7 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
     for agent in ["opencode", "claude-code", "codex", "pi"] {
         let store = store();
         let definition = definition("/workspace/demo");
-        activate(&store, &definition);
+        let (adapter, activation) = activate(&store, &definition);
         let journal = agent == "opencode";
         store.lock().execute(
             "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
@@ -2367,6 +2626,7 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
 
         if agent == "claude-code" {
             seed_current_claude_origin(&store, "main");
+            apply_ready_publications(&store, adapter, &activation);
         }
         let receipt = delivery_receipt(agent, "main");
         for revision in [63, 64, 65, PARSER_REVISION] {

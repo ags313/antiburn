@@ -730,9 +730,10 @@ and OS. The denominator is observed settled explicit requests, not all Settings
 views, folders, files, or people. A completion does not prove a file edit, a
 successful check, or visible Finder content.
 
-The native installed-check directory command owns completion after its issued
-reference, current repository membership, grants, canonical directory binding,
-remote-cache exclusion, and native opener settle. The event serializes only
+The native installed-check directory command records one outcome after the
+request finishes, including validation failures before the native opener runs.
+Validation covers the issued reference, current repository membership, grants,
+canonical directory binding, and remote-cache exclusion. The event serializes only
 `{ "detail": "<closed outcome>" }` with the standard envelope. It contains no
 path, reference, name, count, input, model, cost, or private error. Renderer
 interaction input rejects it. It does not reuse the definition-open event.

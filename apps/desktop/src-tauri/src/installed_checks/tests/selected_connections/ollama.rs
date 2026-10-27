@@ -22,7 +22,86 @@ fn harness(a: &Server) -> Harness {
     .unwrap();
     let worker = Arc::new(WorkerHandle::default());
     headless::restore_keyless_profile(&fixture.store, &worker).unwrap();
+    assert_eq!(
+        worker.execution_snapshot().unwrap().connection.provider,
+        SystemOneProvider::Ollama
+    );
     Harness::with_worker(fixture, worker)
+}
+
+#[test]
+fn ollama_headless_setup_requires_valid_keyless_loopback_profiles() {
+    let connection = SystemOneConnection {
+        provider: SystemOneProvider::Ollama,
+        endpoint: SystemOneEndpoint::BaseUrl("http://127.0.0.1:11434".into()),
+        model: "synthetic-local-model".into(),
+        credential: None,
+        ..SystemOneConnection::default()
+    };
+    for base in ["http://127.0.0.1:11434", "http://[::1]:11434"] {
+        let fixture = Fixture::new();
+        let mut local = connection.clone();
+        local.endpoint = SystemOneEndpoint::BaseUrl(base.into());
+        headless::setup_keyless_profiles(
+            &fixture.store,
+            BTreeMap::from([("local".into(), local)]),
+            "local",
+            true,
+        )
+        .unwrap();
+    }
+    let mut rejected = Vec::new();
+    for base in [
+        "http://192.0.2.1:11434",
+        "http://[2001:db8::1]:11434",
+        "http://provider.invalid:11434",
+        "http://localhost:11434",
+        "http://127.0.0.1:11434?query=unsupported",
+    ] {
+        let mut nonlocal = connection.clone();
+        nonlocal.endpoint = SystemOneEndpoint::BaseUrl(base.into());
+        rejected.push(nonlocal);
+    }
+    for credential in [
+        crate::jev::config::CredentialReference::LegacyTypeSafe,
+        crate::jev::config::CredentialReference::Connection("synthetic-slot".into()),
+    ] {
+        let mut authenticated = connection.clone();
+        authenticated.credential = Some(credential);
+        rejected.push(authenticated);
+    }
+    let mut wrong_endpoint = connection.clone();
+    wrong_endpoint.endpoint = SystemOneEndpoint::ExactUrl("http://127.0.0.1:11434".into());
+    rejected.push(wrong_endpoint);
+    let mut invalid_model = connection.clone();
+    invalid_model.model.clear();
+    rejected.push(invalid_model);
+    for provider in [SystemOneProvider::Jev, SystemOneProvider::Cloudflare] {
+        let mut unsupported = connection.clone();
+        unsupported.provider = provider;
+        rejected.push(unsupported);
+    }
+    for connection in rejected {
+        let fixture = Fixture::new();
+        let before = fixture
+            .store
+            .internal_value("internal:smartChecksConnectionsV1");
+        assert!(
+            headless::setup_keyless_profiles(
+                &fixture.store,
+                BTreeMap::from([("rejected".into(), connection)]),
+                "rejected",
+                true,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .internal_value("internal:smartChecksConnectionsV1"),
+            before
+        );
+    }
 }
 
 fn correct_native_source(store: &Store, candidate: &str, now_ms: u64) {
@@ -93,6 +172,159 @@ fn correct_native_source(store: &Store, candidate: &str, now_ms: u64) {
     tx.commit().unwrap();
 }
 
+fn assert_candidate_diagnostic(
+    harness: &Harness,
+    candidate: &str,
+    expected: EvaluationFailureCode,
+) {
+    let diagnostic: EvaluationDiagnostic = serde_json::from_str(
+        &harness
+            .fixture
+            .store
+            .lock()
+            .query_row(
+                "SELECT diagnostic_json FROM burn_check_candidate WHERE candidate_id = ?1",
+                [candidate],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(diagnostic.code, expected);
+}
+
+fn assert_no_provider_usage(harness: &Harness) {
+    let usage = harness.fixture.store.burn_check_usage_summary().unwrap();
+    assert_eq!((usage.confirmed_calls, usage.unknown_outcomes), (0, 0));
+    assert_eq!(
+        harness
+            .fixture
+            .store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_decision_usage",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn ollama_held_slot_claim_invalidation_stays_unsent() {
+    let a = Server::new();
+    let mut harness = harness(&a);
+    harness.publish(1);
+    let candidate = pending_candidate(&harness);
+    let generation = harness
+        .runtime
+        .worker
+        .execution_snapshot()
+        .unwrap()
+        .generation;
+    let held = test_hooks::hold_inference_slots().await;
+    let pending = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&pending);
+    let store = Arc::clone(&harness.fixture.store);
+    let queued_candidate = candidate.clone();
+    let clock = harness.runtime.clock.load(Ordering::Acquire);
+    let job = harness.host.evaluation_jobs(1).pop().unwrap();
+    let runtime: Arc<dyn SelectedJobRuntime> = harness.runtime.clone();
+    let task = tokio::spawn(test_hooks::with_inference_slot_pending(
+        move || {
+            assert_eq!(observed.fetch_add(1, Ordering::AcqRel), 0);
+            correct_native_source(&store, &queued_candidate, clock);
+        },
+        job.run_selected(runtime),
+    ));
+    let settlement = task.await.unwrap().unwrap().unwrap();
+    assert_eq!(settlement.outcome, RunOutcome::Stale);
+    assert_eq!((settlement.attempts, settlement.new_intents), (1, 1));
+    assert_eq!(pending.load(Ordering::Acquire), 1);
+    assert!(harness.runtime.worker.key_is_current(generation));
+    assert_stale_attempt(&harness, &candidate, "permanent");
+    assert_candidate_diagnostic(&harness, &candidate, EvaluationFailureCode::Cancelled);
+    assert_no_provider_usage(&harness);
+    assert_eq!(a.count(), 0);
+    drop(held);
+    harness.host.catch_up().unwrap();
+    assert!(harness.job().await.unwrap().unwrap().is_none());
+    assert_stale_attempt(&harness, &candidate, "permanent");
+    assert_no_provider_usage(&harness);
+    assert_eq!(a.count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn ollama_held_slot_deadline_stays_unsent() {
+    let a = Server::new();
+    let mut harness = harness(&a);
+    harness.publish(1);
+    let candidate = pending_candidate(&harness);
+    let generation = harness
+        .runtime
+        .worker
+        .execution_snapshot()
+        .unwrap()
+        .generation;
+    let held = test_hooks::hold_inference_slots().await;
+    let (pending, reached) = tokio::sync::oneshot::channel();
+    let pending = Mutex::new(Some(pending));
+    let job = harness.host.evaluation_jobs(1).pop().unwrap();
+    let runtime: Arc<dyn SelectedJobRuntime> = harness.runtime.clone();
+    let task = tokio::spawn(test_hooks::with_inference_slot_pending(
+        move || {
+            pending
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(tokio::time::Instant::now())
+                .unwrap();
+        },
+        job.run_selected(runtime),
+    ));
+    let started = reached.await.unwrap();
+    tokio::time::advance(Duration::from_secs(59)).await;
+    assert!(!task.is_finished());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let settlement = task.await.unwrap().unwrap().unwrap();
+    assert!(matches!(settlement.outcome, RunOutcome::Failed(_)));
+    assert_eq!((settlement.attempts, settlement.new_intents), (1, 1));
+    assert_eq!(
+        tokio::time::Instant::now(),
+        started + Duration::from_secs(60)
+    );
+    assert!(harness.runtime.worker.key_is_current(generation));
+    let (state, attempt_state, outcome, attempts, statuses): (String, String, String, u64, u64) = harness
+        .fixture.store.lock().query_row(
+            "SELECT c.state, a.state, a.outcome,
+                (SELECT COUNT(*) FROM burn_check_evaluation_attempt WHERE candidate_id = c.candidate_id),
+                (SELECT COUNT(*) FROM burn_check_current_status)
+             FROM burn_check_candidate c JOIN burn_check_evaluation_attempt a USING(candidate_id)
+             WHERE c.candidate_id = ?1",
+            [&candidate],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+    assert_eq!(
+        (state.as_str(), attempt_state.as_str(), outcome.as_str()),
+        ("execution_failed", "settled", "permanent")
+    );
+    assert_eq!((attempts, statuses), (1, 0));
+    assert_candidate_diagnostic(
+        &harness,
+        &candidate,
+        EvaluationFailureCode::ProviderUnavailable,
+    );
+    assert_no_provider_usage(&harness);
+    assert_eq!(a.count(), 0);
+    drop(held);
+    harness.host.catch_up().unwrap();
+    assert!(harness.job().await.unwrap().unwrap().is_none());
+    assert_no_provider_usage(&harness);
+    assert_eq!(a.count(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ollama_inner_slot_release_rechecks_the_exact_claim_before_http_send() {
     let a = Server::new();
@@ -135,20 +367,7 @@ async fn ollama_inner_slot_release_rechecks_the_exact_claim_before_http_send() {
     assert!(held.lock().unwrap().is_none());
     assert!(harness.runtime.worker.key_is_current(generation));
     assert_stale_attempt(&harness, &candidate, "permanent");
-    let diagnostic: EvaluationDiagnostic = serde_json::from_str(
-        &harness
-            .fixture
-            .store
-            .lock()
-            .query_row(
-                "SELECT diagnostic_json FROM burn_check_candidate WHERE candidate_id = ?1",
-                [&candidate],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(diagnostic.code, EvaluationFailureCode::Cancelled);
+    assert_candidate_diagnostic(&harness, &candidate, EvaluationFailureCode::Cancelled);
     harness.host.catch_up().unwrap();
     assert!(harness.job().await.unwrap().unwrap().is_none());
     assert_stale_attempt(&harness, &candidate, "permanent");

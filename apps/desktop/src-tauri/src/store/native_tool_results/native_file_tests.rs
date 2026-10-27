@@ -7,9 +7,8 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::store::native_tool_results::ToolResultPublicationOutcome;
-
-#[path = "main_64_preservation_tests.rs"]
-mod preservation;
+use crate::store::native_tool_results::main_64_preservation_tests as preservation;
+use crate::store::native_tool_results::publications::PublicationGapKind;
 
 const CLAUDE_RESULTS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -29,10 +28,10 @@ mod main_64_fixture {
         expand_sparse_arrays(&mut saved);
         assert_eq!(saved["cursor"]["revision"], 1);
         assert_eq!(
-            format!(
-                "{:x}",
-                Sha256::digest(serde_json::to_vec(&saved["cursor"]).unwrap())
-            ),
+            Sha256::digest(serde_json::to_vec(&saved["cursor"]).unwrap())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
             saved["cursor_sha256"].as_str().unwrap()
         );
         saved
@@ -171,20 +170,24 @@ fn main_64_codex_and_pi_partial_publication_restart_keep_converted_read_state() 
         };
         let mut saved = main_64_fixture::load(text);
         let prefix = saved["source_prefix"].as_str().unwrap().to_owned();
-        let (directory, store, mut input) = fixture(&prefix);
-        let store = std::sync::Arc::new(store);
-        input.agent = agent.into();
-        input.session_id = saved["cursor"]["session_id"].as_str().unwrap().into();
-        input.source_format =
+        let source_format =
             serde_json::from_value(saved["cursor"]["source_format"].clone()).unwrap();
+        let key = SessionKey::new(
+            "native",
+            agent,
+            saved["cursor"]["session_id"].as_str().unwrap(),
+        );
+        let (directory, store, input) = fixture_for_source(&prefix, key.clone(), source_format);
+        let store = std::sync::Arc::new(store);
         store
             .lock()
             .execute(
-                "UPDATE session SET agent=?1,session_id=?2,source_format=?3",
+                "UPDATE session SET source_format=?1 WHERE environment_key=?2 AND agent=?3 AND session_id=?4",
                 params![
+                    serde_json::to_string(&input.source_format).unwrap(),
+                    key.environment_key,
                     agent,
                     input.session_id,
-                    serde_json::to_string(&input.source_format).unwrap()
                 ],
             )
             .unwrap();
@@ -192,6 +195,7 @@ fn main_64_codex_and_pi_partial_publication_restart_keep_converted_read_state() 
         saved["cursor"]["anchor"]["identity"] =
             serde_json::to_value(identity.cursor).unwrap()["anchor"]["identity"].clone();
         let claim = store.claim_next_native_file(100, 60).unwrap().unwrap();
+        assert_eq!(claim.key, key);
         let mut completed: ToolResultObservation =
             serde_json::from_value(saved["completed"][0].clone()).unwrap();
         let antiburn_local::analysis::ToolResultPosition::FileBytes { record_end, .. } =
@@ -215,6 +219,7 @@ fn main_64_codex_and_pi_partial_publication_restart_keep_converted_read_state() 
                 },
                 PublicationPolicy {
                     live_eligible: Some(true),
+                    gap_kind: PublicationGapKind::Partial,
                     ..Default::default()
                 },
             )
@@ -270,8 +275,30 @@ fn main_64_codex_and_pi_partial_publication_restart_keep_converted_read_state() 
                 0,NEW.source_generation,NEW.claim_fence,NEW.project_cwd,NEW.session_incarnation,'test-page-budget','partial'
               FROM json_each('[0,1,2,3,4,5,6]');
             END;").unwrap();
+        let before_conversion: i64 = store
+            .lock()
+            .query_row(
+                "SELECT COALESCE(MAX(publication_sequence),0) FROM native_tool_result_publication",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         let (claim, page) = next_page(&store, &input, 101);
         let frontier = page.cursor.evidence_baseline_offset();
+        let result_baseline = saved["cursor"]["baseline_offset"].as_u64().unwrap();
+        assert_eq!(page.baseline_offset, result_baseline);
+        let assert_frontier = |store: &Store| {
+            preservation::assert_publication_frontier(
+                store,
+                before_conversion,
+                antiburn_local::analysis::ToolResultPosition::FileBytes {
+                    record_start: 0,
+                    record_end: frontier,
+                    item_index: 0,
+                },
+                result_baseline,
+            )
+        };
         let offset = saved["cursor"]["anchor"]["tail"]["offset"]
             .as_u64()
             .unwrap();
@@ -323,11 +350,13 @@ fn main_64_codex_and_pi_partial_publication_restart_keep_converted_read_state() 
         );
         let cursor: NativeFileCursor = serde_json::from_str(&encoded).unwrap();
         assert_eq!(cursor.offset(), offset);
+        assert_eq!(cursor.baseline_offset(), result_baseline);
         assert_eq!(cursor.evidence_baseline_offset(), frontier);
         let partial = store.native_tool_results_current(&claim.key).unwrap();
         assert!(partial.len() > accepted_results.len() && partial.len() < 82);
         assert!(partial.contains(&accepted_results[0]));
         paid.assert_preserved(&store);
+        assert_frontier(&store);
         let mut late_call = call;
         let mut late_result = completion;
         if agent == "codex" {
@@ -346,6 +375,7 @@ fn main_64_codex_and_pi_partial_publication_restart_keep_converted_read_state() 
         drop(store);
         let store = std::sync::Arc::new(Store::open(directory.path()).unwrap());
         paid.assert_preserved(&store);
+        assert_frontier(&store);
         let mut finished = false;
         for now in 102..122 {
             let (claim, page) = next_page(&store, &input, now);
@@ -355,10 +385,16 @@ fn main_64_codex_and_pi_partial_publication_restart_keep_converted_read_state() 
                 frontier
             );
             assert_eq!(page.cursor.evidence_baseline_offset(), frontier);
+            assert_eq!(
+                claim.cursor().unwrap().unwrap().baseline_offset(),
+                result_baseline
+            );
+            assert_eq!(page.baseline_offset, result_baseline);
             store
                 .publish_native_file_page(&claim, &page, &[], now)
                 .unwrap();
             paid.assert_preserved(&store);
+            assert_frontier(&store);
             let current = store.native_tool_results_current(&claim.key).unwrap();
             if page.results.iter().any(|result| {
                 !current
@@ -431,19 +467,40 @@ fn main_64_codex_and_pi_partial_publication_restart_keep_converted_read_state() 
             .publish_native_file_page(&claim, &idle, &[], 122)
             .unwrap();
         assert_eq!(native_update_count(&store), updates);
+        assert_frontier(&store);
         paid.assert_paid_fences(&store, false);
     }
 }
 
 fn fixture(source: &str) -> (tempfile::TempDir, Store, SessionInput) {
+    fixture_for_source(
+        source,
+        SessionKey::new("native", "claude-code", "scope-test"),
+        SourceFormat::ClaudeJsonl,
+    )
+}
+
+fn fixture_for_source(
+    source: &str,
+    key: SessionKey,
+    source_format: SourceFormat,
+) -> (tempfile::TempDir, Store, SessionInput) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("session.jsonl");
     std::fs::write(&path, source).unwrap();
     let store = Store::open(directory.path()).unwrap();
+    let input = SessionInput {
+        agent: crate::agents::vendor_label(crate::agents::kind_from_slug(&key.agent).unwrap())
+            .into(),
+        session_id: key.session_id.clone(),
+        source: RawSource::File(path.clone()),
+        source_format,
+        fork_parent_session_id: None,
+    };
     store
         .upsert_sessions(
             &[SessionRecord {
-                key: SessionKey::new("native", "claude-code", "scope-test"),
+                key,
                 source_kind: "file".into(),
                 source_label: path.to_string_lossy().into_owned(),
                 cwd: Some("/synthetic".into()),
@@ -467,13 +524,6 @@ fn fixture(source: &str) -> (tempfile::TempDir, Store, SessionInput) {
          VALUES ('file-upgrade', ?1, 'synthetic', 1, 1, 0, 0, 100)",
         [json!({"environment":"native", "session_cwd":"/synthetic", "run":"Live"}).to_string()],
     ).unwrap();
-    let input = SessionInput {
-        agent: "claude".into(),
-        session_id: "scope-test".into(),
-        source: RawSource::File(path),
-        source_format: SourceFormat::ClaudeJsonl,
-        fork_parent_session_id: None,
-    };
     (directory, store, input)
 }
 
@@ -566,7 +616,29 @@ fn compatible_parser_receipts_keep_partial_records_baselines_and_completed_resul
         assert_eq!(origin_markers(&store), markers);
         let after = store.native_tool_result_publications_after(0, 100).unwrap();
         assert!(after.starts_with(&publications));
-        assert!(after[publications.len()..].iter().all(|publication| publication.outcome == ToolResultPublicationOutcome::CoverageGap));
+        let coverage = &after[publications.len()..];
+        assert_eq!(coverage.len(), usize::from(parser_revision == 65));
+        for publication in coverage {
+            assert_eq!(
+                publication.outcome,
+                if idle.history_complete {
+                    ToolResultPublicationOutcome::CoverageRestored
+                } else {
+                    ToolResultPublicationOutcome::CoverageGap
+                }
+            );
+            assert_eq!(publication.complete, idle.history_complete);
+            assert_eq!(publication.gap_kind, PublicationGapKind::Partial);
+            assert_eq!(
+                publication.gap_reason.as_deref(),
+                (!idle.history_complete).then_some("file-history-incomplete")
+            );
+            assert!(publication.payload.is_none());
+            assert!(publication.native_identity.is_none());
+            assert!(publication.native_position.is_none());
+            assert!(publication.native_revision.is_none());
+            assert_eq!(publication.live_eligible, None);
+        }
         assert_eq!(
             store
                 .lock()

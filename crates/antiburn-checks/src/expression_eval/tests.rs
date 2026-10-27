@@ -298,6 +298,139 @@ fn comparisons_keep_numeric_precision_and_convert_only_different_types() {
 }
 
 #[test]
+fn unicode_lowercase_preserves_contextual_final_sigma() {
+    for (source, expected) in [
+        ("'ΟΣ' == 'ος'", true),
+        ("'ΟΣ' != 'ος'", false),
+        ("'ΟΣ' < 'ος'", false),
+        ("'ΟΣ' <= 'ος'", true),
+        ("'ΟΣ' > 'ος'", false),
+        ("'ΟΣ' >= 'ος'", true),
+        ("'ΟΣ' < 'οσ'", true),
+        ("'οσ' > 'ΟΣ'", true),
+        ("'ΟΣΑ' == 'οσα'", true),
+        ("'ΟΣ Α' == 'ος α'", true),
+        ("'ΟΣ\u{0301}' == 'ος\u{0301}'", true),
+        ("contains('prefix ΟΣ suffix', 'ος')", true),
+        ("startsWith('ΟΣ suffix', 'ος')", true),
+        ("endsWith('prefix ΟΣ', 'ος')", true),
+        ("contains(fromJSON('[\"ΟΣ\"]'), 'ος')", true),
+        ("contains('ΟΣΑ', 'ΟΣ')", false),
+        ("startsWith('ΟΣΑ', 'ΟΣ')", false),
+        ("endsWith('ΟΣΑ', 'ΟΣ')", false),
+        ("startsWith('ΟΣΑ', 'οσ')", true),
+    ] {
+        assert_value(source, json!(expected));
+    }
+}
+
+#[test]
+fn unicode_lowercase_reserves_exact_generated_bytes_before_allocating() {
+    for (upper, lower, comparison_bytes, text_bytes) in [
+        ("ΟΣ", "ος", 8, 16),
+        ("İ", "i\u{0307}", 6, 11),
+        ("K", "k", 2, 6),
+    ] {
+        let context = json!({"upper": upper, "lower": lower, "items": [upper]});
+        for (source, expected, bytes) in [
+            ("upper == lower", true, comparison_bytes),
+            ("upper != lower", false, comparison_bytes),
+            ("upper < lower", false, comparison_bytes),
+            ("upper <= lower", true, comparison_bytes),
+            ("upper > lower", false, comparison_bytes),
+            ("upper >= lower", true, comparison_bytes),
+            ("contains(items, lower)", true, comparison_bytes),
+            ("contains(upper, lower)", true, text_bytes),
+            ("startsWith(upper, lower)", true, text_bytes),
+            ("endsWith(upper, lower)", true, text_bytes),
+        ] {
+            let expression = parse_expression(source).unwrap();
+            for fits in [true, false] {
+                let mut budget = EvaluationBudget::default();
+                budget
+                    .reserve_generated_bytes(
+                        DEFAULT_MAX_GENERATED_BYTES - bytes + usize::from(!fits),
+                    )
+                    .unwrap();
+                let result = evaluate_expression_with_budget(
+                    &expression,
+                    &context,
+                    &EvaluationBindings::new(),
+                    &mut budget,
+                    1,
+                );
+                if fits {
+                    assert_eq!(
+                        result.unwrap().value,
+                        EvaluationValue::Available(json!(expected)),
+                        "{source}: {upper}"
+                    );
+                    assert_eq!(budget.generated_bytes(), DEFAULT_MAX_GENERATED_BYTES);
+                    assert!(!budget.exhausted());
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().code,
+                        DiagnosticCode::EvaluationLimitExceeded,
+                        "{source}: {upper}"
+                    );
+                    assert!(budget.exhausted());
+                    assert!(budget.generated_bytes() <= DEFAULT_MAX_GENERATED_BYTES);
+                    assert!(budget.reserve_generated_bytes(0).is_err());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unicode_comparison_budget_failure_discards_earlier_status_actions() {
+    let context = json!({"message": {"tool": {"arguments": {
+        "upper": "ΟΣ", "lower": "ος", "items": ["ΟΣ"]
+    }}}});
+    for condition in [
+        "message.tool.arguments.upper == message.tool.arguments.lower",
+        "message.tool.arguments.upper <= message.tool.arguments.lower",
+        "contains(message.tool.arguments.items, message.tool.arguments.lower)",
+    ] {
+        let check = crate::compiler::compile(&format!(
+            "name: Unicode budget\non: {{tool_result: null}}\nactions:\n  - type: status\n    input: {{result: success}}\n  - type: status\n    if: {condition}\n    input: {{result: failure}}\n"
+        ))
+        .unwrap();
+        let mut budget = EvaluationBudget::default();
+        budget
+            .reserve_generated_bytes(DEFAULT_MAX_GENERATED_BYTES - 7)
+            .unwrap();
+        let error = crate::actions::plan_status_actions_with_budget(
+            &check.actions,
+            &context,
+            &crate::results::EvaluatedAssessment::local(),
+            None,
+            &mut budget,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, DiagnosticCode::EvaluationLimitExceeded);
+        assert!(budget.exhausted());
+    }
+}
+
+#[test]
+fn strict_equals_keeps_source_strings_case_sensitive_without_lowercase_allocation() {
+    for (upper, lower) in [("ΟΣ", "ος"), ("İ", "i\u{0307}"), ("K", "k")] {
+        let context = json!({"upper": upper, "lower": lower});
+        for (source, expected) in [
+            ("strictEquals(upper, lower)", false),
+            ("strictEquals(lower, lower)", true),
+        ] {
+            let mut budget = EvaluationBudget::new(EvaluationLimits::default(), 1000, 0);
+            let value = traced(source, &context, &EvaluationBindings::new(), &mut budget);
+            assert_eq!(value.value, EvaluationValue::Available(json!(expected)));
+            assert_eq!(budget.generated_bytes(), 0);
+            assert!(!budget.exhausted());
+        }
+    }
+}
+
+#[test]
 fn aliases_preserve_frozen_identity_but_json_roundtrips_do_not() {
     let context = json!({"data": [{"keep": true, "used": {"x": 1}, "unused": 5}, {"keep": false, "unused": 9}]});
     let mut budget = EvaluationBudget::default();

@@ -16,13 +16,14 @@ repository or branch names, working directories, token counts, or costs.
 
 If you enable **Run checks** under **Settings → Checks → Model-based checks**, authored YAML
 definitions can review new local session activity. The provider controls under
-**Model-based checks** select Jev through TypeSafe, compatible Ollama, Cloudflare, or a Custom System
-One endpoint. Custom supports direct System One and Cloudflare-envelope
-responses. Model requests go to your selected connection and contain the definition's
-selected public messages, tool arguments and results, response-cycle or session
-facts, current instruction text, and declared skill descriptions. Source evidence
-limits which event types are available. The app sends authored selections, not
-an automatic full-transcript upload.
+**Model-based checks** select Jev through TypeSafe, an Ollama endpoint that supports
+System One, Cloudflare, or a Custom System One endpoint. Custom supports direct
+System One and Cloudflare-envelope responses. Model requests go to your selected
+connection and contain the definition's selected public messages, tool arguments
+and results, response-cycle or session facts, current instruction text, and
+declared skill descriptions. Source evidence limits which event types are
+available. The app sends authored selections, not an automatic full-transcript
+upload.
 Skill inventory inputs contain declared metadata, not full skill bodies. Selected
 tool results can still contain file text, including skill bodies. These fields
 can contain private work content, source code, paths, or credentials.
@@ -58,9 +59,10 @@ test sends synthetic input and can incur charges. Developer replay is an
 explicit, isolated diagnostic; the app does not automatically assess historical
 YAML activity.
 
-Connection recovery runs only at an explicit retry or startup recovery boundary.
-A settings read does not complete a pending connection operation. Recovery
-preserves a saved off setting and does not authorize resending an unknown request.
+Antiburn recovers unfinished connection changes only during startup recovery or
+when you explicitly retry them. Opening or refreshing Settings does not complete
+a pending connection change. Recovery keeps **Run checks** off if that is the
+saved setting. It does not permit a resend when request delivery is unknown.
 Its local journal stores connection metadata and credential references, not
 credential values. Operation tokens and Save request tags do not enter analytics.
 
@@ -73,10 +75,11 @@ earlier attempt may have incurred a charge. Request bounds limit local admission
 not the total cost of a long session or repeated revisions.
 Settings shows estimated usage, not a spending cap or provider invoice.
 
-Local status checks omit model decisions. They send no model request and create
-no provider attempt or usage record. They still require **Run checks**, a selected
-configured connection, its credential/authentication rules, and the source and
-runtime gates. **Test connection** remains a separate operation.
+Local status checks use no model decisions. They send no model request and create
+no provider attempt or usage record. They still require **Run checks** to be on
+and a configured connection to be selected. The connection's credential and
+authentication rules, and the source and runtime requirements, still apply.
+**Test connection** is a separate operation.
 
 Each model assessment uses one captured connection. Saved model preparation
 retains the actual provider/model and an endpoint digest, not the raw endpoint

@@ -79,4 +79,6 @@ second maintained copy of a repository example inside this skill.
   copying an available partial history whole can retain its explicit limits.
 
 These limits describe supported forms, not complete source or provider support.
-Use the matching authoring guide, compiler, and coverage documents for admission.
+Use the matching authoring guide and compiler to check runtime support. Use the
+coverage documents for source limits and the provider contracts for connection
+limits.

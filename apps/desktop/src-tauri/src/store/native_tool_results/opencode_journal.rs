@@ -317,8 +317,22 @@ impl Store {
             .live_baseline()
             .or(claim.baseline_sequence)
             .unwrap_or(page.snapshot_end);
-        let history_complete = page.history_complete && !claim.history_gap && claim.main_session;
-        let gap_reason = if !claim.main_session {
+        let history_complete = page.history_complete
+            && page.evidence.history_complete
+            && !claim.history_gap
+            && claim.main_session;
+        let unsafe_reason = page.evidence.events.iter().find_map(|event| {
+            if let antiburn_local::analysis::NativeEvidenceFact::AdmissionFailure(failure) =
+                &event.fact
+            {
+                super::super::admission::reason(failure.reason)
+            } else {
+                None
+            }
+        });
+        let gap_reason = if unsafe_reason.is_some() {
+            unsafe_reason
+        } else if !claim.main_session {
             Some("journal-main-session-unavailable")
         } else {
             (!history_complete).then_some("journal-history-incomplete")
@@ -348,7 +362,10 @@ impl Store {
             &tx,
             &claim.key,
             &cursor_json,
-            consumed && !page.has_more && generation == claim.source_generation,
+            consumed
+                && unsafe_reason.is_none()
+                && !page.has_more
+                && generation == claim.source_generation,
             now * 1000,
         )?;
         if !consumed {
@@ -585,3 +602,7 @@ fn current_generation(
 #[cfg(test)]
 #[path = "journal/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "journal_regression_tests.rs"]
+mod regression_tests;

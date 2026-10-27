@@ -191,7 +191,7 @@ impl<'a> Evaluator<'a, '_> {
                     right_value.metadata.dependencies.merge(&left_value.trace());
                     return Ok(right_value);
                 }
-                Ok(compare(*operator, left_value, right_value))
+                compare(*operator, left_value, right_value, self.budget)
             }
         }
     }
@@ -458,66 +458,76 @@ fn compare<'a>(
     operator: BinaryOperator,
     left: RuntimeValue<'a>,
     right: RuntimeValue<'a>,
-) -> RuntimeValue<'a> {
+    budget: &mut EvaluationBudget,
+) -> Result<RuntimeValue<'a>, EvaluationError> {
     let mut trace = left.trace();
     trace.merge(&right.trace());
     let (Some(left_value), Some(right_value)) = (left.value, right.value) else {
-        return RuntimeValue::unavailable(ValueMetadata::derived(trace));
+        return Ok(RuntimeValue::unavailable(ValueMetadata::derived(trace)));
     };
     let same_identity = match (&left.metadata.identity, &right.metadata.identity) {
         (Some(left), Some(right)) => left.same(right),
         _ => false,
     };
     let result = match operator {
-        BinaryOperator::Equal => equal(&left_value, &right_value, same_identity),
-        BinaryOperator::NotEqual => !equal(&left_value, &right_value, same_identity),
+        BinaryOperator::Equal => equal(&left_value, &right_value, same_identity, budget)?,
+        BinaryOperator::NotEqual => !equal(&left_value, &right_value, same_identity, budget)?,
         BinaryOperator::Less => {
-            ordered(&left_value, &right_value).is_some_and(|order| order.is_lt())
+            ordered(&left_value, &right_value, budget)?.is_some_and(|order| order.is_lt())
         }
         BinaryOperator::LessOrEqual => {
-            ordered(&left_value, &right_value).is_some_and(|order| !order.is_gt())
+            ordered(&left_value, &right_value, budget)?.is_some_and(|order| !order.is_gt())
         }
         BinaryOperator::Greater => {
-            ordered(&left_value, &right_value).is_some_and(|order| order.is_gt())
+            ordered(&left_value, &right_value, budget)?.is_some_and(|order| order.is_gt())
         }
         BinaryOperator::GreaterOrEqual => {
-            ordered(&left_value, &right_value).is_some_and(|order| !order.is_lt())
+            ordered(&left_value, &right_value, budget)?.is_some_and(|order| !order.is_lt())
         }
         BinaryOperator::And | BinaryOperator::Or => unreachable!("logical operators short-circuit"),
     };
-    RuntimeValue::owned(Value::Bool(result), trace)
+    Ok(RuntimeValue::owned(Value::Bool(result), trace))
 }
 
-fn equal(left: &Value, right: &Value, same_origin: bool) -> bool {
-    match (left, right) {
+fn equal(
+    left: &Value,
+    right: &Value,
+    same_origin: bool,
+    budget: &mut EvaluationBudget,
+) -> Result<bool, EvaluationError> {
+    Ok(match (left, right) {
         (Value::Null, Value::Null) => true,
         (Value::Bool(left), Value::Bool(right)) => left == right,
         (Value::Number(left), Value::Number(right)) => decimal_value(left) == decimal_value(right),
         (Value::String(left), Value::String(right)) => {
-            lowercase_chars(left).eq(lowercase_chars(right))
+            lowercase(left, budget)? == lowercase(right, budget)?
         }
         (Value::Array(_) | Value::Object(_), Value::Array(_) | Value::Object(_)) => same_origin,
         (left, right) => match (coerce_number(left), coerce_number(right)) {
             (Some(left), Some(right)) => left == right,
             _ => false,
         },
-    }
+    })
 }
 
-fn ordered(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
-    match (left, right) {
+fn ordered(
+    left: &Value,
+    right: &Value,
+    budget: &mut EvaluationBudget,
+) -> Result<Option<std::cmp::Ordering>, EvaluationError> {
+    Ok(match (left, right) {
         (Value::String(left), Value::String(right)) => {
-            Some(lowercase_chars(left).cmp(lowercase_chars(right)))
+            Some(lowercase(left, budget)?.cmp(&lowercase(right, budget)?))
         }
-        (Value::Number(left), Value::Number(right)) => {
-            decimal_value(left)?.partial_cmp(&decimal_value(right)?)
-        }
+        (Value::Number(left), Value::Number(right)) => decimal_value(left)
+            .zip(decimal_value(right))
+            .map(|(left, right)| left.cmp(&right)),
         (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
-        _ if std::mem::discriminant(left) != std::mem::discriminant(right) => {
-            coerce_number(left)?.partial_cmp(&coerce_number(right)?)
-        }
+        _ if std::mem::discriminant(left) != std::mem::discriminant(right) => coerce_number(left)
+            .zip(coerce_number(right))
+            .map(|(left, right)| left.cmp(&right)),
         _ => None,
-    }
+    })
 }
 
 fn coerce_number(value: &Value) -> Option<DecimalNumber> {
@@ -666,8 +676,15 @@ fn parse_exponent(source: &str) -> Option<i64> {
     })
 }
 
-fn lowercase_chars(value: &str) -> impl Iterator<Item = char> + '_ {
-    value.chars().flat_map(char::to_lowercase)
+fn lowercase(value: &str, budget: &mut EvaluationBudget) -> Result<String, EvaluationError> {
+    // Contextual final sigma changes the character, not its UTF-8 byte count.
+    let bytes = value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(char::len_utf8)
+        .sum();
+    budget.reserve_generated_bytes(bytes)?;
+    Ok(value.to_lowercase())
 }
 
 fn limit_error(message: &str) -> EvaluationError {

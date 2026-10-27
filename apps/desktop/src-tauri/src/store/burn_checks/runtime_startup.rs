@@ -445,14 +445,17 @@ impl StoreCheckStore {
         tx.execute("INSERT OR REPLACE INTO burn_check_session_attachment
             (check_id, activation_scope_key, generation, branch_key, incarnation) VALUES (?1, ?2, ?3, ?4, ?5)",
              params![activation.id.definition_id, self.activation_scope_key, activation.id.generation.0, branch.0, session.incarnation])?;
-        crate::store::native_tool_results::observers::attach_in(
-            &tx,
-            &activation.id,
-            &session.key,
-            session.incarnation,
-            &session.receipt,
-            now_epoch() * 1000,
-        )?;
+        // Cursor snapshots do not provide session observer evidence.
+        if session.key.agent != "cursor" {
+            crate::store::native_tool_results::observers::attach_in(
+                &tx,
+                &activation.id,
+                &session.key,
+                session.incarnation,
+                &session.receipt,
+                now_epoch() * 1000,
+            )?;
+        }
         tx.commit()?;
         ::tracing::debug!(
             event = "burn_check_startup_admitted",

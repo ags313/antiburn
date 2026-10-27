@@ -93,6 +93,7 @@ fn fixture(
             Some(&activation),
         )
         .unwrap();
+    publish_runtime_definition(&store, &definition);
     let engine = CheckEngine::new(adapter, Arc::new(evaluator));
     (store, activation, definition, engine)
 }
@@ -106,7 +107,7 @@ async fn run(
     engine
         .apply_source_page(
             activation,
-            &local::source_page(store, 1, "one", 1, true, input),
+            &local::source_page(store, activation, 1, "one", 1, true, input),
         )
         .unwrap();
     let StartOutcome::Started(task) = engine.start_one_due(activation, 1_001).unwrap() else {

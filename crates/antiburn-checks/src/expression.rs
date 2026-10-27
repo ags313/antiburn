@@ -324,47 +324,12 @@ impl ExpressionParser {
                 "true" => Expression::Literal(ExpressionLiteral::Boolean(true)),
                 "false" => Expression::Literal(ExpressionLiteral::Boolean(false)),
                 "null" => Expression::Literal(ExpressionLiteral::Null),
-                _ => {
-                    if matches!(self.current(), TokenKind::LeftParen) {
-                        let Some(function) = ExpressionFunction::parse(&value) else {
-                            return Err(self.error(
-                                DiagnosticCode::CompileUnsupportedFeature,
-                                "Unknown expression function.",
-                            ));
-                        };
-                        self.advance();
-                        let mut arguments = Vec::new();
-                        if !matches!(self.current(), TokenKind::RightParen) {
-                            loop {
-                                let argument = self.parse_binary(0, depth + 1)?;
-                                expression_depth = expression_depth.max(argument.depth + 1);
-                                arguments.push(argument.expression);
-                                if !matches!(self.current(), TokenKind::Comma) {
-                                    break;
-                                }
-                                self.advance();
-                            }
-                        }
-                        if !matches!(self.advance(), TokenKind::RightParen) {
-                            return Err(self.error(
-                                DiagnosticCode::CompileInvalidExpression,
-                                "Expected `)` after function arguments.",
-                            ));
-                        }
-                        if !function.accepts_arity(arguments.len()) {
-                            return Err(self.error(
-                                DiagnosticCode::CompileInvalidExpression,
-                                "Wrong number of expression function arguments.",
-                            ));
-                        }
-                        Expression::Call {
-                            function,
-                            arguments,
-                        }
-                    } else {
-                        Expression::Path(vec![PathSegment::Property(value)])
-                    }
+                _ if matches!(self.current(), TokenKind::LeftParen) => {
+                    let call = self.parse_call(&value, depth)?;
+                    expression_depth = call.depth;
+                    call.expression
                 }
+                _ => Expression::Path(vec![PathSegment::Property(value)]),
             },
             TokenKind::String(value) => Expression::Literal(ExpressionLiteral::String(value)),
             TokenKind::Number(value) => Expression::Literal(ExpressionLiteral::Number(value)),
@@ -461,6 +426,52 @@ impl ExpressionParser {
         }
         Ok(ParsedExpression {
             expression,
+            depth: expression_depth,
+        })
+    }
+
+    fn parse_call(
+        &mut self,
+        name: &str,
+        depth: usize,
+    ) -> Result<ParsedExpression, ExpressionError> {
+        let Some(function) = ExpressionFunction::parse(name) else {
+            return Err(self.error(
+                DiagnosticCode::CompileUnsupportedFeature,
+                "Unknown expression function.",
+            ));
+        };
+        self.advance();
+        let mut arguments = Vec::new();
+        let mut expression_depth = 1;
+        if !matches!(self.current(), TokenKind::RightParen) {
+            loop {
+                let argument = self.parse_binary(0, depth + 1)?;
+                expression_depth = expression_depth.max(argument.depth + 1);
+                arguments.push(argument.expression);
+                if !matches!(self.current(), TokenKind::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+        }
+        if !matches!(self.advance(), TokenKind::RightParen) {
+            return Err(self.error(
+                DiagnosticCode::CompileInvalidExpression,
+                "Expected `)` after function arguments.",
+            ));
+        }
+        if !function.accepts_arity(arguments.len()) {
+            return Err(self.error(
+                DiagnosticCode::CompileInvalidExpression,
+                "Wrong number of expression function arguments.",
+            ));
+        }
+        Ok(ParsedExpression {
+            expression: Expression::Call {
+                function,
+                arguments,
+            },
             depth: expression_depth,
         })
     }
