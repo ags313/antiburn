@@ -10,7 +10,6 @@ import {
 } from "./register-usage-view";
 import { renderUsageDebugView } from "./register-debug-view";
 import {
-  resetUsageBurnControls,
   renderSessionModeView,
   renderUsageComposition,
 } from "./register-usage-bands";
@@ -313,7 +312,6 @@ function resetBurn(): void {
   burnPlaybackUntil = 0;
   burnCoolingStrength = 0;
   burnSvgKey = "";
-  resetUsageBurnControls();
 }
 
 async function resetBurnState($: EngineInterface): Promise<void> {
@@ -486,6 +484,7 @@ const usageEntrance = new EntranceOwner();
 let usageMount: string | undefined;
 let usageRenderKey: string | undefined;
 let usageSources: string[] = [];
+let usageResponsiveSources: string[] = [];
 let usageMark = "";
 let usageMarkEntranceAt: number | null | undefined;
 let usageMarkReplayRevision = -1;
@@ -497,8 +496,7 @@ let usageSequenceEmber = false;
 let usageMeterWidth = 0;
 let usageLayoutVariant: "inline" | "current" = "inline";
 let usagePreviewFill:
-  | { from: number[]; to: number[]; startedAt: number }
-  | undefined;
+  { from: number[]; to: number[]; startedAt: number } | undefined;
 let previousUsage: UsageSnapshot | undefined;
 let usageRoll: { previous: UsageSnapshot; startedAt: number } | undefined;
 
@@ -1141,6 +1139,7 @@ function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
       const cache: DesktopAssetCache = {
         key: usageRenderKey,
         sources: usageSources,
+        responsiveSources: usageResponsiveSources,
         mark: usageMark,
         markEntranceAt: usageMarkEntranceAt,
         markReplayRevision: usageMarkReplayRevision,
@@ -1163,11 +1162,17 @@ function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
         cache,
       });
       usageSources = assets.sources;
+      usageResponsiveSources = assets.responsiveSources!;
       usageMark = assets.mark;
       usageMarkEntranceAt = assets.markEntranceAt;
       usageMarkReplayRevision = assets.markReplayRevision;
       usageRenderKey = assets.key;
-      return { layout, sources: usageSources, mark: usageMark };
+      return {
+        layout,
+        sources: usageSources,
+        responsiveSources: usageResponsiveSources,
+        mark: usageMark,
+      };
     },
     empty: (event) => {
       if (event.surface === "terminal")

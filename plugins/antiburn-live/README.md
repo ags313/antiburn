@@ -244,6 +244,12 @@ labels are not claims about the current session. See `hooks/catalog.ts` and
 
 ## Development
 
+Release and development use `hooks/usage-meter-band.tsx` for Desktop flex slots
+and `hooks/usage-meter-graphics.ts` for meter drawing and presentation.
+Development supplies fixture data and warning appearances; the public controller
+never imports fixtures, playback, or debug controls. Terminal rendering keeps its
+cell-based layout and interaction bindings.
+
 From the repository root:
 
 ```bash
@@ -281,7 +287,8 @@ cargo nextest run --manifest-path crates/antiburn-local/Cargo.toml --test live_c
 ```
 
 The [antiburn Claude plugin workflow](../../.github/workflows/plugin.yml) uses
-Node 24 and Claude Code 2.1.303. It checks deterministic packaging, strictly
+Node 24 and Claude Code 2.1.303. It checks deterministic candidate packaging
+and verifies the marketplace artifact against the sources at its pinned commit. It strictly
 validates the public marketplace/plugin, tests the exact public artifact and
 separate development build, and runs an isolated installation lifecycle check.
 The public capability policy permits only the approved account-usage and website
