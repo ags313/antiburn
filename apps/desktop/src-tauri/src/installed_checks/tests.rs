@@ -26,9 +26,11 @@ use crate::store::{
 };
 
 mod analytics;
+mod cursor_desktop;
 mod journal_delivery;
 mod opencode_v2_fairness;
 mod opencode_v2_source_gates;
+mod removal;
 mod selected_connections;
 mod selection_live;
 mod session_identity;
@@ -627,16 +629,40 @@ impl Fixture {
                 .unwrap()
         );
         if environment == "native" {
+            let path = self.directory.path().join(format!("{session_id}.jsonl"));
+            std::fs::write(&path, transcript(session_id, count)).unwrap();
+            let input = SessionInput {
+                agent: "pi".into(),
+                session_id: session_id.into(),
+                source: RawSource::File(path),
+                source_format: SourceFormat::PiV3Jsonl,
+                fork_parent_session_id: None,
+            };
+            let mut cursor = None;
+            loop {
+                let page = antiburn_local::analysis::file_live::read_native_file_page(
+                    &input,
+                    cursor.as_ref(),
+                    &|| false,
+                )
+                .unwrap();
+                let more = page.has_more;
+                cursor = Some(page.cursor);
+                if !more {
+                    break;
+                }
+            }
+            let cursor = serde_json::to_string(&cursor.unwrap()).unwrap();
             self.store.lock().execute(
             "INSERT INTO native_file_delivery (environment_key, agent, session_id, incarnation,
                 source_label, cwd, parser_revision, cursor_json, observed_generation, pending, active_until_epoch)
-             SELECT environment_key, agent, session_id, incarnation, source_label, cwd, ?4, '{}', source_generation, 0, 0
+             SELECT environment_key, agent, session_id, incarnation, source_label, cwd, ?4, ?5, source_generation, 0, 0
                FROM session WHERE environment_key = ?1 AND agent = 'pi' AND session_id = ?2
              ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
                incarnation = excluded.incarnation, source_label = excluded.source_label, cwd = excluded.cwd,
-               observed_generation = excluded.observed_generation, pending = 0, cursor_json = '{}',
+                observed_generation = excluded.observed_generation, pending = 0, cursor_json = excluded.cursor_json,
                parser_revision = excluded.parser_revision",
-            rusqlite::params![environment, session_id, cwd.to_str(), antiburn_local::analysis::PARSER_REVISION],
+            rusqlite::params![environment, session_id, cwd.to_str(), antiburn_local::analysis::PARSER_REVISION, cursor],
         ).unwrap();
         }
     }

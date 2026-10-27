@@ -19,6 +19,11 @@ and host session observations. Each source must prove its event and bindings.
 The desktop emits `session_start` reason `attached` only. `session_idle` records
 a 120-second observation boundary, not real idle time, model occupancy, or savings.
 
+Cursor Desktop has a separate ordered snapshot tool-result route. Its accepted
+user-slot prefix supplies result context, not a separate public user event. It
+does not add public assistant/call, response-cycle, or host-session events. See
+the [source contract](../session-coverage.md#cursor-desktop-yaml-tool-evidence).
+
 Message actions are not supported, including behind `if: false`. Effective
 `agent.skills`, `repo.branch`, historical instruction activation, and historical
 effective skill inventories are also unavailable. Remote, WSL, child, and
@@ -114,6 +119,15 @@ toggle and decision-model setup available without definitions. A discovered
 check without a configured System One provider MUST show an actionable setup
 error in its detail; absence of definitions MUST NOT create a placeholder check
 or error.
+
+Turning the master setting off stops execution, not local definition discovery.
+The desktop can read and parse bounded YAML definitions and watch their
+installation directories, including at cold startup, to show names, diagnostics,
+and paused cards. Current limits are 256 KiB per definition and 128 files per
+folder, with the existing directory-access gates. This discovery MUST NOT restore
+provider configuration, discover model capabilities, catch up session sources,
+or run assessments. File presence MUST NOT enable checks or bypass execution
+gates.
 
 ## 3. YAML and document structure
 

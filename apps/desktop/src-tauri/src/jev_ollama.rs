@@ -25,6 +25,13 @@ fn inference_slots() -> &'static tokio::sync::Semaphore {
     SLOTS.get_or_init(|| tokio::sync::Semaphore::new(DEFAULT_LOCAL_CONCURRENCY))
 }
 
+async fn acquire_inference_slot() -> Result<tokio::sync::SemaphorePermit<'static>, OllamaError> {
+    let acquire = inference_slots().acquire();
+    #[cfg(test)]
+    let acquire = test_hooks::observe_inference_slot_pending(acquire);
+    acquire.await.map_err(|_| OllamaError::ProviderUnavailable)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OllamaError {
     InvalidBaseUrl,
@@ -194,8 +201,32 @@ impl OllamaClient {
         capabilities: &ModelCapabilities,
         record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
     ) -> Result<JevResponse, JevError> {
-        let bytes = self
-            .evaluate_bytes(request, capabilities)
+        self.evaluate_with_usage_cancellable(request, capabilities, || false, record_usage)
+            .await
+    }
+
+    /// Checks cancellation only before HTTP send.
+    pub(crate) async fn evaluate_with_usage_cancellable(
+        &self,
+        request: &JevRequest,
+        capabilities: &ModelCapabilities,
+        is_cancelled: impl Fn() -> bool,
+        record_usage: impl Fn(JevUsage) -> Result<(), JevError>,
+    ) -> Result<JevResponse, JevError> {
+        if is_cancelled() {
+            return Err(JevError::Cancelled);
+        }
+        let _permit = acquire_inference_slot().await.map_err(jev_error)?;
+        if is_cancelled() {
+            return Err(JevError::Cancelled);
+        }
+        let builder = self
+            .evaluation_request(request, capabilities)
+            .map_err(jev_error)?;
+        if is_cancelled() {
+            return Err(JevError::Cancelled);
+        }
+        let bytes = Self::send_evaluation(builder, capabilities)
             .await
             .map_err(jev_error)?;
         let decoded = decode_jev_json_with_usage(&bytes, JevUsageLocation::Direct, record_usage)?;
@@ -208,10 +239,16 @@ impl OllamaClient {
         request: &JevRequest,
         capabilities: &ModelCapabilities,
     ) -> Result<Vec<u8>, OllamaError> {
-        let _permit = inference_slots()
-            .acquire()
-            .await
-            .map_err(|_| OllamaError::ProviderUnavailable)?;
+        let _permit = acquire_inference_slot().await?;
+        let builder = self.evaluation_request(request, capabilities)?;
+        Self::send_evaluation(builder, capabilities).await
+    }
+
+    fn evaluation_request(
+        &self,
+        request: &JevRequest,
+        capabilities: &ModelCapabilities,
+    ) -> Result<reqwest::RequestBuilder, OllamaError> {
         validate_jev_request_with_capabilities(request, capabilities)
             .map_err(|_| OllamaError::InvalidRequest)?;
         let body = serde_json::to_vec(request).map_err(|_| OllamaError::InvalidRequest)?;
@@ -226,6 +263,13 @@ impl OllamaClient {
         if let Some(key) = &self.api_key {
             builder = builder.bearer_auth(key.as_ref());
         }
+        Ok(builder)
+    }
+
+    async fn send_evaluation(
+        builder: reqwest::RequestBuilder,
+        capabilities: &ModelCapabilities,
+    ) -> Result<Vec<u8>, OllamaError> {
         let response = builder.send().await.map_err(|error| {
             if error.is_builder() {
                 OllamaError::InvalidRequest
@@ -260,10 +304,7 @@ impl OllamaClient {
         {
             return Ok(discovered);
         }
-        let _permit = inference_slots()
-            .acquire()
-            .await
-            .map_err(|_| OllamaError::ProviderUnavailable)?;
+        let _permit = acquire_inference_slot().await?;
         let _: serde_json::Value = self
             .post_json(
                 "/api/generate",
@@ -768,6 +809,49 @@ fn verified_chat_envelope(show: &ShowResponse) -> Option<&'static str> {
                 .collect();
             (digest == TEV1_QWEN35_TEMPLATE_SHA256).then_some(TEV1_QWEN35_CHAT_ENVELOPE)
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::future::{Future, poll_fn};
+    use std::sync::Arc;
+
+    tokio::task_local! {
+        static INFERENCE_SLOT_PENDING: Arc<dyn Fn() + Send + Sync>;
+    }
+
+    pub(crate) async fn hold_inference_slots() -> tokio::sync::SemaphorePermit<'static> {
+        super::inference_slots()
+            .acquire_many(super::DEFAULT_LOCAL_CONCURRENCY as u32)
+            .await
+            .unwrap()
+    }
+
+    pub(crate) async fn with_inference_slot_pending<T>(
+        on_pending: impl Fn() + Send + Sync + 'static,
+        run: impl Future<Output = T>,
+    ) -> T {
+        INFERENCE_SLOT_PENDING
+            .scope(Arc::new(on_pending), run)
+            .await
+    }
+
+    pub(super) async fn observe_inference_slot_pending<T>(acquire: impl Future<Output = T>) -> T {
+        let mut on_pending = INFERENCE_SLOT_PENDING.try_with(Arc::clone).ok();
+        tokio::pin!(acquire);
+        poll_fn(|cx| {
+            let result = acquire.as_mut().poll(cx);
+            if result.is_pending()
+                && let Some(on_pending) = on_pending.take()
+            {
+                on_pending();
+                // Test the permit-release race before the outer cancellation timer can poll.
+                return acquire.as_mut().poll(cx);
+            }
+            result
+        })
+        .await
     }
 }
 

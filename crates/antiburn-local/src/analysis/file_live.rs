@@ -103,6 +103,8 @@ pub struct NativeFileCursor {
     evidence_baseline_offset: u64,
     pending_evidence: JsonState<VecDeque<NativeEvidenceEvent>>,
     admission_failure: JsonState<Option<NativeAdmissionFailure>>,
+    #[serde(skip)]
+    main_64_public_baseline_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,9 +368,15 @@ fn read_page(
                 evidence_baseline_offset: source.size,
                 pending_evidence: JsonState::default(),
                 admission_failure: JsonState::default(),
+                main_64_public_baseline_pending: false,
             }
         }
     };
+    if cursor.main_64_public_baseline_pending {
+        cursor.evidence_baseline_offset = source.size;
+        cursor.anchor.boundary = source.size;
+        cursor.main_64_public_baseline_pending = false;
+    }
     let offset = cursor.offset();
     let mut results = Vec::new();
     let mut result_bytes = serde_json::to_vec(&NativeEvidenceBatch {

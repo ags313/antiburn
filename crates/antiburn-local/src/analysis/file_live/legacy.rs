@@ -2,6 +2,8 @@
 
 use super::*;
 
+mod main_64;
+
 #[derive(Serialize, Deserialize)]
 struct CursorV4 {
     revision: u32,
@@ -31,7 +33,14 @@ enum AdapterV4 {
 
 impl CursorV4 {
     fn convert(self) -> anyhow::Result<NativeFileCursor> {
-        anyhow::ensure!(self.revision == 4, NativeFileReadError::InvalidCursor);
+        self.convert_revision(4)
+    }
+
+    fn convert_revision(self, revision: u32) -> anyhow::Result<NativeFileCursor> {
+        anyhow::ensure!(
+            self.revision == revision,
+            NativeFileReadError::InvalidCursor
+        );
         let evidence_baseline_offset = self.anchor.boundary;
         let admission_failure = self.pending_results.as_ref().and_then(|pending| {
             pending
@@ -88,6 +97,7 @@ impl CursorV4 {
             evidence_baseline_offset,
             pending_evidence: JsonState::default(),
             admission_failure: JsonState(admission_failure.clone()),
+            main_64_public_baseline_pending: false,
         };
         if let Some(failure) = admission_failure {
             cursor.requests.clear();
@@ -103,6 +113,33 @@ impl CursorV4 {
 }
 
 impl NativeFileCursor {
+    /// Decode only the JSON body from main parser 64 and file cursor 1.
+    /// The next read validates the source before it freezes new-event eligibility.
+    pub fn convert_main_64_json(bytes: &[u8]) -> anyhow::Result<Self> {
+        main_64::convert(bytes)
+    }
+
+    /// Retain the old read position and the validated page's conversion frontier.
+    pub fn retry_json_after_page(mut self, page: &Self) -> anyhow::Result<String> {
+        if self.main_64_public_baseline_pending {
+            anyhow::ensure!(
+                self.agent == page.agent
+                    && self.session_id == page.session_id
+                    && self.source_format == page.source_format
+                    && self.anchor.identity == page.anchor.identity
+                    && self.anchor.head == page.anchor.head
+                    && self.offset() <= page.offset()
+                    && !page.main_64_public_baseline_pending,
+                NativeFileReadError::InvalidCursor
+            );
+            self.anchor.boundary = page.anchor.boundary;
+            self.evidence_baseline_offset = page.evidence_baseline_offset;
+            self.main_64_public_baseline_pending = false;
+            anyhow::ensure!(self.valid(), NativeFileReadError::InvalidCursor);
+        }
+        Ok(serde_json::to_string(&self)?)
+    }
+
     /// Remove request text whose pre-65 Claude state does not retain origin proof.
     /// Call this only for a cursor saved before parser revision 65.
     pub fn migrate_pre_65_claude_requests(mut self) -> anyhow::Result<Self> {

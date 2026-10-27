@@ -11,7 +11,6 @@ import {
   renderCompactUsageBand,
   renderDesktopUsageBand,
   renderEmptyUsageBand,
-  usageBurnControls,
 } from "./register-usage-bands";
 import {
   pace,
@@ -22,8 +21,17 @@ import {
   type UsageSnapshot,
   type UsageWindow,
 } from "./usage";
-import { markSvg, meterSvg, usageStatusSvg } from "./usage-graphics";
-import { desktopPercentage, usageLayout } from "./usage-presentation";
+import {
+  markSvg,
+  meterSvg,
+  responsiveMeterSvg,
+  usageStatusSvg,
+} from "./usage-graphics";
+import {
+  desktopPercentage,
+  meterGeometry,
+  type usageLayout,
+} from "./usage-presentation";
 import { usageFixture, previewRetryText } from "./usage-fixtures";
 
 type AbovePromptEvent = RenderInput<"AbovePrompt">;
@@ -48,6 +56,7 @@ export function terminalHoverBinding(requestId: string, shape: string): string {
 export type DesktopAssetCache = {
   key: string | undefined;
   sources: string[];
+  responsiveSources?: string[];
   mark: string;
   markEntranceAt: number | null | undefined;
   markReplayRevision: number;
@@ -101,36 +110,52 @@ export function buildDesktopUsageAssets(input: {
       : Math.max(0, liveNow - entranceStartedAt);
   const rollElapsed =
     roll === undefined ? undefined : Math.max(0, liveNow - roll.startedAt);
-  const sources = windows.map((window, index) =>
-    meterSvg(
-      window,
-      layout.meterWidth,
-      now,
-      fixture !== undefined && state.previewReveal === "show",
-      true,
-      {
-        layout: variant,
-        resetPreview: fixture ? state.previewReveal : undefined,
-        warning: fixture?.warning,
-        previousFillEnd:
-          fixture && previewFill ? previewFill.from[index] : undefined,
-        fillElapsed:
-          fixture && previewFill ? liveNow - previewFill.startedAt : undefined,
-        entranceElapsed: elapsed,
-        meterIndex: index as 0 | 1,
-        previousPercent:
-          roll === undefined
-            ? undefined
-            : desktopPercentage(
-                primaryWindow(
-                  roll.previous,
-                  window.kind as "five_hour" | "seven_day",
-                ),
+  const frames = windows.map((window, index) => {
+    const geometry = meterGeometry(window, layout.meterWidth, now, variant);
+    const motion: Parameters<typeof meterSvg>[5] = {
+      previousFillFraction:
+        fixture && previewFill
+          ? Math.max(
+              0,
+              Math.min(
+                1,
+                (previewFill.from[index]! - geometry.trackX) /
+                  Math.max(1, geometry.trackWidth),
               ),
-        rollElapsed,
-      },
-    ).replace("<svg ", `<svg data-entrance="${replayRevision}" `),
-  );
+            )
+          : undefined,
+      layout: variant,
+      resetPreview: fixture ? state.previewReveal : undefined,
+      warning: fixture?.warning,
+      previousFillEnd:
+        fixture && previewFill ? previewFill.from[index] : undefined,
+      fillElapsed:
+        fixture && previewFill ? liveNow - previewFill.startedAt : undefined,
+      entranceElapsed: elapsed,
+      meterIndex: index as 0 | 1,
+      previousPercent:
+        roll === undefined
+          ? undefined
+          : desktopPercentage(
+              primaryWindow(
+                roll.previous,
+                window.kind as "five_hour" | "seven_day",
+              ),
+            ),
+      rollElapsed,
+    };
+    const revealed = fixture !== undefined && state.previewReveal === "show";
+    const tag = (source: string) =>
+      source.replace("<svg ", `<svg data-entrance="${replayRevision}" `);
+    return {
+      fixed: tag(
+        meterSvg(window, layout.meterWidth, now, revealed, true, motion),
+      ),
+      responsive: tag(responsiveMeterSvg(window, now, motion, revealed)),
+    };
+  });
+  const sources = frames.map((frame) => frame.fixed);
+  const responsiveSources = frames.map((frame) => frame.responsive);
   let mark = cache.mark;
   let markEntranceAt = cache.markEntranceAt;
   let markReplayRevision = cache.markReplayRevision;
@@ -147,7 +172,14 @@ export function buildDesktopUsageAssets(input: {
     markEntranceAt = entranceStartedAt;
     markReplayRevision = replayRevision;
   }
-  return { key, sources, mark, markEntranceAt, markReplayRevision };
+  return {
+    key,
+    sources,
+    responsiveSources,
+    mark,
+    markEntranceAt,
+    markReplayRevision,
+  };
 }
 
 type UsageFrame = {
@@ -167,8 +199,6 @@ type DesktopUsageInput = {
   now: number;
   liveNow: number;
   variant: "inline" | "current";
-  burnActive: boolean;
-  burnRevealExpires: number;
 };
 
 type UsageRuntime = {
@@ -185,6 +215,7 @@ type UsageRuntime = {
   prepareDesktop: (input: DesktopUsageInput) => {
     layout: DesktopLayout;
     sources: string[];
+    responsiveSources: string[];
     mark: string;
   };
   empty: (event: AbovePromptEvent) => void;
@@ -231,8 +262,7 @@ export async function renderUsageView(
   runtime.settle(liveNow);
   const windows = PRIMARY_WINDOWS.map((kind) => primaryWindow(snapshot, kind));
   const isDesktop = event.surface === "desktop" && "Svg" in ui;
-  const { active: burnActive, revealExpires: burnRevealExpires } =
-    runtime.prepareBurn(burnState, liveNow);
+  const { active: burnActive } = runtime.prepareBurn(burnState, liveNow);
   const hasReading = windows.some((window) => window.percent !== null);
   const pending = fixture?.state === "checking";
   const status = fixture?.state
@@ -271,7 +301,7 @@ export async function renderUsageView(
   }
   const columns = event.props.bodyColumns;
   if (isDesktop && columns >= 24 && "Svg" in ui) {
-    const { layout, sources, mark } = runtime.prepareDesktop({
+    const { layout, responsiveSources, mark } = runtime.prepareDesktop({
       event,
       state,
       snapshot,
@@ -281,8 +311,6 @@ export async function renderUsageView(
       now,
       liveNow,
       variant,
-      burnActive,
-      burnRevealExpires,
     });
     const markAlt =
       burnState.previewUntil > liveNow
@@ -294,16 +322,12 @@ export async function renderUsageView(
       ui,
       windows,
       layout,
-      variant,
-      usageSources: sources,
+      responsiveSources,
       now,
       status: snapshot.status,
-      burnActive,
-      burnRevealExpires,
       usageMark: mark,
       markAlt,
       renderMark: (source, alt) => runtime.renderMark(event, source, alt),
-      usageBurnControls,
     });
   }
   runtime.cancel();

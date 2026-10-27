@@ -253,6 +253,72 @@ it("moves focus from a removed row to a surviving row and updates header counts"
   expect(screen.getByRole("heading", { name: "Failed checks 1" })).toBeVisible()
 })
 
+it.each([false, true])(
+  "does not revive a canceled search after fallback removal, with an empty report between: %s",
+  async (emptyBetween) => {
+    currentReport = {
+      ...currentReport,
+      installedChecks: [
+        {
+          ...installedCheckFixture,
+          effectiveId: "installed:other-check",
+          name: "Other check",
+          targets: [],
+        },
+      ],
+    }
+    const session = new BurnChecksController()
+    const view = render(<BurnChecksView active session={session} />)
+    const other = await screen.findByRole("button", { name: /Other check, / })
+    view.rerender(
+      <BurnChecksView
+        active
+        session={session}
+        focusedCheck={installedCheckFixture.effectiveId}
+        focusRevision={1}
+      />,
+    )
+    expect(screen.getByRole("heading", { name: "failed-retry-loop" })).toBeVisible()
+
+    fireEvent.click(other)
+    expect(other).toHaveAttribute("aria-pressed", "true")
+    expect(screen.getByRole("heading", { name: "Other check" })).toBeVisible()
+    expect(screen.queryByRole("heading", { name: "failed-retry-loop" })).not.toBeInTheDocument()
+    if (emptyBetween) {
+      currentReport = { ...currentReport, installedChecks: [] }
+      await act(async () => emit("checks:report-changed"))
+      expect(
+        screen.getByText("Select a check to see its result and explanation."),
+      ).toBeVisible()
+    }
+
+    currentReport = { ...currentReport, installedChecks: [installedCheckFixture] }
+    await act(async () => emit("checks:report-changed"))
+    expect(screen.getByRole("button", { name: /Failed retry loop, / })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    )
+    const detail = document.getElementById(
+      `burn-check-${installedCheckFixture.effectiveId}-detail`,
+    )!
+    expect(detail).toBeVisible()
+    expect(screen.getByRole("heading", { name: "Failed retry loop" })).toBeVisible()
+
+    currentReport = { ...currentReport, installedChecks: [] }
+    await act(async () => emit("checks:report-changed"))
+
+    expect(detail).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: /Failed retry loop, / }),
+    ).not.toBeInTheDocument()
+    expect(screen.queryByRole("heading", { name: "failed-retry-loop" })).not.toBeInTheDocument()
+    expect(
+      screen.queryByText("This check has not checked any sessions yet."),
+    ).not.toBeInTheDocument()
+    expect(screen.getByText("Select a check to see its result and explanation.")).toBeVisible()
+  },
+)
+
 it.each(["row", "detail"] as const)(
   "does not take focus from a later control after %s removal",
   async (owner) => {

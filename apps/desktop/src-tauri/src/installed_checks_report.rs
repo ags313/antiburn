@@ -1009,57 +1009,37 @@ pub(crate) fn source_ready_sql(parser: usize, analyzer: usize, evidence: usize) 
 }
 
 fn source_ready_at_sql(parser: usize, analyzer: usize, evidence: usize, now: &str) -> String {
-    let v2 = live_capture_sql(now);
-    let v1_source = crate::store::selected_source::OPENCODE_V1_SOURCE_SQL;
-    format!("CASE WHEN s.agent = 'opencode' AND s.source_kind = 'providerDb'
-           AND s.source_format = '\"open_code_v2_sqlite\"' THEN ({v2})
-           WHEN ({v1_source}) THEN EXISTS (
-            SELECT 1 FROM opencode_journal_delivery d
-             WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
-               AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                AND d.parser_revision IN (?{parser}, 63, 64) AND d.cursor_json IS NOT NULL
-               AND d.blocked = 0 AND d.main_session = 1
-               AND (d.last_error IS NULL OR d.last_error IN ('journal-history-incomplete', 'journal-cancelled'))
-               AND NOT EXISTS(SELECT 1 FROM session_relation r WHERE r.environment_key = s.environment_key
-                   AND r.agent = s.agent AND r.session_id = s.session_id AND r.kind = 'forkParent'))
-           WHEN s.environment_key = 'native' AND s.agent IN ('claude-code', 'codex', 'pi')
-             AND s.source_kind = 'file' THEN EXISTS (
-             SELECT 1 FROM native_file_delivery d
-              WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
-                AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                  AND d.parser_revision IN (?{parser}, 63, 64) AND d.cursor_json IS NOT NULL
-                AND d.blocked = 0 AND d.last_error IS NULL
-                AND NOT EXISTS(SELECT 1 FROM session_relation r
-                  WHERE r.environment_key = s.environment_key AND r.agent = s.agent
-                    AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
-                      OR (r.related_id = s.session_id AND r.kind = 'subagent'))))
-           ELSE COALESCE(e.status = 'ready' AND e.analyzed_generation = s.source_generation
-              AND e.parser_revision = ?{parser} AND e.analyzer_revision = ?{analyzer}
-              AND e.evidence_schema_revision = ?{evidence}, 0) END")
+    antiburn_checks_store::source_ready_at_sql(parser, analyzer, evidence, now)
 }
 
 pub(crate) fn source_can_arrive_sql(parser: usize, active_since: usize) -> String {
     // Match delivery reset admission. A compatible pending claim can outlive activity.
-    let route = |table: &str, reset: &str| {
+    let fresh_revision = format!("d.parser_revision IN (?{parser}, 62, 63, 64, 65)");
+    let route = |table: &str, reset: &str, compatible: &str| {
+        let scheduled = "d.blocked = 0 AND (d.last_error IS NULL OR d.last_error NOT IN ('native-unsafe-identity', 'native-unsafe-order', 'native-unsafe-ownership'))
+              AND (d.pending = 1 OR d.next_attempt_at_epoch IS NOT NULL
+                OR d.observed_generation <> s.source_generation)";
         format!(
-            "COALESCE((SELECT CASE WHEN d.parser_revision NOT IN (?{parser}, 62, 63, 64) THEN 0
-           WHEN {reset} THEN s.updated_at_epoch >= ?{active_since}
-           ELSE d.blocked = 0 AND (d.last_error IS NULL OR d.last_error NOT IN ('native-unsafe-identity', 'native-unsafe-order', 'native-unsafe-ownership'))
-             AND (d.pending = 1 OR d.next_attempt_at_epoch IS NOT NULL
-            OR d.observed_generation <> s.source_generation) END
-          FROM {table} d WHERE d.environment_key = s.environment_key AND d.agent = s.agent
-            AND d.session_id = s.session_id), s.updated_at_epoch >= ?{active_since}, 0)"
+            "COALESCE((SELECT CASE
+           WHEN {reset} THEN ({fresh_revision}) AND s.updated_at_epoch >= ?{active_since}
+           WHEN d.cursor_json IS NULL THEN ({fresh_revision}) AND ({scheduled})
+           WHEN NOT COALESCE(({compatible}), 0) THEN 0
+           ELSE ({scheduled}) END
+           FROM {table} d WHERE d.environment_key = s.environment_key AND d.agent = s.agent
+             AND d.session_id = s.session_id), s.updated_at_epoch >= ?{active_since}, 0)"
         )
     };
     let journal = route(
         "opencode_journal_delivery",
         "d.incarnation <> s.incarnation OR d.source_label <> s.source_label
            OR d.cwd IS NOT s.cwd OR d.main_session <> 1",
+        &antiburn_checks_store::opencode_journal_receipt_compatible_sql(parser),
     );
     let file = route(
         "native_file_delivery",
         "d.incarnation <> s.incarnation OR ((d.source_label <> s.source_label
            OR d.cwd IS NOT s.cwd) AND d.cursor_json IS NULL)",
+        &antiburn_checks_store::native_file_receipt_compatible_sql(parser),
     );
     let v2 = live_capture_sql(&format!(
         "?{active_since} + {}",
@@ -1103,6 +1083,8 @@ fn current_sessions(
     let v2_status = source_status_sql("?12");
     let target = crate::store::native_tool_results::evidence::target_predicate("p", 8, 9, 10);
     let v1_source = crate::store::selected_source::OPENCODE_V1_SOURCE_SQL;
+    let journal_receipt = antiburn_checks_store::opencode_journal_receipt_compatible_sql(5);
+    let file_receipt = antiburn_checks_store::native_file_receipt_compatible_sql(5);
     let mut statement = connection.prepare(&format!(
         "SELECT s.agent, s.session_id, ({ready}),
                 EXISTS(SELECT 1 FROM burn_check_candidate c
@@ -1124,7 +1106,9 @@ fn current_sessions(
                           AND (p.session_incarnation IS NULL OR
                             (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd))))
                        AND (({v1_source})
-                       OR (s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'))
+                       OR (s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file')
+             OR (s.agent = 'cursor' AND s.source_kind = 'inline'
+               AND s.source_label GLOB 'cursor-desktop:*'))
                      AND NOT EXISTS(SELECT 1 FROM burn_check_session_attachment t
                        WHERE t.check_id = ?8 AND t.activation_scope_key = ?9 AND t.generation = ?10
                          AND t.branch_key = json_array(s.environment_key, s.agent, s.session_id)
@@ -1142,7 +1126,7 @@ fn current_sessions(
                       WHERE d.environment_key = s.environment_key AND d.agent = s.agent
                         AND d.session_id = s.session_id AND d.incarnation = s.incarnation
                         AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                         AND d.parser_revision IN (?5, 63, 64) AND d.blocked = 0
+                          AND (d.cursor_json IS NULL OR ({journal_receipt})) AND d.blocked = 0
                           AND ({can_arrive})
                           AND (d.pending = 1 OR d.observed_generation <> s.source_generation)))
                    OR (s.environment_key = 'native' AND s.agent IN ('claude-code', 'codex', 'pi')
@@ -1150,7 +1134,7 @@ fn current_sessions(
                        WHERE d.environment_key = s.environment_key AND d.agent = s.agent
                          AND d.session_id = s.session_id AND d.incarnation = s.incarnation
                          AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                         AND d.parser_revision IN (?5, 63, 64) AND d.blocked = 0
+                          AND (d.cursor_json IS NULL OR ({file_receipt})) AND d.blocked = 0
                           AND ({can_arrive})
                            AND (d.pending = 1 OR d.observed_generation <> s.source_generation)))),
                    ({v2_status}),
@@ -1175,7 +1159,9 @@ fn current_sessions(
                     AND (p.session_incarnation IS NULL OR
                        (p.session_incarnation = s.incarnation AND p.project_cwd = s.cwd))))
              AND s.environment_key = 'native' AND s.wsl_distro IS NULL
-             AND s.agent IN ('claude-code', 'codex', 'pi', 'opencode')
+              AND s.agent IN ('claude-code', 'codex', 'pi', 'opencode', 'cursor')
+              AND (s.agent <> 'cursor' OR (s.source_kind = 'inline'
+                AND s.source_label GLOB 'cursor-desktop:*'))
              AND NOT EXISTS(SELECT 1 FROM session_relation r
                WHERE r.environment_key = s.environment_key AND r.agent = s.agent
                  AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
@@ -1481,14 +1467,17 @@ struct StoredAction {
 #[derive(Deserialize)]
 enum StoredActionOutcome {
     Applied {
-        result: InstalledCheckStatus,
-        message: Option<String>,
+        #[serde(rename = "result")]
+        _result: InstalledCheckStatus,
+        #[serde(rename = "message")]
+        _message: Option<String>,
     },
     SkippedConditionFalse,
     SkippedConditionUnavailable,
     SkippedInputUnavailable,
     Failed {
-        message: String,
+        #[serde(rename = "message")]
+        _message: String,
     },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1498,32 +1487,7 @@ pub(crate) enum InstalledCheckStatus {
 }
 
 fn status_message(actions: Option<&str>, status: &str) -> Result<Option<String>> {
-    let Some(actions) = actions else {
-        return Ok(None);
-    };
-    let plan: StoredPlan = serde_json::from_str(actions).context("decode stored status actions")?;
-    for action in plan.outcomes.into_iter().rev() {
-        match action.outcome {
-            StoredActionOutcome::Applied { result, message } => {
-                ensure!(
-                    matches!(
-                        (result, status),
-                        (InstalledCheckStatus::Failure, "failure")
-                            | (InstalledCheckStatus::Success, "success")
-                    ),
-                    "status write does not match its action"
-                );
-                return Ok(message);
-            }
-            StoredActionOutcome::Failed { message } => {
-                drop(message);
-            }
-            StoredActionOutcome::SkippedConditionFalse
-            | StoredActionOutcome::SkippedConditionUnavailable
-            | StoredActionOutcome::SkippedInputUnavailable => {}
-        }
-    }
-    anyhow::bail!("current status has no applied action")
+    antiburn_checks_store::status_message(actions, status)
 }
 
 #[derive(Default)]
@@ -1541,20 +1505,13 @@ fn current_activation(
     connection: &Connection,
     definition: &InstalledCheckDefinition,
 ) -> Result<bool> {
-    Ok(!matches!(
-        definition.availability,
-        InstalledCheckAvailability::Invalid { .. }
-    ) && connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM burn_check_activation
-              WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3
-                AND definition_revision = ?4 AND enabled = 1)",
-        params![
-            definition.check_id,
-            definition.activation_scope_key,
-            definition.generation,
-            definition.definition_revision
-        ],
-        |row| row.get::<_, bool>(0),
+    Ok(antiburn_checks_store::is_current_activation(
+        connection,
+        &definition.check_id,
+        &definition.activation_scope_key,
+        definition.generation.unwrap_or_default(),
+        &definition.definition_revision,
+        definition.availability == InstalledCheckAvailability::Available,
     )?)
 }
 

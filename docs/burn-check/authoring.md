@@ -204,6 +204,14 @@ characterized Codex, Pi, and OpenCode V1/V2 contracts, not Claude. Only Codex an
 OpenCode V2 currently prove `turn_end`. Format names do not extend those claims
 to every producer version or to exported, remote, WSL, or child-session sources.
 
+Cursor Desktop uses a separate ordered snapshot `tool_result` route, with
+accepted user-slot prefix context. It does not supply separate public user,
+assistant, call, cycle, or session-observation triggers. Native inline main
+ownership, recorded header order, exact bubble/call identities, current ready
+evidence, and the characterized terminal-tool shape are required. It supplies no
+requester model/mode or operation-path proof. Cursor CLI and generic stores do not
+inherit this support. See the [Cursor source contract](../session-coverage.md#cursor-desktop-yaml-tool-evidence).
+
 ### Session observations
 
 The desktop emits `session_start` once per observation attachment with reason
@@ -579,6 +587,14 @@ override stays selected instead of authorizing fallback. Keep drafts outside
 active folders. The app watches existing installation chains and reconciles
 periodically; it never creates installation directories. Existing folder access
 settings apply.
+
+Definition discovery remains local and active with **Run checks** off, including
+at cold startup. The app reads and parses existing YAML files and watches their
+installation directories to show names, invalid-file diagnostics, and paused
+cards. The limits remain 256 KiB per definition and 128 files per folder, with
+the existing directory-access gates. This discovery does not restore provider
+configuration, discover model capabilities, catch up session sources, or run
+local/model assessments. Turning checks on still requires the normal gates.
 
 **Settings → Checks → Check files** lists enabled folders with confirmed check
 files and their physical file counts, even when **Run checks** is off. The count

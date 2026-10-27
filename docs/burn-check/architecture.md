@@ -85,6 +85,16 @@ Stored-session parsing remains available when the live service is unavailable
 or its database binding cannot be proven. Remote and WSL sources do not enter
 this native live route.
 
+Cursor Desktop follows a separate ordered snapshot result path. Discovery reads
+composer headers and bubbles in one SQLite transaction. The native parser emits
+characterized terminal tool results and their user-slot prefix. Winning complete
+snapshots reconcile through the native-result outbox; startup binds the exact
+source generation and incarnation. Desktop admission requires a native inline
+main source labeled `cursor-desktop:*`, no WSL source, and current ready cached
+evidence. This route does not use file/journal cursors or supply public user,
+assistant, call, cycle, or host-session events. Requester model/mode and operation
+paths remain unavailable. See the [Cursor source contract](../session-coverage.md#cursor-desktop-yaml-tool-evidence).
+
 ## Identity, order, and frozen evidence
 
 A definition has a filename-stem ID, installation scope, and content revision.
@@ -574,10 +584,26 @@ public kinds use a separate future-only baseline and first-eligible publication.
 The named file-cursor-4 and journal-4 converters preserve committed progress,
 pending result joins, source bindings, and the original result baseline when
 upgrading to revision 5. They set a new-event frontier without replaying old
-result identities. Parser 63 accepts the named parser-62 predecessor through this
-path; unknown revisions fail closed. Core checkpoint version 1 and existing
-result encodings remain unchanged. Missing new first-eligible fields do not
-authorize historical new-kind events.
+result identities. Parser 66 accepts branch parser-63, parser-64, and parser-65
+cursor/state-5 receipts, and the named parser-62/cursor/state-4 predecessors
+through their exact converters. Separate converters accept main's parser-64
+file cursor 1 and V1 live state 2 from the pinned producer at
+`143d4b05681938cb362e828ecc27d2e082638176`. Actual old-encoder synthetic
+fixtures define the accepted shape, not a published release range. File conversion
+validates the original identity and hash anchors; V1 conversion requires matching
+stored and encoded parser 64 and validates the session, native owner, sequence,
+origin, and boundary. Both retain result progress and pending joins, then freeze
+the validated current source frontier for new public event kinds. They do not
+infer missing attribution or erase history limits. Partial publication retains
+the consumed position and frozen public frontier across restart. Decoder
+eligibility does not grant readiness: a validated layout-5 page must commit under
+the existing claim and source fences first. Conversion leaves accepted inputs,
+history, paid attempts, cooldowns, and usage intact. Unsupported layouts keep
+their receipt and prior assessments but remain blocked without automatic rewind
+or reseeding. Unknown revisions fail closed. The historical
+parser-65 Claude request-origin boundary remains unchanged. Core checkpoint
+version 1 and existing result encodings remain unchanged. Missing new
+first-eligible fields do not authorize historical new-kind events.
 
 Each journal page commits current rows, immutable outbox events, cursor,
 baseline, diagnostics, and continuation together under the current lease/claim,
@@ -608,6 +634,14 @@ or repository definitions supply check cards and navigation. Without a discovere
 definition, these surfaces and placeholder errors stay absent; the Settings
 master toggle and connection setup remain available. A discovered check without
 a configured System One provider gets an actionable setup diagnostic in its detail.
+Definition discovery remains active with **Run checks** off, including at cold
+startup. It reads and parses bounded local YAML files, refreshes directory
+watches, and publishes names, diagnostics, and paused cards. It keeps the existing
+256 KiB/file and 128-files/folder limits and directory-access gates. This path does
+not restore provider configuration, discover model capabilities, catch up session
+sources, or execute local/model assessments. Provider readiness still gates live
+delivery and execution, not definition visibility.
+
 The connection list under **Model-based checks** separates saved configuration
 from selection. Native save takes an explicit create or update intent. Updates
 require an existing profile and matching revision, so a stale editor cannot

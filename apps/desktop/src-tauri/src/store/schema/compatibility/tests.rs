@@ -24,6 +24,7 @@ fn history(connection: &Connection, branch: bool, version: usize) {
         branch_steps[1],
         branch_steps[2],
         include_str!("main_metadata_v85.sql"),
+        include_str!("main_registry_v86.sql"),
     ];
     let steps = if branch {
         &branch_steps[..]
@@ -268,7 +269,7 @@ fn snapshot(connection: &Connection) -> BTreeMap<String, (Vec<String>, Vec<Vec<V
 
 #[test]
 fn pinned_histories_preserve_populated_state_through_disk_open_and_reopen() {
-    for (branch, versions) in [(true, 81..=87), (false, 80..=85)] {
+    for (branch, versions) in [(true, 81..=87), (false, 80..=86)] {
         for version in versions {
             let directory = tempfile::tempdir().unwrap();
             let connection = Connection::open(database_path(directory.path())).unwrap();
@@ -283,10 +284,10 @@ fn pinned_histories_preserve_populated_state_through_disk_open_and_reopen() {
                 let store = Store::open(directory.path()).unwrap_or_else(|error| {
                     panic!("branch={branch}, version={version}: {error:#}")
                 });
-                assert_eq!(store.schema_version().unwrap(), 90);
+                assert_eq!(store.schema_version().unwrap(), 91);
                 store.migrate().unwrap();
                 let connection = store.lock();
-                assert_eq!(read_profile(&connection).unwrap(), Profile::canonical(90));
+                assert_eq!(read_profile(&connection).unwrap(), Profile::canonical(91));
                 for (table, (columns, expected)) in &before {
                     assert_eq!(
                         rows(&connection, table, columns),
@@ -323,7 +324,7 @@ fn pinned_histories_preserve_populated_state_through_disk_open_and_reopen() {
 fn branch_repair_maps_each_known_shape_and_canonical_profiles_are_no_ops() {
     for version in 81..=87 {
         let mut connection = historical_connection(true, version);
-        let expected = version as i64 + if version <= 83 { 1 } else { 2 };
+        let expected = version as i64 + if version <= 83 { 1 } else { 3 };
         assert_eq!(
             repair_branch_version(&mut connection, version as i64).unwrap(),
             expected
@@ -337,7 +338,7 @@ fn branch_repair_maps_each_known_shape_and_canonical_profiles_are_no_ops() {
             expected
         );
     }
-    for version in 81..=90 {
+    for version in 81..=91 {
         let mut connection = Connection::open_in_memory().unwrap();
         for sql in &super::super::MIGRATIONS[..version] {
             connection.execute_batch(sql).unwrap();
@@ -367,6 +368,149 @@ fn branch_repair_maps_each_known_shape_and_canonical_profiles_are_no_ops() {
             schema
         );
     }
+}
+
+#[test]
+fn pre_registry_branch_versions_keep_populated_state_through_open_and_reopen() {
+    for version in 86..=90 {
+        let directory = tempfile::tempdir().unwrap();
+        let connection = Connection::open(database_path(directory.path())).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        history(&connection, false, 85);
+        for sql in &super::super::MIGRATIONS[86..version + 1] {
+            connection.execute_batch(sql).unwrap();
+        }
+        connection
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        assert_eq!(
+            read_profile(&connection).unwrap(),
+            Profile::pre_registry(version as i64)
+        );
+        seed(&connection);
+        let before = snapshot(&connection);
+        drop(connection);
+        for _ in 0..2 {
+            let store = Store::open(directory.path()).unwrap();
+            let connection = store.lock();
+            assert_eq!(read_profile(&connection).unwrap(), Profile::canonical(91));
+            for (table, (columns, expected)) in &before {
+                assert_eq!(
+                    rows(&connection, table, columns),
+                    *expected,
+                    "version={version}, table={table}"
+                );
+            }
+            assert!(!antiburn_checks_store::runtime_snapshot_ready(&connection).unwrap());
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn main_registry_rows_and_initialization_survive_retirement_and_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let connection = Connection::open(database_path(directory.path())).unwrap();
+    history(&connection, false, 86);
+    seed(&connection);
+    connection
+        .execute_batch(
+            "INSERT INTO burn_check_runtime_definition VALUES
+            ('fixture', '{}', 1, 'revision', 'Saved definition', 'paused');
+         UPDATE burn_check_runtime_definition_state SET initialized = 1;",
+        )
+        .unwrap();
+    let before = snapshot(&connection);
+    drop(connection);
+    for _ in 0..2 {
+        let store = Store::open(directory.path()).unwrap();
+        let connection = store.lock();
+        assert!(antiburn_checks_store::runtime_snapshot_ready(&connection).unwrap());
+        for table in [
+            "burn_check_runtime_definition",
+            "burn_check_runtime_definition_state",
+        ] {
+            let (columns, expected) = &before[table];
+            assert_eq!(rows(&connection, table, columns), *expected);
+        }
+        assert_eq!(read_profile(&connection).unwrap(), Profile::canonical(91));
+    }
+}
+
+#[test]
+fn malformed_registry_shapes_fail_before_any_migration() {
+    for sql in [
+        "DROP TABLE burn_check_runtime_definition_state",
+        "DELETE FROM burn_check_runtime_definition_state",
+        "DROP TABLE burn_check_runtime_definition_state;
+         CREATE TABLE burn_check_runtime_definition_state (
+            singleton INTEGER PRIMARY KEY, protocol_version INTEGER, initialized INTEGER) STRICT;
+         INSERT INTO burn_check_runtime_definition_state VALUES (1, 1, 1);",
+        "ALTER TABLE burn_check_runtime_definition ADD COLUMN extra TEXT",
+    ] {
+        let mut connection = historical_connection(false, 86);
+        connection.execute_batch(sql).unwrap();
+        assert_profile_rejected(&mut connection, 86, "runtime");
+    }
+}
+
+#[test]
+fn failed_registry_repair_keeps_the_pre_registry_version_and_data() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    let mut connection = historical_connection(false, 85);
+    connection.execute_batch(super::super::V87).unwrap();
+    connection.pragma_update(None, "user_version", 86).unwrap();
+    seed(&connection);
+    let before = snapshot(&connection);
+    connection.authorizer(Some(|context: AuthContext<'_>| {
+        if matches!(
+            context.action,
+            AuthAction::Pragma {
+                pragma_name: "user_version",
+                pragma_value: Some("87"),
+            }
+        ) {
+            Authorization::Deny
+        } else {
+            Authorization::Allow
+        }
+    }));
+    assert!(repair_branch_version(&mut connection, 86).is_err());
+    connection.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    assert_eq!(snapshot(&connection), before);
+    assert_eq!(
+        read_profile(&connection).unwrap(),
+        Profile::pre_registry(86)
+    );
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        86
+    );
+    assert_eq!(repair_branch_version(&mut connection, 86).unwrap(), 87);
+}
+
+#[test]
+fn pre_registry_served_model_column_requires_its_known_usage_constraints() {
+    let mut connection = historical_connection(false, 85);
+    for sql in &super::super::MIGRATIONS[86..90] {
+        connection.execute_batch(sql).unwrap();
+    }
+    connection
+        .execute_batch("ALTER TABLE burn_check_decision_usage ADD COLUMN served_model TEXT")
+        .unwrap();
+    connection.pragma_update(None, "user_version", 90).unwrap();
+    assert_profile_rejected(&mut connection, 90, "usage observation constraints");
 }
 
 #[test]
@@ -465,7 +609,7 @@ fn failed_backfills_roll_back_index_columns_trigger_rows_and_version() {
         connection
             .execute_batch("DROP TRIGGER fail_backfill")
             .unwrap();
-        assert_eq!(repair_branch_version(&mut connection, 87).unwrap(), 89);
+        assert_eq!(repair_branch_version(&mut connection, 87).unwrap(), 90);
     }
 }
 
@@ -683,10 +827,10 @@ fn failed_evidence_migration_rolls_back_temporary_work_and_keeps_the_version() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open_in_memory(directory.path()).unwrap();
     let connection = historical_connection(false, 85);
-    for sql in &super::super::MIGRATIONS[85..87] {
+    for sql in &super::super::MIGRATIONS[85..88] {
         connection.execute_batch(sql).unwrap();
     }
-    connection.pragma_update(None, "user_version", 87).unwrap();
+    connection.pragma_update(None, "user_version", 88).unwrap();
     seed(&connection);
     connection
         .execute_batch("CREATE TEMP TABLE current_evidence_copy (synthetic INTEGER)")
@@ -694,7 +838,7 @@ fn failed_evidence_migration_rolls_back_temporary_work_and_keeps_the_version() {
     let before = snapshot(&connection);
     *store.lock() = connection;
     assert!(store.migrate().is_err());
-    assert_eq!(store.schema_version().unwrap(), 87);
+    assert_eq!(store.schema_version().unwrap(), 88);
     assert_eq!(snapshot(&store.lock()), before);
     assert_eq!(
         store
@@ -712,7 +856,7 @@ fn failed_evidence_migration_rolls_back_temporary_work_and_keeps_the_version() {
         .execute_batch("DROP TABLE current_evidence_copy")
         .unwrap();
     store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 90);
+    assert_eq!(store.schema_version().unwrap(), 91);
 }
 
 #[test]
@@ -973,7 +1117,7 @@ fn interrupted_untyped_upgrade_keeps_its_boundary_and_preserves_newer_typed_gaps
             None,
         );
         if branch {
-            assert_eq!(repair_branch_version(&mut connection, 86).unwrap(), 88);
+            assert_eq!(repair_branch_version(&mut connection, 86).unwrap(), 89);
         } else {
             connection
                 .execute_batch(
@@ -988,7 +1132,7 @@ fn interrupted_untyped_upgrade_keeps_its_boundary_and_preserves_newer_typed_gaps
                 connection
                     .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                     .unwrap(),
-                85
+                86
             );
             connection
                 .execute_batch("DROP TRIGGER fail_retirement")
@@ -1006,7 +1150,7 @@ fn interrupted_untyped_upgrade_keeps_its_boundary_and_preserves_newer_typed_gaps
         drop(connection);
         for _ in 0..2 {
             let store = Store::open(directory.path()).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 90);
+            assert_eq!(store.schema_version().unwrap(), 91);
             assert_eq!(gap_kind(&store.lock(), old_gap), "partial");
             assert_eq!(gap_kind(&store.lock(), new_gap), "invalidated");
             assert!(store.internal_value(UNTYPED_GAP_HEAD_KEY).is_none());

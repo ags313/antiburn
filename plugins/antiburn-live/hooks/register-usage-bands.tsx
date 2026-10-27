@@ -10,34 +10,9 @@ import {
   meterLayer,
   secondaryTextSvg,
 } from "./usage-graphics";
-import { PRESENTATION, usageLayout } from "./usage-presentation";
-import { burnControlsSvg } from "./burn-controls";
-
-let burnControlsKey = "";
-let burnControlsSource = "";
-
-export function resetUsageBurnControls(): void {
-  burnControlsKey = "";
-  burnControlsSource = "";
-}
-
-export function usageBurnControls(
-  layout: ReturnType<typeof usageLayout>,
-  sources: readonly string[],
-  expiresAt: number,
-  now: number,
-): string {
-  const key = JSON.stringify([layout, sources, expiresAt]);
-  if (key !== burnControlsKey) {
-    burnControlsSource = burnControlsSvg(
-      layout,
-      sources,
-      Math.max(0, expiresAt - now),
-    );
-    burnControlsKey = key;
-  }
-  return burnControlsSource;
-}
+import { PRESENTATION, type usageLayout } from "./usage-presentation";
+import { renderUsageMeterBand } from "./usage-meter-band";
+import { RESPONSIVE_FRAME_WIDTH } from "./usage-graphics";
 
 type UsageUi = ReturnType<EngineInterface["ui"]["resolve"]>;
 type AbovePromptEvent = RenderInput<"AbovePrompt">;
@@ -176,108 +151,60 @@ type DesktopBandInput = {
   ui: Extract<UsageUi, { Svg: unknown }>;
   windows: readonly UsageWindow[];
   layout: ReturnType<typeof usageLayout>;
-  variant: "inline" | "current";
-  usageSources: readonly string[];
+  responsiveSources: readonly string[];
   now: number;
   status: "ready" | "error" | "empty";
-  burnActive: boolean;
-  burnRevealExpires: number;
   usageMark: string;
   markAlt: string;
   renderMark: (source: string, alt: string) => RenderNode | null;
-  usageBurnControls: (
-    layout: ReturnType<typeof usageLayout>,
-    sources: readonly string[],
-    expiresAt: number,
-    now: number,
-  ) => string;
 };
 
 export function renderDesktopUsageBand({
   ui,
   windows,
   layout,
-  variant,
-  usageSources,
+  responsiveSources,
   now,
   status,
-  burnActive,
-  burnRevealExpires,
   usageMark,
   markAlt,
   renderMark,
-  usageBurnControls,
 }: DesktopBandInput): RenderElement {
   const { Box } = ui;
-  return (
-    <Box
-      key="usage-band"
-      position="relative"
-      flexDirection="row"
-      alignItems="center"
-    >
-      <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
-      {renderMark(usageMark, markAlt)}
-      <Box width={PRESENTATION.brandGap / 8} flexShrink={0} />
-      <Box
-        flexDirection={layout.inline ? "row" : "column"}
-        gap={layout.inline ? 3 : layout.stackedGap / 16}
-      >
-        {windows.map((window, index) => (
-          <Box
-            key={`meter-${window.kind}`}
-            position="relative"
-            height={variant === "inline" ? layout.meterHeight / 16 : 1.25}
-            alignItems="center"
-          >
-            <ui.Svg
-              key={`meter-base-${window.kind}`}
-              source={meterLayer(usageSources[index]!, "base")}
-              alt={`${meterDescription(window, now, true)}${status === "error" ? ". Usage unavailable · Last known" : ""}`}
-              width={layout.meterWidth}
-              height={layout.meterHeight}
-            />
-            {!burnActive && (
-              <Box
-                position="absolute"
-                top={0}
-                bottom={0}
-                left={0}
-                alignItems="center"
-              >
-                <ui.Svg
-                  key={`meter-interaction-${window.kind}`}
-                  source={meterLayer(usageSources[index]!, "interaction")}
-                  alt={`${window.label} reset and pace controls`}
-                  width={layout.meterWidth}
-                  height={layout.meterHeight}
-                  isInteractive
-                />
-              </Box>
-            )}
-          </Box>
-        ))}
-      </Box>
-      <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
-      {burnActive && (
-        <Box position="absolute" left={layout.meters[0]!.x / 8} top={0}>
+  return renderUsageMeterBand({
+    ui,
+    layout,
+    windows,
+    mark: renderMark(usageMark, markAlt),
+    renderMeter: (window, index) => (
+      <Box position="relative" width="100%" minWidth={0} alignItems="center">
+        <ui.Svg
+          key={`meter-base-${window.kind}`}
+          source={meterLayer(responsiveSources[index]!, "base")}
+          alt={`${meterDescription(window, now, true)}${status === "error" ? ". Usage unavailable · Last known" : ""}`}
+          width={RESPONSIVE_FRAME_WIDTH}
+          height={layout.meterHeight}
+        />
+        <Box
+          position="absolute"
+          top={0}
+          bottom={0}
+          left={0}
+          right={0}
+          alignItems="center"
+        >
           <ui.Svg
-            key="burn-controls"
-            source={usageBurnControls(
-              layout,
-              usageSources,
-              burnRevealExpires,
-              now,
-            )}
-            alt="Usage reset and pace controls"
-            width={layout.width - layout.meters[0]!.x}
-            height={layout.height}
+            key={`meter-interaction-${window.kind}`}
+            source={meterLayer(responsiveSources[index]!, "interaction")}
+            alt={`${window.label} reset and pace controls`}
+            width={RESPONSIVE_FRAME_WIDTH}
+            height={layout.meterHeight}
             isInteractive
           />
         </Box>
-      )}
-    </Box>
-  );
+      </Box>
+    ),
+  });
 }
 
 type CompactBandInput = {

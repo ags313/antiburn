@@ -1,4 +1,4 @@
-//! Preserve live settings and incurred usage before the V86 table removal.
+//! Preserve live settings and incurred usage before the V87 table removal.
 
 use std::collections::BTreeSet;
 
@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use super::usage_accounting::{USAGE_LEDGER_KEY, UsageLedger, write_json_setting};
 
-pub(super) const VERSION: i64 = 86;
+pub(super) const VERSION: i64 = 87;
 pub(super) const FRESH_INITIALIZATION_KEY: &str = "internal:freshDatabaseInitializationV1";
 const RETIRED_KEYS: [&str; 4] = [
     "ignored_instructions",

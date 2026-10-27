@@ -106,9 +106,10 @@ pub const MIGRATIONS: &[&str] = &[
     V88,
     V89,
     V90,
+    V91,
 ];
 
-const V90: &str = r#"
+const V91: &str = r#"
 ALTER TABLE burn_check_decision_usage ADD COLUMN served_model TEXT
     CHECK (served_model IS NULL OR (usage_known = 1
         AND length(served_model) BETWEEN 1 AND 128
@@ -116,7 +117,7 @@ ALTER TABLE burn_check_decision_usage ADD COLUMN served_model TEXT
         AND served_model NOT GLOB '*[^A-Za-z0-9._:/-]*'));
 "#;
 
-const V89: &str = concat!(
+const V90: &str = concat!(
     r#"
 ALTER TABLE native_tool_result_publication ADD COLUMN session_selection_json TEXT
     CHECK (session_selection_json IS NULL OR json_valid(session_selection_json));
@@ -124,9 +125,9 @@ ALTER TABLE native_tool_result_publication ADD COLUMN session_selection_json TEX
     include_str!("schema/compatibility/legacy_soft_gaps.sql")
 );
 
-const V88: &str = include_str!("native_tool_results/evidence_schema.sql");
+const V89: &str = include_str!("native_tool_results/evidence_schema.sql");
 
-const V87: &str = r#"
+const V88: &str = r#"
 ALTER TABLE burn_check_candidate ADD COLUMN started_cooldown_until_epoch INTEGER;
 CREATE TABLE burn_check_evaluation_attempt_v85 (
     attempt_id TEXT PRIMARY KEY NOT NULL,
@@ -165,7 +166,7 @@ UPDATE burn_check_candidate SET state = 'not_assessed', claim_owner = NULL,
 WHERE state IN ('pending', 'claimed', 'dispatching', 'answered');
 "#;
 
-const V86: &str = r#"
+const V87: &str = r#"
 DELETE FROM remediation_contribution
 WHERE detector_id IN ('ignored_instructions', 'skill_opportunities', 'over_exploring', 'scope_creep')
    OR remediation_id IN (
@@ -287,7 +288,7 @@ CREATE TABLE opencode_v2_source_status (
 
 /// v81 seeks published turns before reading their history payloads.
 const V81: &str = r#"
-CREATE INDEX turn_quota_published
+CREATE INDEX IF NOT EXISTS turn_quota_published
     ON turn(environment_key, agent, session_id, claim_fence, ts_ms)
     WHERE ts_ms IS NOT NULL;
 "#;
@@ -302,6 +303,27 @@ ALTER TABLE session ADD COLUMN strict_fingerprint_pending INTEGER NOT NULL DEFAU
 "#,
     include_str!("source_fingerprint_work.sql")
 );
+
+const V86: &str = r#"
+CREATE TABLE IF NOT EXISTS burn_check_runtime_definition (
+    check_id TEXT NOT NULL,
+    activation_scope_key TEXT NOT NULL,
+    generation INTEGER CHECK (generation IS NULL OR generation > 0),
+    definition_revision TEXT NOT NULL,
+    name TEXT NOT NULL,
+    availability TEXT NOT NULL CHECK (availability IN ('available', 'paused', 'invalid', 'unsupported')),
+    PRIMARY KEY (check_id, activation_scope_key)
+) STRICT;
+CREATE TABLE IF NOT EXISTS burn_check_runtime_definition_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    protocol_version INTEGER NOT NULL CHECK (protocol_version = 1),
+    initialized INTEGER NOT NULL CHECK (initialized IN (0, 1))
+) STRICT;
+INSERT OR IGNORE INTO burn_check_runtime_definition_state VALUES (1, 1, 0);
+CREATE INDEX IF NOT EXISTS turn_quota_published
+    ON turn(environment_key, agent, session_id, claim_fence, ts_ms)
+    WHERE ts_ms IS NOT NULL;
+"#;
 
 const V79: &str = r#"
 CREATE TABLE work_queue_schedule (
@@ -2199,14 +2221,14 @@ mod decision_migration_tests {
     }
 
     #[test]
-    fn v87_preserves_accepted_evidence_progress_settings_and_usage() {
+    fn v88_preserves_accepted_evidence_progress_settings_and_usage() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("migration.sqlite");
         let connection = Connection::open(&path).unwrap();
         connection
             .pragma_update(None, "foreign_keys", true)
             .unwrap();
-        for migration in &MIGRATIONS[..86] {
+        for migration in &MIGRATIONS[..87] {
             connection.execute_batch(migration).unwrap();
         }
         connection.execute_batch(r#"
@@ -2291,8 +2313,8 @@ mod decision_migration_tests {
             CASE WHEN state = 'dispatch_intent' THEN 'unknown' ELSE outcome END, response_json, updated_at_epoch)
             FROM burn_check_evaluation_attempt ORDER BY attempt_id").unwrap()
             .query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-        connection.execute_batch(V87).unwrap();
-        connection.pragma_update(None, "user_version", 87).unwrap();
+        connection.execute_batch(V88).unwrap();
+        connection.pragma_update(None, "user_version", 88).unwrap();
         drop(connection);
         let connection = Connection::open(path).unwrap();
         for (table, before) in tables.into_iter().zip(before) {

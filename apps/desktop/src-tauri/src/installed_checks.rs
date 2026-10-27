@@ -109,6 +109,145 @@ fn publish_metadata(state: &InstalledChecks, definitions: &[InstalledCheckDefini
     true
 }
 
+fn persist_runtime_definitions(
+    store: &Store,
+    definitions: &[InstalledCheckDefinition],
+) -> Result<()> {
+    let runtime_definitions = definitions
+        .iter()
+        .map(|definition| antiburn_checks_store::RuntimeDefinition {
+            check_id: definition.check_id.clone(),
+            activation_scope_key: definition.activation_scope_key.clone(),
+            generation: definition.generation,
+            definition_revision: definition.definition_revision.clone(),
+            name: definition.name.clone(),
+            availability: match definition.availability {
+                InstalledCheckAvailability::Available => {
+                    antiburn_checks_store::DefinitionAvailability::Available
+                }
+                InstalledCheckAvailability::Paused { .. } => {
+                    antiburn_checks_store::DefinitionAvailability::Paused
+                }
+                InstalledCheckAvailability::Invalid { .. } => {
+                    antiburn_checks_store::DefinitionAvailability::Invalid
+                }
+                InstalledCheckAvailability::Unsupported { .. } => {
+                    antiburn_checks_store::DefinitionAvailability::Unsupported
+                }
+            },
+        })
+        .collect::<Vec<_>>();
+    antiburn_checks_store::replace_runtime_definitions(&mut store.lock(), &runtime_definitions)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InventoryEvent {
+    Availability,
+    Report,
+}
+
+fn publish_inventory(
+    state: &InstalledChecks,
+    store: &Store,
+    definitions: &[InstalledCheckDefinition],
+    mut emit: impl FnMut(InventoryEvent),
+) -> Result<bool> {
+    persist_runtime_definitions(store, definitions)?;
+    let changed = publish_metadata(state, definitions);
+    if changed {
+        emit(InventoryEvent::Availability);
+        emit(InventoryEvent::Report);
+    }
+    Ok(changed)
+}
+
+fn pause_saved_inventory(
+    state: &InstalledChecks,
+    store: &Store,
+    mut emit: impl FnMut(InventoryEvent),
+) -> Result<()> {
+    let saved_changed = store.lock().execute(
+        "UPDATE burn_check_runtime_definition SET availability = 'paused'
+         WHERE availability = 'available'",
+        [],
+    )?;
+    let mut definitions = state
+        .metadata
+        .read()
+        .expect("installed metadata lock")
+        .clone();
+    for definition in &mut definitions {
+        if definition.availability == InstalledCheckAvailability::Available {
+            definition.availability = InstalledCheckAvailability::Paused {
+                reason: Some(
+                    "Installed checks could not be refreshed. Refresh Checks to try again.".into(),
+                ),
+            };
+        }
+    }
+    let changed = publish_metadata(state, &definitions);
+    if changed || saved_changed > 0 {
+        emit(InventoryEvent::Availability);
+        emit(InventoryEvent::Report);
+    }
+    Ok(())
+}
+
+fn finish_inventory_update<E>(
+    state: &InstalledChecks,
+    host: &InstalledCheckHost<E>,
+    update: Result<()>,
+    stage: diagnostics::RuntimeStage,
+    previous_failure: &mut Option<diagnostics::RuntimeFailure>,
+    mut emit: impl FnMut(InventoryEvent),
+) -> bool {
+    let result = update.and_then(|()| {
+        ensure!(
+            host.inventory_ready,
+            "installed check inventory has not completed discovery"
+        );
+        publish_inventory(state, &host.store, &host.definitions, &mut emit)?;
+        Ok(())
+    });
+    let Err(error) = result else {
+        return true;
+    };
+    state.delivery_ready.store(false, Ordering::Release);
+    let mut failure = diagnostics::RuntimeFailure::classify(stage, &error);
+    if let Err(error) = pause_saved_inventory(state, &host.store, &mut emit) {
+        failure.trace_if_changed(previous_failure, "installed_check_update_failed");
+        failure = diagnostics::RuntimeFailure::classify(stage, &error);
+    }
+    failure.trace_if_changed(previous_failure, "installed_check_update_failed");
+    publish_runtime_failure(state, &failure);
+    emit(InventoryEvent::Report);
+    false
+}
+
+fn finish_app_inventory_update<E>(
+    app: &tauri::AppHandle,
+    state: &InstalledChecks,
+    host: &InstalledCheckHost<E>,
+    update: Result<()>,
+    stage: diagnostics::RuntimeStage,
+    previous_failure: &mut Option<diagnostics::RuntimeFailure>,
+) -> bool {
+    finish_inventory_update(
+        state,
+        host,
+        update,
+        stage,
+        previous_failure,
+        |event| match event {
+            InventoryEvent::Availability => crate::jev::settings::progress_changed(app),
+            InventoryEvent::Report => {
+                let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
+            }
+        },
+    )
+}
+
 pub(crate) fn wake(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<InstalledChecks>() {
         state.requested_turn.fetch_add(1, Ordering::AcqRel);
@@ -309,6 +448,7 @@ struct InstalledCheckHost<E> {
     scope_work: BTreeMap<ActivationScope, bool>,
     projects: BTreeMap<ActivationScope, ProjectChecks<E>>,
     definitions: Vec<InstalledCheckDefinition>,
+    inventory_ready: bool,
     source_turn: usize,
     source_sweep: Vec<antiburn_checks::domain::ActivationId>,
     source_sweep_remaining: usize,
@@ -337,6 +477,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             scope_work: BTreeMap::new(),
             projects: BTreeMap::new(),
             definitions: Vec::new(),
+            inventory_ready: false,
             source_turn: 0,
             source_sweep: Vec::new(),
             source_sweep_remaining: 0,
@@ -347,36 +488,12 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
     }
 
     fn reconcile(&mut self, admission: &Admission) -> Result<()> {
+        self.inventory_ready = false;
         let _phase = diagnostics::SlowPhase::start("reconcile");
         let scopes = live_projects(&self.store)?;
         let repositories = native_repositories(self.store.repositories()?);
-        let mut granted = self.store.granted_dirs()?;
-        let mut directories = BTreeMap::new();
         let mut errors = diagnostics::DiagnosticBatch::new();
-        self.watch_directories.clear();
-        for (directory, enabled) in self
-            .global_directory
-            .iter()
-            .cloned()
-            .map(|path| (path, true))
-            .chain(
-                repositories
-                    .iter()
-                    .map(|(root, enabled)| (root.join(".antiburn/checks"), *enabled)),
-            )
-        {
-            let checks = if enabled {
-                loader::load_directory(&self.store, &directory, &granted)
-            } else {
-                loader::disabled(&directory)
-            };
-            granted = self.store.granted_dirs()?;
-            if enabled && !protected::cwd_resolution_blocked(&directory, &granted) {
-                self.watch_directories.push(directory.clone());
-            }
-            diagnostics::collect(&mut errors, checks.error.as_slice());
-            directories.insert(directory, checks);
-        }
+        let directories = self.load_directories(&repositories, &mut errors)?;
         let mut discovered = Vec::new();
         let mut metadata = Vec::new();
         let mut definition_count = 0;
@@ -548,7 +665,6 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
             metadata.len() <= MAX_DEFINITIONS,
             "installed checks exceed the {MAX_DEFINITIONS}-definition report limit"
         );
-        self.definitions = metadata;
         self.source_states.retain(|id, _| {
             self.projects
                 .get(&id.scope)
@@ -561,13 +677,178 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
         });
         for project in self.projects.values() {
             for activation in &project.active {
-                update_condition_diagnostic(
-                    &mut self.definitions,
-                    &self.diagnostic_log,
-                    activation,
-                );
+                update_condition_diagnostic(&mut metadata, &self.diagnostic_log, activation);
             }
         }
+        persist_runtime_definitions(&self.store, &metadata)?;
+        self.definitions = metadata;
+        self.inventory_ready = true;
+        Ok(())
+    }
+
+    fn load_directories(
+        &mut self,
+        repositories: &BTreeMap<PathBuf, bool>,
+        errors: &mut diagnostics::DiagnosticBatch,
+    ) -> Result<BTreeMap<PathBuf, loader::DirectoryChecks>> {
+        ensure!(
+            repositories.len() <= MAX_DEFINITIONS,
+            "too many installed check projects"
+        );
+        let mut granted = self.store.granted_dirs()?;
+        let mut directories = BTreeMap::new();
+        let mut incomplete = false;
+        self.watch_directories.clear();
+        for (directory, enabled) in self
+            .global_directory
+            .iter()
+            .cloned()
+            .map(|path| (path, true))
+            .chain(
+                repositories
+                    .iter()
+                    .map(|(root, enabled)| (root.join(".antiburn/checks"), *enabled)),
+            )
+        {
+            let checks = if enabled {
+                loader::load_directory(&self.store, &directory, &granted)
+            } else {
+                loader::disabled(&directory)
+            };
+            incomplete |= checks
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == DiagnosticCode::DiscoveryReadFailed);
+            granted = self.store.granted_dirs()?;
+            if enabled && !protected::cwd_resolution_blocked(&directory, &granted) {
+                self.watch_directories.push(directory.clone());
+            }
+            diagnostics::collect(errors, checks.error.as_slice());
+            directories.insert(directory, checks);
+        }
+        ensure!(
+            !incomplete,
+            "one or more installed check folders could not be read"
+        );
+        Ok(directories)
+    }
+
+    fn refresh_paused_inventory(&mut self) -> Result<()> {
+        self.inventory_ready = false;
+        let repositories = native_repositories(self.store.repositories()?);
+        let mut errors = diagnostics::DiagnosticBatch::new();
+        let directories = self.load_directories(&repositories, &mut errors)?;
+        let mut scopes = live_projects(&self.store)?;
+        let mut represented_roots = BTreeSet::new();
+        let mut configurations = Vec::new();
+        for scope in scopes.drain(..) {
+            let root = repositories
+                .keys()
+                .filter(|root| Path::new(&scope.session_cwd).starts_with(root))
+                .max_by_key(|root| root.components().count())
+                .cloned();
+            represented_roots.extend(root.iter().cloned());
+            configurations.push((scope, root));
+        }
+        for root in repositories
+            .keys()
+            .filter(|root| !represented_roots.contains(*root))
+        {
+            configurations.push((
+                ActivationScope {
+                    environment: "native".into(),
+                    session_cwd: root.to_string_lossy().into_owned(),
+                    run: RunScope::Live,
+                },
+                Some(root.clone()),
+            ));
+        }
+        if configurations.is_empty() {
+            configurations.push((
+                ActivationScope {
+                    environment: "native".into(),
+                    session_cwd: String::new(),
+                    run: RunScope::Live,
+                },
+                None,
+            ));
+        }
+        ensure!(
+            configurations.len() <= MAX_DEFINITIONS,
+            "too many installed check projects"
+        );
+        let mut metadata = Vec::new();
+        for (scope, root) in configurations {
+            let scope_key = StoreCheckStore::activation_scope_key(&scope);
+            let generations = {
+                let connection = self.store.lock();
+                let mut statement = connection.prepare(
+                    "SELECT check_id, generation FROM burn_check_activation
+                     WHERE activation_scope_key = ?1 ORDER BY check_id LIMIT 129",
+                )?;
+                statement
+                    .query_map([&scope_key], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<BTreeMap<_, _>>>()?
+            };
+            ensure!(
+                generations.len() <= MAX_DEFINITIONS,
+                "too many installed check definitions"
+            );
+            let ids = generations
+                .keys()
+                .cloned()
+                .chain(
+                    self.definitions
+                        .iter()
+                        .filter(|definition| definition.activation_scope_key == scope_key)
+                        .map(|definition| definition.check_id.clone()),
+                )
+                .collect();
+            let config = DiscoveryConfig {
+                global_checks_directory: self.global_directory.clone(),
+                project_root: root.clone(),
+            };
+            let result =
+                discover_definitions(&config, &definition_files(&config, &directories, &ids));
+            diagnostics::collect(&mut errors, &result.diagnostics);
+            append_invalid_filenames(&mut metadata, &scope, &config, &result.diagnostics)?;
+            let admission = Admission::Paused(
+                if root.as_ref().is_some_and(|root| !repositories[root]) {
+                    "Repository is disabled."
+                } else {
+                    "Model-based checks are turned off in Settings → Checks."
+                }
+                .into(),
+            );
+            for definition in result.definitions {
+                let state = LifecycleState::Removed {
+                    generation: antiburn_checks::domain::Generation(
+                        generations.get(&definition.id).copied().unwrap_or_default(),
+                    ),
+                };
+                metadata.push(definition_metadata(
+                    &scope,
+                    &definition,
+                    &state,
+                    &admission,
+                )?);
+            }
+            ensure!(
+                metadata.len() <= MAX_DEFINITIONS,
+                "installed checks exceed the {MAX_DEFINITIONS}-definition report limit"
+            );
+        }
+        attach_directory_diagnostics(&mut metadata, &directories)?;
+        ensure!(
+            metadata.len() <= MAX_DEFINITIONS,
+            "installed checks exceed the {MAX_DEFINITIONS}-definition report limit"
+        );
+        persist_runtime_definitions(&self.store, &metadata)?;
+        self.definitions = metadata;
+        self.inventory_ready = true;
+        self.diagnostic_log.publish(errors);
         Ok(())
     }
 
@@ -1109,7 +1390,9 @@ fn live_projects(store: &Store) -> Result<Vec<ActivationScope>> {
            AND ((s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file')
               OR (s.agent = 'opencode' AND s.source_kind = 'providerDb'
                 AND s.source_label IN ('opencode:' || s.session_id,
-                  'opencode:' || s.session_id || ':open_code_v2_sqlite')))
+                  'opencode:' || s.session_id || ':open_code_v2_sqlite'))
+             OR (s.agent = 'cursor' AND s.source_kind = 'inline'
+               AND s.source_label GLOB 'cursor-desktop:*'))
            AND s.cwd IS NOT NULL AND s.cwd <> '' AND s.updated_at_epoch >= ?1
            AND NOT EXISTS(SELECT 1 FROM session_relation r
              WHERE r.environment_key = s.environment_key AND r.agent = s.agent
@@ -1157,7 +1440,9 @@ fn scope_has_work(store: &Store, scope: &ActivationScope) -> Result<bool> {
         &format!("SELECT EXISTS(SELECT 1 FROM session s
             LEFT JOIN session_evidence e USING(environment_key, agent, session_id)
            WHERE s.environment_key = ?1 AND s.cwd = ?2
-              AND s.agent IN ('claude-code', 'codex', 'pi', 'opencode')
+              AND s.agent IN ('claude-code', 'codex', 'pi', 'opencode', 'cursor')
+              AND (s.agent <> 'cursor' OR (s.source_kind = 'inline'
+                AND s.source_label GLOB 'cursor-desktop:*'))
               AND NOT EXISTS(SELECT 1 FROM session_relation r
                 WHERE r.environment_key = s.environment_key AND r.agent = s.agent
                   AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
@@ -1775,6 +2060,35 @@ pub(crate) fn lifecycle_changes_projects(event: &crate::session_lifecycle::Sessi
     }
 }
 
+fn refresh_watcher(
+    app: &tauri::AppHandle,
+    watcher: &mut Option<watch::DirectoryWatcher>,
+    directories: &[PathBuf],
+    previous_failure: &mut Option<diagnostics::RuntimeFailure>,
+) {
+    if watcher.is_none() {
+        let watch_app = app.clone();
+        match watch::DirectoryWatcher::new(move || wake(&watch_app)) {
+            Ok(created) => {
+                *watcher = Some(created);
+                *previous_failure = None;
+            }
+            Err(error) => {
+                diagnostics::RuntimeFailure::classify(
+                    diagnostics::RuntimeStage::DirectoryWatch,
+                    &error.into(),
+                )
+                .trace_if_changed(previous_failure, "installed_check_watch_failed");
+            }
+        }
+    }
+    if let Some(watcher) = watcher
+        && watcher.refresh(directories)
+    {
+        app.state::<InstalledChecks>().wake.notify_one();
+    }
+}
+
 async fn run(app: &tauri::AppHandle) -> Result<()> {
     let started = Instant::now();
     let state = app.state::<InstalledChecks>();
@@ -1870,21 +2184,52 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         }
         if !crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>()) {
             state.delivery_ready.store(false, Ordering::Release);
+            let requested = state.requested_turn.load(Ordering::Acquire);
             diagnostics::worker_result(
                 diagnostics::RuntimeStage::DisableSettlement,
                 host.pause_disabled(),
             )?;
-            if publish_metadata(&state, &host.definitions) {
-                crate::jev::settings::progress_changed(app);
-                let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
+            discover |= previous_admission.is_some()
+                || last_discovery.is_none_or(|last| last.elapsed() >= DISCOVERY_INTERVAL);
+            let update = if discover {
+                let (returned_host, result) = diagnostics::worker_result(
+                    diagnostics::RuntimeStage::Reconcile,
+                    tauri::async_runtime::spawn_blocking(move || {
+                        let result = host.refresh_paused_inventory();
+                        (host, result)
+                    })
+                    .await
+                    .map_err(Into::into),
+                )?;
+                host = returned_host;
+                result
+            } else {
+                Ok(())
+            };
+            if finish_app_inventory_update(
+                app,
+                &state,
+                &host,
+                update,
+                diagnostics::RuntimeStage::Reconcile,
+                &mut previous_update_failure,
+            ) {
+                if discover {
+                    last_discovery = Some(Instant::now());
+                }
+                previous_update_failure = None;
+            } else {
+                last_discovery = None;
             }
-            if let Some(watcher) = &mut watcher {
-                watcher.refresh(&[]);
-            }
+            refresh_watcher(
+                app,
+                &mut watcher,
+                &host.watch_directories,
+                &mut previous_watch_failure,
+            );
             catch_up_more = false;
-            last_discovery = None;
             previous_admission = None;
-            let requested = state.requested_turn.load(Ordering::Acquire);
+            previous_connection_generation = None;
             state.complete_disable(requested);
             continue;
         }
@@ -1929,10 +2274,17 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
             Ok(())
         };
         let reconciled = discover && reconciliation.is_ok();
-        let metadata_changed = publish_metadata(&state, &host.definitions);
-        if metadata_changed {
-            crate::jev::settings::progress_changed(app);
-            let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
+        if !finish_app_inventory_update(
+            app,
+            &state,
+            &host,
+            reconciliation,
+            diagnostics::RuntimeStage::Reconcile,
+            &mut previous_update_failure,
+        ) {
+            catch_up_more = false;
+            last_discovery = None;
+            continue;
         }
         if reconciled {
             state.delivery_ready.store(
@@ -1966,51 +2318,43 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
             last_discovery = Some(Instant::now());
             previous_admission = Some(current_admission);
             previous_connection_generation = connection_generation;
-            if watcher.is_none() {
-                let watch_app = app.clone();
-                match watch::DirectoryWatcher::new(move || wake(&watch_app)) {
-                    Ok(created) => {
-                        watcher = Some(created);
-                        previous_watch_failure = None;
-                    }
-                    Err(error) => {
-                        diagnostics::RuntimeFailure::classify(
-                            diagnostics::RuntimeStage::DirectoryWatch,
-                            &error.into(),
-                        )
-                        .trace_if_changed(
-                            &mut previous_watch_failure,
-                            "installed_check_watch_failed",
-                        );
-                    }
-                }
-            }
-            if let Some(watcher) = &mut watcher
-                && watcher.refresh(&host.watch_directories)
-            {
-                state.wake.notify_one();
-            }
+            refresh_watcher(
+                app,
+                &mut watcher,
+                &host.watch_directories,
+                &mut previous_watch_failure,
+            );
         }
-        let result = match reconciliation {
-            Ok(()) => {
-                let (returned_host, result) = diagnostics::worker_result(
+        let (returned_host, result) = diagnostics::worker_result(
+            diagnostics::RuntimeStage::SourceCatchUp,
+            tauri::async_runtime::spawn_blocking(move || {
+                let result = host.catch_up();
+                (host, result)
+            })
+            .await
+            .map_err(Into::into),
+        )?;
+        host = returned_host;
+        if !finish_app_inventory_update(
+            app,
+            &state,
+            &host,
+            Ok(()),
+            diagnostics::RuntimeStage::SourceCatchUp,
+            &mut previous_update_failure,
+        ) {
+            if let Err(error) = result {
+                diagnostics::RuntimeFailure::classify(
                     diagnostics::RuntimeStage::SourceCatchUp,
-                    tauri::async_runtime::spawn_blocking(move || {
-                        let result = host.catch_up();
-                        (host, result)
-                    })
-                    .await
-                    .map_err(Into::into),
-                )?;
-                host = returned_host;
-                if publish_metadata(&state, &host.definitions) {
-                    crate::jev::settings::progress_changed(app);
-                    let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
-                }
-                result.map_err(|error| (diagnostics::RuntimeStage::SourceCatchUp, error))
+                    &error,
+                )
+                .trace("installed_check_update_failed");
             }
-            Err(error) => Err((diagnostics::RuntimeStage::Reconcile, error)),
-        };
+            catch_up_more = false;
+            last_discovery = None;
+            continue;
+        }
+        let result = result.map_err(|error| (diagnostics::RuntimeStage::SourceCatchUp, error));
         match result {
             Ok((changed, more)) => {
                 previous_update_failure = None;

@@ -270,7 +270,7 @@ fn interrupted_fresh_initialization_keeps_its_default_and_explicit_choices() {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            85
+            86
         );
         assert_eq!(
             read_setting(&connection, FRESH_INITIALIZATION_KEY)
@@ -780,7 +780,7 @@ fn malformed_dispatched_reservations_roll_back_all_state_and_allow_a_safe_retry(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            85
+            86
         );
         for (table, before) in snapshots {
             assert!(table_exists(&connection, table), "{table}");
@@ -870,7 +870,7 @@ fn unreadable_ledger_preferences_or_snoozes_fail_without_partial_migration() {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            85
+            86
         );
         for table in RETIRED_TABLES {
             assert!(table_exists(&connection, table));
@@ -911,7 +911,7 @@ fn failure_before_ledger_write_before_drop_or_at_commit_rolls_back_and_retries_o
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            85,
+            86,
             "{fault}"
         );
         for (table, before) in snapshots {
@@ -1058,7 +1058,7 @@ fn live_yaml_state_is_preserved_and_legacy_unknown_work_cannot_resume() {
                 }
             }
             "burn_check_session_attachment" => {
-                // V88 leaves existing attachment observers uninitialized.
+                // V89 leaves existing attachment observers uninitialized.
                 for row in &mut before {
                     row.extend(std::iter::repeat_n(SqlValue::Null, 9));
                     row.push(SqlValue::Integer(0));

@@ -215,6 +215,16 @@ fn current_claude_cursor_restore_does_not_repeat_legacy_text_migration() {
 }
 
 #[test]
+fn main_revision_one_cursor_is_not_the_named_v4_predecessor() {
+    let (_directory, _input, mut cursor, _) = legacy_cursor(false);
+    cursor.revision = 1;
+
+    assert!(!cursor.valid());
+    assert!(NativeFileCursor::decode(&cursor.encode()).is_err());
+    assert!(NativeFileCursor::convert_v4_json(&serde_json::to_vec(&cursor).unwrap()).is_err());
+}
+
+#[test]
 fn parser_64_claude_state_and_v4_converter_share_the_historical_field_layout() {
     use std::collections::BTreeSet;
     let (_directory, _input, cursor, _) = legacy_cursor(false);

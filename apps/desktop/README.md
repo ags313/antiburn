@@ -35,9 +35,11 @@ server, or backend.
   when other connections remain. Saved results and usage remain available. The app
   manages supported model limits; unknown Custom limits block execution.
   Custom supports direct System One and Cloudflare-envelope responses, not arbitrary chat APIs. Credentials use native
-  credential storage or memory. Requests contain selected tool results and
-  available user-slot text, current instruction text, and declared skill
-  descriptions, not full transcripts. Skill inventory inputs contain declared
+  credential storage or memory. Model requests contain the definition's selected
+  public messages, tool calls/results, response-cycle or session facts, current
+  instruction text, and declared skill descriptions, not automatic full
+  transcripts. Local status checks send no model request but keep the selected
+  configuration, credential/authentication, and runtime gates. Skill inventory inputs contain declared
   metadata, not full bodies; selected tool results can still contain file text. Current-file inputs
   remain frozen for delayed decisions and retries. Partial fields, truncated
   text, and source gaps are identified for the model; missing images are not analyzed.
@@ -48,6 +50,11 @@ server, or backend.
   confirmed files and reloads when you revisit Checks settings. Model usage shows
   recorded values and omits absent estimates and unknown counts. The app retains
   the full local accounting records.
+  With **Run checks** off, the app still reads and parses bounded local YAML
+  definitions and watches their directories, including at cold startup. This
+  supplies names, diagnostics, paused cards, and file counts. It does not restore
+  provider configuration, discover model capabilities, catch up session sources,
+  or run assessments.
 - **Model prices:** The app downloads public prices from models.dev at startup
   and once an hour while it runs. The request contains no session data or
   credentials.
@@ -226,6 +233,13 @@ cycles are available only from characterized Codex intervals and continuous
 OpenCode V2 execution periods. Session events record an observation attachment or
 120 seconds without observed source activity, not agent creation or measured work
 time. New activity cancels unfinished idle work.
+
+Cursor Desktop has a separate ordered snapshot tool-result route. Only its
+characterized native inline main-session source with recorded header order,
+exact bubble/call identities, and current ready cached evidence qualifies. It
+does not supply separate public message/call, cycle, or session-observation
+events. Cursor CLI and generic stores do not inherit the route. See the
+[Cursor source contract](../../docs/session-coverage.md#cursor-desktop-yaml-tool-evidence).
 
 Safe identity and order can allow partial optional fields or retained history.
 Quality fields preserve those limits. A missing required expression value can

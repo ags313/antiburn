@@ -289,7 +289,8 @@ pub use vendors::{has_dedicated_reader, reader_for, reader_for_input};
 // Reparse corrected read extents, native skill links, and V2 user-text authority.
 // Reparse the combined public-event and parser safety contracts.
 // Reparse corrected native compaction, generated text, and lifecycle records.
-pub const PARSER_REVISION: i64 = 65;
+// Reparse Claude and Pi sessions after native delivery lineage changes.
+pub const PARSER_REVISION: i64 = 66;
 
 // +1 for turn row chart signals: `has_thinking`, `last_tool`, and
 // `subagent_launches` are now ingest-derived row columns

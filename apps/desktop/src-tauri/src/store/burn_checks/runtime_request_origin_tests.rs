@@ -193,6 +193,229 @@ fn immutable_input(fixture: &FileFixture, id: &CandidateId) -> String {
         .unwrap()
 }
 
+fn save_parser_65_receipt(fixture: &FileFixture) {
+    assert_eq!(
+        fixture
+            .store
+            .lock()
+            .execute(
+                "UPDATE native_file_delivery SET parser_revision = 65
+               WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
+                 AND json_extract(cursor_json, '$.revision') = 5",
+                params![
+                    fixture.key.environment_key,
+                    fixture.key.agent,
+                    fixture.key.session_id
+                ],
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn parser_65_receipt_keeps_saved_pending_work_current_before_the_first_parser_66_page() {
+    let mut fixture =
+        FileFixture::with_source(SourceFormat::ClaudeJsonl, CHECK, false, false, true);
+    let (call, result) = fixture.result_records(0, true);
+    fixture.append_bytes(format!("{call}{result}").as_bytes());
+    fixture.publish(NOW + 1);
+    fixture.sync();
+    let candidate = fixture.pending();
+    let id = CandidateId::from(&candidate);
+    let input = immutable_input(&fixture, &id);
+    let progress = fixture
+        .adapter
+        .load_source_progress(&fixture.active)
+        .unwrap();
+    let publications = fixture
+        .store
+        .native_evidence_publications_after(0, 100)
+        .unwrap();
+    save_parser_65_receipt(&fixture);
+    fixture.reopen();
+
+    let claimed = claim(&fixture.adapter, &candidate);
+    assert_eq!(claimed.candidate, candidate);
+    assert_eq!(immutable_input(&fixture, &id), input);
+    assert_eq!(
+        fixture
+            .adapter
+            .load_source_progress(&fixture.active)
+            .unwrap(),
+        progress
+    );
+    assert_eq!(
+        fixture
+            .store
+            .native_evidence_publications_after(0, 100)
+            .unwrap(),
+        publications
+    );
+    assert_eq!(
+        fixture
+            .store
+            .lock()
+            .query_row(
+                "SELECT parser_revision FROM native_file_delivery",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        65
+    );
+    assert_eq!(
+        fixture
+            .store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_evaluation_attempt",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        fixture
+            .adapter
+            .dispatch_review(&claimed, 1_100_000, Duration::ZERO, 1)
+            .unwrap(),
+        ClaimOutcome::Current
+    );
+}
+
+#[test]
+fn parser_65_receipt_accepts_a_saved_paid_answer_before_the_first_parser_66_page() {
+    let mut fixture =
+        FileFixture::with_source(SourceFormat::ClaudeJsonl, CHECK, false, false, true);
+    let (call, result) = fixture.result_records(0, true);
+    fixture.append_bytes(format!("{call}{result}").as_bytes());
+    fixture.publish(NOW + 1);
+    fixture.sync();
+    let assessment = answer(
+        &fixture.adapter,
+        &fixture.active,
+        claim(&fixture.adapter, &fixture.pending()),
+        0.99,
+    );
+    let id = hex(&assessment.claimed.id.0);
+    fixture
+        .store
+        .record_burn_check_decision_usage(
+            &id,
+            &review_attempt(1),
+            &fixture.active.id.definition_id,
+            ("custom-systemone", "synthetic-model"),
+            Some(antiburn_local::analysis::jev::JevUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+            }),
+            NOW + 1,
+        )
+        .unwrap();
+    save_parser_65_receipt(&fixture);
+    let input = immutable_input(&fixture, &assessment.claimed.id);
+    let usage = fixture.store.burn_check_usage_summary().unwrap();
+    assert_eq!(
+        (
+            usage.confirmed_calls,
+            usage.input_tokens,
+            usage.output_tokens
+        ),
+        (1, 7, 3)
+    );
+    let progress = fixture
+        .adapter
+        .load_source_progress(&fixture.active)
+        .unwrap();
+    let publications = fixture
+        .store
+        .native_evidence_publications_after(0, 100)
+        .unwrap();
+    let attempts = |store: &Store| {
+        store
+            .lock()
+            .query_row(
+                "SELECT json_group_array(json_array(attempt_id, state, outcome, response_json))
+           FROM burn_check_evaluation_attempt",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    let saved_attempts = attempts(&fixture.store);
+    let receipt: String = fixture.store.lock().query_row(
+        "SELECT json_array(parser_revision, cursor_json, observed_generation) FROM native_file_delivery",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    fixture.reopen();
+
+    let mut recovery = fixture.adapter.load_recovery(None, 10).unwrap();
+    assert_eq!(recovery.len(), 1);
+    let RecoveryWork::Answered { claimed, evaluated } = recovery.remove(0).work else {
+        panic!("the paid answer must recover without another dispatch");
+    };
+    assert_eq!(evaluated, assessment.evaluated);
+    let recovered = AssessmentAcceptance {
+        claimed,
+        evaluated,
+        actions: assessment.actions,
+    };
+    assert_eq!(
+        fixture.adapter.accept(&recovered).unwrap(),
+        AcceptanceOutcome::Accepted
+    );
+    assert_eq!(immutable_input(&fixture, &recovered.claimed.id), input);
+    assert_eq!(fixture.store.burn_check_usage_summary().unwrap(), usage);
+    assert_eq!(attempts(&fixture.store), saved_attempts);
+    assert_eq!(
+        fixture
+            .adapter
+            .load_source_progress(&fixture.active)
+            .unwrap(),
+        progress
+    );
+    assert_eq!(
+        fixture
+            .store
+            .native_evidence_publications_after(0, 100)
+            .unwrap(),
+        publications
+    );
+    assert_eq!(fixture.store.lock().query_row(
+        "SELECT json_array(parser_revision, cursor_json, observed_generation) FROM native_file_delivery",
+        [],
+        |row| row.get::<_, String>(0),
+    ).unwrap(), receipt);
+    let status: String = fixture
+        .store
+        .lock()
+        .query_row(
+            "SELECT json_array(status, assessment_id, position, evidence_valid, updated_at_epoch)
+           FROM burn_check_current_status",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    fixture.reopen();
+    assert_eq!(fixture.engine.recover_pending().unwrap().candidates, 0);
+    assert!(fixture.adapter.load_recovery(None, 10).unwrap().is_empty());
+    assert_eq!(
+        fixture.adapter.accept(&recovered).unwrap(),
+        AcceptanceOutcome::AlreadyAccepted
+    );
+    assert_eq!(fixture.store.burn_check_usage_summary().unwrap(), usage);
+    assert_eq!(attempts(&fixture.store), saved_attempts);
+    assert_eq!(fixture.store.lock().query_row(
+        "SELECT json_array(status, assessment_id, position, evidence_valid, updated_at_epoch)
+           FROM burn_check_current_status",
+        [],
+        |row| row.get::<_, String>(0),
+    ).unwrap(), status);
+}
+
 #[test]
 fn parser_65_boundary_blocks_legacy_claim_dispatch_and_final_acceptance() {
     let fixture = legacy_fixture();
@@ -395,6 +618,7 @@ fn parser_65_paid_result_accepts_a_late_answer_after_a_real_native_read_outage()
                 .unwrap(),
             ClaimOutcome::Current
         );
+        save_parser_65_receipt(&fixture);
         let input = immutable_input(&fixture, &claimed.id);
         let publications = fixture
             .store
@@ -825,6 +1049,11 @@ fn parser_65_boundary_survives_retention_and_restart_without_another_reset() {
     fixture.publish(NOW + 1);
     fixture.sync();
     let candidate = fixture.pending();
+    save_parser_65_receipt(&fixture);
+    let progress = fixture
+        .adapter
+        .load_source_progress(&fixture.active)
+        .unwrap();
     let marker: i64 = fixture
         .store
         .lock()
@@ -901,7 +1130,35 @@ fn parser_65_boundary_survives_retention_and_restart_without_another_reset() {
         .unwrap()
     );
     fixture.reopen();
-    fixture.publish(NOW + 201);
+    assert!(
+        request_origin::new_candidate_request_origin_current_in(
+            &fixture.store.lock(),
+            &hex(&candidate.fingerprint),
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        fixture
+            .adapter
+            .load_source_progress(&fixture.active)
+            .unwrap(),
+        progress
+    );
+    assert_eq!(
+        fixture
+            .store
+            .lock()
+            .query_row(
+                "SELECT parser_revision FROM native_file_delivery",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        65
+    );
+    let page = fixture.publish(NOW + 201);
+    assert_eq!(page.bytes_read, 0);
+    assert!(page.evidence.events.is_empty() && page.results.is_empty());
     fixture.sync();
     assert_eq!(
         fixture

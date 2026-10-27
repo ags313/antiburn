@@ -60,6 +60,28 @@ discovered definition. Settings stays available without one. A discovered check
 without a configured provider shows a setup error in its detail pane; the app
 does not create a placeholder check.
 
+Turning **Run checks** off stops execution, not local definition discovery. The
+app can still read and parse bounded YAML files and watch their directories,
+including at cold startup, to show names, invalid-file diagnostics, paused cards,
+and file counts. This does not restore provider configuration, discover model
+capabilities, catch up session sources, or run local/model assessments.
+
+## Upgrade from fixed model-based checks
+
+Authored YAML checks replace the fixed Ignored instructions, Over-exploring,
+Scope creep, and Skill opportunities detectors. The nine deterministic built-in
+checks remain separate. Install a YAML definition to run its replacement;
+the app does not install the repository examples into your other projects.
+
+The database upgrade removes the retired detectors' assessment history, response
+cache, and old snoozes. It does not convert their findings into YAML results.
+It preserves incurred usage totals and saved connection settings. New YAML
+checks start Not assessed until they write their own result.
+
+This migration is different from deleting a YAML definition. Removing a YAML
+file stops its effective check but retains its accepted assessment history and
+incurred usage.
+
 ## What works today
 
 The runtime supports local status checks and model checks with independent named
@@ -81,6 +103,12 @@ identity, order, and native-main-session limits still apply. Remote, WSL, child,
 and historical-only sources do not start new live checks. See
 [event selection](authoring.md#event-selection) and
 [live attachment](authoring.md#identity-and-installation).
+
+Cursor Desktop has a separate ordered snapshot route for terminal tool results
+and their user-slot context. It does not supply the other public or session
+events. Only the characterized native inline main-session source qualifies;
+Cursor CLI and generic stores do not. See the
+[Cursor snapshot limits](../session-coverage.md#cursor-desktop-yaml-tool-evidence).
 
 Inputs can use frozen context, pure functions, dynamic brackets, nested
 projections, text templates, and bounded maps. Optional `fit` rules permit loss

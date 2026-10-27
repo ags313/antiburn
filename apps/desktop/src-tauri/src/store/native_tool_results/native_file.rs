@@ -44,7 +44,7 @@ const CANDIDATES: &str = "WITH candidates AS (
       FROM session s LEFT JOIN native_file_delivery d USING(environment_key, agent, session_id)
      WHERE s.environment_key = 'native' AND s.wsl_distro IS NULL
         AND s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'
-        AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62, 63, 64))
+        AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62, 63, 64, 65))
         AND s.cwd IS NOT NULL AND s.cwd <> ''
         AND EXISTS(SELECT 1 FROM burn_check_activation a
           WHERE a.enabled = 1 AND json_extract(a.activation_scope_key, '$.environment') = s.environment_key
@@ -83,9 +83,10 @@ impl NativeFileClaim {
         );
         let value: serde_json::Value = serde_json::from_str(encoded)?;
         let cursor = match (self.parser_revision, value["revision"].as_u64()) {
+            (Some(64), Some(1)) => NativeFileCursor::convert_main_64_json(encoded.as_bytes())?,
             (Some(62), Some(4)) => NativeFileCursor::convert_v4_json(encoded.as_bytes())?,
             (Some(revision), Some(5))
-                if revision == PARSER_REVISION || matches!(revision, 63 | 64) =>
+                if revision == PARSER_REVISION || matches!(revision, 63..=65) =>
             {
                 let cursor: NativeFileCursor = serde_json::from_value(value)?;
                 if revision < 65
@@ -242,8 +243,8 @@ impl Store {
             generation,
             claim.fence,
         )?;
-        let origin_upgrade =
-            claude && (origin_boundary || claim.parser_revision != Some(PARSER_REVISION));
+        let origin_upgrade = claude
+            && (origin_boundary || !matches!(claim.parser_revision, Some(65 | PARSER_REVISION)));
         let mut unsafe_reason = if claim.reset {
             None
         } else {
@@ -334,14 +335,10 @@ impl Store {
         )?;
         if !consumed {
             // Retain the old read position. Saved outputs make the next reconciliation advance.
-            let retry_cursor = if origin_upgrade {
-                claim
-                    .cursor()?
-                    .map(|cursor| serde_json::to_string(&cursor))
-                    .transpose()?
-            } else {
-                claim.cursor_json.clone()
-            };
+            let retry_cursor = claim
+                .cursor()?
+                .map(|cursor| cursor.retry_json_after_page(&page.cursor))
+                .transpose()?;
             tx.execute("UPDATE native_file_delivery SET pending = 1, claim_fence = NULL, lease_expires_at_epoch = NULL,
                 next_attempt_at_epoch = ?4, cursor_json = ?5, parser_revision = ?6
                 WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3 AND claim_fence = ?7",
@@ -454,7 +451,7 @@ fn current_generation(
            AND d.claim_fence = ?4 AND d.cursor_json IS ?5 AND d.lease_expires_at_epoch > ?6
            AND d.incarnation = ?7 AND s.incarnation = ?7 AND d.source_label = ?8
            AND s.source_label = ?8 AND s.source_kind = 'file' AND s.wsl_distro IS NULL
-            AND d.cwd = ?9 AND s.cwd = ?9 AND d.parser_revision IN (?10, 62, 63, 64)
+            AND d.cwd = ?9 AND s.cwd = ?9 AND d.parser_revision IN (?10, 62, 63, 64, 65)
            AND NOT EXISTS(SELECT 1 FROM session_relation r
              WHERE r.environment_key = s.environment_key AND r.agent = s.agent
                AND ((r.session_id = s.session_id AND r.kind = 'forkParent')

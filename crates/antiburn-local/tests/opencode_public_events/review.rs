@@ -60,11 +60,16 @@ fn parser_64_live_cursor_keeps_progress_public_baseline_and_frozen_context() {
     compatible_live_cursor_keeps_progress_public_baseline_and_frozen_context(64);
 }
 
+#[test]
+fn parser_65_saved_live_cursor_keeps_progress_public_baseline_and_frozen_context() {
+    compatible_live_cursor_keeps_progress_public_baseline_and_frozen_context(65);
+}
+
 fn compatible_live_cursor_keeps_progress_public_baseline_and_frozen_context(parser_revision: i64) {
     use antiburn_local::analysis::{
         PARSER_REVISION, ToolResultStatus, opencode_journal_has_new_events,
     };
-    let (_directory, path, connection) = journal();
+    let (directory, path, connection) = journal();
     v1_messages_with_tool_status(&connection, true);
     let initial = read(&path, "root", None, None, &|| false).unwrap();
     assert_eq!(initial.results.len(), 1);
@@ -86,7 +91,15 @@ fn compatible_live_cursor_keeps_progress_public_baseline_and_frozen_context(pars
     );
     let mut old = serde_json::to_value(&initial.cursor).unwrap();
     old["parser_revision"] = json!(parser_revision);
-    let cursor: OpenCodeJournalCursor = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(old["live"]["revision"], 5);
+    assert!(old["live"]["requests"]["messages"]["user"].is_array());
+    assert!(old["live"]["parts"]["tool"].is_object());
+    assert!(!old["live"]["contexts"].as_array().unwrap().is_empty());
+    let saved_path = directory.path().join("saved-live-cursor.json");
+    std::fs::write(&saved_path, serde_json::to_vec(&old).unwrap()).unwrap();
+    let cursor: OpenCodeJournalCursor =
+        serde_json::from_slice(&std::fs::read(&saved_path).unwrap()).unwrap();
+    assert_eq!(serde_json::to_value(&cursor).unwrap(), old);
     assert!(opencode_journal_has_new_events(&path, "root", &cursor).unwrap());
     let upgraded = read(&path, "root", Some(&cursor), None, &|| false).unwrap();
     assert!(upgraded.results.is_empty());
@@ -176,8 +189,8 @@ fn compatible_parser_revisions_require_the_current_journal_layout() {
     let (_directory, path, connection) = journal();
     v1_messages(&connection);
     let initial = read(&path, "root", None, None, &|| false).unwrap();
-    for parser_revision in [63, 64, PARSER_REVISION] {
-        for live_revision in [4, 6] {
+    for parser_revision in [63, 64, 65, PARSER_REVISION] {
+        for live_revision in [2, 4, 6] {
             let mut incompatible = serde_json::to_value(&initial.cursor).unwrap();
             incompatible["parser_revision"] = json!(parser_revision);
             incompatible["live"]["revision"] = json!(live_revision);
@@ -207,6 +220,11 @@ fn parser_63_strict_cursor_continues_after_its_existing_frontier() {
 #[test]
 fn parser_64_strict_cursor_continues_after_its_existing_frontier() {
     compatible_strict_cursor_continues_after_its_existing_frontier(64);
+}
+
+#[test]
+fn parser_65_strict_cursor_continues_after_its_existing_frontier() {
+    compatible_strict_cursor_continues_after_its_existing_frontier(65);
 }
 
 fn compatible_strict_cursor_continues_after_its_existing_frontier(parser_revision: i64) {

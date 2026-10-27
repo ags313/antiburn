@@ -75,6 +75,7 @@ impl DecisionTransport {
         &self,
         request: &JevRequest,
         capabilities: &ModelCapabilities,
+        is_cancelled: &(impl Fn() -> bool + Sync),
         record_usage: impl Fn(JevResponseObservation) -> Result<(), JevError>,
     ) -> Result<JevResponse, JevError> {
         match self {
@@ -90,7 +91,7 @@ impl DecisionTransport {
             }
             Self::Ollama(client) => {
                 client
-                    .evaluate_with_usage(request, capabilities, |usage| {
+                    .evaluate_with_usage_cancellable(request, capabilities, is_cancelled, |usage| {
                         record_usage(JevResponseObservation {
                             usage,
                             served_model: None,
@@ -469,14 +470,17 @@ pub(super) async fn dispatch_decision_attempt(
     }
 
     let usage_received = AtomicBool::new(false);
-    let call = request_with_deadline(transport.evaluate(request, capabilities, |usage| {
-        usage_received.store(true, Ordering::Relaxed);
-        provider_pacing(provider)
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .settle(&reservation_id, usage.usage.input_tokens);
-        record_usage(Some(usage))
-    }));
+    let call =
+        request_with_deadline(
+            transport.evaluate(request, capabilities, &is_cancelled, |usage| {
+                usage_received.store(true, Ordering::Relaxed);
+                provider_pacing(provider)
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .settle(&reservation_id, usage.usage.input_tokens);
+                record_usage(Some(usage))
+            }),
+        );
     let result = wait_for_decision_response(call, &is_cancelled).await;
     if let Err(error) = &result {
         {
@@ -486,7 +490,9 @@ pub(super) async fn dispatch_decision_attempt(
             apply_provider_cooldown(&mut pacing, error, tokio::time::Instant::now());
             if matches!(
                 error,
-                JevError::RateLimited { .. } | JevError::ProviderOverloaded { .. }
+                JevError::Cancelled
+                    | JevError::RateLimited { .. }
+                    | JevError::ProviderOverloaded { .. }
             ) {
                 pacing.settle(&reservation_id, 0);
             }

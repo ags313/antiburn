@@ -70,6 +70,10 @@ set. YAML checks do not provide Auto Fix, verification watches, or savings
 estimates. Read the [specification](docs/burn-check/specification.md) and its
 implementation limits before writing a check.
 
+YAML checks replace four fixed model-based detectors. Their old findings do not
+become YAML results. See [upgrade notes](docs/burn-check/README.md#upgrade-from-fixed-model-based-checks)
+for the history and settings changes.
+
 To help your coding agent author checks, install the
 [Burn Check authoring skill](.agents/skills/antiburn-checks/SKILL.md) with
 the [Skills CLI](https://skills.sh/docs):

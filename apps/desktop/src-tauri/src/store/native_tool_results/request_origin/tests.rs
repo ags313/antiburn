@@ -66,6 +66,50 @@ fn marker(store: &crate::store::Store, key: &SessionKey) -> i64 {
 }
 
 #[test]
+fn origin_proof_accepts_only_parser_65_or_current_with_cursor_5() {
+    use antiburn_local::analysis::PARSER_REVISION;
+
+    let (_directory, store, key) = fixture();
+    marker(&store, &key);
+    let ready = source_ready_sql("s");
+    for (parser, cursor, accepted) in [
+        (62, 4, false),
+        (63, 5, false),
+        (64, 1, false),
+        (64, 5, false),
+        (65, 1, false),
+        (65, 4, false),
+        (65, 5, true),
+        (PARSER_REVISION, 1, false),
+        (PARSER_REVISION, 4, false),
+        (PARSER_REVISION, 5, true),
+        (PARSER_REVISION + 1, 5, false),
+    ] {
+        let connection = store.lock();
+        connection
+            .execute(
+                "UPDATE native_file_delivery SET parser_revision = ?1,
+                cursor_json = json_set(cursor_json, '$.revision', ?2)",
+                params![parser, cursor],
+            )
+            .unwrap();
+        assert_eq!(
+            new_candidate_request_origin_current_in(&connection, "candidate").unwrap(),
+            accepted,
+            "parser {parser}, cursor {cursor}"
+        );
+        assert_eq!(
+            connection
+                .query_row(&format!("SELECT {ready} FROM session s"), [], |row| row
+                    .get::<_, bool>(0))
+                .unwrap(),
+            accepted,
+            "parser {parser}, cursor {cursor}"
+        );
+    }
+}
+
+#[test]
 fn parser_65_boundary_requires_safe_receipt_consumed_reset_and_new_candidate_head() {
     let (_directory, store, key) = fixture();
     assert!(!new_candidate_request_origin_current_in(&store.lock(), "candidate").unwrap());

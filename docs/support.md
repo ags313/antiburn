@@ -115,6 +115,24 @@ Connection diagnostics contain closed error codes and safe action text. They do
 not include credentials, raw event bodies, or database paths. Connection outcomes
 stay local; shared OpenCode surface events do not measure V2 connection success.
 
+### YAML source limits
+
+The five native live routes supply only the public events their source contracts
+can prove. Claude's characterized CLI 2.1.278/2.1.309 lineage does not supply
+public assistant completion or response cycles. Pi's inert Antiburn advisory can
+preserve native continuity but does not become a user request or native activity.
+
+Cursor Desktop has a separate ordered snapshot tool-result route for its
+characterized native inline main-session source. Recorded header order, exact
+bubble/call identities, and current ready cached evidence are required. Cursor
+CLI and generic stores do not inherit it. It does not supply separate public
+message/call, cycle, or host-session events. See
+[source coverage](session-coverage.md#cursor-desktop-yaml-tool-evidence).
+
+YAML status checks do not grant the native remediation features below. Burn
+Checks use the experimental `v1-alpha` draft, without backward compatibility.
+Missing features are unassigned future work; beta and stable scope are not set.
+
 ## Burn Check remediation
 
 The main Burn checks workspace shows supported findings only for the agents and
@@ -298,6 +316,13 @@ The app manages supported limits without manual overrides. See
 [decision connections](burn-check/authoring.md#decision-connections) for the
 provider-specific fields and limits. The selected Settings connection owns
 routing; decision-level YAML `model` is rejected as an unknown field.
+Local status checks send no model request but keep master enablement, selected
+configuration, credential/authentication, source, and runtime gates. With **Run
+checks** off, the app still reads and parses bounded local YAML definitions and
+watches their directories, including at cold startup. This supplies names,
+diagnostics, paused cards, and file counts. It does not restore provider
+configuration, discover model capabilities, catch up session sources, or run
+assessments.
 Partial history and fields are identified; missing images are not analyzed.
 Provider usage charges can apply. See
 [Burn Checks](burn-check/README.md) and the [privacy policy](privacy-policy.md).

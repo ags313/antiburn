@@ -395,27 +395,44 @@ fn opencode_jsonl_does_not_gain_sqlite_document_proof() {
 
 #[test]
 fn matched_native_failure_keeps_error_status_and_exact_result_range() {
-    let mut records = parsed_records(CLAUDE);
-    records[0]["version"] = json!("2.1.278");
-    records[1]["version"] = json!("2.1.278");
-    records[1]["toolUseResult"]["success"] = json!(false);
-    records[1]["message"]["content"][0]["is_error"] = json!(true);
-    records[1]["message"]["content"][0]["content"] = json!("Skill permission denied.");
-    let (_, content) = jsonl_content("claude", SourceFormat::ClaudeJsonl, &jsonl(&records));
-    let facts = skill_facts(&content);
-    assert_eq!(facts[1].status, JevRecordedSkillStatus::Failed);
-    assert_eq!(facts[1].state, JevOperationState::Error);
-    let action = &content.actions[1];
-    assert_eq!(facts[1].ranges[0].pointer, "/message/content/0/content");
-    assert_eq!(facts[1].ranges[0].end, action.text.len());
-    for change in 0..3 {
-        let mut changed = action.clone();
-        match change {
-            0 => changed.metadata.bindings.clear(),
-            1 => changed.reference.native_record_id = Some("other-record".into()),
-            _ => changed.tool_call_id = Some("other-call".into()),
+    for (version, entrypoint) in [
+        ("2.1.278", None),
+        ("2.1.278", Some("cli")),
+        ("2.1.309", Some("cli")),
+    ] {
+        let mut records = parsed_records(CLAUDE);
+        for record in &mut records {
+            record["version"] = json!(version);
+            if let Some(entrypoint) = entrypoint {
+                record["entrypoint"] = json!(entrypoint);
+            } else {
+                record.as_object_mut().unwrap().remove("entrypoint");
+            }
         }
-        assert!(!facts[1].matches_action(&changed, content.source_format));
+        records[1]["toolUseResult"]["success"] = json!(false);
+        records[1]["message"]["content"][0]["is_error"] = json!(true);
+        records[1]["message"]["content"][0]["content"] = json!("Skill permission denied.");
+        let (_, content) = jsonl_content("claude", SourceFormat::ClaudeJsonl, &jsonl(&records));
+        let facts = skill_facts(&content);
+        assert_eq!(
+            facts[1].status,
+            JevRecordedSkillStatus::Failed,
+            "version {version}, entrypoint {entrypoint:?}"
+        );
+        assert_eq!(facts[1].state, JevOperationState::Error);
+        let action = &content.actions[1];
+        assert_eq!(facts[1].ranges[0].pointer, "/message/content/0/content");
+        assert_eq!(facts[1].ranges[0].end, action.text.len());
+        for change in 0..4 {
+            let mut changed = action.clone();
+            match change {
+                0 => changed.metadata.bindings.clear(),
+                1 => changed.reference.native_record_id = Some("other-record".into()),
+                2 => changed.tool_call_id = Some("other-call".into()),
+                _ => changed.metadata.bindings[0].end -= 1,
+            }
+            assert!(!facts[1].matches_action(&changed, content.source_format));
+        }
     }
 }
 

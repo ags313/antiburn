@@ -239,6 +239,10 @@ impl UserMessage {
                 SourceFormat::PiV3Jsonl,
                 UserMessagePosition::Jsonl { .. },
                 UserMessageOrigin::PiUserContent
+            ) | (
+                SourceFormat::CursorIdeComposer,
+                UserMessagePosition::Jsonl { .. },
+                UserMessageOrigin::CursorDesktopUserContent
             )
         );
         let byte_contract_matches = matches!(self.position,
@@ -337,6 +341,8 @@ pub enum UserMessageOrigin {
     OpenCodeUserText,
     /// Pi's user-role message content, including extension and API messages.
     PiUserContent,
+    /// Cursor Desktop user text from the ordered native bubble list.
+    CursorDesktopUserContent,
 }
 
 /// Native proof that the request belongs to the main session.

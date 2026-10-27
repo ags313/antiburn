@@ -366,7 +366,39 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::SourceFormat;
+    use crate::analysis::interface::{RawSource, SessionCollector, SessionInput};
     use serde_json::json;
+
+    #[derive(Default)]
+    struct NativeSink {
+        users: Vec<UserMessage>,
+        results: Vec<ToolResultObservation>,
+        activity: Vec<crate::analysis::NativeActivityObservation>,
+        gaps: usize,
+    }
+
+    impl RecordSink for NativeSink {
+        fn record(&mut self, record: NormalizedRecord) {
+            if let NormalizedRecord::ToolResult(result) = record {
+                self.results.push(*result);
+            }
+        }
+
+        fn user_message(&mut self, message: UserMessage) {
+            self.users.push(message);
+        }
+
+        fn native_activity(&mut self, activity: crate::analysis::NativeActivityObservation) {
+            self.activity.push(activity);
+        }
+
+        fn tool_result_gap(&mut self) {
+            self.gaps += 1;
+        }
+
+        fn finish(&mut self, _: SessionSummary) {}
+    }
 
     #[test]
     fn exact_record_identity_cache_stops_at_both_retention_limits() {
@@ -401,5 +433,85 @@ mod tests {
                 + postcard::to_allocvec(&MAX_RECORD_IDS).unwrap().len();
             assert!(postcard::to_allocvec(&state.record_ids).unwrap().len() <= bound);
         }
+    }
+    #[test]
+    fn inert_antiburn_custom_message_preserves_native_continuation_root() {
+        let input = SessionInput {
+            agent: "pi".to_owned(),
+            session_id: "synthetic-pi-session".to_owned(),
+            source: RawSource::Jsonl(String::new()),
+            fork_parent_session_id: None,
+            source_format: SourceFormat::PiV3Jsonl,
+        };
+        let header = json!({
+            "type": "session",
+            "version": 3,
+            "id": "synthetic-pi-session",
+            "timestamp": "2026-01-01T00:00:00Z"
+        });
+        let mut state = State::new(&input, &header, false);
+        let rows = [
+            json!({"type":"session","version":3,"id":"synthetic-pi-session","timestamp":"2026-01-01T00:00:00Z"}),
+            json!({"type":"model_change","id":"model","parentId":null,"timestamp":"2026-01-01T00:00:01Z","provider":"synthetic","modelId":"model"}),
+            json!({"type":"message","id":"user","parentId":"model","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":"Run the fixture check."}}),
+            json!({"type":"message","id":"call","parentId":"user","timestamp":"2026-01-01T00:00:03Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-id","name":"bash","arguments":{"command":"false"}}]}}),
+            json!({"type":"message","id":"result","parentId":"call","timestamp":"2026-01-01T00:00:04Z","message":{"role":"toolResult","toolCallId":"call-id","toolName":"bash","isError":true,"content":[{"type":"text","text":"synthetic command failed"}]}}),
+            json!({"type":"thinking_level_change","id":"thinking","parentId":"result","timestamp":"2026-01-01T00:00:05Z","thinkingLevel":"low"}),
+            json!({"type":"message","id":"system","parentId":"thinking","timestamp":"2026-01-01T00:00:06Z","message":{"role":"system","content":""},"sections":[]}),
+            json!({"type":"message","id":"next-user","parentId":"system","timestamp":"2026-01-01T00:00:07Z","message":{"role":"user","content":"Report the result."}}),
+            json!({"type":"custom_message","id":"antiburn","parentId":"next-user","timestamp":"2026-01-01T00:00:08Z","customType":"antiburn-session-checks","display":false,"content":"Synthetic advisory."}),
+            json!({"type":"message","id":"assistant","parentId":"antiburn","timestamp":"2026-01-01T00:00:09Z","message":{"role":"assistant","content":[{"type":"text","text":"I received the advisory."},{"type":"toolCall","id":"next-call-id","name":"bash","arguments":{"command":"true"}}]}}),
+            json!({"type":"message","id":"next-result","parentId":"assistant","timestamp":"2026-01-01T00:00:10Z","message":{"role":"toolResult","toolCallId":"next-call-id","toolName":"bash","isError":false,"content":[{"type":"text","text":"synthetic command succeeded"}]}}),
+        ];
+        let mut sink = NativeSink::default();
+        for (index, row) in rows.iter().cloned().enumerate() {
+            state.observe(row, index as u64, &mut sink);
+        }
+
+        assert!(state.main_session());
+        assert_eq!(
+            sink.users
+                .iter()
+                .map(|message| message.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["user", "next-user"]
+        );
+        assert!(sink.activity.iter().all(|activity| !matches!(
+            activity.position,
+            ToolResultPosition::Jsonl {
+                record_index: 8,
+                ..
+            }
+        )));
+        assert_eq!(sink.results.len(), 2);
+        assert_eq!(sink.results[1].call_id.as_deref(), Some("next-call-id"));
+        assert_eq!(sink.results[1].status, ToolResultStatus::Success);
+        assert!(sink.gaps > 0);
+
+        let mut signal_state = State::new(&input, &header, false);
+        let mut signal_sink = SessionCollector::new("pi", "synthetic-pi-session");
+        for (index, mut row) in rows.iter().cloned().enumerate() {
+            if index == 8 {
+                row.as_object_mut()
+                    .expect("synthetic row is an object")
+                    .insert("usage".to_owned(), json!({"input": 1}));
+            }
+            signal_state.observe(row, index as u64, &mut signal_sink);
+        }
+
+        assert!(!signal_state.main_session());
+
+        let mut partial_state = State::new(&input, &header, false);
+        let mut partial_sink = SessionCollector::new("pi", "synthetic-pi-session");
+        for (index, mut row) in rows.iter().cloned().enumerate() {
+            if index == 8 {
+                row.as_object_mut()
+                    .expect("synthetic row is an object")
+                    .insert("incomplete".to_owned(), json!(true));
+            }
+            partial_state.observe(row, index as u64, &mut partial_sink);
+        }
+
+        assert!(!partial_state.main_session());
     }
 }

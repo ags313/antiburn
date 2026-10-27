@@ -18,6 +18,7 @@ use crate::analysis::{
     ToolResultPosition, ToolResultStatus,
 };
 
+mod main_64;
 mod public;
 use public::PublicState;
 
@@ -36,9 +37,42 @@ pub struct OpenCodeJournalCursor {
     parser_revision: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     live: Option<LiveState>,
+    #[serde(skip)]
+    main_64: bool,
 }
 
 impl OpenCodeJournalCursor {
+    /// Decode only main parser 64's result-only live journal state 2.
+    pub fn decode_main_64_json(bytes: &[u8]) -> anyhow::Result<Self> {
+        main_64::decode(bytes)
+    }
+
+    /// Keep the read sequence and the validated conversion frontier on retry.
+    pub fn main_64_retry_json(&self, page: &Self) -> anyhow::Result<Option<String>> {
+        if !self.main_64 {
+            return Ok(None);
+        }
+        ensure!(
+            self.session_id == page.session_id
+                && self.owner_id == page.owner_id
+                && self.through_sequence <= page.through_sequence,
+            OpenCodeJournalReadError::SourceChanged
+        );
+        let frontier = page
+            .public_baseline()
+            .ok_or(OpenCodeJournalReadError::SourceChanged)?;
+        let mut cursor = self.clone();
+        cursor.live = Some(convert_live_v4(
+            cursor
+                .live
+                .take()
+                .ok_or(OpenCodeJournalReadError::SourceChanged)?,
+            frontier,
+        ));
+        cursor.parser_revision = PARSER_REVISION;
+        cursor.main_64 = false;
+        Ok(Some(serde_json::to_string(&cursor)?))
+    }
     /// The live window boundary replaces a legacy replay baseline on attachment.
     pub fn live_baseline(&self) -> Option<u64> {
         self.live.as_ref().map(|state| state.baseline)
@@ -628,6 +662,7 @@ pub(super) fn read(
             prefix_hash: accepted_hash,
             parser_revision: PARSER_REVISION,
             live: None,
+            main_64: false,
         },
         has_more: through < latest,
         snapshot_end: latest,
@@ -767,7 +802,67 @@ fn live_boundary(
 }
 
 fn compatible_parser_revision(revision: i64) -> bool {
-    revision == PARSER_REVISION || matches!(revision, 63 | 64)
+    revision == PARSER_REVISION || matches!(revision, 63..=65)
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn known_parser_numbers_do_not_admit_main_journal_state_two() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE event (id TEXT, type TEXT, aggregate_id TEXT, seq INTEGER, data TEXT);
+                 CREATE UNIQUE INDEX event_aggregate_seq_idx ON event(aggregate_id, seq);
+                 INSERT INTO event VALUES ('initial', 'session.created.1', 'root', 0, '{}');",
+            )
+            .unwrap();
+        let boundary = live_boundary(&connection, "root", 0).unwrap();
+        let current = LiveState {
+            revision: LIVE_STATE_REVISION,
+            baseline: 0,
+            origin: boundary,
+            boundary,
+            requests: Default::default(),
+            parts: Default::default(),
+            contexts: Default::default(),
+            next_context: 0,
+            history_safe: true,
+            evidence_gap: false,
+            public: Default::default(),
+            public_baseline: Some(0),
+        };
+        let metadata = JournalMetadata {
+            latest: 0,
+            owner: None,
+            root: true,
+            all_events_visible: true,
+        };
+        for parser_revision in [63, 64, 65, PARSER_REVISION] {
+            let cursor = OpenCodeJournalCursor {
+                session_id: "root".into(),
+                owner_id: None,
+                through_sequence: 0,
+                prefix_hash: [0; 32],
+                parser_revision,
+                live: Some(current.clone()),
+                main_64: false,
+            };
+            validate_live(&connection, "root", &cursor, &current, &metadata).unwrap();
+            for revision in [2, 4, 6] {
+                let mut incompatible = current.clone();
+                incompatible.revision = revision;
+                let error = validate_live(&connection, "root", &cursor, &incompatible, &metadata)
+                    .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<OpenCodeJournalReadError>(),
+                    Some(&OpenCodeJournalReadError::SourceChanged)
+                );
+            }
+        }
+    }
 }
 
 fn validate_live(
@@ -785,7 +880,13 @@ fn validate_live(
                 && live
                     .public_baseline
                     .is_some_and(|baseline| baseline <= metadata.latest))
-                || (cursor.parser_revision == 62 && live.revision == 4))
+                || (cursor.parser_revision == 62 && live.revision == 4)
+                || (cursor.main_64
+                    && metadata.root
+                    && cursor.parser_revision == 64
+                    && live.revision == 2
+                    && live.public_baseline.is_none()
+                    && live.public == PublicState::default()))
             && cursor.through_sequence <= metadata.latest
             && live.origin == live_boundary(connection, session, 0)?
             && live.boundary == live_boundary(connection, session, cursor.through_sequence)?,
@@ -874,7 +975,9 @@ fn read_live(
     let cold = restored.is_none();
     let selected = cold.then(|| select_live_window(&events));
     let mut live = match restored {
-        Some((_, state)) if state.revision == 4 => convert_live_v4(state.clone(), metadata.latest),
+        Some((cursor, state)) if state.revision == 4 || cursor.main_64 => {
+            convert_live_v4(state.clone(), metadata.latest)
+        }
         Some((_, state)) => state.clone(),
         None => LiveState {
             revision: LIVE_STATE_REVISION,
@@ -1028,6 +1131,7 @@ fn read_live(
         prefix_hash: [0; 32],
         parser_revision: PARSER_REVISION,
         live: Some(live),
+        main_64: false,
     };
     ensure!(
         serde_json::to_vec(&cursor)?.len() <= 1024 * 1024,

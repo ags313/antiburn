@@ -18,7 +18,7 @@ If you enable **Run checks** under **Settings → Checks → Model-based checks*
 definitions can review new local session activity. The provider controls under
 **Model-based checks** select Jev through TypeSafe, compatible Ollama, Cloudflare, or a Custom System
 One endpoint. Custom supports direct System One and Cloudflare-envelope
-responses. Requests go to your selected connection and contain the definition's
+responses. Model requests go to your selected connection and contain the definition's
 selected public messages, tool arguments and results, response-cycle or session
 facts, current instruction text, and declared skill descriptions. Source evidence
 limits which event types are available. The app sends authored selections, not
@@ -26,8 +26,9 @@ an automatic full-transcript upload.
 Skill inventory inputs contain declared metadata, not full skill bodies. Selected
 tool results can still contain file text, including skill bodies. These fields
 can contain private work content, source code, paths, or credentials.
-Private thinking is excluded. User-slot text can include API, extension, or
-synthetic input; it does not prove human approval. Partial history, truncated
+Private thinking is excluded. User-slot text can include API or extension input;
+it does not prove human approval. Explicitly synthetic OpenCode text and Pi's
+inert Antiburn advisory do not become user requests. Partial history, truncated
 text, and missing fields are identified as quality limits. Missing images are
 not analyzed. See the [supported subset](burn-check/authoring.md#supported-subset)
 and [session coverage](session-coverage.md#burn-check-source-facts).
@@ -37,10 +38,13 @@ charges can apply. An Ollama or Custom connection can use a local or remote
 endpoint; its address determines where the request goes. Provider requests and
 authentication credentials are separate from first-party analytics. Credentials
 use native credential storage or memory,
-not the session database. Turning off model-based checks stops new check
-activation while retaining saved connections and local results. Settings can
-still read check-folder entry metadata for its file counts without running
-checks. Removing a saved connection does not erase local results or usage.
+not the session database. Turning off **Run checks** stops check execution while
+retaining saved connections and local results. The app can still read and parse
+bounded local YAML definitions and watch their directories, including at cold
+startup, to show names, invalid-file diagnostics, paused check cards, and file
+counts. These reads do not restore provider configuration, discover model
+capabilities, catch up session sources, or run assessments. Removing a saved
+connection does not erase local results or usage.
 Removing the selected connection turns checks off and clears selection rather
 than choosing another provider. Shared credentials can remain after a connection
 is removed; forgetting a saved credential is a separate explicit action. Past
@@ -69,8 +73,14 @@ earlier attempt may have incurred a charge. Request bounds limit local admission
 not the total cost of a long session or repeated revisions.
 Settings shows estimated usage, not a spending cap or provider invoice.
 
-Each assessment uses one captured connection. Local preparation retains the
-actual provider/model and an endpoint digest, not the raw endpoint or credential.
+Local status checks omit model decisions. They send no model request and create
+no provider attempt or usage record. They still require **Run checks**, a selected
+configured connection, its credential/authentication rules, and the source and
+runtime gates. **Test connection** remains a separate operation.
+
+Each model assessment uses one captured connection. Saved model preparation
+retains the actual provider/model and an endpoint digest, not the raw endpoint
+or credential.
 Changing or removing the selected connection, or choosing another connection,
 cancels unfinished assessments while keeping accepted results and source progress.
 Inactive connection edits and removals leave active work unchanged. Switching

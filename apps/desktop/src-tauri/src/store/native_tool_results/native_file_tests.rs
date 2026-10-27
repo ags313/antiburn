@@ -8,10 +8,432 @@ use serde_json::{Value, json};
 use super::*;
 use crate::store::native_tool_results::ToolResultPublicationOutcome;
 
+#[path = "main_64_preservation_tests.rs"]
+mod preservation;
+
 const CLAUDE_RESULTS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../crates/antiburn-local/tests/fixtures/claude_characterization/retained_native_results.jsonl"
 ));
+
+mod main_64_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../crates/antiburn-local/tests/fixtures/native_receipt_compatibility/decode.rs"
+    ));
+
+    pub(super) fn load(text: &str) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+
+        let mut saved: serde_json::Value = serde_json::from_str(text).unwrap();
+        expand_sparse_arrays(&mut saved);
+        assert_eq!(saved["cursor"]["revision"], 1);
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&saved["cursor"]).unwrap())
+            ),
+            saved["cursor_sha256"].as_str().unwrap()
+        );
+        saved
+    }
+}
+
+#[test]
+fn main_64_actual_receipt_converts_without_replaying_completed_results() {
+    let mut saved = main_64_fixture::load(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../crates/antiburn-local/tests/fixtures/native_receipt_compatibility/file-claude.json"
+    )));
+    let (directory, store, input) = fixture(saved["source_prefix"].as_str().unwrap());
+    let store = std::sync::Arc::new(store);
+    let anchor = read_native_file_page(&input, None, &|| false).unwrap();
+    saved["cursor"]["anchor"]["identity"] =
+        serde_json::to_value(&anchor.cursor).unwrap()["anchor"]["identity"].clone();
+    let claim = store.claim_next_native_file(100, 60).unwrap().unwrap();
+    // Seed paid rows through current APIs, then admit the old receipt without origin proof.
+    store
+        .publish_native_file_page(&claim, &anchor, &[], 100)
+        .unwrap();
+    let paid = preservation::seed(&store);
+    let legacy_text = saved["cursor"]["requests"][0]["message"]["parts"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        store
+            .lock()
+            .query_row(
+                "SELECT frozen_input_json FROM burn_check_candidate WHERE state='accepted'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap()
+            .contains(legacy_text)
+    );
+    let prior_markers = origin_markers(&store);
+    assert_eq!(prior_markers.len(), 1);
+    {
+        let mut connection = store.lock();
+        let tx = connection.transaction().unwrap();
+        crate::store::native_tool_results::request_origin::delete_session_binding_in(
+            &tx, &claim.key,
+        )
+        .unwrap();
+        tx.execute("UPDATE native_file_delivery SET parser_revision=64,cursor_json=?1,
+            observed_generation=?2,pending=1,claim_fence=NULL,lease_expires_at_epoch=NULL,next_attempt_at_epoch=101",
+            params![saved["cursor"].to_string(), claim.generation]).unwrap();
+        tx.commit().unwrap();
+    }
+    paid.assert_preserved(&store);
+    let before = store.native_tool_results_current(&claim.key).unwrap();
+    drop(store);
+    let store = std::sync::Arc::new(Store::open(directory.path()).unwrap());
+    paid.assert_preserved(&store);
+    let (claim, page) = next_page(&store, &input, 101);
+    assert_eq!(claim.parser_revision, Some(64));
+    assert!(!claim.request_origin_boundary);
+    assert_eq!(page.bytes_read, 0);
+    assert!(page.requests.is_empty() && page.results.is_empty());
+    assert!(
+        !serde_json::to_string(&page.cursor)
+            .unwrap()
+            .contains(legacy_text)
+    );
+    assert_eq!(
+        page.cursor.offset(),
+        saved["cursor"]["anchor"]["tail"]["offset"]
+            .as_u64()
+            .unwrap()
+    );
+    store
+        .publish_native_file_page(&claim, &page, &[], 101)
+        .unwrap();
+    assert_eq!(
+        store.native_tool_results_current(&claim.key).unwrap(),
+        before
+    );
+    paid.assert_preserved(&store);
+    let markers = origin_markers(&store);
+    assert_eq!(markers.len(), prior_markers.len() + 1);
+    assert!(markers.starts_with(&prior_markers));
+    drop(store);
+    let store = std::sync::Arc::new(Store::open(directory.path()).unwrap());
+    paid.assert_preserved(&store);
+    append(&input, saved["source_suffix"].as_str().unwrap());
+    let (claim, page) = next_page(&store, &input, 102);
+    assert_eq!(page.results.len(), 1);
+    assert!(!format!("{page:?}").contains(legacy_text));
+    assert_eq!(
+        page.results[0].observation.call_id.as_deref(),
+        Some("call-1")
+    );
+    store
+        .publish_native_file_page(&claim, &page, &[], 102)
+        .unwrap();
+    assert_eq!(
+        store.native_tool_results_current(&claim.key).unwrap().len(),
+        before.len() + 1
+    );
+    paid.assert_preserved(&store);
+    drop(store);
+    let store = std::sync::Arc::new(Store::open(directory.path()).unwrap());
+    let (claim, idle) = next_page(&store, &input, 103);
+    assert!(idle.results.is_empty() && idle.evidence.events.is_empty());
+    store
+        .publish_native_file_page(&claim, &idle, &[], 103)
+        .unwrap();
+    assert_eq!(origin_markers(&store), markers);
+    assert!(
+        !format!(
+            "{:?}",
+            store
+                .native_evidence_publications_after(*markers.last().unwrap(), 100)
+                .unwrap()
+        )
+        .contains(legacy_text)
+    );
+    paid.assert_paid_fences(&store, true);
+}
+
+#[test]
+fn main_64_codex_and_pi_partial_publication_restart_keep_converted_read_state() {
+    for agent in ["codex", "pi"] {
+        let text = if agent == "codex" {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../crates/antiburn-local/tests/fixtures/native_receipt_compatibility/file-codex.json"
+            ))
+        } else {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../crates/antiburn-local/tests/fixtures/native_receipt_compatibility/file-pi.json"
+            ))
+        };
+        let mut saved = main_64_fixture::load(text);
+        let prefix = saved["source_prefix"].as_str().unwrap().to_owned();
+        let (directory, store, mut input) = fixture(&prefix);
+        let store = std::sync::Arc::new(store);
+        input.agent = agent.into();
+        input.session_id = saved["cursor"]["session_id"].as_str().unwrap().into();
+        input.source_format =
+            serde_json::from_value(saved["cursor"]["source_format"].clone()).unwrap();
+        store
+            .lock()
+            .execute(
+                "UPDATE session SET agent=?1,session_id=?2,source_format=?3",
+                params![
+                    agent,
+                    input.session_id,
+                    serde_json::to_string(&input.source_format).unwrap()
+                ],
+            )
+            .unwrap();
+        let identity = read_native_file_page(&input, None, &|| false).unwrap();
+        saved["cursor"]["anchor"]["identity"] =
+            serde_json::to_value(identity.cursor).unwrap()["anchor"]["identity"].clone();
+        let claim = store.claim_next_native_file(100, 60).unwrap().unwrap();
+        let mut completed: ToolResultObservation =
+            serde_json::from_value(saved["completed"][0].clone()).unwrap();
+        let antiburn_local::analysis::ToolResultPosition::FileBytes { record_end, .. } =
+            completed.position
+        else {
+            unreachable!()
+        };
+        completed.revision = record_end;
+        {
+            let mut connection = store.lock();
+            let tx = connection.transaction().unwrap();
+            crate::store::native_tool_results::publications::reconcile_with_policy(
+                &tx,
+                &claim.key,
+                claim.generation,
+                claim.fence,
+                &crate::store::native_tool_results::publications::ToolResultBatch {
+                    source_format: input.source_format,
+                    results: vec![completed],
+                    complete: false,
+                },
+                PublicationPolicy {
+                    live_eligible: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let accepted_results = store.native_tool_results_current(&claim.key).unwrap();
+        let paid = preservation::seed(&store);
+        store.lock().execute("UPDATE native_file_delivery SET parser_revision=64,cursor_json=?1,
+            observed_generation=?2,pending=1,claim_fence=NULL,lease_expires_at_epoch=NULL,next_attempt_at_epoch=101",
+            params![saved["cursor"].to_string(), claim.generation]).unwrap();
+        let call = prefix
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .rfind(|record| {
+                if agent == "codex" {
+                    record["payload"]["type"] == "function_call"
+                } else {
+                    record["message"]["role"] == "assistant"
+                }
+            })
+            .unwrap();
+        let completion: Value = serde_json::from_str(&format!(
+            "{}{}",
+            prefix.lines().last().unwrap(),
+            saved["source_suffix"].as_str().unwrap()
+        ))
+        .unwrap();
+        append(&input, saved["source_suffix"].as_str().unwrap());
+        for index in 2..82 {
+            let mut call = call.clone();
+            let mut result = completion.clone();
+            if agent == "codex" {
+                call["payload"]["call_id"] = json!(format!("call-{index}"));
+                result["payload"]["call_id"] = json!(format!("call-{index}"));
+                result["payload"]["id"] = json!(format!("result-{index}"));
+            } else {
+                call["id"] = json!(format!("request-{index}"));
+                call["parentId"] = json!(format!("result-{}", index - 1));
+                call["message"]["content"][0]["id"] = json!(format!("call-{index}"));
+                result["id"] = json!(format!("result-{index}"));
+                result["parentId"] = call["id"].clone();
+                result["message"]["toolCallId"] = json!(format!("call-{index}"));
+            }
+            append(&input, &format!("{call}\n{result}\n"));
+        }
+        expand_publication_cost(&store);
+        store.lock().execute_batch("CREATE TRIGGER expand_main_64_test_publication AFTER INSERT ON native_tool_result_publication
+            WHEN NEW.outcome='update' BEGIN
+              INSERT INTO native_tool_result_publication(outcome,environment_key,agent,session_id,
+                source_format,complete,source_generation,claim_fence,project_cwd,session_incarnation,gap_reason,gap_kind)
+              SELECT 'coverage_gap',NEW.environment_key,NEW.agent,NEW.session_id,NEW.source_format,
+                0,NEW.source_generation,NEW.claim_fence,NEW.project_cwd,NEW.session_incarnation,'test-page-budget','partial'
+              FROM json_each('[0,1,2,3,4,5,6]');
+            END;").unwrap();
+        let (claim, page) = next_page(&store, &input, 101);
+        let frontier = page.cursor.evidence_baseline_offset();
+        let offset = saved["cursor"]["anchor"]["tail"]["offset"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            frontier,
+            std::fs::metadata(match &input.source {
+                RawSource::File(path) => path,
+                _ => unreachable!(),
+            })
+            .unwrap()
+            .len()
+        );
+        assert!(page.cursor.offset() > offset);
+        assert!(
+            page.results
+                .iter()
+                .all(|result| result.observation.call_id.as_deref() != Some("call-0"))
+        );
+        let before = publication_state(&store);
+        store.lock().execute_batch("CREATE TEMP TRIGGER reject_main_64_cursor BEFORE UPDATE OF cursor_json ON native_file_delivery
+            BEGIN SELECT RAISE(ABORT, 'synthetic conversion rollback'); END;").unwrap();
+        assert!(
+            store
+                .publish_native_file_page(&claim, &page, &[], 101)
+                .is_err()
+        );
+        assert_eq!(publication_state(&store), before);
+        paid.assert_preserved(&store);
+        store
+            .lock()
+            .execute_batch("DROP TRIGGER reject_main_64_cursor")
+            .unwrap();
+        store
+            .publish_native_file_page(&claim, &page, &[], 101)
+            .unwrap();
+        let (parser, encoded, pending): (i64, String, bool) = store
+            .lock()
+            .query_row(
+                "SELECT parser_revision,cursor_json,pending FROM native_file_delivery",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(parser, PARSER_REVISION);
+        assert!(pending, "{agent} must exercise partial publication");
+        assert_eq!(
+            serde_json::from_str::<Value>(&encoded).unwrap()["revision"],
+            5
+        );
+        let cursor: NativeFileCursor = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(cursor.offset(), offset);
+        assert_eq!(cursor.evidence_baseline_offset(), frontier);
+        let partial = store.native_tool_results_current(&claim.key).unwrap();
+        assert!(partial.len() > accepted_results.len() && partial.len() < 82);
+        assert!(partial.contains(&accepted_results[0]));
+        paid.assert_preserved(&store);
+        let mut late_call = call;
+        let mut late_result = completion;
+        if agent == "codex" {
+            late_call["payload"]["call_id"] = json!("call-82");
+            late_result["payload"]["call_id"] = json!("call-82");
+            late_result["payload"]["id"] = json!("result-82");
+        } else {
+            late_call["id"] = json!("request-82");
+            late_call["parentId"] = json!("result-81");
+            late_call["message"]["content"][0]["id"] = json!("call-82");
+            late_result["id"] = json!("result-82");
+            late_result["parentId"] = json!("request-82");
+            late_result["message"]["toolCallId"] = json!("call-82");
+        }
+        append(&input, &format!("{late_call}\n{late_result}\n"));
+        drop(store);
+        let store = std::sync::Arc::new(Store::open(directory.path()).unwrap());
+        paid.assert_preserved(&store);
+        let mut finished = false;
+        for now in 102..122 {
+            let (claim, page) = next_page(&store, &input, now);
+            let loaded_offset = claim.cursor().unwrap().unwrap().offset();
+            assert_eq!(
+                claim.cursor().unwrap().unwrap().evidence_baseline_offset(),
+                frontier
+            );
+            assert_eq!(page.cursor.evidence_baseline_offset(), frontier);
+            store
+                .publish_native_file_page(&claim, &page, &[], now)
+                .unwrap();
+            paid.assert_preserved(&store);
+            let current = store.native_tool_results_current(&claim.key).unwrap();
+            if page.results.iter().any(|result| {
+                !current
+                    .iter()
+                    .any(|saved| saved.result.call_id == result.observation.call_id)
+            }) {
+                let encoded: String = store
+                    .lock()
+                    .query_row("SELECT cursor_json FROM native_file_delivery", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<NativeFileCursor>(&encoded)
+                        .unwrap()
+                        .offset(),
+                    loaded_offset
+                );
+            }
+            if !store
+                .lock()
+                .query_row("SELECT pending FROM native_file_delivery", [], |row| {
+                    row.get::<_, bool>(0)
+                })
+                .unwrap()
+            {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "{agent} must finish bounded retry pages");
+        assert_unique_native_updates(&store);
+        assert_eq!(
+            store.native_tool_results_current(&claim.key).unwrap().len(),
+            83
+        );
+        assert_eq!(
+            store
+                .native_tool_results_current(&claim.key)
+                .unwrap()
+                .iter()
+                .map(|row| row.result.call_id.clone().unwrap())
+                .collect::<std::collections::BTreeSet<_>>(),
+            (0..83)
+                .map(|index| format!("call-{index}"))
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert!(
+            store
+                .native_tool_results_current(&claim.key)
+                .unwrap()
+                .contains(&accepted_results[0])
+        );
+        assert!(
+            store
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) = 1 AND MIN(live_eligible) = 1
+            FROM native_tool_result_publication WHERE event_kind='tool_call'
+            AND json_extract(payload_json, '$.call_id')='call-82'",
+                    [],
+                    |row| row.get::<_, bool>(0)
+                )
+                .unwrap()
+        );
+        let updates = native_update_count(&store);
+        let (claim, idle) = next_page(&store, &input, 122);
+        assert!(idle.results.is_empty() && idle.evidence.events.is_empty());
+        store
+            .publish_native_file_page(&claim, &idle, &[], 122)
+            .unwrap();
+        assert_eq!(native_update_count(&store), updates);
+        paid.assert_paid_fences(&store, false);
+    }
+}
 
 fn fixture(source: &str) -> (tempfile::TempDir, Store, SessionInput) {
     let directory = tempfile::tempdir().unwrap();
@@ -87,7 +509,7 @@ fn prior_receipt(store: &Store, parser_revision: i64, now: i64) {
 
 #[test]
 fn compatible_parser_receipts_keep_partial_records_baselines_and_completed_results() {
-    for parser_revision in [63, 64] {
+    for parser_revision in [63, 64, 65] {
         let lines: Vec<_> = CLAUDE_RESULTS.split_inclusive('\n').collect();
         let pending = lines[4];
         let split = pending.len() / 2;
@@ -102,6 +524,7 @@ fn compatible_parser_receipts_keep_partial_records_baselines_and_completed_resul
         let current = store.native_tool_results_current(&claim.key).unwrap();
         let publications = store.native_tool_result_publications_after(0, 100).unwrap();
         let saved = serde_json::to_string(&first.cursor).unwrap();
+        let markers = origin_markers(&store);
         prior_receipt(&store, parser_revision, 101);
         drop(store);
 
@@ -109,6 +532,7 @@ fn compatible_parser_receipts_keep_partial_records_baselines_and_completed_resul
         let (claim, idle) = next_page(&store, &input, 101);
         assert!(!claim.reset);
         assert_eq!(claim.cursor_json.as_deref(), Some(saved.as_str()));
+        assert_eq!(claim.parser_revision, Some(parser_revision));
         assert_eq!(idle.bytes_read, 0);
         assert_eq!(idle.cursor.offset(), first.cursor.offset());
         assert_eq!(idle.baseline_offset, first.baseline_offset);
@@ -118,6 +542,20 @@ fn compatible_parser_receipts_keep_partial_records_baselines_and_completed_resul
         );
         assert!(idle.pending_tail);
         assert!(idle.results.is_empty() && idle.evidence.events.is_empty());
+        if parser_revision == 65 {
+            assert_eq!(serde_json::to_string(&idle.cursor).unwrap(), saved);
+            assert_eq!(
+                store
+                    .lock()
+                    .query_row(
+                        "SELECT parser_revision FROM native_file_delivery",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                65
+            );
+        }
         store
             .publish_native_file_page(&claim, &idle, &[], 101)
             .unwrap();
@@ -125,6 +563,7 @@ fn compatible_parser_receipts_keep_partial_records_baselines_and_completed_resul
             store.native_tool_results_current(&claim.key).unwrap(),
             current
         );
+        assert_eq!(origin_markers(&store), markers);
         let after = store.native_tool_result_publications_after(0, 100).unwrap();
         assert!(after.starts_with(&publications));
         assert!(after[publications.len()..].iter().all(|publication| publication.outcome == ToolResultPublicationOutcome::CoverageGap));
@@ -159,88 +598,164 @@ fn compatible_parser_receipts_keep_partial_records_baselines_and_completed_resul
         );
         let (_, idle) = next_page(&store, &input, 103);
         assert!(idle.results.is_empty() && idle.evidence.events.is_empty());
+        assert_eq!(origin_markers(&store), markers);
     }
 }
 
 #[test]
-fn parser_64_receipt_keeps_pending_output_without_reading_or_replaying_completed_results() {
-    let lines: Vec<_> = CLAUDE_RESULTS.lines().collect();
-    let mut call: Value = serde_json::from_str(lines[1]).unwrap();
-    call["message"]["content"] = json!(
-        (0..300)
-            .map(|index| json!({
-                "type":"tool_use", "id":format!("call-{index}"), "name":"Read",
-                "input":{"file_path":"/synthetic/file.rs"}
-            }))
-            .collect::<Vec<_>>()
-    );
-    let mut result: Value = serde_json::from_str(lines[2]).unwrap();
-    result.as_object_mut().unwrap().remove("toolUseResult");
-    result.as_object_mut().unwrap().remove("sourceToolUseID");
-    result
-        .as_object_mut()
-        .unwrap()
-        .remove("sourceToolAssistantUUID");
-    result["message"]["content"] =
-        json!((0..300).map(|index| json!({
+fn compatible_parser_receipts_keep_pending_output_without_reading_or_replaying_completed_results() {
+    for parser_revision in [64, 65] {
+        let lines: Vec<_> = CLAUDE_RESULTS.lines().collect();
+        let mut call: Value = serde_json::from_str(lines[1]).unwrap();
+        call["message"]["content"] = json!(
+            (0..300)
+                .map(|index| json!({
+                    "type":"tool_use", "id":format!("call-{index}"), "name":"Read",
+                    "input":{"file_path":"/synthetic/file.rs"}
+                }))
+                .collect::<Vec<_>>()
+        );
+        let mut result: Value = serde_json::from_str(lines[2]).unwrap();
+        result.as_object_mut().unwrap().remove("toolUseResult");
+        result.as_object_mut().unwrap().remove("sourceToolUseID");
+        result
+            .as_object_mut()
+            .unwrap()
+            .remove("sourceToolAssistantUUID");
+        result["message"]["content"] = json!((0..300).map(|index| json!({
         "type":"tool_result", "tool_use_id":format!("call-{index}"), "content":"source text"
     })).collect::<Vec<_>>());
-    let source = format!("{}\n{call}\n{result}\n", lines[0]);
-    let (directory, store, input) = fixture(&source);
-    let mut now = 100;
-    let first_pending = loop {
+        let source = format!("{}\n{call}\n{result}\n", lines[0]);
+        let (directory, store, input) = fixture(&source);
+        let mut now = 100;
+        let first_pending = loop {
+            let (claim, page) = next_page(&store, &input, now);
+            store
+                .publish_native_file_page(&claim, &page, &[], now)
+                .unwrap();
+            now += 1;
+            if !page.results.is_empty() && page.has_more {
+                break page;
+            }
+            assert!(page.has_more, "fixture must leave result output pending");
+            assert!(
+                now < 110,
+                "fixture must reach result output within ten pages"
+            );
+        };
+        let saved = serde_json::to_string(&first_pending.cursor).unwrap();
+        let pending: Vec<Value> = serde_json::from_str(
+            serde_json::from_str::<Value>(&saved).unwrap()["pending_evidence"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !pending.is_empty(),
+            "the stored receipt must contain pending output"
+        );
+        let key = SessionKey::new("native", "claude-code", "scope-test");
+        let completed = store.native_tool_results_current(&key).unwrap();
+        assert!(!completed.is_empty() && completed.len() < 300);
+        prior_receipt(&store, parser_revision, now);
+        drop(store);
+
+        let store = Store::open(directory.path()).unwrap();
         let (claim, page) = next_page(&store, &input, now);
+        assert!(!claim.reset);
+        assert_eq!(claim.cursor_json.as_deref(), Some(saved.as_str()));
+        assert_eq!(page.bytes_read, 0);
+        assert_eq!(page.cursor.offset(), first_pending.cursor.offset());
+        assert_eq!(page.baseline_offset, first_pending.baseline_offset);
+        assert!(!page.results.is_empty());
+        for result in &page.results {
+            assert!(
+                completed
+                    .iter()
+                    .all(|prior| prior.result.call_id != result.observation.call_id)
+            );
+        }
         store
             .publish_native_file_page(&claim, &page, &[], now)
             .unwrap();
-        now += 1;
-        if !page.results.is_empty() && page.has_more {
-            break page;
-        }
-        assert!(page.has_more, "fixture must leave result output pending");
-        assert!(
-            now < 110,
-            "fixture must reach result output within ten pages"
+        assert_eq!(
+            store.native_tool_results_current(&key).unwrap().len(),
+            completed.len() + page.results.len()
         );
-    };
-    let saved = serde_json::to_string(&first_pending.cursor).unwrap();
-    let pending: Vec<Value> = serde_json::from_str(
-        serde_json::from_str::<Value>(&saved).unwrap()["pending_evidence"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(
-        !pending.is_empty(),
-        "the stored receipt must contain pending output"
-    );
-    let key = SessionKey::new("native", "claude-code", "scope-test");
-    let completed = store.native_tool_results_current(&key).unwrap();
-    assert!(!completed.is_empty() && completed.len() < 300);
-    prior_receipt(&store, 64, now);
+    }
+}
+
+#[test]
+fn malformed_main_parser_64_cursor_1_blocks_without_reseeding_saved_evidence() {
+    let (directory, store, input) = fixture(CLAUDE_RESULTS);
+    let (claim, first) = next_page(&store, &input, 100);
+    store
+        .publish_native_file_page(&claim, &first, &[], 100)
+        .unwrap();
+    let current = store.native_tool_results_current(&claim.key).unwrap();
+    let publications = store.native_tool_result_publications_after(0, 100).unwrap();
+    let mut cursor = serde_json::to_value(&first.cursor).unwrap();
+    cursor["revision"] = json!(1);
+    for field in [
+        "evidence_baseline_offset",
+        "pending_evidence",
+        "admission_failure",
+    ] {
+        cursor.as_object_mut().unwrap().remove(field);
+    }
+    let saved = cursor.to_string();
+    prior_receipt(&store, 64, 101);
+    store
+        .lock()
+        .execute("UPDATE native_file_delivery SET cursor_json = ?1", [&saved])
+        .unwrap();
     drop(store);
 
     let store = Store::open(directory.path()).unwrap();
-    let (claim, page) = next_page(&store, &input, now);
+    let claim = store.claim_next_native_file(101, 60).unwrap().unwrap();
     assert!(!claim.reset);
     assert_eq!(claim.cursor_json.as_deref(), Some(saved.as_str()));
-    assert_eq!(page.bytes_read, 0);
-    assert_eq!(page.cursor.offset(), first_pending.cursor.offset());
-    assert_eq!(page.baseline_offset, first_pending.baseline_offset);
-    assert!(!page.results.is_empty());
-    for result in &page.results {
-        assert!(
-            completed
-                .iter()
-                .all(|prior| prior.result.call_id != result.observation.call_id)
-        );
-    }
-    store
-        .publish_native_file_page(&claim, &page, &[], now)
-        .unwrap();
+    assert!(claim.cursor().is_err());
+    assert!(
+        store
+            .fail_native_file(&claim, NativeFileReadError::InvalidCursor, 101, 101)
+            .unwrap()
+    );
     assert_eq!(
-        store.native_tool_results_current(&key).unwrap().len(),
-        completed.len() + page.results.len()
+        store.native_tool_results_current(&claim.key).unwrap(),
+        current
+    );
+    assert_eq!(
+        store.native_tool_result_publications_after(0, 100).unwrap(),
+        publications
+    );
+    let receipt: (i64, String, bool, bool, String) = store.lock().query_row(
+        "SELECT parser_revision, cursor_json, blocked, pending, last_error FROM native_file_delivery",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).unwrap();
+    assert_eq!(
+        receipt,
+        (64, saved.clone(), true, false, "file-cursor-invalid".into())
+    );
+    append(&input, "\n");
+    assert!(store.claim_next_native_file(102, 60).unwrap().is_none());
+    drop(store);
+
+    let store = Store::open(directory.path()).unwrap();
+    assert!(store.claim_next_native_file(200, 60).unwrap().is_none());
+    assert_eq!(
+        store.native_tool_results_current(&claim.key).unwrap(),
+        current
+    );
+    assert_eq!(
+        store
+            .lock()
+            .query_row("SELECT cursor_json FROM native_file_delivery", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        saved
     );
 }
 
@@ -298,8 +813,12 @@ fn native_cursor_loader_requires_exact_parser_and_cursor_revision_pairs() {
         (64, 5, true),
         (65, 4, false),
         (65, 5, true),
+        (PARSER_REVISION, 1, false),
+        (PARSER_REVISION, 4, false),
+        (PARSER_REVISION, 5, true),
         (64, 6, false),
         (65, 6, false),
+        (PARSER_REVISION, 6, false),
     ] {
         let (_directory, store, input) = fixture(CLAUDE_RESULTS);
         let (claim, first) = next_page(&store, &input, 100);
@@ -335,7 +854,7 @@ fn native_cursor_loader_requires_exact_parser_and_cursor_revision_pairs() {
             assert_eq!(loaded.baseline_offset(), first.baseline_offset);
             assert_eq!(
                 serde_json::to_string(&loaded).unwrap().contains(CANARY),
-                parser == 65
+                parser == 65 || parser == PARSER_REVISION
             );
         } else {
             store
@@ -530,8 +1049,8 @@ fn parser_65_empty_upgrade_commits_one_marker_with_the_sanitized_cursor() {
         .unwrap();
     assert_eq!(origin_markers(&store), markers);
     let connection = store.lock();
-    assert!(connection.query_row("SELECT parser_revision = 65 AND json_extract(cursor_json, '$.revision') = 5
-        AND json_array_length(json_extract(cursor_json, '$.requests')) = 0 FROM native_file_delivery", [], |row| row.get::<_, bool>(0)).unwrap());
+    assert!(connection.query_row("SELECT parser_revision = ?1 AND json_extract(cursor_json, '$.revision') = 5
+        AND json_array_length(json_extract(cursor_json, '$.requests')) = 0 FROM native_file_delivery", [PARSER_REVISION], |row| row.get::<_, bool>(0)).unwrap());
 }
 
 #[test]
@@ -586,7 +1105,7 @@ fn parser_65_receipt_without_a_marker_sanitizes_requests_and_pending_contexts_be
     let publications = store.native_tool_result_publications_after(0, 100).unwrap();
     assert!(origin_markers(&store).is_empty());
     let claim = store.claim_next_native_file(101, 60).unwrap().unwrap();
-    assert_eq!(claim.parser_revision, Some(65));
+    assert_eq!(claim.parser_revision, Some(PARSER_REVISION));
     assert!(!claim.request_origin_boundary);
     assert!(claim.cursor_json.as_ref().unwrap().contains(CANARY));
     let loaded = claim.cursor().unwrap().unwrap();

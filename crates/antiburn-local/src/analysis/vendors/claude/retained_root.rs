@@ -13,7 +13,7 @@ use crate::analysis::jev_evidence::{
     JevNativeFieldContainer, JevNativeFieldRange, UserTextHistoryProof,
 };
 
-const VERSION: &str = "2.1.278";
+const CHARACTERIZED_VERSIONS: &[&str] = &["2.1.278", "2.1.309"];
 const MAX_RECORDS: usize = 16_384;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -114,7 +114,7 @@ impl ClaudeRetainedRoot {
     }
 
     fn observe_record(&mut self, record: &Value, retained_start: bool) {
-        self.characterized |= record["version"] == VERSION && record["entrypoint"] == "cli";
+        self.characterized |= is_characterized_cli(record);
         if ((record["subtype"] == "compact_boundary" || record["isCompactSummary"] == true)
             && !self.user_slot)
             || record["type"] == "fork-context-ref"
@@ -141,8 +141,7 @@ impl ClaudeRetainedRoot {
         } else {
             self.has_known_seam(record)
         };
-        if record["version"] != VERSION
-            || record["entrypoint"] != "cli"
+        if !is_characterized_cli(record)
             || record["isSidechain"] != false
             || record.get("agentId").is_some()
             || id.is_none()
@@ -236,6 +235,13 @@ fn is_human(record: &Value) -> bool {
         && !has_injection_flags(record)
 }
 
+pub(super) fn is_characterized_cli(record: &Value) -> bool {
+    record["entrypoint"] == "cli"
+        && record["version"]
+            .as_str()
+            .is_some_and(|version| CHARACTERIZED_VERSIONS.contains(&version))
+}
+
 pub(super) fn is_user_content(record: &Value) -> bool {
     record["type"] == "user"
         && record.pointer("/message/role").and_then(Value::as_str) == Some("user")
@@ -315,7 +321,7 @@ fn denies_human_authority(record: &Value) -> bool {
 
 pub(super) fn set_user_authority(record: &Value, parts: &mut [ContentPart]) {
     let injected = denies_human_authority(record);
-    let unproven = record["version"] == VERSION && !is_human(record);
+    let unproven = is_characterized_cli(record) && !is_human(record);
     let injected_block = record
         .pointer("/message/content")
         .and_then(Value::as_array)
@@ -328,6 +334,112 @@ pub(super) fn set_user_authority(record: &Value, parts: &mut [ContentPart]) {
         for part in parts {
             if part.kind == ContentKind::UserText {
                 part.authority = ContentAuthority::Unknown;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(version: &str, id: &str, parent: Value) -> Value {
+        serde_json::json!({
+            "type": "user",
+            "version": version,
+            "entrypoint": "cli",
+            "sessionId": "session",
+            "isSidechain": false,
+            "uuid": id,
+            "parentUuid": parent,
+            "origin": {"kind": "human"},
+            "promptSource": "typed",
+            "turnOrigin": "human",
+            "message": {"role": "user", "content": format!("Request {id}.")}
+        })
+    }
+
+    #[test]
+    fn characterized_cli_upgrade_keeps_a_linear_root() {
+        let mut root = ClaudeRetainedRoot::default();
+        let first = user("2.1.278", "root", Value::Null);
+        root.observe(&first);
+        let bridge = serde_json::json!({
+            "type": "system",
+            "subtype": "bridge_status",
+            "version": "2.1.309",
+            "entrypoint": "cli",
+            "sessionId": "session",
+            "isSidechain": false,
+            "uuid": "bridge",
+            "parentUuid": "root",
+            "isMeta": false,
+            "content": "Connected"
+        });
+        root.observe(&bridge);
+        let resumed = user("2.1.309", "resumed", Value::String("bridge".into()));
+        root.observe(&resumed);
+
+        assert!(root.admits("session"));
+        let mut parts = vec![
+            ContentPart::new(ContentKind::UserText, "Request resumed.")
+                .with_authority(ContentAuthority::User),
+        ];
+        root.bind_user_text(&resumed, &mut parts);
+        assert!(parts[0].metadata.user_text_history.is_some());
+    }
+
+    #[test]
+    fn unsupported_cli_version_invalidates_the_retained_root() {
+        let mut root = ClaudeRetainedRoot::default();
+        root.observe(&user("2.1.278", "root", Value::Null));
+        root.observe(&user("2.1.310", "resumed", Value::String("root".into())));
+
+        assert!(!root.admits("session"));
+    }
+
+    #[test]
+    fn current_cli_user_without_origin_does_not_gain_human_authority() {
+        let mut record = user("2.1.309", "user", Value::Null);
+        record
+            .as_object_mut()
+            .expect("test record must be an object")
+            .remove("origin");
+        let mut parts = [ContentPart::new(ContentKind::UserText, "Request user.")
+            .with_authority(ContentAuthority::User)];
+
+        set_user_authority(&record, &mut parts);
+
+        assert_eq!(parts[0].authority, ContentAuthority::Unknown);
+    }
+
+    #[test]
+    fn characterized_cli_injected_text_never_gains_human_history() {
+        for version in CHARACTERIZED_VERSIONS {
+            for case in 0..5 {
+                let mut record = user(version, "user", Value::Null);
+                match case {
+                    0 => record["planContent"] = Value::String("Recorded plan.".into()),
+                    1 => record["isMeta"] = Value::Bool(true),
+                    2 => record["isSynthetic"] = Value::Bool(true),
+                    3 => record["origin"]["kind"] = Value::String("api".into()),
+                    _ => {
+                        record["message"]["content"] = serde_json::json!([
+                            {"type":"text","text":"Request user.","isSynthetic":true}
+                        ]);
+                    }
+                }
+                let mut root = ClaudeRetainedRoot::default();
+                root.observe(&record);
+                let mut parts = vec![
+                    ContentPart::new(ContentKind::UserText, "Request user.")
+                        .with_authority(ContentAuthority::User),
+                ];
+                set_user_authority(&record, &mut parts);
+                root.bind_user_text(&record, &mut parts);
+
+                assert_eq!(parts[0].authority, ContentAuthority::Unknown);
+                assert!(parts[0].metadata.user_text_history.is_none());
             }
         }
     }

@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicUsize;
 const SOURCE: &str = "name: Selected connection\non:\n  tool_result:\n  cooldown: 0s\ndecisions:\n  review:\n    input: {activity: '${{ message.tool.result }}'}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    if: decisions.review.outputs.verdict == 'concern'\n    input: {result: failure}\n  - type: status\n    if: decisions.review.outputs.verdict == 'clear'\n    input: {result: success}\n";
 
 mod local;
+mod ollama;
 mod recovery;
 
 #[derive(Default)]
@@ -244,7 +245,10 @@ impl SelectedJobRuntime for Runtime {
                 return resolve_capabilities(snapshot).await;
             }
             // The loopback fixture implements this explicit synthetic System One contract.
-            assert_eq!(snapshot.connection.provider, SystemOneProvider::Custom);
+            assert!(matches!(
+                snapshot.connection.provider,
+                SystemOneProvider::Custom | SystemOneProvider::Ollama
+            ));
             let mut capabilities = ModelCapabilities::jev_default();
             capabilities.model.clone_from(&snapshot.connection.model);
             if self.unsupported_resolution.load(Ordering::Acquire) {

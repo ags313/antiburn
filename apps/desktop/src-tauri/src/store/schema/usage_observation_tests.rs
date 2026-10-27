@@ -1,13 +1,13 @@
 use rusqlite::{Connection, params};
 
-use super::{MIGRATIONS, V90};
+use super::{MIGRATIONS, V91};
 use crate::store::{Store, database_path};
 
 fn legacy(connection: &Connection) {
-    for migration in &MIGRATIONS[..89] {
+    for migration in &MIGRATIONS[..90] {
         connection.execute_batch(migration).unwrap();
     }
-    connection.pragma_update(None, "user_version", 89).unwrap();
+    connection.pragma_update(None, "user_version", 90).unwrap();
     connection
         .execute_batch(
             "INSERT INTO burn_check_decision_usage (attempt_id, usage_known)
@@ -30,7 +30,7 @@ fn usage_rows(connection: &Connection) -> Vec<(String, bool, Option<String>)> {
 #[test]
 fn fresh_usage_schema_bounds_observations_without_candidate_ownership() {
     let store = Store::open_in_memory(std::path::Path::new("usage-schema")).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 90);
+    assert_eq!(store.schema_version().unwrap(), 91);
     let connection = store.lock();
     assert_eq!(
         connection
@@ -71,7 +71,7 @@ fn fresh_usage_schema_bounds_observations_without_candidate_ownership() {
 }
 
 #[test]
-fn v90_upgrade_and_reopen_keep_raw_legacy_rows_null_and_settings_unchanged() {
+fn v91_upgrade_and_reopen_keep_raw_legacy_rows_null_and_settings_unchanged() {
     let directory = tempfile::tempdir().unwrap();
     let connection = Connection::open(database_path(directory.path())).unwrap();
     legacy(&connection);
@@ -85,7 +85,7 @@ fn v90_upgrade_and_reopen_keep_raw_legacy_rows_null_and_settings_unchanged() {
     drop(connection);
     for _ in 0..2 {
         let store = Store::open(directory.path()).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 90);
+        assert_eq!(store.schema_version().unwrap(), 91);
         let connection = store.lock();
         assert_eq!(
             usage_rows(&connection),
@@ -112,8 +112,8 @@ fn dropped_usage_migration_transaction_rolls_back_column_rows_and_version() {
     legacy(&connection);
     {
         let transaction = connection.transaction().unwrap();
-        transaction.execute_batch(V90).unwrap();
-        transaction.pragma_update(None, "user_version", 90).unwrap();
+        transaction.execute_batch(V91).unwrap();
+        transaction.pragma_update(None, "user_version", 91).unwrap();
         assert!(
             transaction
                 .execute(
@@ -127,7 +127,7 @@ fn dropped_usage_migration_transaction_rolls_back_column_rows_and_version() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        89
+        90
     );
     assert_eq!(connection.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('burn_check_decision_usage') WHERE name = 'served_model'", [],
@@ -145,7 +145,7 @@ fn dropped_usage_migration_transaction_rolls_back_column_rows_and_version() {
     );
     let directory = tempfile::tempdir().unwrap();
     let store = Store::from_connection(connection, directory.path().to_path_buf()).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 90);
+    assert_eq!(store.schema_version().unwrap(), 91);
     assert_eq!(usage_rows(&store.lock()).len(), 2);
 }
 
@@ -168,7 +168,7 @@ fn production_usage_migration_rolls_back_when_version_write_fails() {
             context.action,
             AuthAction::Pragma {
                 pragma_name: "user_version",
-                pragma_value: Some("90")
+                pragma_value: Some("91")
             }
         ) {
             observed.store(true, Ordering::Relaxed);
@@ -185,7 +185,7 @@ fn production_usage_migration_rolls_back_when_version_write_fails() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        89
+        90
     );
     assert_eq!(connection.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('burn_check_decision_usage') WHERE name = 'served_model'", [],
@@ -214,7 +214,7 @@ fn production_usage_migration_rolls_back_when_version_write_fails() {
     drop(connection);
 
     let store = Store::open(directory.path()).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 90);
+    assert_eq!(store.schema_version().unwrap(), 91);
     assert!(
         usage_rows(&store.lock())
             .iter()

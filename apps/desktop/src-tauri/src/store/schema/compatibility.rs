@@ -22,6 +22,7 @@ struct Profile {
     capture_fields: bool,
     accounting: bool,
     source_metadata: bool,
+    runtime_definitions: bool,
     retired: bool,
     decisions: bool,
     evidence: bool,
@@ -32,16 +33,17 @@ struct Profile {
 impl Profile {
     fn canonical(version: i64) -> Self {
         Self {
-            quota: true,
+            quota: version >= 81,
             capture: version >= 82,
             capture_fields: version >= 83,
             accounting: version >= 84,
             source_metadata: version >= 85,
-            retired: version >= 86,
-            decisions: version >= 87,
-            evidence: version >= 88,
-            selection: version >= 89,
-            served_model: version >= 90,
+            runtime_definitions: version >= 86,
+            retired: version >= 87,
+            decisions: version >= 88,
+            evidence: version >= 89,
+            selection: version >= 90,
+            served_model: version >= 91,
         }
     }
 
@@ -52,11 +54,19 @@ impl Profile {
             capture_fields: version >= 82,
             accounting: version >= 83,
             source_metadata: false,
+            runtime_definitions: false,
             retired: version >= 84,
             decisions: version >= 85,
             evidence: version >= 86,
             selection: version >= 87,
             served_model: false,
+        }
+    }
+
+    fn pre_registry(version: i64) -> Self {
+        Self {
+            runtime_definitions: false,
+            ..Self::canonical(version + 1)
         }
     }
 }
@@ -65,7 +75,7 @@ pub(in crate::store) fn repair_branch_version(
     connection: &mut Connection,
     current: i64,
 ) -> Result<i64> {
-    if !(81..=90).contains(&current) {
+    if !(81..=91).contains(&current) {
         return Ok(current);
     }
     let transaction = connection.transaction()?;
@@ -75,22 +85,38 @@ pub(in crate::store) fn repair_branch_version(
         transaction.commit()?;
         return Ok(current);
     }
-    ensure!(
-        current <= 87 && profile == Profile::branch(current),
-        "unrecognized migration schema at version {current}: {profile:?}"
-    );
-
-    // Each branch step already ran. Add only the missing main schema.
-    transaction.execute_batch(super::V81)?;
-    let target = if current <= 83 {
+    let registry_only = Profile {
+        quota: profile.quota,
+        runtime_definitions: true,
+        ..Profile::canonical(80)
+    };
+    if current <= 83 && profile == registry_only {
+        transaction.execute_batch(super::V81)?;
+        transaction.pragma_update(None, "user_version", 81)?;
+        transaction.commit()?;
+        return Ok(81);
+    }
+    let target = if (86..=90).contains(&current) && profile == Profile::pre_registry(current) {
+        transaction.execute_batch(super::V86)?;
         current + 1
     } else {
-        prepare_source_metadata(&transaction)?;
-        transaction.execute_batch(super::V85)?;
-        if current == 87 {
-            transaction.execute_batch(LEGACY_SOFT_GAPS)?;
+        ensure!(
+            current <= 87 && profile == Profile::branch(current),
+            "unrecognized migration schema at version {current}: {profile:?}"
+        );
+        // Each branch step already ran. Add only the missing main schema.
+        transaction.execute_batch(super::V81)?;
+        if current <= 83 {
+            current + 1
+        } else {
+            prepare_source_metadata(&transaction)?;
+            transaction.execute_batch(super::V85)?;
+            transaction.execute_batch(super::V86)?;
+            if current == 87 {
+                transaction.execute_batch(LEGACY_SOFT_GAPS)?;
+            }
+            current + 3
         }
-        current + 2
     };
     ensure!(
         read_profile(&transaction)? == Profile::canonical(target),
@@ -109,7 +135,11 @@ fn read_profile(connection: &Connection) -> Result<Profile> {
         &["turn_quota_published"],
     )?;
     if quota {
-        validate_index(connection, "turn_quota_published", super::V81)?;
+        validate_index(
+            connection,
+            "turn_quota_published",
+            &super::V81.replace("IF NOT EXISTS ", ""),
+        )?;
     }
     let capture = objects(
         connection,
@@ -340,12 +370,49 @@ fn read_profile(connection: &Connection) -> Result<Profile> {
         "usage served model",
         &[("burn_check_decision_usage", "served_model")],
     )?;
+    if served_model {
+        let sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'burn_check_decision_usage'",
+            [], |row| row.get(0),
+        )?;
+        let actual = sql
+            .split_once('(')
+            .context("missing usage observation definition")?
+            .1;
+        let column = super::V91
+            .split_once("ADD COLUMN ")
+            .context("missing compiled usage observation column")?
+            .1
+            .trim()
+            .trim_end_matches(';');
+        let expected = format!(
+            "attempt_id TEXT PRIMARY KEY NOT NULL,
+            usage_known INTEGER NOT NULL CHECK (usage_known IN (0, 1)), {column}) STRICT"
+        );
+        ensure!(
+            normalize_sql(actual) == normalize_sql(&expected),
+            "invalid usage observation constraints"
+        );
+    }
+    let runtime_definitions = objects(
+        connection,
+        "runtime definition registry",
+        "table",
+        &[
+            "burn_check_runtime_definition",
+            "burn_check_runtime_definition_state",
+        ],
+    )?;
+    if runtime_definitions {
+        validate_runtime_definitions(connection)?;
+    }
     Ok(Profile {
         quota,
         capture,
         capture_fields,
         accounting,
         source_metadata,
+        runtime_definitions,
         retired,
         decisions,
         evidence,
@@ -368,7 +435,7 @@ fn validate_evidence_publication(connection: &Connection) -> Result<()> {
         .strip_suffix(")strict")
         .context("invalid publication storage mode")?
         .to_owned();
-    let expected = super::V88
+    let expected = super::V89
         .split_once("CREATE TABLE native_tool_result_publication_v86 (")
         .context("missing compiled publication definition")?
         .1
@@ -497,6 +564,42 @@ fn validate_capture_tables(connection: &Connection) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+fn validate_runtime_definitions(connection: &Connection) -> Result<()> {
+    for table in [
+        "burn_check_runtime_definition",
+        "burn_check_runtime_definition_state",
+    ] {
+        let sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        let actual = sql
+            .split_once('(')
+            .context("missing runtime registry definition")?
+            .1;
+        let expected = super::V86
+            .split_once(&format!("CREATE TABLE IF NOT EXISTS {table} ("))
+            .context("missing compiled runtime registry definition")?
+            .1
+            .split_once(';')
+            .context("missing runtime registry statement")?
+            .0;
+        ensure!(
+            normalize_sql(actual) == normalize_sql(expected),
+            "invalid runtime registry constraints in {table}"
+        );
+    }
+    let state: (i64, bool) = connection.query_row(
+        "SELECT COUNT(*), COALESCE(MIN(singleton = 1 AND protocol_version = 1
+            AND initialized IN (0, 1)), 0) FROM burn_check_runtime_definition_state",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    ensure!(state == (1, true), "invalid runtime registry state");
     Ok(())
 }
 

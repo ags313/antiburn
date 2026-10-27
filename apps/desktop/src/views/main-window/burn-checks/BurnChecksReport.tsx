@@ -704,6 +704,7 @@ export function BurnChecksReport({
   const selectCheck = (id: CheckId, deliberate = true) => {
     setUi((value) => ({
       ...value,
+      pendingSearch: false,
       selectedId: id,
       deliberateIds: deliberate ? new Set([...value.deliberateIds, id]) : value.deliberateIds,
     }))

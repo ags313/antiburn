@@ -173,6 +173,46 @@ fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
             Some(&activation),
         )
         .unwrap();
+    let mut connection = store.lock();
+    let mut runtime_definitions = connection
+        .prepare(
+            "SELECT check_id, activation_scope_key, generation, definition_revision, name, availability
+             FROM burn_check_runtime_definition",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            let availability: String = row.get(5)?;
+            Ok(antiburn_checks_store::RuntimeDefinition {
+                check_id: row.get(0)?,
+                activation_scope_key: row.get(1)?,
+                generation: row.get(2)?,
+                definition_revision: row.get(3)?,
+                name: row.get(4)?,
+                availability: match availability.as_str() {
+                    "paused" => antiburn_checks_store::DefinitionAvailability::Paused,
+                    "invalid" => antiburn_checks_store::DefinitionAvailability::Invalid,
+                    "unsupported" => antiburn_checks_store::DefinitionAvailability::Unsupported,
+                    _ => antiburn_checks_store::DefinitionAvailability::Available,
+                },
+            })
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    runtime_definitions.retain(|saved| {
+        saved.check_id != definition.check_id
+            || saved.activation_scope_key != definition.activation_scope_key
+    });
+    runtime_definitions.push(antiburn_checks_store::RuntimeDefinition {
+        check_id: definition.check_id.clone(),
+        activation_scope_key: definition.activation_scope_key.clone(),
+        generation: definition.generation,
+        definition_revision: definition.definition_revision.clone(),
+        name: definition.name.clone(),
+        availability: antiburn_checks_store::DefinitionAvailability::Available,
+    });
+    antiburn_checks_store::replace_runtime_definitions(&mut connection, &runtime_definitions)
+        .unwrap();
 }
 
 fn session(store: &Store, id: &str, epoch: i64) {
@@ -223,6 +263,78 @@ fn claude_cursor(id: &str) -> String {
     };
     let page = read_native_file_page(&input, None, &|| false).unwrap();
     serde_json::to_string(&page.cursor).unwrap()
+}
+
+fn delivery_receipt(agent: &str, id: &str) -> serde_json::Value {
+    use antiburn_local::analysis::{RawSource, SessionInput, SourceFormat};
+    if agent == "claude-code" {
+        return serde_json::from_str(&claude_cursor(id)).unwrap();
+    }
+    if agent == "opencode" {
+        let journal = crate::insights_worker::journal::tests::SyntheticJournal::named(16, id);
+        let page = antiburn_local::analysis::read_opencode_live_tool_result_page(
+            &journal.path,
+            id,
+            None,
+            None,
+            &|| false,
+        )
+        .unwrap();
+        return serde_json::to_value(page.cursor).unwrap();
+    }
+    let (source_format, record) = match agent {
+        "codex" => (
+            SourceFormat::CodexRolloutJsonl,
+            json!({"type":"session_meta","payload":{"id":id,"cwd":"/workspace/demo","source":"cli"}}),
+        ),
+        "pi" => (
+            SourceFormat::PiV3Jsonl,
+            json!({"type":"session","version":3,"id":id,"cwd":"/workspace/demo"}),
+        ),
+        _ => panic!("unsupported native receipt test agent"),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("session.jsonl");
+    std::fs::write(&path, format!("{record}\n")).unwrap();
+    let page = antiburn_local::analysis::file_live::read_native_file_page(
+        &SessionInput {
+            agent: agent.into(),
+            session_id: id.into(),
+            source: RawSource::File(path),
+            source_format,
+            fork_parent_session_id: None,
+        },
+        None,
+        &|| false,
+    )
+    .unwrap();
+    serde_json::to_value(page.cursor).unwrap()
+}
+
+fn receipt_compatible(store: &Store, agent: &str) -> bool {
+    let (table, compatible) = if agent == "opencode" {
+        (
+            "opencode_journal_delivery",
+            antiburn_checks_store::opencode_journal_receipt_compatible_sql(1),
+        )
+    } else {
+        (
+            "native_file_delivery",
+            antiburn_checks_store::native_file_receipt_compatible_sql(1),
+        )
+    };
+    store
+        .lock()
+        .query_row(
+            &format!(
+                "SELECT COALESCE(({compatible}), 0) FROM session s JOIN {table} d
+           USING(environment_key, agent, session_id)
+         WHERE s.environment_key = 'native' AND s.agent = ?2 AND s.session_id = 'main'"
+            ),
+            params![PARSER_REVISION, agent],
+            |row| row.get(0),
+        )
+        .unwrap()
 }
 
 fn seed_current_claude_origin(store: &Store, id: &str) -> i64 {
@@ -2212,7 +2324,33 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
             "{agent}: an unknown parser cannot reset an active source"
         );
         request.computed_at_epoch = 281;
-        for revision in [62, 63, 64] {
+        store
+            .lock()
+            .execute(
+                &format!("UPDATE {table} SET parser_revision = ?1, incarnation = 6, blocked = 1"),
+                [PARSER_REVISION],
+            )
+            .unwrap();
+        request.computed_at_epoch = 280;
+        assert_eq!(
+            report(&request).waiting_for_data_count,
+            1,
+            "{agent}: an active new incarnation can reset an old blocked NULL receipt"
+        );
+        request.computed_at_epoch = 281;
+        assert_eq!(
+            report(&request).waiting_for_data_count,
+            0,
+            "{agent}: pending work on the old incarnation cannot bypass reset activity"
+        );
+        store
+            .lock()
+            .execute(
+                &format!("UPDATE {table} SET incarnation = 7, blocked = 0"),
+                [],
+            )
+            .unwrap();
+        for revision in [62, 63, 64, 65] {
             store
                 .lock()
                 .execute(
@@ -2226,6 +2364,219 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
                 "{agent}: parser {revision} keeps admitted pending work"
             );
         }
+
+        if agent == "claude-code" {
+            seed_current_claude_origin(&store, "main");
+        }
+        let receipt = delivery_receipt(agent, "main");
+        for revision in [63, 64, 65, PARSER_REVISION] {
+            let mut compatible = receipt.clone();
+            if journal {
+                compatible["parser_revision"] = json!(revision);
+            }
+            store
+                .lock()
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET parser_revision = ?1, cursor_json = ?2,
+                 blocked = 0, pending = 1, last_error = NULL"
+                    ),
+                    params![revision, compatible.to_string()],
+                )
+                .unwrap();
+            assert!(
+                receipt_compatible(&store, agent),
+                "{agent}: parser {revision}"
+            );
+            let sessions = current_sessions(&store.lock(), &definition, &request).unwrap();
+            let current = sessions
+                .iter()
+                .find(|session| session.key.agent == agent)
+                .unwrap();
+            assert_eq!(
+                current.ready,
+                agent != "claude-code" || revision >= 65,
+                "{agent}: parser {revision} readiness keeps the Claude origin gate"
+            );
+            assert!(
+                current.data_can_arrive && current.catching_up,
+                "{agent}: parser {revision} keeps known pending work"
+            );
+            assert_eq!(report(&request).waiting_for_data_count, 1);
+        }
+
+        // This fixture checks SQL eligibility. The converter owns the pinned main bodies.
+        let mut main_receipt = receipt.clone();
+        if journal {
+            main_receipt["parser_revision"] = json!(64);
+            main_receipt["live"]["revision"] = json!(2);
+        } else {
+            main_receipt["revision"] = json!(1);
+        }
+        request.computed_at_epoch = 200;
+        store
+            .lock()
+            .execute(
+                &format!(
+                    "UPDATE {table} SET parser_revision = 64, cursor_json = ?1,
+                incarnation = 7, blocked = 0, pending = 1, last_error = NULL"
+                ),
+                [main_receipt.to_string()],
+            )
+            .unwrap();
+        assert!(receipt_compatible(&store, agent));
+        let progress = |request: &ReportRequest| {
+            current_sessions(&store.lock(), &definition, request)
+                .unwrap()
+                .into_iter()
+                .find(|session| session.key.agent == agent)
+                .map(|session| (session.ready, session.data_can_arrive, session.catching_up))
+        };
+        assert_eq!(
+            progress(&request),
+            Some((false, true, true)),
+            "{agent}: the pinned main converter permits pending work, not readiness"
+        );
+        assert_eq!(report(&request).waiting_for_data_count, 1);
+        store
+            .lock()
+            .execute(&format!("UPDATE {table} SET blocked = 1"), [])
+            .unwrap();
+        assert_eq!(
+            progress(&request),
+            Some((false, false, false)),
+            "{agent}: conversion eligibility cannot bypass a blocked source"
+        );
+        store
+            .lock()
+            .execute(
+                &format!(
+                    "UPDATE {table} SET blocked = 0, pending = 0, next_attempt_at_epoch = NULL,
+                observed_generation = (SELECT source_generation FROM session
+                  WHERE environment_key = 'native' AND agent = ?1 AND session_id = 'main')"
+                ),
+                [agent],
+            )
+            .unwrap();
+        assert_eq!(
+            progress(&request),
+            Some((false, false, false)),
+            "{agent}: recent activity alone does not schedule a retained main receipt"
+        );
+        store
+            .lock()
+            .execute(
+                &format!("UPDATE {table} SET next_attempt_at_epoch = 201"),
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            progress(&request),
+            Some((false, true, true)),
+            "{agent}: an existing retry permits conversion catch-up"
+        );
+        store
+            .lock()
+            .execute(
+                &format!(
+                    "UPDATE {table} SET incarnation = 6, blocked = 1, next_attempt_at_epoch = NULL"
+                ),
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            progress(&request),
+            Some((false, true, true)),
+            "{agent}: the existing active-incarnation reset still applies"
+        );
+        request.computed_at_epoch = 281;
+        assert_eq!(
+            progress(&request),
+            None,
+            "{agent}: an inactive reset cannot promise conversion work"
+        );
+        assert_eq!(report(&request).waiting_for_data_count, 0);
+        store
+            .lock()
+            .execute(
+                &format!("UPDATE {table} SET incarnation = 7, blocked = 0, pending = 1"),
+                [],
+            )
+            .unwrap();
+        request.computed_at_epoch = 200;
+        let mut wrong_pair = main_receipt.clone();
+        if journal {
+            wrong_pair["parser_revision"] = json!(65);
+        }
+        let mut wrong_identity = main_receipt.clone();
+        wrong_identity["session_id"] = json!("other");
+        let mut future_parser = receipt.clone();
+        if journal {
+            future_parser["parser_revision"] = json!(PARSER_REVISION + 1);
+        }
+        let mut incompatible_receipts = vec![
+            (65, wrong_pair),
+            (64, wrong_identity),
+            (PARSER_REVISION + 1, future_parser),
+            (
+                65,
+                json!({"revision":5,"parser_revision":65,"live":{"revision":5}}),
+            ),
+            (PARSER_REVISION, json!("not an object")),
+        ];
+        if journal {
+            let mut malformed_baseline = main_receipt.clone();
+            malformed_baseline["live"]["baseline"] = json!(-1);
+            incompatible_receipts.push((64, malformed_baseline));
+            incompatible_receipts.push((65, main_receipt));
+        }
+        for (revision, incompatible) in incompatible_receipts {
+            store
+                .lock()
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET parser_revision = ?1, cursor_json = ?2,
+                 blocked = 0, pending = 1, last_error = NULL"
+                    ),
+                    params![revision, incompatible.to_string()],
+                )
+                .unwrap();
+            assert!(
+                !receipt_compatible(&store, agent),
+                "{agent}: {incompatible}"
+            );
+            let sessions = current_sessions(&store.lock(), &definition, &request).unwrap();
+            let current = sessions
+                .iter()
+                .find(|session| session.key.agent == agent)
+                .unwrap();
+            assert!(
+                !current.ready && !current.data_can_arrive && !current.catching_up,
+                "{agent}: an incompatible receipt is not catch-up before the producer blocks it"
+            );
+            let blocked = report(&request);
+            assert_eq!(blocked.waiting_for_data_count, 0);
+            assert_eq!(blocked.waiting_for_results_count, 0);
+        }
+        store
+            .lock()
+            .execute(
+                &format!(
+                    "UPDATE {table} SET parser_revision = ?1, cursor_json = NULL, pending = 1"
+                ),
+                [PARSER_REVISION],
+            )
+            .unwrap();
+        let sessions = current_sessions(&store.lock(), &definition, &request).unwrap();
+        let fresh = sessions
+            .iter()
+            .find(|session| session.key.agent == agent)
+            .unwrap();
+        assert!(
+            !fresh.ready && fresh.data_can_arrive && fresh.catching_up,
+            "{agent}: a fresh NULL receipt permits pending work but does not prove readiness"
+        );
+        request.computed_at_epoch = 281;
 
         accept(&store, &definition, "main", 1, Some(StatusResult::Success));
         if agent != "claude-code" {
@@ -2244,20 +2595,24 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
                 )
                 .unwrap();
         }
-        for (revision, clean) in [(PARSER_REVISION, 1), (63, 1), (64, 1), (-1, 0)] {
+        for revision in [PARSER_REVISION, 65, 63, 64, -1] {
+            let mut saved = receipt.clone();
+            if journal {
+                saved["parser_revision"] = json!(revision);
+            }
             store
                 .lock()
                 .execute(
                     &format!(
-                        "UPDATE {table} SET parser_revision = ?1, cursor_json = '{{}}',
+                        "UPDATE {table} SET parser_revision = ?1, cursor_json = ?2,
                          pending = 0, last_error = NULL"
                     ),
-                    [revision],
+                    params![revision, saved.to_string()],
                 )
                 .unwrap();
             assert_eq!(
                 report(&request).clean,
-                clean,
+                u64::from(revision != -1 && (agent != "claude-code" || revision >= 65)),
                 "{agent}: parser {revision} controls saved clean-result readiness"
             );
         }

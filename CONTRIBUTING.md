@@ -17,7 +17,13 @@ Thank you for contributing.
 
 antiburn keeps its session index locally and needs no project-operated account.
 **Run checks** under Settings → Checks → Model-based checks controls YAML check
-activation. Settings can still read check-folder entry metadata while it is off.
+activation. Turning it off does not stop local definition discovery. The app can
+read and parse bounded YAML files and watch their directories, including at cold
+startup, to show names, invalid-file diagnostics, paused check cards, and file
+counts. That discovery does not restore provider configuration, discover model
+capabilities, catch up session sources, or run local/model assessments. Keep the
+existing limits of 256 KiB per definition and 128 files per folder, plus
+directory-access gates.
 The provider controls under **Model-based checks** select the active System One connection: Jev, compatible
 Ollama, Cloudflare, or Custom. Settings owns routing; decision-level YAML `model`
 is an unknown field, not a migration input. Observed coding-agent model fields

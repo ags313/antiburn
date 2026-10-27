@@ -36,7 +36,7 @@ fn candidates_sql() -> String {
       FROM source_sessions s LEFT JOIN opencode_journal_delivery d
         ON d.environment_key = s.environment_key AND d.agent = s.agent
        AND d.session_id = s.session_id
-      WHERE s.main_session AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62, 63, 64))
+      WHERE s.main_session AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62, 63, 64, 65))
 ), scheduled AS (
     SELECT *, CASE WHEN reset THEN ?2 ELSE MAX(COALESCE(lease_expires_at_epoch, ?2),
         CASE WHEN observed_generation <> source_generation THEN ?2
@@ -58,6 +58,7 @@ pub(crate) struct OpenCodeJournalClaim {
     source_generation: i64,
     claim_fence: i64,
     cursor_json: Option<String>,
+    parser_revision: Option<i64>,
     pub(crate) baseline_sequence: Option<u64>,
     pub(crate) requires_full_read: bool,
     history_gap: bool,
@@ -75,9 +76,38 @@ impl OpenCodeJournalClaim {
         );
         self.cursor_json
             .as_deref()
-            .map(serde_json::from_str)
+            .map(|encoded| {
+                let value: serde_json::Value = serde_json::from_str(encoded)?;
+                let parser = value["parser_revision"]
+                    .as_i64()
+                    .ok_or_else(|| anyhow::anyhow!("journal parser revision is invalid"))?;
+                ensure!(
+                    self.parser_revision == Some(parser),
+                    "journal parser binding mismatch"
+                );
+                let layout = if value["live"].is_null() {
+                    None
+                } else {
+                    Some(
+                        value["live"]["revision"]
+                            .as_u64()
+                            .ok_or_else(|| anyhow::anyhow!("journal live revision is invalid"))?,
+                    )
+                };
+                ensure!(
+                    matches!(
+                        (parser, layout),
+                        (64, Some(2)) | (62, Some(4)) | (63..=65, Some(5)) | (62..=65, None)
+                    ) || (parser == PARSER_REVISION && matches!(layout, None | Some(5))),
+                    "journal parser and live layout are incompatible"
+                );
+                if (parser, layout) == (64, Some(2)) {
+                    OpenCodeJournalCursor::decode_main_64_json(encoded.as_bytes())
+                } else {
+                    Ok(serde_json::from_value(value)?)
+                }
+            })
             .transpose()
-            .map_err(Into::into)
     }
 }
 
@@ -176,6 +206,7 @@ impl Store {
                         source_generation: generation,
                         claim_fence: 0,
                         cursor_json: if reset { None } else { row.get(7)? },
+                        parser_revision: row.get(15)?,
                         baseline_sequence: if reset { None } else { row.get(8)? },
                         requires_full_read: reset
                             || row.get::<_, Option<i64>>(15)? != Some(PARSER_REVISION)
@@ -321,9 +352,25 @@ impl Store {
             now * 1000,
         )?;
         if !consumed {
-            tx.execute("UPDATE opencode_journal_delivery SET pending = 1, lease_expires_at_epoch = NULL,
-                next_attempt_at_epoch = ?4 WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
-                params![claim.key.environment_key, claim.key.agent, claim.key.session_id, now])?;
+            let retry = claim
+                .cursor()?
+                .map(|cursor| cursor.main_64_retry_json(&page.cursor))
+                .transpose()?
+                .flatten();
+            tx.execute(
+                "UPDATE opencode_journal_delivery SET pending = 1, lease_expires_at_epoch = NULL,
+                next_attempt_at_epoch = ?4, cursor_json = COALESCE(?5, cursor_json),
+                parser_revision = CASE WHEN ?5 IS NOT NULL THEN ?6 ELSE parser_revision END
+                WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+                params![
+                    claim.key.environment_key,
+                    claim.key.agent,
+                    claim.key.session_id,
+                    now,
+                    retry,
+                    PARSER_REVISION
+                ],
+            )?;
             tx.commit()?;
             return Ok(true);
         }
@@ -525,7 +572,7 @@ fn current_generation(
           AND d.claim_fence = ?4 AND d.cursor_json IS ?5 AND d.lease_expires_at_epoch > ?6
           AND d.incarnation = ?7 AND s.incarnation = ?7
           AND s.source_kind = 'providerDb' AND s.wsl_distro IS NULL AND s.source_label = ?8 AND s.cwd IS ?9
-          AND d.source_label = ?8 AND d.cwd IS ?9 AND d.parser_revision IN (?10, 62, 63, 64)
+          AND d.source_label = ?8 AND d.cwd IS ?9 AND d.parser_revision IN (?10, 62, 63, 64, 65)
           AND d.main_session = ?11 AND ?11 = (NOT EXISTS (
               SELECT 1 FROM session_relation r WHERE r.environment_key = s.environment_key
                 AND r.agent = s.agent AND ((r.session_id = s.session_id AND r.kind = 'forkParent')

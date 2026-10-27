@@ -14,9 +14,17 @@ fn installed_skill_example_compiles_and_keeps_its_stated_result_policy() {
     assert!(check.question_requirements().is_empty());
     for (status, prior, expected) in [
         ("cancelled", None, Some(StatusResult::Failure)),
-        ("completed", Some(StatusResult::Failure), Some(StatusResult::Success)),
+        (
+            "completed",
+            Some(StatusResult::Failure),
+            Some(StatusResult::Success),
+        ),
         ("error", None, None),
-        ("unknown", Some(StatusResult::Failure), Some(StatusResult::Failure)),
+        (
+            "unknown",
+            Some(StatusResult::Failure),
+            Some(StatusResult::Failure),
+        ),
     ] {
         let plan = plan_status_actions(
             &check.actions,

@@ -195,7 +195,7 @@ export function isPureEngineReleaseChange(files, readAtRef) {
 export const CROSS_WORKSPACE_INPUTS = {
   ".agents/skills/antiburn-checks/SKILL.md": ["checks"],
   ".antiburn/checks/fast-mode-value.yml": ["checks", "shell"],
-  ".antiburn/checks/ignored-instructions.yml": ["checks"],
+  ".antiburn/checks/ignored-instructions.yml": ["checks", "shell"],
   ".antiburn/checks/over-exploring.yml": ["checks", "shell"],
   ".antiburn/checks/scope-creep.yml": ["checks", "shell"],
   ".antiburn/checks/skill-opportunities.yml": ["checks"],
