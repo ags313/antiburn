@@ -675,9 +675,11 @@ fn v2_capture_fixture() -> (Store, SessionKey, ActivationId, OpenCodeV2CaptureSt
     };
     attach(&store, &key, &activation, 1000);
     let admitted_source = OpenCodeV2AdmittedSource {
-        database_path: "/synthetic/opencode.db".into(),
+        database_path: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("synthetic/opencode.db"),
         file_identity: "synthetic-database-identity".into(),
     };
+    assert!(admitted_source.database_path.is_absolute());
     let cursor = format!(
         "opencode-admission-v2:{}",
         serde_json::to_string(&(

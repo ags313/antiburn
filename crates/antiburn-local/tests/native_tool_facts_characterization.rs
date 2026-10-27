@@ -11,6 +11,9 @@ use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[path = "support/jsonl_fixture.rs"]
+mod jsonl_fixture;
+
 const CLAUDE: &str = include_str!("fixtures/native_tool_facts/claude.jsonl");
 const CODEX: &str = include_str!("fixtures/native_tool_facts/codex.jsonl");
 const CODEX_COMPLETED: &str = include_str!("fixtures/native_tool_facts/codex_completed.jsonl");
@@ -96,32 +99,40 @@ fn encode_rows(records: &[Value]) -> String {
 }
 
 fn assert_live_facts_at_every_split(agent: &str, format: SourceFormat, source: &str) {
-    let expected: Vec<_> = parse(agent, format, source)
-        .into_iter()
-        .map(|result| result.facts)
-        .collect();
-    assert!(!expected.is_empty());
-    let lines: Vec<_> = source.lines().collect();
-    for boundary in 1..lines.len() {
-        let directory = TempDir::new().unwrap();
-        let path = directory.path().join("session.jsonl");
-        std::fs::write(&path, format!("{}\n", lines[..boundary].join("\n"))).unwrap();
-        let input = input(agent, format, RawSource::File(path.clone()));
-        let first = read_native_file_page(&input, None, &|| false).unwrap();
-        let cursor = NativeFileCursor::decode(&first.cursor.encode()).unwrap();
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        writeln!(file, "{}", lines[boundary..].join("\n")).unwrap();
-        let second = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
-        let actual: Vec<_> = first
-            .results
+    for line_ending in ["\n", "\r\n"] {
+        let source = jsonl_fixture::with_line_ending(source, line_ending);
+        let expected: Vec<_> = parse(agent, format, &source)
             .into_iter()
-            .chain(second.results)
-            .map(|result| result.observation.facts)
+            .map(|result| result.facts)
             .collect();
-        assert_eq!(actual, expected, "{agent} at boundary {boundary}");
+        assert!(!expected.is_empty());
+        let lines: Vec<_> = source.split_inclusive('\n').collect();
+        for boundary in 1..lines.len() {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join("session.jsonl");
+            std::fs::write(&path, lines[..boundary].concat()).unwrap();
+            let input = input(agent, format, RawSource::File(path.clone()));
+            let first = read_native_file_page(&input, None, &|| false).unwrap();
+            let cursor = NativeFileCursor::decode(&first.cursor.encode()).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(lines[boundary..].concat().as_bytes())
+                .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+            let second = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
+            let actual: Vec<_> = first
+                .results
+                .into_iter()
+                .chain(second.results)
+                .map(|result| result.observation.facts)
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "{agent} at boundary {boundary}, line ending: {line_ending:?}"
+            );
+        }
     }
 }
 
@@ -559,27 +570,32 @@ fn native_file_facts_survive_every_call_result_cursor_boundary() {
         ("pi", SourceFormat::PiV3Jsonl, PI_SSH),
         ("pi", SourceFormat::PiV3Jsonl, PI_MODE),
     ] {
-        let expected = parse(agent, format, source).remove(0).facts;
-        let lines: Vec<_> = source.lines().collect();
-        for boundary in 1..lines.len() {
-            let directory = TempDir::new().unwrap();
-            let path = directory.path().join("source.jsonl");
-            std::fs::write(&path, format!("{}\n", lines[..boundary].join("\n"))).unwrap();
-            let input = input(agent, format, RawSource::File(path.clone()));
-            let first = read_native_file_page(&input, None, &|| false).unwrap();
-            assert!(first.results.is_empty(), "{agent} at {boundary}");
-            let cursor = NativeFileCursor::decode(&first.cursor.encode()).unwrap();
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
-            writeln!(file, "{}", lines[boundary..].join("\n")).unwrap();
-            let second = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
-            assert_eq!(second.results.len(), 1, "{agent} at {boundary}");
-            assert_eq!(
-                second.results[0].observation.facts, expected,
-                "{agent} at {boundary}"
-            );
+        for line_ending in ["\n", "\r\n"] {
+            let source = jsonl_fixture::with_line_ending(source, line_ending);
+            let expected = parse(agent, format, &source).remove(0).facts;
+            let lines: Vec<_> = source.split_inclusive('\n').collect();
+            for boundary in 1..lines.len() {
+                let directory = TempDir::new().unwrap();
+                let path = directory.path().join("source.jsonl");
+                std::fs::write(&path, lines[..boundary].concat()).unwrap();
+                let input = input(agent, format, RawSource::File(path.clone()));
+                let first = read_native_file_page(&input, None, &|| false).unwrap();
+                assert!(first.results.is_empty(), "{agent} at {boundary}");
+                let cursor = NativeFileCursor::decode(&first.cursor.encode()).unwrap();
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                file.write_all(lines[boundary..].concat().as_bytes())
+                    .unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+                let second = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
+                assert_eq!(second.results.len(), 1, "{agent} at {boundary}");
+                assert_eq!(
+                    second.results[0].observation.facts, expected,
+                    "{agent} at {boundary}, line ending: {line_ending:?}"
+                );
+            }
         }
     }
 }

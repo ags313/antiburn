@@ -22,6 +22,9 @@ mod claude_fixture;
 #[path = "support/corpus.rs"]
 mod corpus;
 
+#[path = "support/jsonl_fixture.rs"]
+mod jsonl_fixture;
+
 #[path = "support/public_event_fixtures.rs"]
 mod public_event_fixtures;
 
@@ -119,7 +122,7 @@ fn session_input(agent: &str, session_id: &str, path: &Path) -> SessionInput {
 /// record-aligned prefixes, the last of which is the whole input.
 /// `num_steps` must not exceed the record count.
 fn record_aligned_steps(jsonl: &str, num_steps: usize) -> Vec<String> {
-    let lines: Vec<&str> = jsonl.lines().collect();
+    let lines: Vec<&str> = jsonl.split_inclusive('\n').collect();
     assert!(
         lines.len() >= num_steps,
         "{} records cannot cut into {num_steps} steps",
@@ -128,11 +131,21 @@ fn record_aligned_steps(jsonl: &str, num_steps: usize) -> Vec<String> {
     (1..=num_steps)
         .map(|step| {
             let cut = (lines.len() * step) / num_steps;
-            let mut prefix = lines[..cut].join("\n");
-            prefix.push('\n');
-            prefix
+            lines[..cut].concat()
         })
         .collect()
+}
+
+#[test]
+fn record_aligned_steps_keep_exact_lf_crlf_and_unterminated_bytes() {
+    for line_ending in ["\n", "\r\n"] {
+        let source = jsonl_fixture::with_line_ending("first café\nsecond\n", line_ending);
+        for source in [source.as_str(), source.strip_suffix(line_ending).unwrap()] {
+            let steps = record_aligned_steps(source, 2);
+            assert_eq!(steps[0], format!("first café{line_ending}"));
+            assert_eq!(steps[1], source);
+        }
+    }
 }
 
 type TurnContentRow = (
@@ -750,6 +763,36 @@ fn assert_native_evidence_resume_parity(
         "{agent}"
     );
     full.native_evidence().to_vec()
+}
+
+#[test]
+fn native_evidence_keeps_exact_lf_and_crlf_positions_after_snapshot_resume() {
+    for (agent, format, capabilities, source) in [
+        (
+            "claude",
+            SourceFormat::ClaudeJsonl,
+            SourceCapabilities::claude(),
+            include_str!("fixtures/native_tool_facts/claude.jsonl"),
+        ),
+        (
+            "codex",
+            SourceFormat::CodexRolloutJsonl,
+            SourceCapabilities::codex(),
+            include_str!("fixtures/public_events/codex.jsonl"),
+        ),
+        (
+            "pi",
+            SourceFormat::PiV3Jsonl,
+            SourceCapabilities::pi(),
+            include_str!("fixtures/public_events/pi.jsonl"),
+        ),
+    ] {
+        for line_ending in ["\n", "\r\n"] {
+            let source = jsonl_fixture::with_line_ending(source, line_ending);
+            let events = assert_native_evidence_resume_parity(agent, format, capabilities, &source);
+            assert!(!events.is_empty(), "{agent}, line ending: {line_ending:?}");
+        }
+    }
 }
 
 fn native_evidence_after_chunks(

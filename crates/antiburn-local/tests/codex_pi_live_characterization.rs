@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 use std::io::Write;
 use tempfile::TempDir;
 
+#[path = "support/jsonl_fixture.rs"]
+mod jsonl_fixture;
+
 const CODEX: &str = include_str!("fixtures/public_events/codex.jsonl");
 const PI: &str = include_str!("fixtures/public_events/pi.jsonl");
 
@@ -78,42 +81,53 @@ fn file_events(agent: &str, source: &str) -> Vec<NativeEvidenceEvent> {
 }
 
 fn assert_live_splits(agent: &str, source: &str) {
-    let expected: Vec<_> = file_events(agent, source)
-        .into_iter()
-        .map(|event| event.fact)
-        .collect();
-    let lines: Vec<_> = source.lines().collect();
-    for boundary in 1..lines.len() {
-        let directory = TempDir::new().unwrap();
-        let path = directory.path().join("session.jsonl");
-        std::fs::write(&path, format!("{}\n", lines[..boundary].join("\n"))).unwrap();
-        let input = input(agent, RawSource::File(path.clone()));
-        let first = read_native_file_page(&input, None, &|| false).unwrap();
-        let cursor: NativeFileCursor =
-            serde_json::from_slice(&serde_json::to_vec(&first.cursor).unwrap()).unwrap();
-        let cursor = NativeFileCursor::decode(&cursor.encode()).unwrap();
-        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-        writeln!(file, "{}", lines[boundary..].join("\n")).unwrap();
-        let second = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
-        assert!(
-            second
-                .evidence
-                .events
-                .iter()
-                .filter(|event| matches!(
-                    &event.fact,
-                    NativeEvidenceFact::Message(NativeMessageObservation::Public(_))
-                ))
-                .all(|event| event.live_eligible)
-        );
-        let actual: Vec<_> = first
-            .evidence
-            .events
+    for line_ending in ["\n", "\r\n"] {
+        let source = jsonl_fixture::with_line_ending(source, line_ending);
+        let expected: Vec<_> = file_events(agent, &source)
             .into_iter()
-            .chain(second.evidence.events)
             .map(|event| event.fact)
             .collect();
-        assert_eq!(actual, expected, "{agent}, boundary {boundary}");
+        let lines: Vec<_> = source.split_inclusive('\n').collect();
+        for boundary in 1..lines.len() {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join("session.jsonl");
+            std::fs::write(&path, lines[..boundary].concat()).unwrap();
+            let input = input(agent, RawSource::File(path.clone()));
+            let first = read_native_file_page(&input, None, &|| false).unwrap();
+            let cursor: NativeFileCursor =
+                serde_json::from_slice(&serde_json::to_vec(&first.cursor).unwrap()).unwrap();
+            let cursor = NativeFileCursor::decode(&cursor.encode()).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(lines[boundary..].concat().as_bytes())
+                .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+            let second = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
+            assert!(
+                second
+                    .evidence
+                    .events
+                    .iter()
+                    .filter(|event| matches!(
+                        &event.fact,
+                        NativeEvidenceFact::Message(NativeMessageObservation::Public(_))
+                    ))
+                    .all(|event| event.live_eligible)
+            );
+            let actual: Vec<_> = first
+                .evidence
+                .events
+                .into_iter()
+                .chain(second.evidence.events)
+                .map(|event| event.fact)
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "{agent}, boundary {boundary}, line ending: {line_ending:?}"
+            );
+        }
     }
 }
 
@@ -137,58 +151,72 @@ fn assert_no_live_admission(events: &[NativeEvidenceEvent]) {
 }
 
 fn assert_pi_denial_splits(source: &str, invalid_index: usize, case: &str) {
-    let lines: Vec<_> = source.lines().collect();
-    let invalid_offset = lines[..invalid_index]
-        .iter()
-        .map(|line| line.len() as u64 + 1)
-        .sum::<u64>();
-    for boundary in 1..lines.len() {
-        let directory = TempDir::new().unwrap();
-        let path = directory.path().join("session.jsonl");
-        std::fs::write(&path, format!("{}\n", lines[..boundary].join("\n"))).unwrap();
-        let input = input("pi", RawSource::File(path.clone()));
-        let first = read_native_file_page(&input, None, &|| false).unwrap();
-        let cursor: NativeFileCursor =
-            serde_json::from_slice(&serde_json::to_vec(&first.cursor).unwrap()).unwrap();
-        let cursor = NativeFileCursor::decode(&cursor.encode()).unwrap();
-        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-        writeln!(file, "{}", lines[boundary..].join("\n")).unwrap();
-        let second = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
-        assert!(!second.history_complete, "{case}, boundary {boundary}");
-        let failure = second
-            .admission_failure
-            .as_ref()
-            .expect("unsafe source retains its admission failure");
-        match case {
-            "parent" => assert_eq!(
-                failure.reason,
-                antiburn_local::analysis::ToolResultCompleteness::UnsafeOrder
-            ),
-            "duplicate-id" => assert_eq!(
-                failure.reason,
-                antiburn_local::analysis::ToolResultCompleteness::UnsafeIdentity
-            ),
-            _ => {}
+    for line_ending in ["\n", "\r\n"] {
+        let source = jsonl_fixture::with_line_ending(source, line_ending);
+        let lines: Vec<_> = source.split_inclusive('\n').collect();
+        let invalid_offset = lines[..invalid_index]
+            .iter()
+            .map(|line| line.len() as u64)
+            .sum::<u64>();
+        for boundary in 1..lines.len() {
+            let directory = TempDir::new().unwrap();
+            let path = directory.path().join("session.jsonl");
+            std::fs::write(&path, lines[..boundary].concat()).unwrap();
+            let input = input("pi", RawSource::File(path.clone()));
+            let first = read_native_file_page(&input, None, &|| false).unwrap();
+            let cursor: NativeFileCursor =
+                serde_json::from_slice(&serde_json::to_vec(&first.cursor).unwrap()).unwrap();
+            let cursor = NativeFileCursor::decode(&cursor.encode()).unwrap();
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(lines[boundary..].concat().as_bytes())
+                .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+            let second = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
+            assert!(!second.history_complete, "{case}, boundary {boundary}");
+            let failure = second
+                .admission_failure
+                .as_ref()
+                .expect("unsafe source retains its admission failure");
+            match case {
+                "parent" => assert_eq!(
+                    failure.reason,
+                    antiburn_local::analysis::ToolResultCompleteness::UnsafeOrder
+                ),
+                "duplicate-id" => assert_eq!(
+                    failure.reason,
+                    antiburn_local::analysis::ToolResultCompleteness::UnsafeIdentity
+                ),
+                _ => {}
+            }
+            let later: Vec<_> = first
+                .evidence
+                .events
+                .into_iter()
+                .chain(second.evidence.events)
+                .filter(|event| {
+                    matches!(event.fact.position(), antiburn_local::analysis::ToolResultPosition::FileBytes { record_start, .. } if record_start >= invalid_offset)
+                })
+                .collect();
+            assert_no_live_admission(&later);
+            let cursor: NativeFileCursor =
+                serde_json::from_slice(&serde_json::to_vec(&second.cursor).unwrap()).unwrap();
+            let cursor = NativeFileCursor::decode(&cursor.encode()).unwrap();
+            let mut later_assistant = rows(PI).pop().unwrap();
+            later_assistant["id"] = json!("assistant-after-unsafe");
+            later_assistant["parentId"] = json!("assistant-2");
+            write!(file, "{later_assistant}{line_ending}").unwrap();
+            let third = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
+            assert_eq!(
+                third.admission_failure.as_ref(),
+                Some(failure),
+                "{case}, boundary {boundary}, line ending: {line_ending:?}"
+            );
+            assert!(!third.history_complete);
+            assert_no_live_admission(&third.evidence.events);
         }
-        let later: Vec<_> = first.evidence.events.into_iter().chain(second.evidence.events).filter(|event| {
-            matches!(event.fact.position(), antiburn_local::analysis::ToolResultPosition::FileBytes { record_start, .. } if record_start >= invalid_offset)
-        }).collect();
-        assert_no_live_admission(&later);
-        let cursor: NativeFileCursor =
-            serde_json::from_slice(&serde_json::to_vec(&second.cursor).unwrap()).unwrap();
-        let cursor = NativeFileCursor::decode(&cursor.encode()).unwrap();
-        let mut later_assistant = rows(PI).pop().unwrap();
-        later_assistant["id"] = json!("assistant-after-unsafe");
-        later_assistant["parentId"] = json!("assistant-2");
-        writeln!(file, "{later_assistant}").unwrap();
-        let third = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
-        assert_eq!(
-            third.admission_failure.as_ref(),
-            Some(failure),
-            "{case}, boundary {boundary}"
-        );
-        assert!(!third.history_complete);
-        assert_no_live_admission(&third.evidence.events);
     }
 }
 

@@ -2435,9 +2435,11 @@ async fn aborting_the_capture_driver_cancels_reads_and_releases_the_live_lease()
         }
         driver.abort();
         assert!(driver.await.unwrap_err().is_cancelled());
+        // The feed can close before the capture epoch commits lease release.
         wait_for(|| {
             fixture.service.open_connections.load(Ordering::SeqCst) == 0
                 && fixture.host.baseline_active.load(Ordering::SeqCst) == 0
+                && fixture.lease().is_none()
         })
         .await;
         assert!(fixture.lease().is_none());

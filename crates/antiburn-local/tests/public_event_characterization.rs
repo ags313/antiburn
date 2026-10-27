@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 use std::io::Write;
 use tempfile::TempDir;
 
+#[path = "support/jsonl_fixture.rs"]
+mod jsonl_fixture;
+
 #[path = "support/public_event_fixtures.rs"]
 mod public_event_fixtures;
 
@@ -497,41 +500,49 @@ fn every_live_split_and_cursor_encoding_keeps_the_same_frozen_members() {
         ("pi", SourceFormat::PiV3Jsonl, PI),
         ("claude", SourceFormat::ClaudeJsonl, CLAUDE),
     ] {
-        let expected: Vec<_> = file_events(agent, format, source)
-            .into_iter()
-            .map(|event| event.fact)
-            .collect();
-        let lines: Vec<_> = source.lines().collect();
-        for boundary in 1..lines.len() {
-            let directory = TempDir::new().unwrap();
-            let path = directory.path().join("session.jsonl");
-            std::fs::write(&path, format!("{}\n", lines[..boundary].join("\n"))).unwrap();
-            let input = input(agent, format, RawSource::File(path.clone()));
-            let first = read_native_file_page(&input, None, &|| false).unwrap();
-            let json = serde_json::to_vec(&first.cursor).unwrap();
-            let cursor: NativeFileCursor = serde_json::from_slice(&json).unwrap();
-            let cursor = NativeFileCursor::decode(&cursor.encode()).unwrap();
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
-            writeln!(file, "{}", lines[boundary..].join("\n")).unwrap();
-            let second = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
-            assert!(
-                second
-                    .evidence
-                    .events
-                    .iter()
-                    .all(|event| event.live_eligible)
-            );
-            let actual: Vec<_> = first
-                .evidence
-                .events
+        for line_ending in ["\n", "\r\n"] {
+            let source = jsonl_fixture::with_line_ending(source, line_ending);
+            let expected: Vec<_> = file_events(agent, format, &source)
                 .into_iter()
-                .chain(second.evidence.events)
                 .map(|event| event.fact)
                 .collect();
-            assert_eq!(actual, expected, "{agent}, boundary {boundary}");
+            let lines: Vec<_> = source.split_inclusive('\n').collect();
+            for boundary in 1..lines.len() {
+                let directory = TempDir::new().unwrap();
+                let path = directory.path().join("session.jsonl");
+                std::fs::write(&path, lines[..boundary].concat()).unwrap();
+                let input = input(agent, format, RawSource::File(path.clone()));
+                let first = read_native_file_page(&input, None, &|| false).unwrap();
+                let json = serde_json::to_vec(&first.cursor).unwrap();
+                let cursor: NativeFileCursor = serde_json::from_slice(&json).unwrap();
+                let cursor = NativeFileCursor::decode(&cursor.encode()).unwrap();
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap();
+                file.write_all(lines[boundary..].concat().as_bytes())
+                    .unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+                let second = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
+                assert!(
+                    second
+                        .evidence
+                        .events
+                        .iter()
+                        .all(|event| event.live_eligible)
+                );
+                let actual: Vec<_> = first
+                    .evidence
+                    .events
+                    .into_iter()
+                    .chain(second.evidence.events)
+                    .map(|event| event.fact)
+                    .collect();
+                assert_eq!(
+                    actual, expected,
+                    "{agent}, boundary {boundary}, line ending: {line_ending:?}"
+                );
+            }
         }
     }
 }
@@ -807,10 +818,7 @@ fn claude_duplicate_call_blocks_are_unsafe_and_native_holes_stay_in_order() {
 #[test]
 fn a_partial_assistant_projection_keeps_cycle_state_without_publishing_fragments() {
     for line_ending in ["\n", "\r\n"] {
-        let source: String = CODEX
-            .lines()
-            .map(|line| format!("{line}{line_ending}"))
-            .collect();
+        let source = jsonl_fixture::with_line_ending(CODEX, line_ending);
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("session.jsonl");
         let lines: Vec<_> = source.split_inclusive('\n').collect();
