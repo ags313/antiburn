@@ -1,9 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use antiburn_local::instructions::{CurrentInstruction, CurrentInstructionScope};
 use serde_json::Value;
 
-use super::{Collector, Producer, hierarchy, skills::SkillTraversal};
+use super::{
+    Collector, Producer,
+    admission::{PathAdmission, has_parent_component},
+    hierarchy,
+    skills::SkillTraversal,
+};
 
 impl Collector<'_> {
     pub(super) fn collect_global(&mut self, producer: Producer, home: &Path, cwd: Option<&Path>) {
@@ -388,15 +393,19 @@ impl Collector<'_> {
                 for entry in self.config_paths(value, global, false) {
                     let targets = self.instruction_targets(&entry, home, workspace, global);
                     for target in targets {
-                        if let Some(safety) = allowed_root(&target, home, workspace) {
-                            let scope = if global {
-                                None
-                            } else {
-                                workspace.map(|(root, _)| root)
-                            };
-                            self.instruction(&target, safety, global, scope, false);
-                        } else {
-                            self.limit(global, false, "configured_path_outside_allowed_roots");
+                        match allowed_root(&target, home, workspace, self.reads.admission) {
+                            Ok(Some(safety)) => {
+                                let scope = if global {
+                                    None
+                                } else {
+                                    workspace.map(|(root, _)| root)
+                                };
+                                self.instruction(&target, &safety, global, scope, false);
+                            }
+                            Ok(None) => {
+                                self.limit(global, false, "configured_path_outside_allowed_roots");
+                            }
+                            Err(reason) => self.limit(global, false, reason),
                         }
                     }
                 }
@@ -428,16 +437,22 @@ impl Collector<'_> {
                             workspace.map(|(_, cwd)| cwd.join(&entry))
                         };
                         if let Some(target) = target {
-                            if let Some(safety) = allowed_root(&target, home, workspace) {
-                                self.skill_source(
+                            match allowed_root(&target, home, workspace, self.reads.admission) {
+                                Ok(Some(safety)) => self.skill_source(
                                     &target,
-                                    safety,
+                                    &safety,
                                     global,
                                     SkillTraversal::for_opencode(producer),
                                     0,
-                                );
-                            } else {
-                                self.limit(global, true, "configured_path_outside_allowed_roots");
+                                ),
+                                Ok(None) => {
+                                    self.limit(
+                                        global,
+                                        true,
+                                        "configured_path_outside_allowed_roots",
+                                    );
+                                }
+                                Err(reason) => self.limit(global, true, reason),
                             }
                         } else {
                             self.limit(global, true, "configured_path_root_unavailable");
@@ -468,7 +483,17 @@ impl Collector<'_> {
                 {
                     if path.contains("://") {
                         self.limit(global, skills, "remote_source_not_read");
-                    } else if path.contains(['*', '?', '[', '{', '!']) {
+                    } else if has_parent_component(Path::new(path)) {
+                        // Windows verbatim joins remove parent components.
+                        self.limit(global, skills, "path_outside_allowed_root");
+                    } else if Path::new(path).components().any(|component| {
+                        !matches!(component, Component::Prefix(_))
+                            && component
+                                .as_os_str()
+                                .as_encoded_bytes()
+                                .iter()
+                                .any(|byte| b"*?[{!".contains(byte))
+                    }) {
                         self.limit(global, skills, "dynamic_or_glob_source_not_read");
                     } else {
                         paths.push(path.to_owned());
@@ -542,15 +567,18 @@ pub(super) fn instruction_scope(
     })
 }
 
-fn allowed_root<'a>(
+fn allowed_root(
     path: &Path,
-    home: Option<&'a Path>,
-    workspace: Option<(&'a Path, &'a Path)>,
-) -> Option<&'a Path> {
-    workspace
-        .map(|(root, _)| root)
-        .filter(|root| path.starts_with(root))
-        .or_else(|| home.filter(|home| path.starts_with(home)))
+    home: Option<&Path>,
+    workspace: Option<(&Path, &Path)>,
+    admission: PathAdmission<'_>,
+) -> Result<Option<PathBuf>, &'static str> {
+    for root in workspace.map(|(root, _)| root).into_iter().chain(home) {
+        if let Some(root) = admission.configured_root(path, root)? {
+            return Ok(Some(root));
+        }
+    }
+    Ok(None)
 }
 
 fn rule_globs(content: &str) -> Result<Vec<String>, &'static str> {

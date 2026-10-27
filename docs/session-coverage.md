@@ -1335,7 +1335,12 @@ The collector requires source-owned home, CWD, repository binding, and recorded
 protected-directory grants. It checks every file and directory before I/O,
 including configured targets. It does not probe for consent. Symlink targets,
 symlink ancestors, and paths outside admitted roots remain unavailable. Safe
-siblings remain usable beside denied or malformed entries. Ambiguous conditional
+siblings remain usable beside denied or malformed entries. On Windows, ordinary
+path components that end in a space or period remain unavailable because Windows
+can resolve them differently during a prefix check and a full-path read.
+Drive and UNC paths can use the verbatim prefix to retain literal names, but
+they still require root and symlink checks. Other Windows namespaces remain
+unavailable. Ambiguous conditional
 frontmatter is omitted with a limit, never made unconditional. Skill descriptions
 come only from bounded declared metadata; missing descriptions stay empty and
 duplicate names at distinct paths remain separate. Skill bodies do not enter this

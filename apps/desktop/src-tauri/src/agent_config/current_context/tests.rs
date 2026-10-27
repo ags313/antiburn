@@ -1,6 +1,7 @@
 use super::*;
 use std::fs;
 
+mod paths;
 mod protected_case_aliases;
 mod review;
 
@@ -132,13 +133,17 @@ fn changed_files_change_revision_without_mutating_a_saved_snapshot() {
     let fixture = Fixture::new();
     fixture.write(fixture.root.join("CLAUDE.md"), "Before\r\n");
     let before = fixture.collect(AgentKind::Claude, SourceFormat::ClaudeJsonl);
+    assert!(before.repo.snapshot_revision.is_some());
+    let saved = serde_json::to_value(&before).unwrap();
     assert_eq!(
         before,
         fixture.collect(AgentKind::Claude, SourceFormat::ClaudeJsonl)
     );
     fixture.write(fixture.root.join("CLAUDE.md"), "After\n");
     let after = fixture.collect(AgentKind::Claude, SourceFormat::ClaudeJsonl);
+    assert!(after.repo.snapshot_revision.is_some());
     assert_ne!(before.repo.snapshot_revision, after.repo.snapshot_revision);
+    assert_eq!(serde_json::to_value(&before).unwrap(), saved);
     assert_eq!(before.repo.instructions.unwrap()[0].content, "Before\r\n");
     assert_eq!(after.repo.instructions.unwrap()[0].content, "After\n");
 }

@@ -208,6 +208,7 @@ impl Runtime {
         self.evaluator.calls.lock().unwrap().len()
     }
 
+    #[cfg(unix)]
     pub(super) fn refresh_source_progress(&self) {
         self.engine.refresh_source_progress(&self.active).unwrap();
     }

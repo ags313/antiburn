@@ -18,15 +18,18 @@ impl<'a> PathAdmission<'a> {
     }
 
     pub fn check(self, path: &Path) -> Result<(), &'static str> {
-        if !self.home.is_absolute()
-            || self
-                .home
-                .components()
-                .any(|part| part == Component::ParentDir)
-        {
+        if !self.home.is_absolute() || has_parent_component(self.home) {
             return Err("home_unavailable");
         }
-        if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+        #[cfg(windows)]
+        if !windows_path_is_supported(self.home) {
+            return Err("home_unavailable");
+        }
+        if !path.is_absolute() || has_parent_component(path) {
+            return Err("path_outside_allowed_root");
+        }
+        #[cfg(windows)]
+        if !windows_path_is_supported(path) {
             return Err("path_outside_allowed_root");
         }
         #[cfg(target_os = "macos")]
@@ -45,9 +48,11 @@ impl<'a> PathAdmission<'a> {
     pub fn canonical_directory(self, path: &Path) -> Result<PathBuf, &'static str> {
         self.check(path)?;
         let mut current = PathBuf::new();
-        for component in path.components() {
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
             current.push(component);
-            if !current.is_absolute() {
+            // A verbatim drive prefix needs its root separator before lookup.
+            if !current.is_absolute() || components.peek() == Some(&Component::RootDir) {
                 continue;
             }
             self.check(&current)?;
@@ -63,6 +68,93 @@ impl<'a> PathAdmission<'a> {
         self.check(&canonical)?;
         Ok(canonical)
     }
+
+    pub fn configured_root(
+        self,
+        path: &Path,
+        root: &Path,
+    ) -> Result<Option<PathBuf>, &'static str> {
+        self.check(path)?;
+        self.check(root)?;
+        if path.starts_with(root) {
+            return Ok(Some(root.to_owned()));
+        }
+        #[cfg(windows)]
+        // Normal and verbatim paths can resolve names differently. Check the root.
+        if let Some(alias) = windows_root_alias(path, root)
+            && self.canonical_directory(&alias)? == root
+        {
+            return Ok(Some(alias));
+        }
+        Ok(None)
+    }
+}
+
+pub(super) fn has_parent_component(path: &Path) -> bool {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .split(|byte| *byte == b'/' || (cfg!(windows) && *byte == b'\\'))
+        .any(|part| part == b"..")
+}
+
+#[cfg(windows)]
+fn windows_path_is_supported(path: &Path) -> bool {
+    use std::path::Prefix;
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return false;
+    };
+    match prefix.kind() {
+        Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _) => true,
+        Prefix::UNC(server, _)
+            if server == std::ffi::OsStr::new("?") || server == std::ffi::OsStr::new(".") =>
+        {
+            false
+        }
+        // Windows can trim a final name but retain the same name inside a path.
+        Prefix::Disk(_) | Prefix::UNC(_, _) => components.all(|component| match component {
+            Component::Normal(name) => {
+                let bytes = name.as_encoded_bytes();
+                !bytes.ends_with(b" ") && !bytes.ends_with(b".")
+            }
+            _ => true,
+        }),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn windows_root_alias(path: &Path, root: &Path) -> Option<PathBuf> {
+    use std::path::Prefix;
+
+    let mut actual = path.components();
+    let mut expected = root.components();
+    let (Some(Component::Prefix(prefix)), Some(Component::Prefix(root_prefix))) =
+        (actual.next(), expected.next())
+    else {
+        return None;
+    };
+    let same_prefix = match (prefix.kind(), root_prefix.kind()) {
+        (Prefix::Disk(a), Prefix::VerbatimDisk(b)) | (Prefix::VerbatimDisk(a), Prefix::Disk(b)) => {
+            a == b
+        }
+        (Prefix::UNC(a, b), Prefix::VerbatimUNC(c, d))
+        | (Prefix::VerbatimUNC(a, b), Prefix::UNC(c, d)) => a == c && b == d,
+        _ => false,
+    };
+    if !same_prefix {
+        return None;
+    }
+    let mut alias = PathBuf::from(prefix.as_os_str());
+    for expected in expected {
+        let component = actual.next()?;
+        if component != expected {
+            return None;
+        }
+        alias.push(component);
+    }
+    Some(alias)
 }
 
 #[cfg(target_os = "macos")]
@@ -83,4 +175,45 @@ fn may_alias_protected_prefix(path: &Path, prefix: &Path) -> bool {
             _ => actual == expected,
         }
     })
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_root_aliases_keep_drives_shares_and_component_boundaries() {
+        for (path, root, alias) in [
+            (r"C:\safe\rules.md", r"\\?\C:\safe", r"C:\safe"),
+            (r"\\?\C:\safe\rules.md", r"C:\safe", r"\\?\C:\safe"),
+            (
+                r"\\server\share\safe\rules.md",
+                r"\\?\UNC\server\share\safe",
+                r"\\server\share\safe",
+            ),
+            (
+                r"\\?\UNC\server\share\safe\rules.md",
+                r"\\server\share\safe",
+                r"\\?\UNC\server\share\safe",
+            ),
+        ] {
+            assert_eq!(
+                windows_root_alias(Path::new(path), Path::new(root)),
+                Some(PathBuf::from(alias))
+            );
+        }
+        for (path, root) in [
+            (r"C:\safe-copy\rules.md", r"\\?\C:\safe"),
+            (r"D:\safe\rules.md", r"\\?\C:\safe"),
+            (r"C:safe\rules.md", r"\\?\C:\safe"),
+            (r"\\.\C:\safe\rules.md", r"\\?\C:\safe"),
+            (r"C:\SAFE\rules.md", r"\\?\C:\safe"),
+            (
+                r"\\server\other\safe\rules.md",
+                r"\\?\UNC\server\share\safe",
+            ),
+        ] {
+            assert_eq!(windows_root_alias(Path::new(path), Path::new(root)), None);
+        }
+    }
 }

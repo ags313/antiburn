@@ -806,41 +806,48 @@ fn claude_duplicate_call_blocks_are_unsafe_and_native_holes_stay_in_order() {
 
 #[test]
 fn a_partial_assistant_projection_keeps_cycle_state_without_publishing_fragments() {
-    let directory = TempDir::new().unwrap();
-    let path = directory.path().join("session.jsonl");
-    let lines: Vec<_> = CODEX.lines().collect();
-    std::fs::write(&path, format!("{}\n", lines[..10].join("\n"))).unwrap();
-    let input = input(
-        "codex",
-        SourceFormat::CodexRolloutJsonl,
-        RawSource::File(path.clone()),
-    );
-    let first = read_native_file_page(&input, None, &|| false).unwrap();
-    let middle = lines[10].len() / 2;
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .unwrap();
-    write!(file, "{}", &lines[10][..middle]).unwrap();
-    let pending = read_native_file_page(&input, Some(&first.cursor), &|| false).unwrap();
-    assert!(pending.pending_tail);
-    assert!(pending.evidence.events.is_empty());
-    let cursor = NativeFileCursor::decode(&pending.cursor.encode()).unwrap();
-    let cursor: NativeFileCursor =
-        serde_json::from_slice(&serde_json::to_vec(&cursor).unwrap()).unwrap();
-    writeln!(file, "{}\n{}", &lines[10][middle..], lines[11]).unwrap();
-    let final_page = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
-    assert_eq!(cycles(&final_page.evidence.events).len(), 1);
-    let actual: Vec<_> = first
-        .evidence
-        .events
-        .into_iter()
-        .chain(final_page.evidence.events)
-        .map(|event| event.fact)
-        .collect();
-    let expected: Vec<_> = file_events("codex", SourceFormat::CodexRolloutJsonl, CODEX)
-        .into_iter()
-        .map(|event| event.fact)
-        .collect();
-    assert_eq!(actual, expected);
+    for line_ending in ["\n", "\r\n"] {
+        let source: String = CODEX
+            .lines()
+            .map(|line| format!("{line}{line_ending}"))
+            .collect();
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let lines: Vec<_> = source.split_inclusive('\n').collect();
+        std::fs::write(&path, lines[..10].concat()).unwrap();
+        let input = input(
+            "codex",
+            SourceFormat::CodexRolloutJsonl,
+            RawSource::File(path.clone()),
+        );
+        let first = read_native_file_page(&input, None, &|| false).unwrap();
+        let middle = lines[10].len() / 2;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(file, "{}", &lines[10][..middle]).unwrap();
+        let pending = read_native_file_page(&input, Some(&first.cursor), &|| false).unwrap();
+        assert!(pending.pending_tail);
+        assert!(pending.evidence.events.is_empty());
+        let cursor = NativeFileCursor::decode(&pending.cursor.encode()).unwrap();
+        let cursor: NativeFileCursor =
+            serde_json::from_slice(&serde_json::to_vec(&cursor).unwrap()).unwrap();
+        write!(file, "{}{}", &lines[10][middle..], lines[11]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+        let final_page = read_native_file_page(&input, Some(&cursor), &|| false).unwrap();
+        assert_eq!(cycles(&final_page.evidence.events).len(), 1);
+        let actual: Vec<_> = first
+            .evidence
+            .events
+            .into_iter()
+            .chain(final_page.evidence.events)
+            .map(|event| event.fact)
+            .collect();
+        let expected: Vec<_> = file_events("codex", SourceFormat::CodexRolloutJsonl, &source)
+            .into_iter()
+            .map(|event| event.fact)
+            .collect();
+        assert_eq!(actual, expected, "line ending: {line_ending:?}");
+    }
 }

@@ -569,6 +569,12 @@ selected result-content truncation. Large protected input can still reject
 preparation rather than silently shrink required evidence. See
 [current-file source limits](session-coverage.md#yaml-current-file-inputs).
 
+Current-file inputs require admitted paths. On Windows, ordinary path components
+that end in a space or period remain unavailable. Drive and UNC paths can retain
+literal verbatim names but do not bypass root or symlink checks. Other Windows
+namespaces remain unavailable. Safe entries can remain available beside rejected
+configured sources.
+
 ### Decision-input fitting limits
 
 Decision-level `fit` authorizes loss from selected evaluated input paths only.
