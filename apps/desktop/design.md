@@ -17,6 +17,7 @@ sources:
   - src/styles/session-analysis-colors.css
   - src/styles/session-rows.css
   - src/styles/session-detail.css
+  - src/components/promotions/promotion.css
   - src/components/ui/text-roll.css
   - src/components/burn-checks/burn-check-summary.css
   - src/views/main-window/overview/overview.css
@@ -108,6 +109,24 @@ colors:
   brand-tint: # antiburn orange for large fills
     light: "hsl(17.6 100% 54%)"
     dark: "hsl(17.6 100% 54%)"
+  brand-hover: # clearer hover for orange actions; dark ink remains legible
+    light: "hsl(17.6 100% 64%)"
+    dark: "hsl(17.6 100% 64%)"
+  brand-ink: # dark text on the shared bright orange action fill
+    light: "hsl(0 0% 0% / 0.85)"
+    dark: "hsl(0 0% 0% / 0.85)"
+  brand-action: # orange action fill with AA white text
+    light: "hsl(17.6 100% 42%)"
+    dark: "hsl(17.6 100% 42%)"
+  brand-action-hover:
+    light: "hsl(17.6 100% 40%)"
+    dark: "hsl(17.6 100% 40%)"
+  brand-action-pressed:
+    light: "hsl(17.6 100% 38%)"
+    dark: "hsl(17.6 100% 38%)"
+  brand-action-ink:
+    light: "hsl(0 0% 100%)"
+    dark: "hsl(0 0% 100%)"
   brand-unlit: # an unlit meter segment: the brand tint, a quarter less saturated
     light: "hsl(17.7 75% 54%)"
     dark: "hsl(17.7 75% 54%)"
@@ -452,10 +471,12 @@ rounded:
   small: 4px
   control: 5px
   popover: 10px # outer corner for macOS floating popover and notification surfaces
+  promotion: 16px # announcement and setup panel, including media clipping
   full: 9999px
 shadow:
+  promotion: "var(--shadow-promotion)" # @theme-registered; light uses popover, dark adds a soft right shadow
   stats-card: "inset 0 0 0 1px var(--color-stats-edge)"
-  popover: "0 4px 12px rgb(0 0 0 / 0.15), 0 1px 3px rgb(0 0 0 / 0.08)"
+  popover: "0 4px 12px rgb(0 0 0 / 0.15), 0 1px 3px rgb(0 0 0 / 0.08)" # @theme-registered; consume as the `shadow-popover` utility
   tooltip: "0 2px 8px rgb(0 0 0 / 0.12), 0 0.5px 2px rgb(0 0 0 / 0.06)"
   raised: "0 1px 2px rgb(0 0 0 / 0.15), 0 0 0 0.5px rgb(0 0 0 / 0.04)" # @theme-registered; consume as the `shadow-raised` utility
 motion:
@@ -1619,3 +1640,40 @@ replaces its icon with a check for two seconds and announces the result. Errors
 stay inline. The selectable monospace path prefers directory-boundary wraps and
 gives the final directory primary ink. No path, folder name, or error text enters
 analytics. Unknown project paths hide the control; deleted paths remain copyable.
+
+## Promotion panel
+
+The main-window promotion panel uses a 320 × 440 logical-pixel frame in both
+announcement and setup views. It sits 8px from the left and bottom window edges,
+covering the sidebar footer while open. The covered footer stays hidden and leaves
+the tab order until the panel closes. Settings remains below the footer separator.
+The sidebar has no promo launcher; What’s new is reserved for recent changes. Small windows constrain the frame and scroll only
+its content. The media cell uses a 32:15 ratio (150px tall at the default width) and bottom-aligned cover fitting.
+Light-mode media and its poster switch together through the optional YAML `media.light` variant.
+The base source remains the dark-mode fallback. Theme changes reset media failures;
+reduced motion still shows the poster. Videos and GIFs keep looping across focus
+changes without swapping sources or resetting playback.
+Use the opaque `surface-overlay`, `rounded-promotion`, and `shadow-promotion`
+tokens. The promotion shadow retains the popover shadow in light mode. In dark mode,
+it uses `6px 0 18px rgb(0 0 0 / 0.32), 0 2px 6px rgb(0 0 0 / 0.18)`
+to separate its right edge from the app. System and explicit themes match.
+A pointer-transparent inset `shadow-stats-card` highlights every panel edge,
+including media. Promo actions use `brand-action` with white `brand-action-ink`,
+`brand-action-hover` for hover and keyboard focus, and `brand-action-pressed` for a press.
+All states exceed 4.5:1 text contrast in both themes. These tokens do not change meter fills.
+The action retains a 28px visible fill inside a 40px hit area and `type-callout font-medium!` text.
+The first visible panel appearance uses the Web Animations API: opacity 0 to 1,
+`translateY(space-sm)` to zero, `duration-medium` (180ms), and `ease-out-quart`.
+It plays once per opening, without replaying on focus, screen changes, or overlay restoration.
+Reduced motion uses opacity only for `duration-quick` (100ms). Closing cancels the reveal immediately.
+The body uses 16px horizontal padding.
+The footer uses 12px horizontal padding, 4px vertical padding, and a 48px minimum height.
+Both footer actions use `space-xs` (4px) between their label and icon.
+Copy controls keep their 60 × 40px target and feedback slot, with a 28px square
+hover fill around the icon. The fill aligns with the command box’s right edge
+for both steps. Copied feedback replaces the icon in the same slot.
+The dismiss circle measures 28px inside a 40px hit area. Its surface-overlay fill
+uses 10% opacity at rest and 35% on hover; the opaque label glyph uses a 2.5px stroke for clearer definition. Learn more changes only its text color
+on hover and keeps a transparent background.
+Use `type-title-2`, `type-body`, `type-callout`, and `type-footnote`. Commands
+use muted text, 4px horizontal and 8px vertical padding, and retain selectable wrapping. The panel remains non-modal.

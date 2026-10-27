@@ -2,6 +2,11 @@ import { Bot, Brain, Flame, Gauge, House, MessagesSquare, Settings } from "lucid
 import { useState, useSyncExternalStore, type ReactNode } from "react"
 import { flushSync } from "react-dom"
 
+import promotionCatalog from "virtual:promotions"
+import { PromotionSession } from "../lib/promotions/PromotionSession"
+import { promotionEnvironment } from "../lib/promotions/promotionEnvironment"
+import { PromotionHost } from "../components/promotions/PromotionHost"
+
 import { SidebarNav, type SidebarNavItem } from "../components/ui/SidebarNav"
 import type { CheckId } from "../lib/insightsIpc"
 import { noteInteraction, openSettingsWindow } from "../lib/ipc"
@@ -45,6 +50,9 @@ export function MainWindowView({ sections }: { sections?: readonly MainWindowSec
   const onboardingComplete =
     overview.mode === "steady" || (overview.mode === "firstRun" && overview.flow === "done")
   const onboardingBlocked = !sections && !onboardingComplete
+  const [promotionSession] = useState(
+    () => new PromotionSession(promotionCatalog, promotionEnvironment),
+  )
   const [searchOpen, setSearchOpen] = useState(false)
   const [settingsError, setSettingsError] = useState(false)
   async function openSettings(...target: Parameters<typeof openSettingsWindow>): Promise<void> {
@@ -295,6 +303,9 @@ export function MainWindowView({ sections }: { sections?: readonly MainWindowSec
               },
             })}
         searchOpen={searchOpen}
+        overlay={
+          <PromotionHost session={promotionSession} blocked={searchOpen || onboardingBlocked} />
+        }
         sidebar={(closeNavigation) => (
           <SidebarNav
             items={availableSections}
@@ -304,9 +315,7 @@ export function MainWindowView({ sections }: { sections?: readonly MainWindowSec
             ariaLabel="Main sections"
             className="main-window-sidebar min-h-0 flex-1"
             footer={
-              <>
-                <div className="mb-2 h-px bg-separator" />
-
+              <div>
                 {settingsError && (
                   <p role="alert" className="px-2 pb-2 type-caption text-label-secondary">
                     Could not open Settings. Try again.
@@ -325,7 +334,7 @@ export function MainWindowView({ sections }: { sections?: readonly MainWindowSec
                   <Settings size={14} strokeWidth={2} aria-hidden="true" />
                   <span>Settings</span>
                 </button>
-              </>
+              </div>
             }
           />
         )}

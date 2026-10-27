@@ -131,6 +131,9 @@ pub enum EventName {
     AppSearchOpened,
     #[cfg(feature = "analytics")]
     AppSearchResultOpened,
+    /// A production promotion panel was viewed or used.
+    #[cfg(feature = "analytics")]
+    PromotionInteraction,
     /// The reader saved a different application interface size preset.
     InterfaceScaleChanged,
     /// The first-run Overview reached a fixed funnel step.
@@ -204,6 +207,7 @@ pub const EVERY_EVENT: &[EventName] = &[
     EventName::NavigationHistoryMoved,
     EventName::AppSearchOpened,
     EventName::AppSearchResultOpened,
+    EventName::PromotionInteraction,
     EventName::InterfaceScaleChanged,
     EventName::FirstRunStepReached,
     EventName::FirstRunAction,
@@ -255,6 +259,7 @@ impl EventName {
             EventName::NavigationHistoryMoved => "antiburn.navigation_history_moved",
             EventName::AppSearchOpened => "antiburn.app_search_opened",
             EventName::AppSearchResultOpened => "antiburn.app_search_result_opened",
+            EventName::PromotionInteraction => "antiburn.promotion_interaction",
             EventName::InterfaceScaleChanged => "antiburn.interface_scale_changed",
             EventName::FirstRunStepReached => "antiburn.first_run_step_reached",
             EventName::FirstRunAction => "antiburn.first_run_action",
@@ -295,6 +300,10 @@ impl EventName {
             | EventName::IgnoredInstructionObserved
             | EventName::CheckEnablementSaved
             | EventName::StepSettingsViewed => true,
+            EventName::PromotionInteraction => matches!(
+                facts.label,
+                Some("primary_activated" | "learn_more_activated" | "command_copied" | "dismissed")
+            ),
             EventName::SurfaceViewed => facts.detail == Some("user"),
             EventName::RemoteSyncCompleted => facts.detail == Some("manual"),
             // `started`, `found`, `read`, and `checked` are reported as the
@@ -746,6 +755,13 @@ pub enum Interaction {
         label: StepSettingsLabel,
         detail: StepSettingsDetail,
     },
+    /// A production promotion panel was viewed or used.
+    #[serde(rename = "promotionInteraction")]
+    PromotionUsed {
+        campaign: PromotionCampaign,
+        action: PromotionAction,
+        origin: Origin,
+    },
 }
 
 /// A stable, closed analytics identity for a check.
@@ -983,6 +999,23 @@ pub enum IgnoredInstructionOutcome {
     Unavailable,
     Failed,
     Copied,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionCampaign {
+    ClaudeMod,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionAction {
+    AnnouncementViewed,
+    SetupViewed,
+    PrimaryActivated,
+    LearnMoreActivated,
+    CommandCopied,
+    Dismissed,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1518,6 +1551,19 @@ impl Interaction {
                     ..Facts::default()
                 },
             ),
+            Interaction::PromotionUsed {
+                campaign,
+                action,
+                origin,
+            } => (
+                EventName::PromotionInteraction,
+                Facts {
+                    detail: Some(campaign.as_str()),
+                    label: Some(action.as_str()),
+                    origin: Some(origin.as_str()),
+                    ..Facts::default()
+                },
+            ),
         }
     }
 }
@@ -1662,6 +1708,18 @@ wire_values!(FirstRunActionKind, {
     FirstRunActionKind::LiveUsageStarted => "live_usage_started",
     FirstRunActionKind::LiveUsageSkipped => "live_usage_skipped",
     FirstRunActionKind::EnhanceOpened => "enhance_opened",
+});
+
+#[cfg(feature = "analytics")]
+wire_values!(PromotionCampaign, { PromotionCampaign::ClaudeMod => "claude_mod" });
+#[cfg(feature = "analytics")]
+wire_values!(PromotionAction, {
+    PromotionAction::AnnouncementViewed => "announcement_viewed",
+    PromotionAction::SetupViewed => "setup_viewed",
+    PromotionAction::PrimaryActivated => "primary_activated",
+    PromotionAction::LearnMoreActivated => "learn_more_activated",
+    PromotionAction::CommandCopied => "command_copied",
+    PromotionAction::Dismissed => "dismissed",
 });
 
 #[cfg(feature = "analytics")]
@@ -3110,6 +3168,7 @@ mod tests {
                 | EventName::NavigationHistoryMoved
                 | EventName::AppSearchOpened
                 | EventName::AppSearchResultOpened
+                | EventName::PromotionInteraction
                 | EventName::InterfaceScaleChanged
                 | EventName::FirstRunStepReached
                 | EventName::FirstRunAction
@@ -3123,7 +3182,7 @@ mod tests {
         }
         assert_eq!(
             EVERY_EVENT.len(),
-            45,
+            46,
             "a variant was added to the match above but not to EVERY_EVENT"
         );
         assert!(EVERY_EVENT.iter().copied().all(listed));
@@ -3754,6 +3813,105 @@ mod tests {
                 serde_json::from_value::<Interaction>(value.clone()).is_err(),
                 "{value}"
             );
+        }
+    }
+
+    #[test]
+    fn promotion_views_do_not_extend_user_activity() {
+        for action in [
+            PromotionAction::AnnouncementViewed,
+            PromotionAction::SetupViewed,
+            PromotionAction::PrimaryActivated,
+            PromotionAction::LearnMoreActivated,
+            PromotionAction::CommandCopied,
+            PromotionAction::Dismissed,
+        ] {
+            let (name, facts) = Interaction::PromotionUsed {
+                campaign: PromotionCampaign::ClaudeMod,
+                action,
+                origin: Origin::Automatic,
+            }
+            .resolve();
+            assert_eq!(
+                name.is_user_oriented(&facts),
+                !matches!(
+                    action,
+                    PromotionAction::AnnouncementViewed | PromotionAction::SetupViewed
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn promotion_interactions_resolve_only_closed_actions_and_origins() {
+        let cases = [
+            (PromotionAction::AnnouncementViewed, "announcement_viewed"),
+            (PromotionAction::SetupViewed, "setup_viewed"),
+            (PromotionAction::PrimaryActivated, "primary_activated"),
+            (PromotionAction::LearnMoreActivated, "learn_more_activated"),
+            (PromotionAction::CommandCopied, "command_copied"),
+            (PromotionAction::Dismissed, "dismissed"),
+        ];
+
+        for (action, label) in cases {
+            for origin in [Origin::User, Origin::Automatic] {
+                let (name, facts) = Interaction::PromotionUsed {
+                    campaign: PromotionCampaign::ClaudeMod,
+                    action,
+                    origin,
+                }
+                .resolve();
+                assert_eq!(name, EventName::PromotionInteraction);
+                assert_eq!(name.as_str(), "antiburn.promotion_interaction");
+                assert_eq!(facts.label, Some(label));
+                assert_eq!(facts.origin, Some(origin.as_str()));
+                assert_eq!(facts.detail, Some("claude_mod"));
+            }
+        }
+
+        let valid = serde_json::json!({
+            "kind": "promotionInteraction",
+            "campaign": "claude_mod",
+            "action": "command_copied",
+            "origin": "user"
+        });
+        let decoded = serde_json::from_value::<Interaction>(valid.clone()).unwrap();
+        assert_eq!(decoded.resolve().1.detail, Some("claude_mod"));
+        for campaign in [
+            serde_json::json!("unregistered"),
+            serde_json::json!(null),
+            serde_json::json!(12),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["campaign"] = campaign;
+            assert!(serde_json::from_value::<Interaction>(invalid).is_err());
+        }
+        let mut missing_campaign = valid;
+        missing_campaign.as_object_mut().unwrap().remove("campaign");
+        assert!(serde_json::from_value::<Interaction>(missing_campaign).is_err());
+
+        for value in [
+            serde_json::json!({
+                "kind": "promotionInteraction",
+                "campaign": "claude_mod",
+                "action": "installed",
+                "origin": "user"
+            }),
+            serde_json::json!({
+                "kind": "promotionInteraction",
+                "campaign": "claude_mod",
+                "action": "command_copied",
+                "origin": "launch_background"
+            }),
+            serde_json::json!({
+                "kind": "promotionInteraction",
+                "campaign": "claude_mod",
+                "action": "command_copied",
+                "origin": "user",
+                "command": "private command text"
+            }),
+        ] {
+            assert!(serde_json::from_value::<Interaction>(value).is_err());
         }
     }
 }
