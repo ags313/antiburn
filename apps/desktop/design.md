@@ -1647,7 +1647,33 @@ The main-window promotion panel uses a 320 × 440 logical-pixel frame in both
 announcement and setup views. It sits 8px from the left and bottom window edges,
 covering the sidebar footer while open. The covered footer stays hidden and leaves
 the tab order until the panel closes. Settings remains below the footer separator.
-The sidebar has no promo launcher; What’s new is reserved for recent changes. Small windows constrain the frame and scroll only
+Detected Claude users have a Claude Mod card above the Settings separator.
+Use `rounded-popover`, `surface-card`, `space-md` padding and `space-xs` between
+its content rows. The header uses a 14px orange Claude mark, a `type-body font-medium`
+label and a neutral NEW badge. The `type-caption` subtitle uses `label-secondary`
+and wraps naturally: Usage, resets, and pace above your prompt.
+Keep this in one text block. Append Find out more with a 12px right arrow inline,
+using `font-medium`, secondary `label-secondary` ink and a `space-xs` label-to-icon gap. Keep the
+affordance label and arrow together as the description wraps.
+Keep it inside the single card button. Use `space-md` between the card and separator
+to optically balance the separator-to-Settings content gap.
+In light mode, use `surface-overlay` to match the larger promo panel’s near-white fill.
+Use a 6% `brand-tint` upper-left radial glow fading to transparent at 45%, with
+a 1px inset edge using 65% `separator` ink. Do not add an outer shadow. On hover, add
+97% `surface-overlay` mixed with 3% `label`, and strengthen the inset edge with 85% `separator` ink.
+Use 50% white `input-fill` for NEW, with 85% `label-secondary` mixed with 15% `label`
+for slightly stronger gray text. The badge has no border.
+In dark mode, keep `surface-card`, `surface-secondary` on hover, a 12% glow, and
+`shadow-stats-card` in both states. System and explicit themes match.
+Transition only background color and box shadow over `duration-fast`.
+The entire card opens the promo. Preserve
+standard keyboard focus. NEW uses `type-caption`, `rounded-control`,
+`surface-secondary` and `label-secondary`, with a `space-lg` (16px) height.
+Keep the header and subtitle clear of clipping.
+Hide the launcher during FTUE; allow manual opening after completion while preserving
+the automatic cooldown. The NEW badge remains visible until the promo card is removed.
+Keep the action after activation. Restore focus to it after manual dismissal.
+What’s new is reserved for recent changes. Small windows constrain the frame and scroll only
 its content. The media cell uses a 32:15 ratio (150px tall at the default width) and bottom-aligned cover fitting.
 Light-mode media and its poster switch together through the optional YAML `media.light` variant.
 The base source remains the dark-mode fallback. Theme changes reset media failures;
@@ -1663,9 +1689,10 @@ including media. Promo actions use `brand-action` with white `brand-action-ink`,
 All states exceed 4.5:1 text contrast in both themes. These tokens do not change meter fills.
 The action retains a 28px visible fill inside a 40px hit area and `type-callout font-medium!` text.
 The first visible panel appearance uses the Web Animations API: opacity 0 to 1,
-`translateY(space-sm)` to zero, `duration-medium` (180ms), and `ease-out-quart`.
+`scale(0.96)` to `scale(1)` from `left bottom`, `duration-medium` (180ms), and `ease-out-quart`.
 It plays once per opening, without replaying on focus, screen changes, or overlay restoration.
-Reduced motion uses opacity only for `duration-quick` (100ms). Closing cancels the reveal immediately.
+Keyboard activation opens immediately. Reduced motion uses opacity only for `duration-quick` (100ms). Closing cancels the reveal immediately.
+The announcement eyebrow says Now available and uses `type-footnote` with `brand` ink.
 The body uses 16px horizontal padding.
 The footer uses 12px horizontal padding, 4px vertical padding, and a 48px minimum height.
 Both footer actions use `space-xs` (4px) between their label and icon.

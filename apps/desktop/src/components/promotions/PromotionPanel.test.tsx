@@ -24,6 +24,9 @@ async function ready(session: PromotionSession) {
   })
 }
 const env: PromotionEnvironment = {
+  isManualReady: () => true,
+  readLauncherOpened: () => null,
+  writeLauncherOpened: vi.fn(),
   loadReady: async () => true,
   loadVisible: async () => true,
   onReady: async () => () => undefined,
@@ -56,7 +59,7 @@ describe("promotion panel", () => {
     existing.focus()
     await ready(session)
     expect(document.activeElement).toBe(existing)
-    const panel = screen.getByRole("dialog", { name: "antiburn for Claude Code" })
+    const panel = screen.getByRole("dialog", { name: "antiburn Claude Mod" })
     expect(panel).toHaveAttribute("aria-modal", "false")
     expect(screen.queryByText("Desktop & Terminal")).not.toBeInTheDocument()
     expect(
@@ -124,11 +127,11 @@ describe("promotion panel", () => {
     const session = new PromotionSession(catalog, { ...env, writeSeen })
     await ready(session)
     expect(
-      screen.queryByRole("dialog", { name: "antiburn for Claude Code" }),
+      screen.queryByRole("dialog", { name: "antiburn Claude Mod" }),
     ).not.toBeInTheDocument()
     expect(writeSeen).not.toHaveBeenCalled()
     await act(async () => modal.remove())
-    const panel = screen.getByRole("dialog", { name: "antiburn for Claude Code" })
+    const panel = screen.getByRole("dialog", { name: "antiburn Claude Mod" })
     expect(writeSeen).toHaveBeenCalledOnce()
     fireEvent.keyDown(panel, { key: "Escape" })
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument()

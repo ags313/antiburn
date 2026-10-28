@@ -2,7 +2,9 @@ import { expect, test } from "@playwright/test"
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
-    localStorage.removeItem("antiburn.promotions.seen.v1")
+    if (new URLSearchParams(location.search).has("promoSeen")) {
+      localStorage.setItem("antiburn.promotions.seen.v1", '["claude-mod@1"]')
+    } else localStorage.removeItem("antiburn.promotions.seen.v1")
     const age = new URLSearchParams(location.search).get("promoAge")
     if (age === null) localStorage.removeItem("antiburn.promotions.ftue.v1")
     else
@@ -44,6 +46,8 @@ for (const theme of ["light", "dark"] as const) {
       "visibility",
       "hidden",
     )
+    await expect(panel.locator(".promotion-eyebrow")).toHaveText("Now available")
+    await expect(panel.locator(".promotion-eyebrow")).toHaveClass(/text-brand/)
     await expect(panel).not.toHaveCSS("box-shadow", "none")
     await expect(panel).toHaveCSS("transform", "none")
     const before = await panel.boundingBox()
@@ -243,14 +247,17 @@ for (const reduced of [false, true]) {
       page.evaluate(() => JSON.parse(sessionStorage.getItem("promo-reveal-test") ?? "null"))
     const initial = await reveal()
     expect(initial.count).toBe(1)
+    expect(await panel.evaluate((node) => getComputedStyle(node).transformOrigin)).toBe(
+      "0px 440px",
+    )
     expect(initial.options.duration).toBe(reduced ? 100 : 180)
     expect(initial.options.easing).toBe("cubic-bezier(0.23, 1, 0.32, 1)")
     expect(initial.keyframes).toEqual(
       reduced
         ? [{ opacity: 0 }, { opacity: 1 }]
         : [
-            { opacity: 0, transform: "translateY(8px)" },
-            { opacity: 1, transform: "translateY(0)" },
+            { opacity: 0, transform: "scale(0.96)" },
+            { opacity: 1, transform: "scale(1)" },
           ],
     )
     await expect.poll(async () => (await reveal()).status).toBe("finish")
@@ -318,4 +325,117 @@ test("light v14 video and poster switch together while dark media stays unchange
     "src",
     /claude-mod-poster.*\.png/,
   )
+})
+
+for (const theme of ["light", "dark"] as const) {
+  test(`${theme}: Claude sidebar launcher reopens the promo, retains NEW and restores focus`, async ({
+    page,
+  }, testInfo) => {
+    await page.emulateMedia({ colorScheme: theme })
+    await page.addInitScript(() => {
+      const animate = Element.prototype.animate
+      window.sessionStorage.removeItem("manual-reveal")
+      Element.prototype.animate = function (keyframes, options) {
+        if (this.classList.contains("promotion-panel"))
+          sessionStorage.setItem("manual-reveal", "yes")
+        return animate.call(this, keyframes, options)
+      }
+    })
+    await page.goto(
+      `/tests/visual/?surface=main&theme=${theme}&scale=100&state=populated&onboarding=complete&promoAge=0`,
+    )
+    await expect(page.locator(".main-window")).toBeVisible({ timeout: 20_000 })
+    await page.bringToFront()
+    const panel = page.locator(".promotion-panel")
+    await expect(panel).toBeHidden()
+    const launcher = page.getByRole("button", { name: "Claude Mod, new", exact: true })
+    await expect(launcher).toBeVisible()
+    await expect(
+      launcher.getByText("Usage, resets, and pace above your prompt.", {
+        exact: false,
+      }),
+    ).toBeVisible()
+    const footer = page.locator(".sidebar-nav-footer")
+    const settings = page.getByRole("button", { name: "Settings", exact: true })
+    const launcherBox = await launcher.boundingBox()
+    const settingsBox = await settings.boundingBox()
+    expect(launcherBox!.y + launcherBox!.height).toBeLessThan(settingsBox!.y)
+    expect(await launcher.evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(true)
+    expect(
+      await launcher
+        .locator(".promotion-launcher-badge")
+        .evaluate((node) => node.scrollWidth <= node.clientWidth),
+    ).toBe(true)
+    const restSurface = await launcher.evaluate((node) => {
+      const style = getComputedStyle(node)
+      return { fill: style.backgroundColor, edge: style.boxShadow }
+    })
+    await expect(launcher.getByText("Find out more", { exact: true })).toBeVisible()
+    expect(restSurface.fill).not.toBe("rgba(0, 0, 0, 0)")
+    if (theme === "light")
+      await expect(launcher.locator(".promotion-launcher-badge")).toHaveCSS(
+        "background-color",
+        "color(srgb 1 1 1 / 0.5)",
+      )
+    await launcher.hover()
+    if (theme === "light") {
+      await expect(launcher).not.toHaveCSS("background-color", restSurface.fill)
+      await expect(launcher).not.toHaveCSS("box-shadow", restSurface.edge)
+    }
+    await expect(launcher).not.toHaveCSS("background-color", "rgba(0, 0, 0, 0)")
+    await page.screenshot({ path: testInfo.outputPath(`${theme}-launcher-new.png`) })
+    await launcher.focus()
+    await page.keyboard.press("Enter")
+    await expect(panel).toBeVisible()
+    await expect(panel).toBeFocused()
+    expect(await page.evaluate(() => sessionStorage.getItem("manual-reveal"))).toBeNull()
+    await expect(panel.getByRole("heading", { name: "antiburn Claude Mod" })).toBeVisible()
+    await expect(footer).toHaveCSS("visibility", "hidden")
+    await panel.getByRole("button", { name: "Set up", exact: true }).click()
+    await page.keyboard.press("Escape")
+    await expect(panel).toBeHidden()
+    const reopened = page.getByRole("button", { name: "Claude Mod, new", exact: true })
+    await expect(reopened).toBeVisible()
+    await expect(reopened).toBeFocused()
+    await expect(reopened.locator(".promotion-launcher-badge")).toHaveCount(1)
+    await expect(page.getByRole("tab", { name: "Overview", exact: true })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    )
+    expect(
+      await page.evaluate(() =>
+        JSON.parse(localStorage.getItem("antiburn.promotions.launcher-opened.v1")!),
+      ),
+    ).toEqual(["claude-mod@1"])
+    await page.screenshot({ path: testInfo.outputPath(`${theme}-launcher-used.png`) })
+    await page.reload()
+    await expect(
+      page.getByRole("button", { name: "Claude Mod, new", exact: true }),
+    ).toBeVisible()
+    await expect(page.locator(".promotion-launcher-badge")).toHaveCount(1)
+    await page.getByRole("button", { name: "Claude Mod, new", exact: true }).click()
+    await expect(panel.getByRole("heading", { name: "antiburn Claude Mod" })).toBeVisible()
+    await expect
+      .poll(() => page.evaluate(() => sessionStorage.getItem("manual-reveal")))
+      .toBe("yes")
+  })
+}
+
+test("automatic viewing retains NEW and an incomplete FTUE hides the launcher", async ({
+  page,
+}) => {
+  await page.goto("/tests/visual/?surface=main&state=populated&onboarding=complete")
+  await expect(page.locator(".main-window")).toBeVisible({ timeout: 20_000 })
+  await page.bringToFront()
+  const panel = page.locator(".promotion-panel")
+  await expect(panel).toBeVisible()
+  await page.getByRole("button", { name: "Close promotion" }).click()
+  await expect(page.getByRole("button", { name: "Claude Mod, new" })).toBeVisible()
+  expect(
+    await page.evaluate(() => localStorage.getItem("antiburn.promotions.launcher-opened.v1")),
+  ).toBeNull()
+  await page.goto("/tests/visual/?surface=main&state=populated&onboarding=firstRun")
+  await expect(page.locator(".main-window")).toBeVisible()
+  await expect(page.getByRole("button", { name: /Claude Mod/ })).toHaveCount(0)
+  await expect(panel).toBeHidden()
 })

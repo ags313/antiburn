@@ -16,8 +16,10 @@ export interface PromotionAnalyticsContext {
 }
 
 export const PROMOTION_SEEN_KEY = "antiburn.promotions.seen.v1"
+export const PROMOTION_LAUNCHER_OPENED_KEY = "antiburn.promotions.launcher-opened.v1"
 
 export interface PromotionEnvironment {
+  isManualReady(): boolean
   loadReady(): Promise<boolean>
   onReady(listener: (ready: boolean) => void): Promise<() => void>
   loadVisible(): Promise<boolean>
@@ -26,6 +28,8 @@ export interface PromotionEnvironment {
   onForeground(listener: () => void): () => void
   readSeen(): string | null
   writeSeen(value: string): void
+  readLauncherOpened(): string | null
+  writeLauncherOpened(value: string): void
 }
 
 export interface PromotionSnapshot {
@@ -34,6 +38,7 @@ export interface PromotionSnapshot {
   visible: boolean
   manual: boolean
   focusPanel: boolean
+  launcherOpened: readonly string[]
 }
 
 /** Own the panel lifecycle outside React. */
@@ -44,6 +49,7 @@ export class PromotionSession {
     visible: false,
     manual: false,
     focusPanel: false,
+    launcherOpened: [],
   }
   private listeners = new Set<() => void>()
   private stops: (() => void)[] = []
@@ -88,6 +94,20 @@ export class PromotionSession {
 
   private async start(): Promise<void> {
     const generation = ++this.generation
+    try {
+      const stored: unknown = JSON.parse(this.environment.readLauncherOpened() ?? "[]")
+      if (Array.isArray(stored)) {
+        this.publish({
+          launcherOpened: this.catalog
+            .map((promo) => this.key(promo))
+            .filter(
+              (key) => stored.includes(key) || this.snapshot.launcherOpened.includes(key),
+            ),
+        })
+      }
+    } catch {
+      // Keep the in-memory history when storage is unavailable.
+    }
     try {
       const stored: unknown = JSON.parse(this.environment.readSeen() ?? "[]")
       if (Array.isArray(stored)) {
@@ -138,7 +158,8 @@ export class PromotionSession {
   }
 
   private sync(): void {
-    const visible = this.visible && this.ready
+    const visible =
+      this.visible && (this.snapshot.manual ? this.environment.isManualReady() : this.ready)
     if (
       !this.automaticSelected &&
       this.ready &&
@@ -221,6 +242,32 @@ export class PromotionSession {
       manual: true,
       focusPanel: true,
     })
+  }
+
+  openFromLauncher = (id: string, animate = true): boolean => {
+    const selected = this.catalog.find((promo) => promo.id === id && !promo.development_only)
+    if (!selected || !this.visible || !this.environment.isManualReady()) return false
+    const key = this.key(selected)
+    const launcherOpened = this.snapshot.launcherOpened.includes(key)
+      ? this.snapshot.launcherOpened
+      : [...this.snapshot.launcherOpened, key]
+    this.automaticSelected = true
+    this.beginOpening(selected, true)
+    this.revealPending = animate
+    this.publish({
+      selected,
+      screen: "announcement",
+      manual: true,
+      focusPanel: true,
+      visible: true,
+      launcherOpened,
+    })
+    try {
+      this.environment.writeLauncherOpened(JSON.stringify(launcherOpened))
+    } catch {
+      // Keep the badge state for this session when storage is unavailable.
+    }
+    return true
   }
 
   select = (id: string): void => {

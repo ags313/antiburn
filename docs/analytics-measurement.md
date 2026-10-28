@@ -192,7 +192,7 @@ interest and where readers stop in its short setup path. The single
 `announcement_viewed`, `setup_viewed`, `primary_activated`,
 `learn_more_activated`, `command_copied`, or `dismissed`. Its `origin` is
 `automatic` when the panel was opened by the post-onboarding announcement gate,
-and `user` when opened from What’s new. The origin is carried through the
+and `user` when opened from the Claude Code Mod sidebar launcher. The origin is carried through the
 panel opening, including later clicks.
 
 Emit screen views only after the screen is visible, at most once for each

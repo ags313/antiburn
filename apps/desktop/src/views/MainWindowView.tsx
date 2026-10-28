@@ -1,10 +1,11 @@
 import { Bot, Brain, Flame, Gauge, House, MessagesSquare, Settings } from "lucide-react"
-import { useState, useSyncExternalStore, type ReactNode } from "react"
+import { useRef, useState, useSyncExternalStore, type ReactNode } from "react"
 import { flushSync } from "react-dom"
 
 import promotionCatalog from "virtual:promotions"
 import { PromotionSession } from "../lib/promotions/PromotionSession"
 import { promotionEnvironment } from "../lib/promotions/promotionEnvironment"
+import { ClaudeModLauncher } from "../components/promotions/ClaudeModLauncher"
 import { PromotionHost } from "../components/promotions/PromotionHost"
 
 import { SidebarNav, type SidebarNavItem } from "../components/ui/SidebarNav"
@@ -53,6 +54,7 @@ export function MainWindowView({ sections }: { sections?: readonly MainWindowSec
   const [promotionSession] = useState(
     () => new PromotionSession(promotionCatalog, promotionEnvironment),
   )
+  const promotionLauncherRef = useRef<HTMLButtonElement>(null)
   const [searchOpen, setSearchOpen] = useState(false)
   const [settingsError, setSettingsError] = useState(false)
   async function openSettings(...target: Parameters<typeof openSettingsWindow>): Promise<void> {
@@ -304,7 +306,11 @@ export function MainWindowView({ sections }: { sections?: readonly MainWindowSec
             })}
         searchOpen={searchOpen}
         overlay={
-          <PromotionHost session={promotionSession} blocked={searchOpen || onboardingBlocked} />
+          <PromotionHost
+            session={promotionSession}
+            blocked={searchOpen || onboardingBlocked}
+            returnFocusTo={promotionLauncherRef}
+          />
         }
         sidebar={(closeNavigation) => (
           <SidebarNav
@@ -314,6 +320,15 @@ export function MainWindowView({ sections }: { sections?: readonly MainWindowSec
             onActivate={closeNavigation}
             ariaLabel="Main sections"
             className="main-window-sidebar min-h-0 flex-1"
+            beforeFooter={
+              !sections && !onboardingBlocked ? (
+                <ClaudeModLauncher
+                  session={promotionSession}
+                  onOpen={closeNavigation}
+                  buttonRef={promotionLauncherRef}
+                />
+              ) : null
+            }
             footer={
               <div>
                 {settingsError && (

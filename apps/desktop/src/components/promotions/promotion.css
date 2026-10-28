@@ -12,6 +12,7 @@
 }
 
 .promotion-panel {
+  transform-origin: left bottom;
   position: relative;
   display: flex;
   flex-direction: column;
@@ -295,4 +296,78 @@
   .promotion-media video {
     visibility: hidden;
   }
+}
+
+.main-window-sidebar .sidebar-nav-footer > div:has(> .promotion-launcher) {
+  margin-block-end: var(--space-md);
+}
+
+.promotion-launcher {
+  --promotion-launcher-fill: var(--color-surface-overlay);
+  --promotion-launcher-hover-fill: color-mix(
+    in srgb,
+    var(--color-surface-overlay) 97%,
+    var(--color-label)
+  );
+  --promotion-launcher-glow: 6%;
+  --promotion-launcher-glow-end: 45%;
+  --promotion-launcher-badge-fill: color-mix(in srgb, var(--color-input-fill) 50%, transparent);
+  --promotion-launcher-badge-ink: color-mix(
+    in srgb,
+    var(--color-label-secondary) 85%,
+    var(--color-label)
+  );
+  --promotion-launcher-edge: inset 0 0 0 1px
+    color-mix(in srgb, var(--color-separator) 65%, transparent);
+  --promotion-launcher-hover-edge: inset 0 0 0 1px
+    color-mix(in srgb, var(--color-separator) 85%, transparent);
+  background-color: var(--promotion-launcher-fill);
+  background-image: radial-gradient(
+    ellipse at top left,
+    color-mix(in srgb, var(--color-brand-tint) var(--promotion-launcher-glow), transparent),
+    transparent var(--promotion-launcher-glow-end)
+  );
+  box-shadow: var(--promotion-launcher-edge);
+  transition:
+    background-color var(--duration-fast) ease-out,
+    box-shadow var(--duration-fast) ease-out;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .promotion-launcher {
+    --promotion-launcher-fill: var(--color-surface-card);
+    --promotion-launcher-hover-fill: var(--color-surface-secondary);
+    --promotion-launcher-glow: 12%;
+    --promotion-launcher-glow-end: 72%;
+    --promotion-launcher-badge-fill: var(--color-surface-secondary);
+    --promotion-launcher-badge-ink: var(--color-label-secondary);
+    --promotion-launcher-edge: var(--shadow-stats-card);
+    --promotion-launcher-hover-edge: var(--shadow-stats-card);
+  }
+}
+
+:root[data-theme="dark"] .promotion-launcher {
+  --promotion-launcher-fill: var(--color-surface-card);
+  --promotion-launcher-hover-fill: var(--color-surface-secondary);
+  --promotion-launcher-glow: 12%;
+  --promotion-launcher-glow-end: 72%;
+  --promotion-launcher-badge-fill: var(--color-surface-secondary);
+  --promotion-launcher-badge-ink: var(--color-label-secondary);
+  --promotion-launcher-edge: var(--shadow-stats-card);
+  --promotion-launcher-hover-edge: var(--shadow-stats-card);
+}
+
+@media (hover: hover) {
+  .promotion-launcher:hover {
+    background-color: var(--promotion-launcher-hover-fill);
+    box-shadow: var(--promotion-launcher-hover-edge);
+  }
+}
+
+.promotion-launcher-badge {
+  background-color: var(--promotion-launcher-badge-fill);
+  color: var(--promotion-launcher-badge-ink);
+  display: inline-flex;
+  align-items: center;
+  block-size: calc(var(--space-md) + var(--space-xs));
 }

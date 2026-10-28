@@ -12,9 +12,9 @@ export function revealPromotion(panel: HTMLElement): () => void {
       : [
           {
             opacity: 0,
-            transform: `translateY(${style.getPropertyValue("--space-sm").trim()})`,
+            transform: "scale(0.96)",
           },
-          { opacity: 1, transform: "translateY(0)" },
+          { opacity: 1, transform: "scale(1)" },
         ],
     { duration, easing: style.getPropertyValue("--ease-out-quart").trim() },
   )

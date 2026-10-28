@@ -1,6 +1,6 @@
 import { getMainWindowVisible, onMainWindowVisibilityChanged } from "../ipc"
 import type { PromotionEnvironment } from "./PromotionSession"
-import { PROMOTION_SEEN_KEY } from "./PromotionSession"
+import { PROMOTION_LAUNCHER_OPENED_KEY, PROMOTION_SEEN_KEY } from "./PromotionSession"
 import { PromotionTiming, PROMOTION_FTUE_KEY } from "./PromotionTiming"
 import {
   overviewProgress,
@@ -15,6 +15,12 @@ const timing = new PromotionTiming({
 const ready = () => timing.ready(overviewProgress())
 
 export const promotionEnvironment: PromotionEnvironment = {
+  isManualReady: () => {
+    const progress = overviewProgress()
+    return (
+      progress.mode === "steady" || (progress.mode === "firstRun" && progress.flow === "done")
+    )
+  },
   loadReady: async () => ready(),
   onReady: async (listener) => {
     const sync = () => listener(ready())
@@ -41,4 +47,6 @@ export const promotionEnvironment: PromotionEnvironment = {
   },
   readSeen: () => localStorage.getItem(PROMOTION_SEEN_KEY),
   writeSeen: (value) => localStorage.setItem(PROMOTION_SEEN_KEY, value),
+  readLauncherOpened: () => localStorage.getItem(PROMOTION_LAUNCHER_OPENED_KEY),
+  writeLauncherOpened: (value) => localStorage.setItem(PROMOTION_LAUNCHER_OPENED_KEY, value),
 }

@@ -20,6 +20,9 @@ function environment(overrides: Partial<PromotionEnvironment> = {}) {
   let foreground: () => void = () => undefined
   const stop = vi.fn()
   const adapter: PromotionEnvironment = {
+    isManualReady: () => true,
+    readLauncherOpened: () => null,
+    writeLauncherOpened: vi.fn(),
     loadReady: async () => true,
     loadVisible: async () => true,
     onReady: async (listener) => {
@@ -289,4 +292,147 @@ describe("promotion analytics enrollment", () => {
       stop()
     }
   })
+})
+
+describe("sidebar promotion opening", () => {
+  it("opens the named campaign directly with user analytics during the automatic cooldown", async () => {
+    vi.mocked(noteInteraction).mockClear()
+    const campaign = { ...promo, analytics: { campaign: "claude_mod" as const } }
+    const env = environment({ loadReady: async () => false })
+    const session = new PromotionSession([{ ...promo, id: "other" }, campaign], env.adapter)
+    const stop = session.subscribe(() => undefined)
+    await settle()
+    expect(session.getSnapshot().selected).toBeNull()
+    expect(session.openFromLauncher("example")).toBe(true)
+    expect(session.getSnapshot()).toMatchObject({
+      selected: campaign,
+      screen: "announcement",
+      manual: true,
+      visible: true,
+      focusPanel: true,
+      launcherOpened: ["example@1"],
+    })
+    expect(env.adapter.writeSeen).not.toHaveBeenCalled()
+    expect(env.adapter.writeLauncherOpened).toHaveBeenCalledWith('["example@1"]')
+    session.presented()
+    expect(noteInteraction).toHaveBeenCalledWith({
+      kind: "promotionInteraction",
+      campaign: "claude_mod",
+      action: "announcement_viewed",
+      origin: "user",
+    })
+    session.navigate("setup")
+    session.presented()
+    expect(noteInteraction).toHaveBeenCalledWith({
+      kind: "promotionInteraction",
+      campaign: "claude_mod",
+      action: "setup_viewed",
+      origin: "user",
+    })
+    session.close()
+    env.foreground()
+    expect(session.getSnapshot().selected).toBeNull()
+    expect(session.openFromLauncher("example")).toBe(true)
+    expect(session.getSnapshot().screen).toBe("announcement")
+    stop()
+  })
+
+  it("does not clear NEW after automatic presentation or dismissal", async () => {
+    const env = environment()
+    const session = new PromotionSession([promo], env.adapter)
+    const stop = session.subscribe(() => undefined)
+    await settle()
+    session.presented()
+    session.close()
+    expect(session.getSnapshot().launcherOpened).toEqual([])
+    expect(env.adapter.writeLauncherOpened).not.toHaveBeenCalled()
+    stop()
+  })
+
+  it("persists sidebar activation independently of seen state and restores NEW for a revision", async () => {
+    let opened: string | null = null
+    const env = environment({
+      readSeen: () => '["example@1"]',
+      readLauncherOpened: () => opened,
+      writeLauncherOpened: (value) => {
+        opened = value
+      },
+    })
+    const first = new PromotionSession([promo], env.adapter)
+    const stop = first.subscribe(() => undefined)
+    await settle()
+    expect(first.openFromLauncher("example")).toBe(true)
+    stop()
+    const next = new PromotionSession([promo], env.adapter)
+    const stopNext = next.subscribe(() => undefined)
+    await settle()
+    expect(next.getSnapshot().launcherOpened).toEqual(["example@1"])
+    expect(next.getSnapshot().selected).toBeNull()
+    expect(next.openFromLauncher("example")).toBe(true)
+    stopNext()
+    const revised = new PromotionSession([{ ...promo, revision: 2 }], env.adapter)
+    const stopRevised = revised.subscribe(() => undefined)
+    await settle()
+    expect(revised.getSnapshot().launcherOpened).not.toContain("example@2")
+    stopRevised()
+  })
+
+  it.each(["onboarding", "hidden", "missing", "development"])(
+    "rejects %s opening without changing history",
+    async (reason) => {
+      const env = environment({
+        loadReady: async () => false,
+        isManualReady: () => reason !== "onboarding",
+        loadVisible: async () => reason !== "hidden",
+      })
+      const session = new PromotionSession(
+        [{ ...promo, development_only: reason === "development" }],
+        env.adapter,
+      )
+      const stop = session.subscribe(() => undefined)
+      await settle()
+      expect(session.openFromLauncher(reason === "missing" ? "absent" : "example")).toBe(false)
+      expect(session.getSnapshot().selected).toBeNull()
+      expect(session.getSnapshot().launcherOpened).toEqual([])
+      expect(env.adapter.writeLauncherOpened).not.toHaveBeenCalled()
+      stop()
+    },
+  )
+
+  it("keeps manual visibility gated by FTUE completion across readiness events", async () => {
+    let complete = true
+    const env = environment({ loadReady: async () => false, isManualReady: () => complete })
+    const session = new PromotionSession([promo], env.adapter)
+    const stop = session.subscribe(() => undefined)
+    await settle()
+    session.openFromLauncher("example")
+    env.ready(false)
+    expect(session.getSnapshot().visible).toBe(true)
+    complete = false
+    env.ready(false)
+    expect(session.getSnapshot().visible).toBe(false)
+    complete = true
+    env.ready(false)
+    expect(session.getSnapshot().visible).toBe(true)
+    stop()
+  })
+
+  it.each(["not json", "{}", '[null,7,"unrelated@1"]'])(
+    "handles invalid launcher history %s",
+    async (stored) => {
+      const env = environment({
+        readLauncherOpened: () => stored,
+        writeLauncherOpened: () => {
+          throw new Error("blocked")
+        },
+      })
+      const session = new PromotionSession([promo], env.adapter)
+      const stop = session.subscribe(() => undefined)
+      await settle()
+      expect(session.getSnapshot().launcherOpened).toEqual([])
+      expect(session.openFromLauncher("example")).toBe(true)
+      expect(session.getSnapshot().launcherOpened).toEqual(["example@1"])
+      stop()
+    },
+  )
 })

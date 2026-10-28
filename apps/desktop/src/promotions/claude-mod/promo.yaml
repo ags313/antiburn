@@ -3,12 +3,12 @@ id: claude-mod
 revision: 1
 analytics:
   campaign: claude_mod
-title: antiburn for Claude Code
+title: antiburn Claude Mod
 
 screens:
   announcement:
     eyebrow: Now available
-    title: antiburn for Claude Code
+    title: antiburn Claude Mod
     description: Pace your Claude Code usage across sessions.
     media:
       kind: image

@@ -407,7 +407,20 @@ paths, identifiers, exact tokens, or exact costs.
 
 ## Bundled promotions
 
-Promotions appear automatically; the sidebar has no promo launcher.
+Promotions appear automatically. Detected Claude users also have a **Claude Mod**
+card above the sidebar’s Settings separator. It uses the same detection as Settings →
+Agents: Claude sessions, installation/sign-in, or Claude Desktop; a Pi-only login does not qualify.
+Agent visibility switches do not hide the action. Unknown or failed detection without
+other evidence keeps it hidden. The action opens the Claude Mod announcement directly,
+even after dismissal or automatic viewing, without changing the selected app view.
+Pointer opening grows the panel from its bottom-left corner over 180ms; keyboard
+opening is immediate. Reduced motion uses a 100ms fade.
+Its **NEW** badge remains visible for as long as the promo card is available, including
+after activation and app restarts. Activation history is still saved separately under
+`antiburn.promotions.launcher-opened.v1`; it does not control the badge.
+The launcher stays available after activation. It is hidden during FTUE and becomes
+available immediately after completion, including the same app session. This deliberate
+opening bypasses the automatic cooldown; automatic display retains its existing timing.
 **What’s new** is reserved for a future recent-changes panel. Add each promotion in `src/promotions/<id>/promo.yaml` with relative assets in that
 folder. The Vite catalog validates the YAML and imports media as hashed assets.
 The Claude Mod definition provides announcement and setup examples.
@@ -449,7 +462,10 @@ reload the main window or quit and reopen the app:
 localStorage.removeItem("antiburn.promotions.seen.v1")
 ```
 
-This clears only promotion history for that app profile. Onboarding must be
+The sidebar’s NEW badge needs no reset: it remains visible while the promo card
+is available. Launcher activation history does not control its visibility.
+
+The seen-key command clears only promotion history for that app profile. Onboarding must be
 complete and the main window must be in the foreground. App version changes
 do not reset this history. To announce again after a future update, increment
 `revision` in the promotion YAML. The new ID/revision pair is shown once.
