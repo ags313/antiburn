@@ -225,16 +225,44 @@ INSERT INTO burn_check_runtime_definition_state VALUES (1, 1, 0);
 }
 
 #[test]
+fn opencode_branch_fixture_frames_lf_and_crlf_without_changing_sql() {
+    let expected = opencode_branch_migrations(include_str!(
+        "../../schema/compatibility/branch_history.sql"
+    ));
+    assert_eq!(expected.len(), 7);
+    for newline in ["\n", "\r\n"] {
+        let fixture = expected.join(&format!("-- next migration{newline}"));
+        assert_eq!(opencode_branch_migrations(&fixture), expected);
+    }
+}
+
+fn opencode_branch_migrations(sql: &str) -> Vec<&str> {
+    let mut steps = Vec::new();
+    let mut start = 0;
+    let mut offset = 0;
+    for line in sql.split_inclusive('\n') {
+        if matches!(line, "-- next migration\n" | "-- next migration\r\n") {
+            steps.push(&sql[start..offset]);
+            start = offset + line.len();
+        }
+        offset += line.len();
+    }
+    steps.push(&sql[start..]);
+    steps
+}
+
+#[test]
 fn opencode_branch_versions_receive_the_main_quota_index() {
+    let branch_migrations = opencode_branch_migrations(include_str!(
+        "../../schema/compatibility/branch_history.sql"
+    ));
+    assert_eq!(branch_migrations.len(), 7);
     for version in 81..=83 {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         for sql in &super::super::schema::MIGRATIONS[..80] {
             connection.execute_batch(sql).unwrap();
         }
-        for sql in include_str!("../../schema/compatibility/branch_history.sql")
-            .split("-- next migration\n")
-            .take(version - 80)
-        {
+        for sql in &branch_migrations[..version - 80] {
             connection.execute_batch(sql).unwrap();
         }
         connection

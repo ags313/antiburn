@@ -75,6 +75,19 @@ fn edited(mut edit: impl FnMut(&mut Vec<Value>)) -> String {
         .collect()
 }
 
+fn with_appended_codex_terminal(
+    source: &str,
+    line_ending: &str,
+    edit: impl FnOnce(&mut Value),
+) -> String {
+    assert!(source.ends_with(line_ending));
+    let (index, terminal) = source.lines().enumerate().last().unwrap();
+    let mut terminal: Value = serde_json::from_str(terminal).unwrap();
+    terminal["ordinal"] = json!(index + 1);
+    edit(&mut terminal);
+    format!("{source}{terminal}{line_ending}")
+}
+
 fn cycles(
     events: &[NativeEvidenceEvent],
 ) -> Vec<&antiburn_local::analysis::ResponseCycleObservation> {
@@ -690,54 +703,57 @@ fn oversized_cycle_is_unavailable_while_standalone_messages_still_flow() {
 
 #[test]
 fn conflicting_terminal_withdraws_the_same_cycle_instead_of_creating_another() {
-    let source = edited(|records| {
-        let mut terminal = records.last().unwrap().clone();
-        terminal["payload"]["error"] =
-            json!({"codex_error_info":"server_overloaded","message":"synthetic"});
-        records.push(terminal);
-    });
-    let events = file_events("codex", SourceFormat::CodexRolloutJsonl, &source);
-    let cycles = cycles(&events);
-    assert_eq!(cycles.len(), 2);
-    assert_eq!(cycles[0].key, cycles[1].key);
-    assert_eq!(
-        cycles[1].change,
-        antiburn_local::analysis::ToolResultChange::Removal
-    );
-    assert!(cycles[1].messages.is_empty());
-    let activity_count = |events: &[NativeEvidenceEvent]| {
-        events
-            .iter()
-            .filter(|event| matches!(&event.fact, NativeEvidenceFact::Activity(_)))
-            .count()
-    };
-    assert_eq!(
-        activity_count(&events),
-        activity_count(&file_events(
-            "codex",
-            SourceFormat::CodexRolloutJsonl,
-            CODEX
-        )) + 1
-    );
+    for line_ending in ["\n", "\r\n"] {
+        let baseline = jsonl_fixture::with_line_ending(CODEX, line_ending);
+        let source = with_appended_codex_terminal(&baseline, line_ending, |terminal| {
+            terminal["payload"]["error"] =
+                json!({"codex_error_info":"server_overloaded","message":"synthetic"});
+        });
+        let expected = file_events("codex", SourceFormat::CodexRolloutJsonl, &baseline);
+        let events = file_events("codex", SourceFormat::CodexRolloutJsonl, &source);
+        assert_eq!(
+            &events[..expected.len()],
+            expected.as_slice(),
+            "line ending: {line_ending:?}"
+        );
+        let cycles = cycles(&events);
+        assert_eq!(cycles.len(), 2);
+        assert_eq!(cycles[0].key, cycles[1].key);
+        assert_eq!(
+            cycles[1].change,
+            antiburn_local::analysis::ToolResultChange::Removal
+        );
+        assert!(cycles[1].messages.is_empty());
+        let activity_count = |events: &[NativeEvidenceEvent]| {
+            events
+                .iter()
+                .filter(|event| matches!(&event.fact, NativeEvidenceFact::Activity(_)))
+                .count()
+        };
+        assert_eq!(activity_count(&events), activity_count(&expected) + 1);
+    }
 }
 
 #[test]
 fn terminal_alias_replay_does_not_withdraw_or_repeat_a_cycle() {
-    let source = edited(|records| {
-        let mut terminal = records.last().unwrap().clone();
-        terminal["payload"]["type"] = json!("turn_complete");
-        records.push(terminal);
-    });
-    let events = file_events("codex", SourceFormat::CodexRolloutJsonl, &source);
-    assert_eq!(cycles(&events).len(), 1);
-    assert_eq!(
-        events,
-        file_events("codex", SourceFormat::CodexRolloutJsonl, CODEX)
-    );
-    assert_eq!(
-        full_events("codex", SourceFormat::CodexRolloutJsonl, &source),
-        full_events("codex", SourceFormat::CodexRolloutJsonl, CODEX)
-    );
+    for line_ending in ["\n", "\r\n"] {
+        let baseline = jsonl_fixture::with_line_ending(CODEX, line_ending);
+        let source = with_appended_codex_terminal(&baseline, line_ending, |terminal| {
+            terminal["payload"]["type"] = json!("turn_complete");
+        });
+        let events = file_events("codex", SourceFormat::CodexRolloutJsonl, &source);
+        assert_eq!(cycles(&events).len(), 1);
+        assert_eq!(
+            events,
+            file_events("codex", SourceFormat::CodexRolloutJsonl, &baseline),
+            "line ending: {line_ending:?}"
+        );
+        assert_eq!(
+            full_events("codex", SourceFormat::CodexRolloutJsonl, &source),
+            full_events("codex", SourceFormat::CodexRolloutJsonl, &baseline),
+            "line ending: {line_ending:?}"
+        );
+    }
 }
 
 #[test]

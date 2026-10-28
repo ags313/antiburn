@@ -9,14 +9,42 @@ const QUOTA: &str = "CREATE INDEX turn_quota_published
     ON turn(environment_key, agent, session_id, claim_fence, ts_ms)
     WHERE ts_ms IS NOT NULL;";
 
+fn migration_steps(sql: &str) -> Vec<&str> {
+    let mut steps = Vec::new();
+    let mut start = 0;
+    let mut offset = 0;
+    for line in sql.split_inclusive('\n') {
+        if matches!(line, "-- next migration\n" | "-- next migration\r\n") {
+            steps.push(&sql[start..offset]);
+            start = offset + line.len();
+        }
+        offset += line.len();
+    }
+    steps.push(&sql[start..]);
+    steps
+}
+
+#[test]
+fn migration_steps_preserve_sql_with_lf_and_crlf_framing() {
+    for newline in ["\n", "\r\n"] {
+        for ending in ["", newline] {
+            let expected = [
+                format!("SELECT '-- next migration';{newline}"),
+                format!("-- next migration suffix{newline}SELECT 2;{newline}{newline}"),
+                format!("SELECT 3;{ending}"),
+            ];
+            let fixture = expected.join(&format!("-- next migration{newline}"));
+            assert_eq!(migration_steps(&fixture), expected);
+        }
+    }
+}
+
 fn history(connection: &Connection, branch: bool, version: usize) {
     // Both pinned histories share the unchanged first 80 migrations.
     for sql in &super::super::MIGRATIONS[..80] {
         connection.execute_batch(sql).unwrap();
     }
-    let branch_steps: Vec<_> = include_str!("branch_history.sql")
-        .split("-- next migration\n")
-        .collect();
+    let branch_steps = migration_steps(include_str!("branch_history.sql"));
     assert_eq!(branch_steps.len(), 7);
     let main_steps = [
         QUOTA,
@@ -797,14 +825,12 @@ fn malformed_publication_nullability_and_host_constraints_are_rejected_without_m
             "event_kind IN ('session_start', 'session_idle') AND outcome = 'removal'",
         ),
         (
-            "    )\n) STRICT;",
-            "    ), CHECK (native_identity IS NOT NULL)\n) STRICT;",
+            ") STRICT;",
+            ", CHECK (native_identity IS NOT NULL)) STRICT;",
         ),
     ] {
         let mut connection = historical_connection(true, 85);
-        let steps: Vec<_> = include_str!("branch_history.sql")
-            .split("-- next migration\n")
-            .collect();
+        let steps = migration_steps(include_str!("branch_history.sql"));
         let sql = steps[5].replacen(from, to, 1);
         assert_ne!(sql, steps[5]);
         connection.execute_batch(&sql).unwrap();
