@@ -10,7 +10,7 @@ use crate::store::native_tool_results::{
     ToolResultPublicationOutcome, main_64_preservation_tests as preservation,
 };
 
-fn next_live_page(
+pub(super) fn next_live_page(
     store: &Store,
     source: &SyntheticJournal,
     now: i64,
@@ -164,7 +164,7 @@ fn v2_selection_retires_the_v1_cursor_without_deleting_immutable_publications() 
     assert!(fresh.requires_full_read);
 }
 
-fn publication_head(store: &Store) -> i64 {
+pub(super) fn publication_head(store: &Store) -> i64 {
     store
         .lock()
         .query_row(
@@ -1785,12 +1785,14 @@ fn live_window_and_incremental_state_commit_atomically_and_resume_after_restart(
             finished = true;
             break;
         }
-        assert!(cursor.is_none() && pending);
+        assert!(cursor.is_some() && pending);
         let partial = store.native_tool_results_current(&claim.key).unwrap();
         assert!(!partial.is_empty() && partial.len() < page.results.len());
         now += 1;
         let (retry, retry_page) = next_live_page(&store, &source, now);
-        assert!(retry.cursor().unwrap().is_none());
+        let saved = retry.cursor().unwrap().unwrap();
+        assert_eq!(saved.live_baseline(), page.cursor.live_baseline());
+        assert_eq!(saved.public_baseline(), page.cursor.public_baseline());
         assert_eq!(retry_page.cursor, page.cursor);
         assert_eq!(retry_page.results, page.results);
         assert!(

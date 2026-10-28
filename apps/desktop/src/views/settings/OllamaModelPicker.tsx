@@ -46,7 +46,7 @@ export function OllamaModelPicker({
               aria-describedby={helpId}
               className="min-h-[var(--control-height-regular)] w-full min-w-0 rounded-control border border-separator bg-input-fill px-2 py-1 type-body text-label"
               value={connection.model}
-              disabled={provider.busy}
+              disabled={provider.busy || provider.loading}
               onChange={(event) => onChange(event.target.value)}
             >
               {!connection.model && <option value="">Choose an installed model</option>}
@@ -63,7 +63,9 @@ export function OllamaModelPicker({
             </select>
             <div className="mt-2 space-y-2">
               <PushButton
-                disabled={provider.busy || state.loading || !endpoint.trim()}
+                disabled={
+                  provider.busy || provider.loading || state.loading || !endpoint.trim()
+                }
                 onClick={() => void lookup.find()}
               >
                 {state.loading

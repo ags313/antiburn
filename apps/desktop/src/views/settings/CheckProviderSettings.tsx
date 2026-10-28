@@ -328,8 +328,9 @@ function ConnectionForm({
   const helpId = useId()
   const needsCredential = connection.provider === "jev" || connection.provider === "cloudflare"
   const setupError = contextLimitError(connection)
+  const unavailable = state.busy || state.loading
   const disabled =
-    state.busy ||
+    unavailable ||
     Boolean(state.saved?.pendingOperation) ||
     !connection.model.trim() ||
     (connection.endpoint.kind !== "provider_default" && !connection.endpoint.value.trim()) ||
@@ -361,13 +362,13 @@ function ConnectionForm({
                 spellCheck={false}
                 className={inputClass}
                 value={value}
-                disabled={state.busy}
+                disabled={unavailable}
                 onChange={(event) => onChange(event.target.value)}
               />
             ) : (
               <div className="flex flex-wrap items-center gap-2 type-callout text-label-secondary">
                 <span>Saved</span>
-                <PushButton disabled={state.busy} onClick={() => setReplacing(true)}>
+                <PushButton disabled={unavailable} onClick={() => setReplacing(true)}>
                   Change
                 </PushButton>
               </div>
@@ -377,20 +378,22 @@ function ConnectionForm({
                 Leave empty to keep the saved credential.
               </p>
             )}
-            {secret && saved?.credential && (
-              <div className="type-footnote text-label-secondary">
-                <button
-                  type="button"
-                  className="text-label-secondary underline disabled:opacity-50"
-                  disabled={state.busy || Boolean(state.saved?.pendingOperation)}
-                  onClick={() => void session.run("remove")}
-                >
-                  {saved.credential.kind === "legacy_type_safe"
-                    ? "Forget shared TypeSafe key"
-                    : "Forget saved credential"}
-                </button>
-              </div>
-            )}
+            {secret &&
+              saved?.credential &&
+              (saved.credential.kind !== "legacy_type_safe" || !state.legacyKeyForgotten) && (
+                <div className="type-footnote text-label-secondary">
+                  <button
+                    type="button"
+                    className="text-label-secondary underline disabled:opacity-50"
+                    disabled={unavailable || Boolean(state.saved?.pendingOperation)}
+                    onClick={() => void session.run("remove")}
+                  >
+                    {saved.credential.kind === "legacy_type_safe"
+                      ? "Forget shared TypeSafe key"
+                      : "Forget saved credential"}
+                  </button>
+                </div>
+              )}
             {secret &&
               connection.provider === "jev" &&
               state.editor === "add" &&
@@ -400,7 +403,7 @@ function ConnectionForm({
                   <div className="flex flex-wrap gap-2">
                     <PushButton
                       disabled={
-                        state.busy || connection.credential?.kind === "legacy_type_safe"
+                        unavailable || connection.credential?.kind === "legacy_type_safe"
                       }
                       onClick={() => session.useLegacyKey()}
                     >
@@ -411,7 +414,7 @@ function ConnectionForm({
                     <button
                       type="button"
                       className="underline disabled:opacity-50"
-                      disabled={state.busy || Boolean(state.saved?.pendingOperation)}
+                      disabled={unavailable || Boolean(state.saved?.pendingOperation)}
                       onClick={() => void session.forgetLegacyKey()}
                     >
                       Forget shared TypeSafe key
@@ -437,7 +440,7 @@ function ConnectionForm({
     textField(id, credential, (value) => session.edit(connection, value || null), true)
 
   return (
-    <div aria-busy={state.busy} className="space-y-5 px-4 pt-2 pb-4">
+    <div aria-busy={unavailable} className="space-y-5 px-4 pt-2 pb-4">
       <div className="space-y-4">
         {state.editor === "add" && (
           <SettingsField searchId="decisionProvider">
@@ -447,7 +450,7 @@ function ConnectionForm({
                 autoFocus
                 className={inputClass}
                 value={connection.provider}
-                disabled={state.busy}
+                disabled={unavailable}
                 onChange={(event) =>
                   void session.changeAddProvider(event.target.value as SmartCheckProvider)
                 }
@@ -478,7 +481,7 @@ function ConnectionForm({
                   id={id}
                   className={inputClass}
                   value={connection.model}
-                  disabled={state.busy}
+                  disabled={unavailable}
                   onChange={(event) => edit({ model: event.target.value })}
                 >
                   <option value="clef">Clef</option>
@@ -500,7 +503,7 @@ function ConnectionForm({
                     id={id}
                     className={inputClass}
                     value={connection.responseMode}
-                    disabled={state.busy}
+                    disabled={unavailable}
                     onChange={(event) =>
                       edit({ responseMode: event.target.value as Connection["responseMode"] })
                     }
@@ -558,7 +561,7 @@ function ConnectionForm({
             {state.action === "test" ? "Testing…" : "Test connection"}
           </PushButton>
           <div className="ml-auto flex flex-wrap justify-end gap-2">
-            <PushButton disabled={state.busy} onClick={() => void session.closeEditor()}>
+            <PushButton disabled={unavailable} onClick={() => void session.closeEditor()}>
               Cancel
             </PushButton>
             <PushButton

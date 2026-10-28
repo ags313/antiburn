@@ -17,6 +17,7 @@ pub const MAX_REQUEST_BODY_BYTES: usize = crate::jev::config::OLLAMA_MAX_REQUEST
 pub const DEFAULT_LOCAL_CONCURRENCY: usize = 4;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+const IDENTITY_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DISCOVERY_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INSTALLED_MODELS: usize = 1024;
 
@@ -164,9 +165,7 @@ impl OllamaClient {
             ) {
                 continue;
             }
-            if tag.digest.trim().is_empty()
-                || tag.digest.len() > 256
-                || tag.digest.chars().any(char::is_control)
+            if !valid_model_digest(&tag.digest)
                 || !crate::jev::config::valid_model_name(&tag.name)
                 || !names.insert(tag.name.clone())
             {
@@ -205,8 +204,8 @@ impl OllamaClient {
             .await
     }
 
-    /// Checks cancellation only before HTTP send.
-    /// Reports possible delivery after local admission and the final cancellation check.
+    /// Checks cancellation before inference send.
+    /// Reports possible inference delivery after local admission and identity checks.
     pub(crate) async fn evaluate_with_usage_cancellable(
         &self,
         request: &JevRequest,
@@ -228,6 +227,13 @@ impl OllamaClient {
         if is_cancelled() {
             return Err(JevError::Cancelled);
         }
+        let identity = self
+            .verify_pre_send_identity(&request.model, capabilities)
+            .await;
+        if is_cancelled() {
+            return Err(JevError::Cancelled);
+        }
+        identity.map_err(jev_error)?;
         on_send();
         let bytes = Self::send_evaluation(builder, capabilities)
             .await
@@ -244,7 +250,70 @@ impl OllamaClient {
     ) -> Result<Vec<u8>, OllamaError> {
         let _permit = acquire_inference_slot().await?;
         let builder = self.evaluation_request(request, capabilities)?;
+        self.verify_pre_send_identity(&request.model, capabilities)
+            .await?;
         Self::send_evaluation(builder, capabilities).await
+    }
+
+    // This read rejects known tag changes. A tag can still change after the read.
+    async fn verify_pre_send_identity(
+        &self,
+        model: &str,
+        capabilities: &ModelCapabilities,
+    ) -> Result<(), OllamaError> {
+        let expected = capabilities
+            .model_revision
+            .as_deref()
+            .filter(|digest| valid_model_digest(digest))
+            .ok_or(OllamaError::UnsupportedRunner)?;
+        if capabilities.model != model || !crate::jev::config::valid_model_name(model) {
+            return Err(OllamaError::UnsupportedRunner);
+        }
+        let read_tags = async {
+            let mut request = self.http.get(format!("{}/api/tags", self.base_url));
+            if let Some(key) = &self.api_key {
+                request = request.bearer_auth(key.as_ref());
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|_| OllamaError::ProviderUnavailable)?;
+            if matches!(response.status().as_u16(), 401 | 403) {
+                return Err(OllamaError::AuthenticationRejected);
+            }
+            // A metadata failure cannot make inference delivery or usage uncertain.
+            decode_json::<TagsResponse>(response)
+                .await
+                .map_err(|_| OllamaError::ProviderUnavailable)
+        };
+        let tags = tokio::time::timeout(IDENTITY_CHECK_TIMEOUT, read_tags)
+            .await
+            .map_err(|_| OllamaError::ProviderUnavailable)??;
+        if tags.models.len() > MAX_INSTALLED_MODELS {
+            return Err(OllamaError::ProviderUnavailable);
+        }
+        let identity = canonical_model_name(model);
+        let mut matching = tags
+            .models
+            .iter()
+            .filter(|tag| canonical_model_name(&tag.name) == identity);
+        let tag = matching.next().ok_or(OllamaError::MissingModel)?;
+        if matching.next().is_some()
+            || !crate::jev::config::valid_model_name(&tag.name)
+            || !valid_model_digest(&tag.digest)
+        {
+            return Err(OllamaError::ProviderUnavailable);
+        }
+        if tag.digest != expected
+            || remote_model(
+                &tag.name,
+                tag.remote_model.as_deref(),
+                tag.remote_host.as_deref(),
+            )
+        {
+            return Err(OllamaError::UnsupportedRunner);
+        }
+        Ok(())
     }
 
     fn evaluation_request(
@@ -308,6 +377,8 @@ impl OllamaClient {
             return Ok(discovered);
         }
         let _permit = acquire_inference_slot().await?;
+        self.verify_pre_send_identity(&discovered.name, &discovered.capabilities)
+            .await?;
         let _: serde_json::Value = self
             .post_json(
                 "/api/generate",
@@ -606,6 +677,10 @@ fn canonical_model_name(name: &str) -> String {
     format!("{host}/{namespace}/{model}:{tag}")
 }
 
+fn valid_model_digest(digest: &str) -> bool {
+    !digest.trim().is_empty() && digest.len() <= 256 && !digest.chars().any(char::is_control)
+}
+
 fn remote_model(name: &str, remote_model: Option<&str>, remote_host: Option<&str>) -> bool {
     remote_model.is_some_and(|value| !value.trim().is_empty())
         || remote_host.is_some_and(|value| !value.trim().is_empty())
@@ -816,6 +891,10 @@ fn verified_chat_envelope(show: &ShowResponse) -> Option<&'static str> {
 }
 
 #[cfg(test)]
+#[path = "jev_ollama/preflight_tests.rs"]
+mod preflight_tests;
+
+#[cfg(test)]
 pub(crate) mod test_hooks {
     use std::future::{Future, poll_fn};
     use std::sync::Arc;
@@ -864,6 +943,49 @@ mod tests {
     use antiburn_local::analysis::jev::{JevQuestion, PINNED_MODEL};
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    fn transport_capabilities() -> ModelCapabilities {
+        ModelCapabilities {
+            model_revision: Some("synthetic-digest".into()),
+            ..ModelCapabilities::jev_default()
+        }
+    }
+
+    fn reply_to_identity_check(listener: &std::net::TcpListener, credential: Option<&str>) {
+        use std::io::{Read, Write};
+
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut received = Vec::new();
+        loop {
+            let mut buffer = [0; 4096];
+            let count = socket.read(&mut buffer).unwrap();
+            assert!(count > 0);
+            received.extend_from_slice(&buffer[..count]);
+            assert!(received.len() < 8192);
+            if received.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let headers = String::from_utf8(received).unwrap().to_ascii_lowercase();
+        assert!(headers.starts_with("get /api/tags http/1.1\r\n"));
+        match credential {
+            Some(credential) => {
+                assert!(headers.contains(&format!("authorization: bearer {credential}")))
+            }
+            None => assert!(!headers.contains("authorization:")),
+        }
+        let body =
+            json!({"models": [{"name": PINNED_MODEL, "digest": "synthetic-digest"}]}).to_string();
+        write!(
+            socket,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    }
 
     #[test]
     fn remote_model_classification_uses_metadata_and_explicit_cloud_tags() {
@@ -1028,7 +1150,7 @@ mod tests {
         use antiburn_local::analysis::jev::JevAnswer;
         use std::io::{Read, Write};
 
-        let caps = ModelCapabilities::jev_default();
+        let caps = transport_capabilities();
         let request = JevRequest {
             model: caps.model.clone(),
             state: json!("synthetic evidence"),
@@ -1081,6 +1203,7 @@ mod tests {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
                 let endpoint = format!("http://{}", listener.local_addr().unwrap());
                 let server = std::thread::spawn(move || {
+                    reply_to_identity_check(&listener, None);
                     let (mut socket, _) = listener.accept().unwrap();
                     socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
                     let mut received = Vec::new();
@@ -1240,7 +1363,7 @@ mod tests {
     async fn reported_usage_precedes_ollama_answer_decode_and_validation() {
         use std::io::{Read, Write};
 
-        let caps = ModelCapabilities::jev_default();
+        let caps = transport_capabilities();
         let request = JevRequest {
             model: caps.model.clone(),
             state: json!("synthetic"),
@@ -1275,6 +1398,7 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let server = std::thread::spawn(move || {
+                reply_to_identity_check(&listener, None);
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut bytes = [0; 4096];
                 assert!(socket.read(&mut bytes).unwrap() > 0);
@@ -1396,6 +1520,25 @@ mod tests {
         let server = tokio::spawn(async move {
             for _ in 0..24 {
                 let (mut socket, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                loop {
+                    let mut buffer = [0; 4096];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    headers.extend_from_slice(&buffer[..count]);
+                    assert!(headers.len() < 8192);
+                    if headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                assert!(
+                    String::from_utf8_lossy(&headers).starts_with("GET /api/tags HTTP/1.1\r\n")
+                );
+                let body =
+                    json!({"models": [{"name": PINNED_MODEL, "digest": "synthetic-digest"}]})
+                        .to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let request: JevRequest = loop {
                     let mut buffer = [0; 4096];
@@ -1465,7 +1608,7 @@ mod tests {
             (2050, "generic"),
         ] {
             let verified = profile != "unknown";
-            let mut limits = ModelCapabilities::jev_default();
+            let mut limits = transport_capabilities();
             limits.total_input_tokens =
                 CapabilityLimit::known(context, CapabilitySource::RuntimeMetadata);
             limits.state_and_longest_question_tokens = limits.total_input_tokens.clone();
@@ -1574,7 +1717,7 @@ mod tests {
                 ),
             ];
             let routes = metadata.clone().into_iter()
-                .chain([("/api/ps", json!({"models": []})), ("/api/generate", json!({"done": true}))])
+                .chain([("/api/ps", json!({"models": []})), metadata[1].clone(), ("/api/generate", json!({"done": true}))])
                 .chain(metadata)
                 .chain([("/api/ps", json!({"models": [{"name": "tev1:0.8b", "digest": "digest", "context_length": 4096}]}))]);
             for (route, body) in routes {
@@ -1621,6 +1764,8 @@ mod tests {
             name: "selected:latest".into(),
             digest: Some("pinned-digest".into()),
             capabilities: ModelCapabilities {
+                model: "selected:latest".into(),
+                model_revision: Some("pinned-digest".into()),
                 total_input_tokens: CapabilityLimit::unknown(),
                 state_and_longest_question_tokens: CapabilityLimit::unknown(),
                 ..ModelCapabilities::jev_default()
@@ -1888,11 +2033,12 @@ mod tests {
                 },
             )]),
         };
-        let caps = ModelCapabilities::jev_default();
+        let caps = transport_capabilities();
         let body = serde_json::to_vec(&json!({"model":PINNED_MODEL,"answers":{"q":{"type":"noul","noul":0.2}},"usage":{"input_tokens":4,"output_tokens":1}})).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
+            reply_to_identity_check(&listener, None);
             let (mut socket, _) = listener.accept().unwrap();
             let mut buf = [0; 4096];
             let n = socket.read(&mut buf).unwrap();
@@ -1926,6 +2072,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
+            reply_to_identity_check(&listener, None);
             let (mut socket, _) = listener.accept().unwrap();
             let mut buffer = [0; 4096];
             let _ = socket.read(&mut buffer).unwrap();
@@ -1950,9 +2097,7 @@ mod tests {
             )]),
         };
         assert_eq!(
-            client
-                .evaluate(&request, &ModelCapabilities::jev_default())
-                .await,
+            client.evaluate(&request, &transport_capabilities()).await,
             Err(OllamaError::RequestOutcomeUnknown)
         );
         server.join().unwrap();
@@ -1984,6 +2129,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
+            reply_to_identity_check(&listener, Some("local-token"));
             let (mut socket, _) = listener.accept().unwrap();
             let mut buffer = [0; 4096];
             let count = socket.read(&mut buffer).unwrap();
@@ -2003,7 +2149,7 @@ mod tests {
         });
         let client = OllamaClient::new(&url, Some("local-token".to_owned())).unwrap();
         client
-            .evaluate(&request, &ModelCapabilities::jev_default())
+            .evaluate(&request, &transport_capabilities())
             .await
             .unwrap();
         server.join().unwrap();
@@ -2029,6 +2175,7 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (started, request_started) = tokio::sync::oneshot::channel();
         let server = std::thread::spawn(move || {
+            reply_to_identity_check(&listener, None);
             let (mut socket, _) = listener.accept().unwrap();
             started.send(()).unwrap();
             let mut buffer = [0; 4096];
@@ -2047,11 +2194,8 @@ mod tests {
                 },
             )]),
         };
-        let task = tokio::spawn(async move {
-            client
-                .evaluate(&request, &ModelCapabilities::jev_default())
-                .await
-        });
+        let task =
+            tokio::spawn(async move { client.evaluate(&request, &transport_capabilities()).await });
         tokio::time::timeout(Duration::from_secs(1), request_started)
             .await
             .unwrap()

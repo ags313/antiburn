@@ -1209,6 +1209,7 @@ mod tests {
             ),
         ] {
             let mut responses = ollama_discovery_responses(None, None, maximum);
+            responses.push(("/api/tags", 200, responses[1].2.clone()));
             responses.push(("/api/generate", 200, json!({"done": true})));
             responses.extend(ollama_discovery_responses(Some(context), None, maximum));
             let limits = resolve_mock_ollama(responses, manual.clone(), true)
@@ -1369,6 +1370,7 @@ mod tests {
             "still-unknown",
         ] {
             let mut responses = ollama_discovery_responses(None, None, 65536);
+            responses.push(("/api/tags", 200, responses[1].2.clone()));
             let expected = match case {
                 "load-authentication" | "load-runner" | "load-unknown" => {
                     let (status, body, expected) = match case {

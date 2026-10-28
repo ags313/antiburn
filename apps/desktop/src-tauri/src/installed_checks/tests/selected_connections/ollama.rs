@@ -211,6 +211,334 @@ fn assert_no_provider_usage(harness: &Harness) {
     );
 }
 
+fn assert_unsent_preflight_failure(
+    harness: &Harness,
+    server: &Server,
+    candidate: &str,
+    diagnostic: EvaluationFailureCode,
+) {
+    let (state, attempt_state, outcome, attempts, statuses): (String, String, String, u64, u64) = harness
+        .fixture.store.lock().query_row(
+            "SELECT c.state, a.state, a.outcome,
+                (SELECT COUNT(*) FROM burn_check_evaluation_attempt WHERE candidate_id = c.candidate_id),
+                (SELECT COUNT(*) FROM burn_check_current_status)
+             FROM burn_check_candidate c JOIN burn_check_evaluation_attempt a USING(candidate_id)
+             WHERE c.candidate_id = ?1",
+            [candidate],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+    assert_eq!(
+        (state.as_str(), attempt_state.as_str(), outcome.as_str()),
+        ("execution_failed", "settled", "permanent")
+    );
+    assert_eq!((attempts, statuses), (1, 0));
+    assert_candidate_diagnostic(harness, candidate, diagnostic);
+    assert_no_provider_usage(harness);
+    assert_eq!(server.count(), 0);
+    assert_eq!(server.tags_count(), 1);
+}
+
+#[tokio::test]
+async fn ollama_matching_preflight_keeps_unpinned_selection_and_records_inference_usage() {
+    let a = Server::new();
+    let mut harness = harness(&a);
+    assert!(
+        harness
+            .runtime
+            .worker
+            .execution_snapshot()
+            .unwrap()
+            .connection
+            .model_revision
+            .is_none()
+    );
+    harness.publish(1);
+    a.reply("clear", None);
+    let settlement = harness.job().await.unwrap().unwrap().unwrap();
+    assert_eq!(settlement.outcome, RunOutcome::Accepted);
+    assert_eq!((settlement.attempts, settlement.new_intents), (1, 1));
+    assert_eq!((a.tags_count(), a.count()), (1, 1));
+    let usage = harness.fixture.store.burn_check_usage_summary().unwrap();
+    assert_eq!((usage.confirmed_calls, usage.unknown_outcomes), (1, 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ollama_retag_during_slot_wait_stays_unsent_without_usage_or_retry() {
+    let a = Server::new();
+    let mut harness = harness(&a);
+    harness.publish(1);
+    let candidate = pending_candidate(&harness);
+    let held = Arc::new(Mutex::new(Some(test_hooks::hold_inference_slots().await)));
+    let released = Arc::clone(&held);
+    let tags = Arc::clone(&a.tags_reply);
+    let reads = Arc::clone(&a.tags_reads);
+    let job = harness.host.evaluation_jobs(1).pop().unwrap();
+    let runtime: Arc<dyn SelectedJobRuntime> = harness.runtime.clone();
+    let settlement = test_hooks::with_inference_slot_pending(
+        move || {
+            assert_eq!(reads.load(Ordering::Acquire), 0);
+            *tags.lock().unwrap() = TagsReply::body(
+                200,
+                json!({"models": [
+                    {"name": "synthetic-local-model:latest", "digest": "replacement-digest"}
+                ]})
+                .to_string(),
+            );
+            drop(released.lock().unwrap().take().unwrap());
+        },
+        job.run_selected(runtime),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(settlement.outcome, RunOutcome::Failed(_)));
+    assert_eq!((settlement.attempts, settlement.new_intents), (1, 1));
+    assert!(held.lock().unwrap().is_none());
+    assert_unsent_preflight_failure(
+        &harness,
+        &a,
+        &candidate,
+        EvaluationFailureCode::InvalidRequest,
+    );
+    harness.host.catch_up().unwrap();
+    assert!(harness.job().await.unwrap().unwrap().is_none());
+    assert_unsent_preflight_failure(
+        &harness,
+        &a,
+        &candidate,
+        EvaluationFailureCode::InvalidRequest,
+    );
+}
+
+#[tokio::test]
+async fn ollama_invalid_preflight_metadata_stays_unsent_without_usage_or_retry() {
+    let unavailable = EvaluationFailureCode::ProviderUnavailable;
+    let unsupported = EvaluationFailureCode::InvalidRequest;
+    let tag = json!({"name": "synthetic-local-model:latest", "digest": "synthetic-digest"});
+    let mut remote = tag.clone();
+    remote["remote_model"] = json!("selected:cloud");
+    let mut remote_host = tag.clone();
+    remote_host["remote_host"] = json!("https://remote.invalid");
+    let mut alias = tag.clone();
+    alias["name"] = json!("registry.ollama.ai/library/synthetic-local-model:latest");
+    let mut malformed_digest = tag.clone();
+    malformed_digest["digest"] = json!("digest\n");
+    let mut too_many = vec![tag.clone()];
+    too_many.extend(
+        (0..1024).map(|index| json!({"name": format!("other:{index}"), "digest": "other"})),
+    );
+    let oversized = "x".repeat(2 * 1024 * 1024 + 1);
+    let cases = [
+        (
+            "missing",
+            TagsReply::body(200, json!({"models": []}).to_string()),
+            unsupported,
+        ),
+        (
+            "duplicate",
+            TagsReply::body(
+                200,
+                json!({"models": [tag.clone(), tag.clone()]}).to_string(),
+            ),
+            unavailable,
+        ),
+        (
+            "canonical duplicate",
+            TagsReply::body(200, json!({"models": [tag.clone(), alias]}).to_string()),
+            unavailable,
+        ),
+        (
+            "remote model",
+            TagsReply::body(200, json!({"models": [remote]}).to_string()),
+            unsupported,
+        ),
+        (
+            "remote host",
+            TagsReply::body(200, json!({"models": [remote_host]}).to_string()),
+            unsupported,
+        ),
+        (
+            "malformed json",
+            TagsReply::body(200, "not json".into()),
+            unavailable,
+        ),
+        (
+            "malformed list",
+            TagsReply::body(200, json!({"models": {}}).to_string()),
+            unavailable,
+        ),
+        (
+            "missing digest",
+            TagsReply::body(
+                200,
+                json!({"models": [{"name": "synthetic-local-model"}]}).to_string(),
+            ),
+            unavailable,
+        ),
+        (
+            "malformed digest",
+            TagsReply::body(200, json!({"models": [malformed_digest]}).to_string()),
+            unavailable,
+        ),
+        (
+            "too many models",
+            TagsReply::body(200, json!({"models": too_many}).to_string()),
+            unavailable,
+        ),
+        (
+            "oversized length",
+            TagsReply {
+                wire: "HTTP/1.1 200 OK\r\nContent-Length: 2097153\r\nConnection: close\r\n\r\n"
+                    .into(),
+                gate: None,
+            },
+            unavailable,
+        ),
+        (
+            "oversized stream",
+            TagsReply {
+                wire: format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{oversized}"),
+                gate: None,
+            },
+            unavailable,
+        ),
+        (
+            "closed connection",
+            TagsReply {
+                wire: String::new(),
+                gate: None,
+            },
+            unavailable,
+        ),
+        (
+            "partial body",
+            TagsReply {
+                wire: "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{".into(),
+                gate: None,
+            },
+            unavailable,
+        ),
+        (
+            "server failure",
+            TagsReply::body(503, "{}".into()),
+            unavailable,
+        ),
+    ];
+    for (name, reply, diagnostic) in cases {
+        let a = Server::new();
+        a.set_tags_reply(reply);
+        let mut harness = harness(&a);
+        harness.publish(1);
+        let candidate = pending_candidate(&harness);
+        let settlement = harness.job().await.unwrap().unwrap().unwrap();
+        assert!(
+            matches!(settlement.outcome, RunOutcome::Failed(_)),
+            "{name}"
+        );
+        assert_eq!(
+            (settlement.attempts, settlement.new_intents),
+            (1, 1),
+            "{name}"
+        );
+        assert_unsent_preflight_failure(&harness, &a, &candidate, diagnostic);
+        harness.host.catch_up().unwrap();
+        assert!(harness.job().await.unwrap().unwrap().is_none(), "{name}");
+        assert_unsent_preflight_failure(&harness, &a, &candidate, diagnostic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ollama_preflight_cancellation_stays_unsent_without_usage_or_retry() {
+    let a = Server::new();
+    let mut harness = harness(&a);
+    harness.publish(1);
+    let candidate = pending_candidate(&harness);
+    let gate = Arc::new(Gate::default());
+    let _release = ReleaseGate(Arc::clone(&gate));
+    a.tags_reply.lock().unwrap().gate = Some(Arc::clone(&gate));
+    let task = harness.job();
+    gate.wait().await;
+    correct_native_source(
+        &harness.fixture.store,
+        &candidate,
+        harness.runtime.clock.load(Ordering::Acquire),
+    );
+    let settlement = tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(settlement.outcome, RunOutcome::Stale);
+    assert_stale_attempt(&harness, &candidate, "permanent");
+    assert_candidate_diagnostic(&harness, &candidate, EvaluationFailureCode::Cancelled);
+    assert_no_provider_usage(&harness);
+    assert_eq!((a.tags_count(), a.count()), (1, 0));
+    gate.open();
+    harness.host.catch_up().unwrap();
+    assert!(harness.job().await.unwrap().unwrap().is_none());
+    assert_no_provider_usage(&harness);
+    assert_eq!((a.tags_count(), a.count()), (1, 0));
+}
+
+#[tokio::test]
+async fn ollama_preflight_deadline_stays_unsent_without_usage_or_retry() {
+    let a = Server::new();
+    let mut harness = harness(&a);
+    harness.publish(1);
+    let candidate = pending_candidate(&harness);
+    let gate = Arc::new(Gate::default());
+    let _release = ReleaseGate(Arc::clone(&gate));
+    a.tags_reply.lock().unwrap().gate = Some(Arc::clone(&gate));
+    let task = harness.job();
+    gate.wait().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let settlement = task.await.unwrap().unwrap().unwrap();
+    assert!(matches!(settlement.outcome, RunOutcome::Failed(_)));
+    assert_eq!((settlement.attempts, settlement.new_intents), (1, 1));
+    assert_unsent_preflight_failure(
+        &harness,
+        &a,
+        &candidate,
+        EvaluationFailureCode::ProviderUnavailable,
+    );
+    gate.open();
+    harness.host.catch_up().unwrap();
+    assert!(harness.job().await.unwrap().unwrap().is_none());
+    assert_unsent_preflight_failure(
+        &harness,
+        &a,
+        &candidate,
+        EvaluationFailureCode::ProviderUnavailable,
+    );
+}
+
+#[tokio::test]
+async fn ollama_preflight_authentication_rejection_stays_unsent_without_usage() {
+    for status in [401, 403] {
+        let a = Server::new();
+        a.set_tags_reply(TagsReply {
+            wire: format!(
+                "HTTP/1.1 {status} Rejected\r\nContent-Length: 2097153\r\nConnection: close\r\n\r\n"
+            ),
+            gate: None,
+        });
+        let mut harness = harness(&a);
+        harness.publish(1);
+        let candidate = pending_candidate(&harness);
+        let settlement = harness.job().await.unwrap().unwrap().unwrap();
+        assert!(matches!(settlement.outcome, RunOutcome::Failed(_)));
+        assert!(harness.runtime.worker.authentication_rejected());
+        assert_unsent_preflight_failure(
+            &harness,
+            &a,
+            &candidate,
+            EvaluationFailureCode::AuthenticationRejected,
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn ollama_held_slot_claim_invalidation_stays_unsent() {
     let a = Server::new();

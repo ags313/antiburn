@@ -205,6 +205,138 @@ fn tainted_action_conditions_results_and_messages_skip_without_blocking_independ
 }
 
 #[test]
+fn string_join_retains_eager_separator_membership_in_inputs_and_local_actions() {
+    for (separator, requires_membership, reads_requests) in [
+        ("session.requests.length", true, true),
+        ("fromJSON(toJSON(session)).requests.length", true, true),
+        ("true || session.requests.length", false, false),
+        ("toJSON(session.requests)", false, true),
+    ] {
+        let result = expression_input(&format!("join('success', {separator})"));
+        let check = compile(&definition(
+            &result,
+            "  - type: status\n    input: {result: failure}",
+        ))
+        .unwrap();
+        let condition =
+            serde_json::to_string(&format!("join('yes', {separator}) == 'yes'")).unwrap();
+        let message = expression_input(&format!("join('Ready.', {separator})"));
+        let local = compile(&format!(
+            "name: String join\non: {{tool_result: null}}\nactions:\n  - type: status\n    if: {condition}\n    input: {{result: success}}\n  - type: status\n    input: {{result: {result}}}\n  - type: status\n    input: {{result: success, message: {message}}}\n"
+        ))
+        .unwrap();
+        assert!(local.is_local());
+        for requests in [Some(json!([])), Some(json!([{"text": "known"}])), None] {
+            for complete in [Some(false), None, Some(true)] {
+                let mut context = context(
+                    requests.clone().unwrap_or_else(|| json!([])),
+                    complete == Some(true),
+                );
+                if requests.is_none() {
+                    context["session"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("requests");
+                }
+                if complete.is_none() {
+                    context["session"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("requests_complete");
+                }
+                let available = (!reads_requests || requests.is_some())
+                    && (!requires_membership || complete == Some(true));
+                let input = evaluate_decision_input_with_budget(
+                    &check.decisions[0],
+                    &context,
+                    &mut EvaluationBudget::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    input.value,
+                    if available {
+                        EvaluationValue::Available(json!({"value": "success"}))
+                    } else {
+                        EvaluationValue::Unavailable
+                    },
+                    "{separator}, {complete:?}"
+                );
+                let plan = plan_status_actions_with_budget(
+                    &local.actions,
+                    &context,
+                    &EvaluatedAssessment::local(),
+                    Some(StatusResult::Failure),
+                    &mut EvaluationBudget::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    plan.current_status,
+                    Some(if available {
+                        StatusResult::Success
+                    } else {
+                        StatusResult::Failure
+                    }),
+                    "{separator}, {complete:?}"
+                );
+                if available {
+                    assert!(plan.outcomes.iter().all(|outcome| matches!(
+                        outcome.outcome,
+                        ActionOutcomeKind::Applied {
+                            result: StatusResult::Success,
+                            ..
+                        }
+                    )));
+                } else {
+                    assert_eq!(
+                        plan.outcomes[0].outcome,
+                        ActionOutcomeKind::SkippedConditionUnavailable
+                    );
+                    for outcome in &plan.outcomes[1..] {
+                        assert_eq!(outcome.outcome, ActionOutcomeKind::SkippedInputUnavailable);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn string_join_preserves_first_argument_identity_and_text_provenance() {
+    let context = context(json!([]), false);
+    for source in [
+        "session.id",
+        "toJSON(session)",
+        "format('{0}', toJSON(session.requests))",
+    ] {
+        let original = evaluate(source, &context);
+        let joined = evaluate(
+            &format!("join({source}, toJSON(session.requests))"),
+            &context,
+        );
+        assert_eq!(joined.value, original.value, "{source}");
+        assert_eq!(
+            joined.metadata.identity, original.metadata.identity,
+            "{source}"
+        );
+        assert_eq!(
+            joined.metadata.encoded_provenance, original.metadata.encoded_provenance,
+            "{source}"
+        );
+        assert_eq!(
+            joined.metadata.text_sources, original.metadata.text_sources,
+            "{source}"
+        );
+        assert!(joined.trace.dependencies.contains(&EvaluationDependency {
+            path: vec![
+                PathSegment::Property("session".into()),
+                PathSegment::Property("requests".into()),
+            ],
+            kind: EvaluationDependencyKind::Value,
+        }));
+    }
+}
+
+#[test]
 fn whole_transformed_copies_and_unrelated_or_unused_values_remain_available() {
     let context = context(json!([]), false);
     for expression in [
@@ -216,6 +348,8 @@ fn whole_transformed_copies_and_unrelated_or_unused_values_remain_available() {
         "fromJSON(format('{0}', toJSON(message.tool.arguments.items))).length",
         "fromJSON(format('{0}', toJSON(window.messages))).length",
         "fromJSON(format('[]', toJSON(session.requests))).length",
+        "fromJSON(join('[]', toJSON(session.requests))).length",
+        "fromJSON(fromJSON(join(toJSON(session), '')).id).length",
         "fromJSON(fromJSON(toJSON(session)).id).length",
         "fromJSON(fromJSON(toJSON(toJSON(session)))).id",
         "fromJSON(true && '[]' || toJSON(session.requests)).length",

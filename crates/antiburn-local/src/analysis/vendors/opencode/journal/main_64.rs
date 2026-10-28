@@ -157,6 +157,7 @@ pub(super) fn decode(bytes: &[u8]) -> anyhow::Result<OpenCodeJournalCursor> {
         prefix_hash: old.prefix_hash,
         parser_revision: 64,
         main_64: true,
+        cold_replay: None,
         live: Some(LiveState {
             revision: 2,
             baseline: old.live.baseline,

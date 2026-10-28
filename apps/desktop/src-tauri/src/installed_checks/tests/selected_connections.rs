@@ -69,10 +69,30 @@ struct Reply {
     gate: Option<Arc<Gate>>,
 }
 
+#[derive(Clone)]
+struct TagsReply {
+    wire: String,
+    gate: Option<Arc<Gate>>,
+}
+
+impl TagsReply {
+    fn body(status: u16, body: String) -> Self {
+        Self {
+            wire: format!(
+                "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            gate: None,
+        }
+    }
+}
+
 struct Server {
     address: std::net::SocketAddr,
     replies: Arc<Mutex<VecDeque<Reply>>>,
     sends: Arc<AtomicUsize>,
+    tags_reply: Arc<Mutex<TagsReply>>,
+    tags_reads: Arc<AtomicUsize>,
     stopped: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -83,12 +103,21 @@ impl Server {
         let address = listener.local_addr().unwrap();
         let replies = Arc::new(Mutex::new(VecDeque::<Reply>::new()));
         let sends = Arc::new(AtomicUsize::new(0));
+        let tags_reply = Arc::new(Mutex::new(TagsReply::body(
+            200,
+            json!({"models": [
+                {"name": "synthetic-local-model:latest", "digest": "synthetic-digest"}
+            ]})
+            .to_string(),
+        )));
+        let tags_reads = Arc::new(AtomicUsize::new(0));
         let stopped = Arc::new(AtomicBool::new(false));
         let (queue, count, stop) = (
             Arc::clone(&replies),
             Arc::clone(&sends),
             Arc::clone(&stopped),
         );
+        let (metadata, metadata_count) = (Arc::clone(&tags_reply), Arc::clone(&tags_reads));
         let thread = std::thread::spawn(move || {
             for socket in listener.incoming() {
                 if stop.load(Ordering::Acquire) {
@@ -128,6 +157,17 @@ impl Server {
                     assert!(read > 0);
                     bytes.extend_from_slice(&buffer[..read]);
                 }
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                if headers.starts_with("GET /api/tags HTTP/1.1\r\n") {
+                    assert_eq!(length, 0);
+                    metadata_count.fetch_add(1, Ordering::AcqRel);
+                    let reply = metadata.lock().unwrap().clone();
+                    if let Some(gate) = reply.gate {
+                        gate.block();
+                    }
+                    let _ = socket.write_all(reply.wire.as_bytes());
+                    continue;
+                }
                 count.fetch_add(1, Ordering::AcqRel);
                 let reply = queue
                     .lock()
@@ -162,6 +202,8 @@ impl Server {
             address,
             replies,
             sends,
+            tags_reply,
+            tags_reads,
             stopped,
             thread: Some(thread),
         }
@@ -191,6 +233,12 @@ impl Server {
     }
     fn count(&self) -> usize {
         self.sends.load(Ordering::Acquire)
+    }
+    fn tags_count(&self) -> usize {
+        self.tags_reads.load(Ordering::Acquire)
+    }
+    fn set_tags_reply(&self, reply: TagsReply) {
+        *self.tags_reply.lock().unwrap() = reply;
     }
 }
 
@@ -251,6 +299,9 @@ impl SelectedJobRuntime for Runtime {
             ));
             let mut capabilities = ModelCapabilities::jev_default();
             capabilities.model.clone_from(&snapshot.connection.model);
+            if snapshot.connection.provider == SystemOneProvider::Ollama {
+                capabilities.model_revision = Some("synthetic-digest".into());
+            }
             if self.unsupported_resolution.load(Ordering::Acquire) {
                 capabilities.output.choice = None;
             }

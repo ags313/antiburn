@@ -1,4 +1,6 @@
-use antiburn_checks_store::{source_ready_at_sql, source_ready_sql};
+use antiburn_checks_store::{
+    opencode_journal_receipt_compatible_sql, source_ready_at_sql, source_ready_sql,
+};
 use antiburn_local::analysis::{ANALYZER_REVISION, EVIDENCE_SCHEMA_REVISION, PARSER_REVISION};
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -130,6 +132,72 @@ fn journal_readiness_requires_live_state_five_and_a_bound_public_baseline() {
             assert!(!ready(&connection, "opencode"));
         }
     }
+}
+
+#[test]
+fn journal_cold_replay_blocks_readiness_but_allows_retry_and_warm_pending_work() {
+    let connection = database();
+    connection
+        .execute_batch(
+            "UPDATE session SET agent = 'opencode', source_kind = 'providerDb',
+                source_format = '\"open_code_sqlite_v2\"';
+             ALTER TABLE opencode_journal_delivery ADD COLUMN pending INTEGER NOT NULL DEFAULT 1;",
+        )
+        .unwrap();
+    let cursor = json!({
+        "session_id": "s1", "owner_id": "owner", "parser_revision": PARSER_REVISION,
+        "through_sequence": 7, "live": {"revision": 5, "public_baseline": 7},
+        "cold_replay": {"output_sha256": vec![0; 32]}
+    });
+    connection
+        .execute(
+            "INSERT INTO opencode_journal_delivery VALUES
+                ('native','opencode','s1',7,'source','/repo',?1,?2,0,1,NULL,1)",
+            params![PARSER_REVISION, cursor.to_string()],
+        )
+        .unwrap();
+    seed_cached_evidence(&connection, "opencode");
+    let compatible = || {
+        let predicate = opencode_journal_receipt_compatible_sql(1);
+        connection
+            .query_row(
+                &format!(
+                    "SELECT ({predicate}) FROM session s JOIN opencode_journal_delivery d
+                     USING(environment_key, agent, session_id) WHERE s.agent = 'opencode'"
+                ),
+                [PARSER_REVISION],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    };
+    assert!(compatible());
+    assert!(!ready(&connection, "opencode"));
+    connection
+        .execute(
+            "UPDATE opencode_journal_delivery
+             SET cursor_json = json_set(cursor_json, '$.cold_replay', NULL)",
+            [],
+        )
+        .unwrap();
+    assert!(compatible());
+    assert!(!ready(&connection, "opencode"));
+    connection
+        .execute(
+            "UPDATE opencode_journal_delivery
+             SET cursor_json = json_remove(cursor_json, '$.cold_replay')",
+            [],
+        )
+        .unwrap();
+    assert!(compatible());
+    assert!(ready(&connection, "opencode"));
+    assert_eq!(
+        connection
+            .query_row("SELECT pending FROM opencode_journal_delivery", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
 }
 
 #[test]

@@ -44,6 +44,8 @@ mod local;
 mod preparation;
 #[path = "runtime_recovery_validation_tests.rs"]
 mod recovery_validation;
+#[path = "runtime_registry_tests.rs"]
+mod registry;
 #[path = "runtime_selection_tests.rs"]
 mod selection;
 #[path = "runtime_snapshot_tests.rs"]

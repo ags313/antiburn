@@ -122,7 +122,7 @@ beforeEach(() => {
           Object.entries(saved.profiles).map(([id, profile]) => [
             id,
             profile.credential?.kind === "legacy_type_safe"
-              ? { ...profile, credential: null, revision: profile.revision + 1 }
+              ? { ...profile, revision: profile.revision + 1 }
               : profile,
           ]),
         ),
@@ -413,6 +413,79 @@ it("keeps a non-first search target through failed-read Retry", async () => {
   ])
   stop()
 })
+
+it.each(["jev", "ollama", "cloudflare", "custom"] as const)(
+  "disables the %s Add form during recovery reload and keeps its create request",
+  async (provider) => {
+    render(<CheckProviderSettings legacyKeySaved />)
+    const dialog = await add()
+    fireEvent.change(screen.getByLabelText("Provider"), { target: { value: provider } })
+    if (provider === "jev")
+      fireEvent.change(screen.getByLabelText("Jev API key"), {
+        target: { value: "keep-secret" },
+      })
+    else if (provider === "ollama") {
+      fireEvent.click(screen.getByRole("button", { name: "Find models" }))
+      await screen.findByRole("option", { name: "Local one" })
+      fireEvent.change(screen.getByLabelText("Ollama model"), {
+        target: { value: "local-one" },
+      })
+    } else if (provider === "cloudflare") {
+      fireEvent.change(screen.getByLabelText("Cloudflare account ID"), {
+        target: { value: "keep-account" },
+      })
+      fireEvent.change(screen.getByLabelText("Cloudflare API token"), {
+        target: { value: "keep-secret" },
+      })
+    } else {
+      fireEvent.change(screen.getByLabelText("Exact inference URL"), {
+        target: { value: "https://api.typesafe.ai/v1/systemone" },
+      })
+      fireEvent.change(screen.getByLabelText("Custom model"), {
+        target: { value: "jev-1.14.0" },
+      })
+    }
+    const values = () =>
+      [...dialog.querySelectorAll<HTMLInputElement | HTMLSelectElement>("input, select")].map(
+        (field) => field.value,
+      )
+    const retainedValues = values()
+    invoke
+      .mockRejectedValueOnce(new Error("save failed"))
+      .mockRejectedValueOnce(new Error("read failed"))
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add connection" }))
+    const retry = await screen.findByRole("button", { name: "Retry loading connections" })
+    const firstSave = invoke.mock.calls.find(
+      ([command]) => command === "save_system_one_connection",
+    )![1]
+    let finish!: (settings: ProviderSettings) => void
+    invoke.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve
+        }),
+    )
+    fireEvent.click(retry)
+    for (const field of dialog.querySelectorAll("input, select, button"))
+      expect(field).toBeDisabled()
+    fireEvent.change(screen.getByLabelText("Provider"), {
+      target: { value: provider === "ollama" ? "jev" : "ollama" },
+    })
+    expect(confirmDiscard).not.toHaveBeenCalled()
+    await act(async () => finish(saved))
+    expect(values()).toEqual(retainedValues)
+    expect(screen.getByRole("dialog", { name: "Add connection" })).toBe(dialog)
+    fireEvent.click(within(dialog).getByRole("button", { name: "Add connection" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    expect(invoke).toHaveBeenLastCalledWith("save_system_one_connection", {
+      draft: firstSave.draft,
+      intent: "create",
+      requestId: expect.any(String),
+    })
+    expect(saved.profiles[firstSave.draft.connection_id]?.provider).toBe(provider)
+    expect(saved.profiles.jev).toEqual(configured("jev"))
+  },
+)
 
 it("opens the search field while a different row menu is open without selecting a menu action", async () => {
   saved.profiles.custom = configured("custom")
@@ -706,6 +779,43 @@ it("submits explicit saved-key reuse instead of only enabling Add", async () => 
       connection: { provider: "jev", credential: { kind: "legacy_type_safe" } },
     },
   })
+})
+
+it("saves a retained Jev replacement after Add forgets the shared key", async () => {
+  saved.profiles.jev = { ...configured("jev"), credential: { kind: "legacy_type_safe" } }
+  const { rerender } = render(<CheckProviderSettings legacyKeySaved />)
+  await edit()
+  fireEvent.click(screen.getByRole("button", { name: "Change" }))
+  fireEvent.change(screen.getByLabelText("Jev API key"), {
+    target: { value: "retained-replacement" },
+  })
+  rerender(
+    <CheckProviderSettings legacyKeySaved control="decisionProvider" targetRevision={1} />,
+  )
+  const dialog = screen.getByRole("dialog", { name: "Add connection" })
+  fireEvent.click(screen.getByRole("button", { name: "Forget shared TypeSafe key" }))
+  await waitFor(() => expect(screen.getByLabelText("Jev API key")).toBeEnabled())
+  fireEvent.change(screen.getByLabelText("Jev API key"), {
+    target: { value: "new-connection-key" },
+  })
+  fireEvent.click(within(dialog).getByRole("button", { name: "Add connection" }))
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+  await edit()
+  expect(screen.getByLabelText("Jev API key")).toHaveValue("retained-replacement")
+  expect(screen.queryByRole("button", { name: "Forget shared TypeSafe key" })).toBeNull()
+  fireEvent.click(screen.getByRole("button", { name: "Save" }))
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+  expect(invoke.mock.calls.at(-1)).toEqual([
+    "save_system_one_connection",
+    expect.objectContaining({
+      intent: "update",
+      draft: expect.objectContaining({
+        connection_id: "jev",
+        credential: "retained-replacement",
+        connection: expect.objectContaining({ revision: 2 }),
+      }),
+    }),
+  ])
 })
 
 it("blocks focused controls, duplicate saves, dismissal, and defers search until Save completes", async () => {

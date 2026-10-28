@@ -115,7 +115,7 @@ Do not discard unsupported fields or actions to make a definition run.
   the model and in assessment details. See [fit large inputs](#fit-large-inputs).
 - **Decisions:** omit `decisions` for local status actions, or declare independent
   named blocks with one to eight questions each. A block can mix Choice, Score,
-  and Noul. Choice uses an ordered label/description map; Score uses an ordered
+  and Noul. Choice uses a label/description map; Score uses an ordered
   description array. Both need at least two criteria. Noul has only a question,
   without authored criteria. Present empty or null `decisions` is invalid.
   Decision inputs cannot read `decisions`; local actions cannot read it either,

@@ -87,6 +87,11 @@ Ollama uses the selected installed model and verified runtime metadata. It does
 not download updates or select cloud-backed models as free local inference.
 An installed `latest` tag does not prove the newest registry artifact. Unknown
 or unsupported required metadata blocks check execution.
+After slot admission, each load or inference checks the installed tag digest
+against the discovered digest. A changed digest blocks the send without adopting
+new metadata or refitting the request. A metadata failure sends no inference and
+records no inference usage. The tag can still change after this check; the
+response model name does not prove an immutable served digest.
 
 One wire request can contain mixed question types. Each selected route also has
 request-byte, response-byte, token, and question-count limits. Keep these limits

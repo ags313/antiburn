@@ -36,10 +36,10 @@ const expressionCorpus = JSON.parse(
 );
 
 test("shared language corpus retains the reviewed admission baseline", () => {
-  assert.equal(expressionCorpus.cases.length, 73);
+  assert.equal(expressionCorpus.cases.length, 76);
   assert.equal(
     expressionCorpus.cases.filter((entry) => entry.yaml_valid !== false).length,
-    72,
+    75,
   );
   assert.equal(
     expressionCorpus.cases.filter((entry) => entry.schema_valid).length,

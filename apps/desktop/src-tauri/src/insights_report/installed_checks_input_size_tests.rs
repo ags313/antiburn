@@ -12,6 +12,9 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
+const MODEL: &str = "synthetic-report-model";
+const MODEL_DIGEST: &str = "synthetic-report-digest";
+
 const CHECK: &str = "name: Input size report
 on:
   tool_result:
@@ -30,7 +33,8 @@ actions:
 
 fn capabilities() -> ModelCapabilities {
     ModelCapabilities {
-        model: "synthetic-report-model".into(),
+        model: MODEL.into(),
+        model_revision: Some(MODEL_DIGEST.into()),
         ..ModelCapabilities::jev_default()
     }
 }
@@ -122,69 +126,85 @@ async fn run(
 fn mock_provider(
     status: &'static str,
     body: serde_json::Value,
-) -> (String, std::thread::JoinHandle<serde_json::Value>) {
+) -> (String, std::thread::JoinHandle<(serde_json::Value, usize)>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut socket = loop {
-            match listener.accept() {
-                Ok((socket, _)) => break socket,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "the mock provider must receive one request"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
+        let mut inference_request = None;
+        let mut inference_requests = 0;
+        for route in ["GET /api/tags HTTP/1.1", "POST /v1/systemone HTTP/1.1"] {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the mock provider must receive {route}"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("the mock provider could not accept a request: {error}"),
                 }
-                Err(error) => panic!("the mock provider could not accept a request: {error}"),
-            }
-        };
-        socket.set_nonblocking(false).unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        socket
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut received = Vec::new();
-        let request = loop {
-            let mut chunk = [0; 4096];
-            let count = socket.read(&mut chunk).unwrap();
-            assert!(count > 0);
-            assert!(received.len() + count <= 512 * 1024);
-            received.extend_from_slice(&chunk[..count]);
-            if let Some(end) = received.windows(4).position(|part| part == b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&received[..end]);
-                let length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap();
-                if received.len() >= end + 4 + length {
-                    break serde_json::from_slice(&received[end + 4..end + 4 + length]).unwrap();
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut received = Vec::new();
+            let request = loop {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                assert!(received.len() + count <= 512 * 1024);
+                received.extend_from_slice(&chunk[..count]);
+                if let Some(end) = received.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&received[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if received.len() >= end + 4 + length {
+                        assert!(headers.starts_with(route), "{headers}");
+                        break received[end + 4..end + 4 + length].to_vec();
+                    }
                 }
-            }
-        };
-        let body = body.to_string();
-        write!(
-            socket,
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
+            };
+            let (response_status, response_body) = if route.starts_with("GET ") {
+                assert!(request.is_empty());
+                (
+                    "200 OK",
+                    json!({"models": [{"name": MODEL, "digest": MODEL_DIGEST}]}).to_string(),
+                )
+            } else {
+                inference_requests += 1;
+                inference_request = Some(serde_json::from_slice(&request).unwrap());
+                (status, body.to_string())
+            };
+            write!(socket,
+                "HTTP/1.1 {response_status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            ).unwrap();
+            socket.flush().unwrap();
+        }
+        (
+            inference_request.expect("the mock provider must receive inference"),
+            inference_requests,
         )
-        .unwrap();
-        socket.flush().unwrap();
-        request
     });
     (endpoint, server)
 }
 
 fn response() -> serde_json::Value {
-    json!({"model": "synthetic-report-model", "answers": {"verdict": {
+    json!({"model": MODEL, "answers": {"verdict": {
         "type": "choice", "choice": "clear", "probabilities": {"clear": 0.9, "concern": 0.1}, "confidence": 0.8
     }}, "usage": {"input_tokens": 12, "output_tokens": 3}})
 }
@@ -218,10 +238,9 @@ async fn a_no_fit_input_that_fits_runs_without_a_size_error() {
     let settled = run(&store, &activation, &engine, "Small input.").await;
     assert_eq!(settled.outcome, RunOutcome::Accepted);
     assert_eq!(settled.attempts, 1);
-    assert_eq!(
-        server.join().unwrap()["state"]["evidence"]["activity"],
-        "Small input."
-    );
+    let (sent, inference_requests) = server.join().unwrap();
+    assert_eq!(inference_requests, 1);
+    assert_eq!(sent["state"]["evidence"]["activity"], "Small input.");
     let report = rows(&store, &[definition]);
     assert_eq!(report[0].review_failed, 0);
     assert!(report[0].diagnostics.is_empty());
@@ -321,7 +340,8 @@ async fn a_provider_context_rejection_keeps_its_own_failure_without_raw_body_tex
         fixture(CHECK, evaluator(&endpoint, capabilities()));
     let settled = run(&store, &activation, &engine, "Locally admitted input.").await;
     assert_eq!(settled.attempts, 1);
-    server.join().unwrap();
+    let (_, inference_requests) = server.join().unwrap();
+    assert_eq!(inference_requests, 1);
     let report = rows(&store, &[definition]);
     let diagnostic = &report[0].diagnostics[0];
     assert_eq!(diagnostic.code, "provider-context-rejected");
@@ -354,7 +374,8 @@ async fn authored_fitting_success_reports_omissions_without_an_error() {
     let original = "Large permitted input. ".repeat(600);
     let settled = run(&store, &activation, &engine, &original).await;
     assert_eq!(settled.outcome, RunOutcome::Accepted);
-    let sent = server.join().unwrap();
+    let (sent, inference_requests) = server.join().unwrap();
+    assert_eq!(inference_requests, 1);
     assert_ne!(sent["state"]["evidence"]["activity"], original);
     assert_eq!(
         sent["state"]["input_omissions"]["targets"][0]["path"],

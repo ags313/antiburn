@@ -682,10 +682,12 @@ Complete and validate all blocks before actions. If any block is unavailable,
 invalid, terminally failed, or has unknown delivery, the check is not assessed
 and no actions run. Preserve incurred usage and successful sibling answers.
 
-Choice and Score questions require at least two criteria. Preserve Choice
-label/description order and Score criterion order. The language has no fixed
-criteria maximum. The host MUST check the selected connection's criteria limit
-and output capabilities before scheduling, separately from language validation.
+Choice and Score questions require at least two criteria. Preserve each Choice
+label/description binding and Score criterion order. Choice labels have no
+positional meaning; provider requests do not promise authored map order. The
+language has no fixed criteria maximum. The host MUST check the selected
+connection's criteria limit and output capabilities before scheduling, separately
+from language validation.
 It MUST repeat this check when the selected connection or its capabilities
 change. A capability mismatch pauses scheduling without invalidating the
 definition; selecting a compatible connection restores eligibility without a

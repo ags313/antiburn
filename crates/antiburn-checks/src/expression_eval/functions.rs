@@ -101,7 +101,9 @@ impl<'a> Evaluator<'a, '_> {
                     Cow::Borrowed(",")
                 };
                 if matches!(available(&values[0]), Value::String(_)) {
-                    return Ok(values.remove(0));
+                    let mut value = values.remove(0);
+                    value.metadata.dependencies.merge(&trace);
+                    return Ok(value);
                 }
                 let Value::Array(items) = available(&values[0]) else {
                     return Err(invalid_error("join requires an array or a string."));

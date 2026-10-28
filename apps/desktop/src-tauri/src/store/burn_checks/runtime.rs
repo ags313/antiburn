@@ -266,21 +266,7 @@ impl StoreCheckStore {
     /// Validates the durable identity before exposing compiled work to recovery.
     pub fn register_activation(&self, activation: &EffectiveActivation) -> Result<(), StoreError> {
         let result = (|| -> Result<()> {
-            self.validate_activation(activation)?;
-            let saved: Option<(i64, String, bool)> = self.store.lock().query_row(
-            "SELECT generation, definition_revision, enabled FROM burn_check_activation WHERE check_id = ?1 AND activation_scope_key = ?2",
-            params![activation.id.definition_id, self.activation_scope_key],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).optional()?;
-            ensure!(
-                saved
-                    == Some((
-                        integer(activation.id.generation.0)?,
-                        hex(&activation.revision),
-                        true,
-                    )),
-                "activation does not match durable generation and revision"
-            );
+            self.validate_durable_activation(activation)?;
             self.activations
                 .lock()
                 .expect("activation mutex is not poisoned")
@@ -292,6 +278,28 @@ impl StoreCheckStore {
             StoreOperation::ActivationRegistration,
             result,
         )
+    }
+
+    fn validate_durable_activation(&self, activation: &EffectiveActivation) -> Result<()> {
+        self.validate_activation(activation)?;
+        #[cfg(test)]
+        self.store
+            .burn_check_test_stage(super::test_hooks::Stage::BeforeActivationRegistration);
+        let saved: Option<(i64, String, bool)> = self.store.lock().query_row(
+            "SELECT generation, definition_revision, enabled FROM burn_check_activation WHERE check_id = ?1 AND activation_scope_key = ?2",
+            params![activation.id.definition_id, self.activation_scope_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        ensure!(
+            saved
+                == Some((
+                    integer(activation.id.generation.0)?,
+                    hex(&activation.revision),
+                    true,
+                )),
+            "activation does not match durable generation and revision"
+        );
+        Ok(())
     }
 
     /// Reads a publication boundary without converting it to observation order.
@@ -617,12 +625,20 @@ impl CheckStore for StoreCheckStore {
             StoreOperation::LifecycleWrite,
             self.persist_lifecycle(definition_id, transition, activation),
         )?;
-        self.activations
-            .lock()
-            .expect("activation mutex is not poisoned")
-            .retain(|id, _| id.definition_id != definition_id);
         if let Some(activation) = activation {
-            self.register_activation(activation)?;
+            self.store_result(
+                StoreTraceContext::Activation(&activation.id),
+                StoreOperation::ActivationRegistration,
+                self.validate_durable_activation(activation),
+            )?;
+        }
+        let mut activations = self
+            .activations
+            .lock()
+            .expect("activation mutex is not poisoned");
+        activations.retain(|id, _| id.definition_id != definition_id);
+        if let Some(activation) = activation {
+            activations.insert(activation.id.clone(), activation.clone());
         }
         Ok(())
     }

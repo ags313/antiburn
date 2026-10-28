@@ -177,6 +177,7 @@ export class ProviderSettingsSession {
     { connectionId: string; editor: "add" | "edit"; draft: ConnectionDraft }
   >()
   private createdDraftIds = new Set<string>()
+  private legacyKeyRemovalProfiles: Record<string, Connection> | null = null
   private readonly onSelectionChange: ((selected: boolean) => void) | undefined
   private readonly onPendingChange: ((pending: boolean) => void) | undefined
   constructor(
@@ -302,6 +303,32 @@ export class ProviderSettingsSession {
     pruneRemoved = false,
   ): Record<string, DraftState> {
     const drafts = { ...this.state.drafts }
+    const removedKeyProfiles = this.legacyKeyRemovalProfiles
+    this.legacyKeyRemovalProfiles = null
+    for (const [id, previous] of Object.entries(removedKeyProfiles ?? {})) {
+      const current = drafts[id]
+      const connection = current?.draft.connection
+      const updated = saved.profiles[id]
+      if (
+        !current ||
+        !connection ||
+        !updated ||
+        previous.credential?.kind !== "legacy_type_safe" ||
+        connection.provider !== previous.provider ||
+        connection.revision !== previous.revision ||
+        JSON.stringify(connection.credential) !== JSON.stringify(previous.credential) ||
+        JSON.stringify(updated) !==
+          JSON.stringify({ ...previous, revision: previous.revision + 1 })
+      )
+        continue
+      drafts[id] = {
+        draft: {
+          ...current.draft,
+          connection: { ...connection, revision: updated.revision },
+        },
+        tested: false,
+      }
+    }
     for (const id of Object.keys(drafts)) {
       if (
         this.state.saved?.profiles[id] &&
@@ -453,8 +480,9 @@ export class ProviderSettingsSession {
     })
   }
   async changeAddProvider(provider: SmartCheckProvider) {
-    if (this.state.editor !== "add" || this.state.busy) return
-    const current = this.state.drafts[this.state.selectedId]
+    if (this.state.editor !== "add" || this.state.busy || this.state.loading) return
+    const id = this.state.selectedId
+    const current = this.state.drafts[id]
     if (!current || current.draft.connection.provider === provider) return
     if (
       connectionDraftChanged(
@@ -464,9 +492,19 @@ export class ProviderSettingsSession {
       !(await this.confirmDiscard())
     )
       return
+    if (
+      this.state.editor !== "add" ||
+      this.state.busy ||
+      this.state.loading ||
+      this.state.selectedId !== id ||
+      this.state.drafts[id] !== current ||
+      !this.createdDraftIds.has(id) ||
+      this.state.saved?.profiles[id]
+    )
+      return
     const drafts = { ...this.state.drafts }
-    delete drafts[this.state.selectedId]
-    this.createdDraftIds.delete(this.state.selectedId)
+    delete drafts[id]
+    this.createdDraftIds.delete(id)
     this.publish({ drafts })
     this.add(provider)
   }
@@ -546,7 +584,7 @@ export class ProviderSettingsSession {
       saved,
       activeConfirmed: true,
       drafts: {
-        ...this.state.drafts,
+        ...this.savedDrafts(saved),
         [id]: draftState(id, connection),
       },
       status,
@@ -558,12 +596,19 @@ export class ProviderSettingsSession {
     this.edit({ ...current.draft.connection, credential: { kind: "legacy_type_safe" } }, null)
   }
   async forgetLegacyKey() {
-    if (this.state.busy || !this.state.saved || this.state.saved.pendingOperation) return
+    const saved = this.state.saved
+    if (
+      this.state.busy ||
+      this.state.loading ||
+      this.state.legacyKeyForgotten ||
+      !saved ||
+      saved.pendingOperation
+    )
+      return
     this.publish({ busy: true, action: "remove", error: null, errorLocation: "editor" })
     try {
       if (!(await this.confirmForgetSharedKey())) return
-      await removeTypeSafeApiKey()
-      this.publish({ legacyKeyForgotten: true })
+      await this.removeSharedKey(saved)
       this.load(await getProviderSettings())
       const current = this.state.drafts[this.state.selectedId]
       if (current?.draft.connection.credential?.kind === "legacy_type_safe")
@@ -597,6 +642,11 @@ export class ProviderSettingsSession {
       okLabel: "Forget key",
       cancelLabel: "Cancel",
     })
+  }
+  private async removeSharedKey(saved: ProviderSettings) {
+    await removeTypeSafeApiKey()
+    this.legacyKeyRemovalProfiles = saved.profiles
+    this.publish({ legacyKeyForgotten: true })
   }
   async removeConnection(id: string) {
     const saved = this.state.saved
@@ -670,11 +720,25 @@ export class ProviderSettingsSession {
       this.state.saved.pendingOperation
     )
       return
+    const savedBefore = this.state.saved
     const id = this.state.selectedId
     let current = this.state.drafts[id]
     if (!current) return
-    const savedConnection = this.state.saved.profiles[id]
+    const savedConnection = savedBefore.profiles[id]
+    const intent = this.createdDraftIds.has(id) ? "create" : "update"
+    if (
+      action === "save" &&
+      this.state.editor === "add" &&
+      (intent !== "create" || savedConnection)
+    ) {
+      this.publish({
+        error: "This connection identity was already used. Open Add connection again.",
+        errorLocation: "editor",
+      })
+      return
+    }
     const sharedKey = savedConnection?.credential?.kind === "legacy_type_safe"
+    if (action === "remove" && sharedKey && this.state.legacyKeyForgotten) return
     if (
       action === "switch" &&
       (!savedConnection ||
@@ -703,16 +767,12 @@ export class ProviderSettingsSession {
         if (requestId)
           this.saveSubmissions.set(requestId, {
             connectionId: id,
-            editor: this.createdDraftIds.has(id) ? "add" : "edit",
+            editor: intent === "create" ? "add" : "edit",
             draft: current.draft,
           })
         const saved =
           action === "save"
-            ? await saveProviderConnection(
-                current.draft,
-                this.createdDraftIds.has(id) ? "create" : "update",
-                requestId!,
-              )
+            ? await saveProviderConnection(current.draft, intent, requestId!)
             : await switchProviderConnection(id)
         this.acceptSaved(
           saved,
@@ -730,31 +790,30 @@ export class ProviderSettingsSession {
           },
         })
         if (sharedKey) {
-          await removeTypeSafeApiKey()
-          this.publish({ legacyKeyForgotten: true })
+          await this.removeSharedKey(savedBefore)
         } else await removeProviderCredential(id)
         const saved = await getProviderSettings()
         this.validate(saved)
         const connection = saved.profiles[id]
         if (!connection) throw new Error("The saved connection is missing.")
+        const drafts = this.savedDrafts(saved)
+        if (!sharedKey)
+          drafts[id] = {
+            draft: {
+              ...current.draft,
+              connection: {
+                ...current.draft.connection,
+                credential: connection.credential,
+                revision: connection.revision,
+              },
+              credential: current.draft.credential,
+            },
+            tested: false,
+          }
         this.publish({
           saved,
           activeConfirmed: true,
-          drafts: {
-            ...this.savedDrafts(saved),
-            [id]: {
-              draft: {
-                ...current.draft,
-                connection: {
-                  ...current.draft.connection,
-                  credential: connection.credential,
-                  revision: connection.revision,
-                },
-                credential: current.draft.credential,
-              },
-              tested: false,
-            },
-          },
+          drafts,
           status: sharedKey
             ? "Shared TypeSafe key forgotten."
             : "Saved credential forgotten. The connection remains saved.",

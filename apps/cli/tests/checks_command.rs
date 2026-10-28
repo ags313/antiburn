@@ -70,6 +70,124 @@ fn malformed_present_legacy_schema_fails_without_json_output() {
 }
 
 #[test]
+fn legacy_yaml_registry_keeps_evidence_and_native_findings_read_only() {
+    let temp = tempdir().unwrap();
+    let data_root = platform_data_root(temp.path());
+    let database_dir = data_root.join("ai.antiburn.desktop");
+    std::fs::create_dir_all(&database_dir).unwrap();
+    let database_path = database_dir.join("antiburn.sqlite3");
+    let connection = Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "../../../crates/antiburn-checks-store/tests/fixtures/registry_v82.sql"
+        ))
+        .unwrap();
+    let mut evidence = SessionEvidenceAccumulator::new(EvidenceSource {
+        agent: "codex".to_owned(),
+        session_id: "s1".to_owned(),
+        kind: SourceKind::File,
+        capabilities: SourceCapabilities::codex(),
+    })
+    .evidence(&TurnFacts::default());
+    evidence.context = EvidenceValue::Complete(ContextEvidence {
+        max_request_context_tokens: ReportCatalogs::default().depth_cap_tokens + 1,
+        top_depth_examples: Vec::new(),
+    });
+    connection
+        .execute(
+            "INSERT INTO session_evidence
+                (environment_key, agent, session_id, status, evidence_json)
+             VALUES ('native', 'codex', 's1', 'ready', ?1)",
+            [serde_json::to_string(&evidence).unwrap()],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO burn_check_assessment
+                (environment_key, agent, session_id, check_id, status, input_revision,
+                 result_revision, incarnation, request_count, created_at_epoch,
+                 updated_at_epoch, progress_json, result_json)
+             VALUES ('native', 'codex', 's1', 'legacy-check', 'completed', 'revision',
+                 'revision', 7, 1, 1, 1, '{}', '{\"findings\":[\"Saved native finding.\"]}');",
+        )
+        .unwrap();
+    connection.pragma_update(None, "query_only", true).unwrap();
+    assert!(connection.execute("DELETE FROM session", []).is_err());
+    drop(connection);
+    let before = std::fs::read(&database_path).unwrap();
+    let mut command = default_lookup_command(temp.path(), &data_root);
+    let output = command.args(["checks", "s1"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["freshness_evaluated"], false);
+    assert!(response.get("evidence").is_none());
+    let checks = response["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 2);
+    assert!(checks.iter().any(|check| {
+        check["source"] == "burn_check_assessment" && check["check_id"] == "legacy-check"
+    }));
+    assert!(checks.iter().any(|check| {
+        check["source"] == "session_evidence_badge" && check["check_id"] == "sessions_over_depth"
+    }));
+    assert!(
+        checks
+            .iter()
+            .all(|check| check["source"] != "predefined_yaml")
+    );
+    assert_eq!(std::fs::read(&database_path).unwrap(), before);
+    let connection =
+        Connection::open_with_flags(&database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        82
+    );
+}
+
+#[test]
+fn malformed_yaml_projection_schema_still_fails_the_cli_read() {
+    for (sql, expected) in [
+        ("PRAGMA user_version = 92", "opencode_v2_capture"),
+        (
+            "ALTER TABLE burn_check_assessment_history DROP COLUMN trigger_position",
+            "h.trigger_position",
+        ),
+    ] {
+        let temp = tempdir().unwrap();
+        let data_root = platform_data_root(temp.path());
+        let database_dir = data_root.join("ai.antiburn.desktop");
+        std::fs::create_dir_all(&database_dir).unwrap();
+        let database_path = database_dir.join("antiburn.sqlite3");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../../crates/antiburn-checks-store/tests/fixtures/registry_v82.sql"
+            ))
+            .unwrap();
+        connection.execute_batch(sql).unwrap();
+        drop(connection);
+        let before = std::fs::read(&database_path).unwrap();
+        let mut command = default_lookup_command(temp.path(), &data_root);
+        let output = command.args(["checks", "s1"]).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("could not read predefined checks"),
+            "{error}"
+        );
+        assert!(error.contains(expected), "{error}");
+        assert_eq!(std::fs::read(&database_path).unwrap(), before);
+    }
+}
+
+#[test]
 fn checks_command_returns_only_new_problematic_findings() {
     let temp = tempdir().unwrap();
     let data_root = platform_data_root(temp.path());

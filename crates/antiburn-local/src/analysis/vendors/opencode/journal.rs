@@ -37,8 +37,28 @@ pub struct OpenCodeJournalCursor {
     parser_revision: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     live: Option<LiveState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cold_replay: Option<ColdReplay>,
     #[serde(skip)]
     main_64: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ColdReplay {
+    output_sha256: [u8; 32],
+    assistant_projections: BTreeMap<String, Option<AssistantProjection>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssistantProjection {
+    parent_id: Value,
+}
+
+struct AssistantProjectionInputs {
+    values: BTreeMap<String, Option<AssistantProjection>>,
+    frozen: bool,
 }
 
 impl OpenCodeJournalCursor {
@@ -104,6 +124,45 @@ pub struct OpenCodeToolResultPage {
     /// Strict replay does not collect these counters.
     pub live_input_events: usize,
     pub live_input_bytes: u64,
+    assistant_projections: BTreeMap<String, Option<AssistantProjection>>,
+}
+
+impl OpenCodeToolResultPage {
+    /// Retain the cold frontier and verify the same output on retry.
+    pub fn cold_retry_json(&self) -> anyhow::Result<Option<String>> {
+        let Some(live) = &self.cursor.live else {
+            return Ok(None);
+        };
+        ensure!(
+            self.cursor.parser_revision == PARSER_REVISION
+                && live.revision == LIVE_STATE_REVISION
+                && live.public_baseline == Some(self.cursor.through_sequence)
+                && self.cursor.cold_replay.is_none()
+                && !self.cursor.main_64,
+            OpenCodeJournalReadError::SourceChanged
+        );
+        let mut cursor = self.cursor.clone();
+        cursor.cold_replay = Some(ColdReplay {
+            output_sha256: self.cold_output_digest()?,
+            assistant_projections: self.assistant_projections.clone(),
+        });
+        let encoded = serde_json::to_string(&cursor)?;
+        ensure!(
+            encoded.len() <= 1024 * 1024,
+            "OpenCode live cursor exceeds its output budget"
+        );
+        Ok(Some(encoded))
+    }
+
+    fn cold_output_digest(&self) -> anyhow::Result<[u8; 32]> {
+        Ok(Sha256::digest(serde_json::to_vec(&(
+            &self.cursor,
+            &self.evidence,
+            self.history_complete,
+            &self.assistant_projections,
+        ))?)
+        .into())
+    }
 }
 
 /// A validated whole-message deletion from the live journal.
@@ -177,6 +236,7 @@ pub fn opencode_journal_has_new_events(
         || cursor.owner_id != state.owner
         || cursor.parser_revision != PARSER_REVISION
         || cursor.live.is_none()
+        || cursor.cold_replay.is_some()
         || cursor.through_sequence != state.latest)
 }
 
@@ -662,6 +722,7 @@ pub(super) fn read(
             prefix_hash: accepted_hash,
             parser_revision: PARSER_REVISION,
             live: None,
+            cold_replay: None,
             main_64: false,
         },
         has_more: through < latest,
@@ -676,6 +737,7 @@ pub(super) fn read(
             && through == latest,
         live_input_events: 0,
         live_input_bytes: 0,
+        assistant_projections: BTreeMap::new(),
     }))
 }
 
@@ -688,6 +750,7 @@ const LIVE_REQUEST_RECORDS: usize = 128;
 const LIVE_REQUEST_BYTES: usize = 64 * 1024;
 const LIVE_CONTEXT_BYTES: usize = 256 * 1024;
 const LIVE_CONTEXTS: usize = 16;
+const ASSISTANT_PROJECTION_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LiveState {
@@ -862,6 +925,7 @@ mod compatibility_tests {
                 prefix_hash: [0; 32],
                 parser_revision,
                 live: Some(current.clone()),
+                cold_replay: None,
                 main_64: false,
             };
             validate_live(&connection, "root", &cursor, &current, &metadata).unwrap();
@@ -902,6 +966,25 @@ fn validate_live(
                     && live.public_baseline.is_none()
                     && live.public == PublicState::default()))
             && cursor.through_sequence <= metadata.latest
+            && cursor.cold_replay.as_ref().is_none_or(|replay| {
+                cursor.parser_revision == PARSER_REVISION
+                    && live.revision == LIVE_STATE_REVISION
+                    && live.baseline <= cursor.through_sequence
+                    && live.public_baseline == Some(cursor.through_sequence)
+                    && !cursor.main_64
+                    && replay.assistant_projections.len() <= LIVE_RESULTS
+                    && replay
+                        .assistant_projections
+                        .iter()
+                        .all(|(message, projection)| {
+                            !message.is_empty()
+                                && message.len() <= EVIDENCE_STRING_CAP
+                                && projection.as_ref().is_none_or(|projection| {
+                                    projection.parent_id.to_string().len()
+                                        <= ASSISTANT_PROJECTION_BYTES
+                                })
+                        })
+            })
             && live.origin == live_boundary(connection, session, 0)?
             && live.boundary == live_boundary(connection, session, cursor.through_sequence)?,
         OpenCodeJournalReadError::SourceChanged
@@ -966,6 +1049,11 @@ fn read_live(
 ) -> anyhow::Result<OpenCodeToolResultPage> {
     require_live_index(connection)?;
     let metadata = metadata(connection, session)?.ok_or(OpenCodeJournalReadError::Unavailable)?;
+    let cold_replay = after.and_then(|cursor| cursor.cold_replay.as_ref());
+    ensure!(
+        cold_replay.is_none() || after.is_some_and(|cursor| cursor.live.is_some()),
+        OpenCodeJournalReadError::SourceChanged
+    );
     let restored = after.and_then(|cursor| cursor.live.as_ref().map(|live| (cursor, live)));
     if let Some((cursor, live)) = restored {
         validate_live(connection, session, cursor, live, &metadata)?;
@@ -979,14 +1067,27 @@ fn read_live(
             OpenCodeJournalReadError::SourceChanged
         );
     }
+    let latest = if cold_replay.is_some() {
+        after.expect("a cold replay has a cursor").through_sequence
+    } else {
+        metadata.latest
+    };
+    // Rebuild the original bounded window before reading its appended suffix.
+    let restored = restored.filter(|_| cold_replay.is_none());
     let (events, input_bytes) = live_events(
         connection,
         session,
         restored.map(|(cursor, _)| cursor.through_sequence),
-        metadata.latest,
+        latest,
         cancel,
     )?;
     let cold = restored.is_none();
+    let mut assistant_projections = AssistantProjectionInputs {
+        values: cold_replay
+            .map(|replay| replay.assistant_projections.clone())
+            .unwrap_or_default(),
+        frozen: cold_replay.is_some(),
+    };
     let selected = cold.then(|| select_live_window(&events));
     let mut live = match restored {
         Some((cursor, state)) if state.revision == 4 || cursor.main_64 => {
@@ -997,7 +1098,7 @@ fn read_live(
             revision: LIVE_STATE_REVISION,
             baseline: events
                 .first()
-                .map_or(metadata.latest, |event| event.sequence.saturating_sub(1)),
+                .map_or(latest, |event| event.sequence.saturating_sub(1)),
             origin: live_boundary(connection, session, 0)?,
             boundary: [0; 32],
             requests: request_context::RequestHistory::partial(metadata.root),
@@ -1007,7 +1108,7 @@ fn read_live(
             history_safe: true,
             evidence_gap: false,
             public: PublicState::default(),
-            public_baseline: Some(metadata.latest),
+            public_baseline: Some(latest),
         },
     };
     let mut through = restored.map_or(0, |(cursor, _)| cursor.through_sequence);
@@ -1038,8 +1139,9 @@ fn read_live(
             event,
             selected.as_ref(),
             metadata.root,
+            &mut assistant_projections,
         )?;
-        let public_baseline = next_live.public_baseline.unwrap_or(metadata.latest);
+        let public_baseline = next_live.public_baseline.unwrap_or(latest);
         let mut next_public = std::mem::take(&mut next_live.public);
         let mut event_evidence = next_public.observe(
             session,
@@ -1119,15 +1221,14 @@ fn read_live(
         through = event.sequence;
     }
     ensure!(
-        through == metadata.latest || !events.is_empty(),
+        through == latest || !events.is_empty(),
         OpenCodeJournalReadError::IncompleteHistory
     );
     live.boundary = live_boundary(connection, session, through)?;
     let history_complete =
         live.history_safe && !live.evidence_gap && metadata.root && live.requests.main_session();
     if cold {
-        live.public
-            .seed_historical_users(&live.requests, metadata.latest);
+        live.public.seed_historical_users(&live.requests, latest);
         evidence = results
             .iter()
             .cloned()
@@ -1173,13 +1274,14 @@ fn read_live(
         prefix_hash: [0; 32],
         parser_revision: PARSER_REVISION,
         live: Some(live),
+        cold_replay: None,
         main_64: false,
     };
     ensure!(
         serde_json::to_vec(&cursor)?.len() <= 1024 * 1024,
         "OpenCode live cursor exceeds its output budget"
     );
-    Ok(OpenCodeToolResultPage {
+    let page = OpenCodeToolResultPage {
         evidence: crate::analysis::NativeEvidenceBatch {
             source_format: SourceFormat::OpenCodeSqliteV1,
             events: evidence,
@@ -1194,7 +1296,15 @@ fn read_live(
         complete: false,
         live_input_events: events.len(),
         live_input_bytes: input_bytes,
-    })
+        assistant_projections: assistant_projections.values,
+    };
+    if let Some(replay) = cold_replay {
+        ensure!(
+            page.cold_output_digest()? == replay.output_sha256,
+            OpenCodeJournalReadError::SourceChanged
+        );
+    }
+    Ok(page)
 }
 
 fn retain_latest(
@@ -1307,6 +1417,7 @@ fn observe_live(
     event: &Event,
     selected: Option<&HashSet<String>>,
     root: bool,
+    assistant_projections: &mut AssistantProjectionInputs,
 ) -> anyhow::Result<Option<ToolResultObservation>> {
     let cold = selected.is_some();
     let Some(data) = event
@@ -1443,6 +1554,7 @@ fn observe_live(
                 message,
                 event.sequence,
                 &mut live.requests,
+                assistant_projections,
             )?;
         }
         let mut context = live.requests.freeze(session, message, event.sequence);
@@ -1510,19 +1622,44 @@ fn seed_live_assistant(
     message: &str,
     sequence: u64,
     requests: &mut request_context::RequestHistory,
+    projections: &mut AssistantProjectionInputs,
 ) -> anyhow::Result<()> {
     if requests.has_message(message) || requests.is_removed_message(message) {
         return Ok(());
     }
-    let info: Option<String> = connection.query_row(
-        "SELECT data FROM message WHERE id = ?1 AND session_id = ?2 AND length(CAST(data AS BLOB)) <= 16384",
-        params![message, session], |row| row.get(0)).optional()?;
-    if let Some(info) = info.and_then(|info| serde_json::from_str::<Value>(&info).ok())
-        && info["role"] == "assistant"
-    {
+    let projection = if let Some(projection) = projections.values.get(message) {
+        projection.clone()
+    } else {
+        ensure!(!projections.frozen, OpenCodeJournalReadError::SourceChanged);
+        ensure!(
+            projections.values.len() < LIVE_RESULTS,
+            "OpenCode cold ownership lookups exceed their count limit"
+        );
+        let info: Option<String> = connection.query_row(
+            "SELECT data FROM message WHERE id = ?1 AND session_id = ?2 AND length(CAST(data AS BLOB)) <= ?3",
+            params![message, session, ASSISTANT_PROJECTION_BYTES], |row| row.get(0)).optional()?;
+        let projection = info
+            .and_then(|info| serde_json::from_str::<Value>(&info).ok())
+            .filter(|info| info["role"] == "assistant")
+            .map(|info| AssistantProjection {
+                parent_id: info["parentID"].clone(),
+            });
+        ensure!(
+            projection.as_ref().is_none_or(|projection| {
+                projection.parent_id.to_string().len() <= ASSISTANT_PROJECTION_BYTES
+            }),
+            "OpenCode cold ownership lookup exceeds its byte limit"
+        );
+        // Retain absent lookups so later projection rows cannot change replay.
+        projections
+            .values
+            .insert(message.to_owned(), projection.clone());
+        projection
+    };
+    if let Some(projection) = projection {
         // Projection metadata supplies ownership only. It supplies no historical request text.
         let data = serde_json::json!({"sessionID": session, "info": {
-            "id": message, "sessionID": session, "role": "assistant", "parentID": info["parentID"]
+            "id": message, "sessionID": session, "role": "assistant", "parentID": projection.parent_id
         }});
         requests.observe("message.updated.1", &data, session, sequence);
         requests.bound(LIVE_REQUEST_RECORDS, LIVE_REQUEST_BYTES);

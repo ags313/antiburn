@@ -465,6 +465,27 @@
       "source": "name: Synthetic unsupported model filter\non: {tool_result: {models: [provider/observed-model]}}\nif: false\ndecisions:\n  review:\n    input: {value: true}\n    output: {applies: {type: noul, question: Does this apply?}}\nactions: [{type: status, input: {result: success}}]\n"
     },
     {
+      "id": "message-model-filter-interpolation-rejected",
+      "feature": "source_filters",
+      "schema_valid": false,
+      "compile_valid": false,
+      "source": "name: Synthetic model filter interpolation\non: {tool_result: {models: ['provider/${{session.model}}']}}\nif: false\nactions: [{type: status, input: {result: failure}}]\n"
+    },
+    {
+      "id": "cycle-model-filter-interpolation-rejected",
+      "feature": "source_filters",
+      "schema_valid": false,
+      "compile_valid": false,
+      "source": "name: Synthetic cycle model filter interpolation\non: {turn_end: {models: ['${{session.model}}/model']}}\nif: false\nactions: [{type: status, input: {result: failure}}]\n"
+    },
+    {
+      "id": "session-model-filter-interpolation-rejected",
+      "feature": "source_filters",
+      "schema_valid": false,
+      "compile_valid": false,
+      "source": "name: Synthetic session model filter interpolation\non: {session_idle: {models: ['provider/vendor/${{session.model}}']}}\nif: false\nactions: [{type: status, input: {result: failure}}]\n"
+    },
+    {
       "id": "tool-result-source-filters",
       "feature": "source_filters",
       "schema_valid": true,

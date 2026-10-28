@@ -88,6 +88,10 @@ incarnation, and attachment epoch instead of a fabricated native result.
 Partial first-page file publication retains the original startup position and
 live baseline across retry and restart. Later appends remain eligible; delivery
 limits do not move them into historical work or discard pending events.
+Partial first-page journal publication also keeps its original recent window
+and result/public baselines. Retry validates and finishes that window before
+reading later appends. The incomplete cold receipt cannot enable startup seeding
+or report readiness; warm continuation remains ready under the normal gates.
 
 ### Reachable event families
 
@@ -486,6 +490,11 @@ Selected cold-window identities retain their first-terminal binding under cache
 pressure within the existing identity budget. Missing frozen context stays
 unavailable; corrections cannot replace it with later request text. A terminal-only
 correction for an identity evicted during warm delivery remains unsafe.
+An interrupted cold journal page stores a bounded retry cursor and output
+digest. Retry and restart validate the original window before publishing its
+remaining results. Frozen ownership lookups do not change when projection rows
+change. Later messages keep their future-live eligibility. A changed
+window requires source recovery rather than a new cold baseline.
 
 Missing legacy model/provider/usage/timing metadata does not by itself block
 journal delivery or YAML results. Missing fields, non-text user parts,

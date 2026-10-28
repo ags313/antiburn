@@ -500,7 +500,13 @@ impl Validator {
     fn parse_models(&mut self, value: &ConfigValue, path: &str) -> Option<Vec<String>> {
         let items = self.unique_strings(value, path)?;
         for (item, text) in &items {
-            if !is_model_identifier(text) {
+            if text.contains("${{") {
+                self.invalid_value(
+                    item,
+                    path,
+                    "Model filters must be fixed text without `${{`.",
+                );
+            } else if !is_model_identifier(text) {
                 self.invalid_value(item, path, "Use an exact provider/model identifier with nonempty segments and no whitespace.");
             }
         }

@@ -164,7 +164,7 @@ fn read_request_with_headers(socket: &mut TcpStream) -> (String, Vec<u8>) {
                     name.eq_ignore_ascii_case("content-length")
                         .then(|| value.trim().parse::<usize>().unwrap())
                 })
-                .unwrap();
+                .unwrap_or(0);
             if received.len() >= end + 4 + length {
                 return (
                     headers.into_owned(),
@@ -492,6 +492,20 @@ async fn mixed_blocks_use_one_exact_request_in_selected_direct_envelope_and_olla
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
+            if route == "ollama" {
+                let mut socket = accept(&listener);
+                let (headers, body) = read_request_with_headers(&mut socket);
+                assert!(headers.starts_with("GET /api/tags HTTP/1.1"));
+                assert!(body.is_empty());
+                reply(
+                    &mut socket,
+                    "200 OK",
+                    &json!({"models": [
+                        {"name": "synthetic-model", "digest": "synthetic-digest"}
+                    ]})
+                    .to_string(),
+                );
+            }
             let mut socket = accept(&listener);
             let request = read_request(&mut socket);
             let value: Value = serde_json::from_slice(&request).unwrap();

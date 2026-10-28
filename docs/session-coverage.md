@@ -134,6 +134,10 @@ Native source delivery has reserved capacity independent of metric indexing.
 Partial first-page file publication retains the initialized startup position and
 EOF baseline. Retry and restart keep that boundary, so later appends remain live
 and pending output is not lost when the startup suffix moves.
+Partial first-page journal publication pins the original recent window and its
+result/public baselines. Retry validates that window before publishing the rest;
+appended messages remain future live work. Startup seeding waits for the whole
+initial journal page to commit.
 The worker alternates file and journal turns. Productive continuation is due
 immediately. Durable monotonic claim order rotates productive sources without
 requiring a clock tick and survives restart. Active sources and changed cursors
@@ -615,6 +619,12 @@ terminal-only identities after attachment can be old corrections and remain
 unsafe; new calls need a retained pending/running update before terminal. Known
 corrections preserve first-terminal order and context. Evicted context stays
 unavailable rather than being reconstructed from old history.
+If cold publication stops early, an optional `cold_replay` cursor field stores
+the frozen window's output digest. Retry rereads only that original bounded
+window and uses its saved ownership lookups, including absent projections. It
+checks the digest and finishes the window before reading appended events. A
+changed window fails closed instead of shifting the baseline. This receipt does
+not grant report readiness or startup seeding until the initial page commits.
 An exact removal without a retained call binding records a coverage gap; later
 independent results can remain usable. An explicit message-role change invalidates
 retained tool ownership even when an older frozen context exists.

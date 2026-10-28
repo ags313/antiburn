@@ -369,14 +369,17 @@ impl Store {
             now * 1000,
         )?;
         if !consumed {
-            let retry = claim
-                .cursor()?
-                .map(|cursor| cursor.main_64_retry_json(&page.cursor))
-                .transpose()?
-                .flatten();
+            let retry = match claim.cursor()? {
+                Some(cursor) if cursor.live_baseline().is_some() => {
+                    cursor.main_64_retry_json(&page.cursor)?
+                }
+                _ => page.cold_retry_json()?,
+            };
+            let retry_baseline = retry.as_ref().and(page.cursor.live_baseline());
             tx.execute(
                 "UPDATE opencode_journal_delivery SET pending = 1, lease_expires_at_epoch = NULL,
                 next_attempt_at_epoch = ?4, cursor_json = COALESCE(?5, cursor_json),
+                baseline_sequence = CASE WHEN ?5 IS NOT NULL THEN ?7 ELSE baseline_sequence END,
                 parser_revision = CASE WHEN ?5 IS NOT NULL THEN ?6 ELSE parser_revision END
                 WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
                 params![
@@ -385,7 +388,8 @@ impl Store {
                     claim.key.session_id,
                     now,
                     retry,
-                    PARSER_REVISION
+                    PARSER_REVISION,
+                    retry_baseline
                 ],
             )?;
             tx.commit()?;
@@ -602,6 +606,10 @@ fn current_generation(
 #[cfg(test)]
 #[path = "journal/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "journal/cold_retry_tests.rs"]
+mod cold_retry_tests;
 
 #[cfg(test)]
 #[path = "journal_regression_tests.rs"]

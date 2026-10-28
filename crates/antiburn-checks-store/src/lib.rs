@@ -280,6 +280,9 @@ pub fn read_session_checks(
         rows.len() <= MAX_RUNTIME_DEFINITIONS,
         "session check projection limit exceeded"
     );
+    if legacy_registry_source_schema(connection)? {
+        return Ok(Vec::new());
+    }
     let source_state = if rows
         .iter()
         .any(|row| row.7 == "available" && row.3 == Some(true))
@@ -412,6 +415,51 @@ pub fn read_session_checks(
         });
     }
     Ok(checks)
+}
+
+fn legacy_registry_source_schema(connection: &Connection) -> Result<bool> {
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !(81..=83).contains(&version) {
+        return Ok(false);
+    }
+    // Registry-only branch builds precede capture and typed source metadata.
+    // Withhold their projection rather than infer current source readiness.
+    let legacy: bool = connection.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE name IN
+            ('opencode_v2_selection', 'opencode_v2_capture', 'opencode_v2_source_status',
+             'session_relation_related'))
+          AND (SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN
+            ('native_file_delivery', 'opencode_journal_delivery',
+             'native_tool_result_publication')) = 3
+          AND NOT EXISTS(SELECT 1 FROM pragma_table_info('session') WHERE name = 'source_format')
+          AND NOT EXISTS(SELECT 1 FROM pragma_table_info('native_tool_result_publication')
+            WHERE name = 'gap_kind')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !legacy {
+        return Ok(false);
+    }
+    for sql in [
+        "SELECT environment_key, agent, session_id, cwd, source_kind, source_generation,
+            incarnation, source_label, wsl_distro FROM session LIMIT 0",
+        "SELECT environment_key, agent, session_id, related_id, kind
+         FROM session_relation LIMIT 0",
+        "SELECT environment_key, agent, session_id, status, analyzed_generation,
+            parser_revision, analyzer_revision, evidence_schema_revision
+         FROM session_evidence LIMIT 0",
+        "SELECT environment_key, agent, session_id, incarnation, source_label, cwd,
+            parser_revision, cursor_json, blocked, last_error FROM native_file_delivery LIMIT 0",
+        "SELECT environment_key, agent, session_id, incarnation, source_label, cwd,
+            parser_revision, cursor_json, blocked, main_session, last_error
+         FROM opencode_journal_delivery LIMIT 0",
+        "SELECT publication_sequence, environment_key, agent, session_id, source_format,
+            session_incarnation, project_cwd, outcome, gap_reason
+         FROM native_tool_result_publication LIMIT 0",
+    ] {
+        let _statement = connection.prepare(sql)?;
+    }
+    Ok(true)
 }
 
 pub fn is_current_activation(
@@ -682,9 +730,10 @@ pub fn source_ready_at_sql(parser: usize, analyzer: usize, evidence: usize, now:
             SELECT 1 FROM opencode_journal_delivery d
              WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
                AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                 AND ({journal_receipt})
-                 AND json_extract(d.cursor_json, '$.live.revision') = 5
-                AND d.blocked = 0 AND d.main_session = 1
+                  AND ({journal_receipt})
+                  AND json_extract(d.cursor_json, '$.live.revision') = 5
+                  AND json_type(d.cursor_json, '$.cold_replay') IS NULL
+                 AND d.blocked = 0 AND d.main_session = 1
                 AND (d.last_error IS NULL OR d.last_error IN ('journal-history-incomplete', 'journal-cancelled')))
             WHEN s.environment_key = 'native' AND s.agent IN ('claude-code', 'codex', 'pi')
               AND s.source_kind = 'file' THEN s.wsl_distro IS NULL

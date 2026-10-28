@@ -349,6 +349,99 @@ it("does not ask to discard untouched Add or Edit and clears only unsaved drafts
   expect(session.getSnapshot().drafts[id]).toBeUndefined()
 })
 
+it("keeps the Add identity when a provider change arrives during reload", async () => {
+  const session = new ProviderSettingsSession()
+  await session.refresh()
+  session.add()
+  const id = session.getSnapshot().selectedId
+  session.edit(defaultConnection("jev"), "keep-secret")
+  const draft = session.getSnapshot().drafts[id]
+  let finish!: (settings: ProviderSettings) => void
+  invoke.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve
+      }),
+  )
+  const loading = session.refresh()
+  await session.changeAddProvider("ollama")
+  expect(session.getSnapshot()).toMatchObject({ selectedId: id, editor: "add" })
+  expect(session.getSnapshot().drafts[id]).toBe(draft)
+  expect(confirmRemoval).not.toHaveBeenCalled()
+  finish(saved)
+  await loading
+  await session.run("save")
+  expect(invoke).toHaveBeenLastCalledWith("save_system_one_connection", {
+    draft: draft!.draft,
+    intent: "create",
+    requestId: expect.any(String),
+  })
+})
+
+it.each(["reload", "another draft", "later edit", "another editor"] as const)(
+  "ignores a stale provider discard after %s",
+  async (change) => {
+    const session = new ProviderSettingsSession()
+    await session.refresh()
+    session.add()
+    const id = session.getSnapshot().selectedId
+    session.edit(defaultConnection("jev"), "keep-secret")
+    let confirm!: (discard: boolean) => void
+    confirmRemoval.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          confirm = resolve
+        }),
+    )
+    const changing = session.changeAddProvider("ollama")
+    let finishRead!: (settings: ProviderSettings) => void
+    let loading: Promise<void> | undefined
+    if (change === "reload") {
+      invoke.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishRead = resolve
+          }),
+      )
+      loading = session.refresh()
+    } else if (change === "another draft") session.revealTarget("cloudflareModel", 1)
+    else if (change === "later edit") session.edit(defaultConnection("jev"), "later-secret")
+    else session.openEdit("local")
+    const before = session.getSnapshot()
+    confirm(true)
+    await changing
+    expect(session.getSnapshot()).toBe(before)
+    expect(session.getSnapshot().drafts[id]).toBe(before.drafts[id])
+    if (loading) {
+      finishRead(saved)
+      await loading
+    }
+  },
+)
+
+it.each(["saved selection", "saved Add identity"] as const)(
+  "never sends an Add as an update after a %s",
+  async (change) => {
+    const session = new ProviderSettingsSession()
+    await session.refresh()
+    session.add()
+    const id = session.getSnapshot().selectedId
+    if (change === "saved selection") session.select("jev")
+    else {
+      saved = providerSettingsFixture({
+        ...saved,
+        profiles: { ...saved.profiles, [id]: defaultConnection("jev") },
+      })
+      await session.refresh()
+    }
+    const calls = invoke.mock.calls.length
+    await session.run("save")
+    expect(invoke).toHaveBeenCalledTimes(calls)
+    expect(session.getSnapshot().editor).toBe("add")
+    expect(session.getSnapshot().error).toContain("Open Add connection again")
+  },
+)
+
 it.each(["local", "jev"])(
   "removes %s, prunes drafts and remembered search choices, and never chooses a replacement",
   async (id) => {
@@ -845,6 +938,201 @@ it("keeps shared-key removal behind confirmation and makes retained-key forgetti
   expect(removeLegacyKey).toHaveBeenCalledOnce()
   expect(session.getSnapshot().legacyKeyForgotten).toBe(true)
 })
+
+it.each(
+  (["add", "edit"] as const).flatMap((editor) =>
+    [0, 1, 2].map((failedReads) => ({ editor, failedReads })),
+  ),
+)(
+  "keeps each dirty draft savable after shared-key removal from $editor with $failedReads failed reads",
+  async ({ editor, failedReads }) => {
+    const legacy = {
+      ...defaultConnection("jev"),
+      credential: { kind: "legacy_type_safe" as const },
+    }
+    saved = providerSettingsFixture({
+      ...saved,
+      profiles: { ...saved.profiles, jev: legacy, work: legacy },
+    })
+    removeLegacyKey.mockImplementation(async () => {
+      saved = {
+        ...saved,
+        profiles: Object.fromEntries(
+          Object.entries(saved.profiles).map(([id, profile]) => [
+            id,
+            profile.credential?.kind === "legacy_type_safe"
+              ? { ...profile, revision: profile.revision + 1 }
+              : profile,
+          ]),
+        ),
+      }
+    })
+    const session = new ProviderSettingsSession()
+    await session.refresh()
+    for (const id of ["jev", "work"]) {
+      session.openEdit(id)
+      session.edit({ ...legacy, modelRevision: `draft-${id}` }, `secret-${id}`)
+    }
+    session.openEdit("local")
+    session.edit({ ...saved.profiles.local!, model: "keep-local-model" }, "keep-local-secret")
+    const local = session.getSnapshot().drafts.local
+    if (editor === "add") {
+      session.add()
+      session.edit(defaultConnection("jev"), "new-connection-secret")
+    } else session.openEdit("work")
+    const id = session.getSnapshot().selectedId
+    const current = session.getSnapshot().drafts[id]!
+    for (let index = 0; index < failedReads; index++)
+      invoke.mockRejectedValueOnce(new Error("settings read failed"))
+    if (editor === "add") await session.forgetLegacyKey()
+    else await session.run("remove")
+    if (failedReads === 2) {
+      expect(session.getSnapshot().activeConfirmed).toBe(false)
+      expect(session.getSnapshot().drafts.jev!.draft.connection.revision).toBe(1)
+      await session.refresh()
+    }
+    for (const legacyId of ["jev", "work"]) {
+      expect(session.getSnapshot().drafts[legacyId]).toMatchObject({
+        draft: {
+          credential: `secret-${legacyId}`,
+          connection: { ...legacy, revision: 2, modelRevision: `draft-${legacyId}` },
+        },
+        tested: false,
+      })
+    }
+    expect(session.getSnapshot().drafts.local).toBe(local)
+    if (editor === "add") {
+      expect(session.getSnapshot().drafts[id]).toBe(current)
+      await session.run("save")
+      expect(invoke.mock.calls.at(-1)?.[1].intent).toBe("create")
+    }
+    session.openEdit("jev")
+    await session.run("save")
+    expect(session.getSnapshot().error).toBeNull()
+    expect(invoke.mock.calls.at(-1)?.[1]).toMatchObject({
+      intent: "update",
+      draft: { connection_id: "jev", connection: { revision: 2 }, credential: "secret-jev" },
+    })
+  },
+)
+
+it.each(["add", "edit"] as const)(
+  "does not rebase an external change during shared-key removal from %s",
+  async (editor) => {
+    const legacy = {
+      ...defaultConnection("jev"),
+      credential: { kind: "legacy_type_safe" as const },
+    }
+    saved = providerSettingsFixture({
+      ...saved,
+      profiles: { ...saved.profiles, jev: legacy, work: legacy },
+    })
+    const session = new ProviderSettingsSession()
+    await session.refresh()
+    for (const id of ["jev", "work"]) {
+      session.openEdit(id)
+      session.edit(legacy, `secret-${id}`)
+    }
+    if (editor === "add") session.add()
+    else session.openEdit("jev")
+    removeLegacyKey.mockImplementation(async () => {
+      saved = {
+        ...saved,
+        profiles: {
+          ...saved.profiles,
+          jev: { ...legacy, revision: 3, modelRevision: "external-change" },
+          work: { ...legacy, revision: 2 },
+        },
+      }
+    })
+    if (editor === "add") await session.forgetLegacyKey()
+    else await session.run("remove")
+    expect(session.getSnapshot().drafts.jev!.draft).toMatchObject({
+      credential: "secret-jev",
+      connection: { revision: 1, modelRevision: null },
+    })
+    expect(session.getSnapshot().drafts.work!.draft.connection.revision).toBe(2)
+    session.openEdit("jev")
+    await session.run("save")
+    expect(session.getSnapshot().error).toContain("changed in another window")
+  },
+)
+
+it("retries the read instead of removing a shared key again after successful removal", async () => {
+  const legacy = {
+    ...defaultConnection("jev"),
+    credential: { kind: "legacy_type_safe" as const },
+  }
+  saved = providerSettingsFixture({
+    ...saved,
+    activeId: "local",
+    profiles: { ...saved.profiles, jev: legacy },
+  })
+  const session = new ProviderSettingsSession()
+  await session.refresh()
+  session.openEdit("jev")
+  session.edit(legacy, "keep-secret")
+  removeLegacyKey.mockImplementation(async () => {
+    saved = {
+      ...saved,
+      profiles: {
+        ...saved.profiles,
+        jev: { ...saved.profiles.jev!, revision: saved.profiles.jev!.revision + 1 },
+      },
+    }
+  })
+  invoke
+    .mockRejectedValueOnce(new Error("read failed"))
+    .mockRejectedValueOnce(new Error("read failed"))
+  await session.run("remove")
+  expect(session.getSnapshot().activeConfirmed).toBe(false)
+  await session.run("remove")
+  await session.forgetLegacyKey()
+  expect(removeLegacyKey).toHaveBeenCalledOnce()
+  await session.refresh()
+  expect(session.getSnapshot().drafts.jev!.draft).toMatchObject({
+    credential: "keep-secret",
+    connection: { revision: 2 },
+  })
+})
+
+it.each(["earlier external revision", "changed credential", "failed removal"] as const)(
+  "keeps a dirty revision after shared-key removal with %s",
+  async (change) => {
+    const legacy = {
+      ...defaultConnection("jev"),
+      credential: { kind: "legacy_type_safe" as const },
+    }
+    saved = providerSettingsFixture({ ...saved, profiles: { ...saved.profiles, jev: legacy } })
+    const session = new ProviderSettingsSession()
+    await session.refresh()
+    session.openEdit("jev")
+    session.edit(
+      change === "changed credential"
+        ? { ...legacy, credential: { kind: "connection", id: "other-key" } }
+        : legacy,
+      "keep-secret",
+    )
+    if (change === "earlier external revision") {
+      saved = { ...saved, profiles: { ...saved.profiles, jev: { ...legacy, revision: 2 } } }
+      await session.refresh()
+    }
+    session.add()
+    removeLegacyKey.mockImplementation(async () => {
+      if (change === "failed removal") throw new Error("credential removal failed")
+      saved = {
+        ...saved,
+        profiles: {
+          ...saved.profiles,
+          jev: { ...saved.profiles.jev!, revision: saved.profiles.jev!.revision + 1 },
+        },
+      }
+    })
+    await session.forgetLegacyKey()
+    expect(session.getSnapshot().drafts.jev!.draft.connection.revision).toBe(1)
+    expect(session.getSnapshot().drafts.jev!.draft.credential).toBe("keep-secret")
+  },
+)
 
 it("defers a non-first search field while busy without extra native calls", async () => {
   const session = new ProviderSettingsSession()

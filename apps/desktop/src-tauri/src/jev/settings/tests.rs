@@ -2660,8 +2660,10 @@ async fn connection_test_loads_idle_model_but_limit_refresh_stays_passive() {
             ];
             let mut responses = discovery(false).to_vec();
             if testing {
+                responses.push(discovery(false)[1].clone());
                 responses.push(("/api/generate", json!({"done": true})));
                 responses.extend(discovery(true));
+                responses.push(discovery(true)[1].clone());
                 responses.push(("/v1/systemone", json!({"model": "selected:latest", "answers": {
                     "validation": {"type": "noul", "noul": 0.9}}, "usage": {"input_tokens": 4, "output_tokens": 1}})));
             }
@@ -2762,7 +2764,7 @@ async fn test_and_refresh_send_saved_authentication_but_keep_keyless_requests_ke
                     serde_json::json!({"models":[{"name":"clef-flash:latest","digest":"synthetic-digest","context_length":8192}]}),
                 ),
             ];
-            for (route, body) in discovery.clone().into_iter().chain([(
+            for (route, body) in discovery.clone().into_iter().chain([discovery[1].clone(), (
                 "/v1/systemone",
                 serde_json::json!({"model":"clef-flash", "answers":{"validation":{"type":"noul","noul":0.9}}, "usage":{"input_tokens":4,"output_tokens":1}}),
             )]).chain(discovery) {

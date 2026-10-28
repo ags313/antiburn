@@ -21,7 +21,7 @@ use antiburn_checks::source::{
     PublishedEvidenceSource, PublishedResultStatus, PublishedToolMetadata, PublishedToolResult,
     SourceError, SourceEvent,
 };
-use antiburn_checks::{CompiledCheck, compile};
+use antiburn_checks::{CompiledCheck, DiagnosticCode, compile};
 use serde_json::json;
 
 fn definition(filters: &str, input: Option<&str>) -> String {
@@ -211,6 +211,47 @@ fn rejects_invalid_filters_before_activation_even_behind_false_conditions() {
     let check = compile(&definition("{models: [Provider/namespace/model], fast_mode: false, paths: ['src/**/?.rs'], paths-ignore: ['**/generated/**']}", None)).unwrap();
     assert_eq!(check.trigger.models.unwrap(), ["Provider/namespace/model"]);
     assert_eq!(check.trigger.fast_mode, Some(false));
+}
+
+#[test]
+fn model_filters_reject_interpolation_at_the_authored_entry() {
+    for event in [
+        "user_message",
+        "assistant_message",
+        "tool_call",
+        "tool_result",
+        "turn_end",
+        "session_start",
+        "session_idle",
+    ] {
+        for model in [
+            "provider/${{session.model}}",
+            "${{session.model}}/model",
+            "provider/${{session.model",
+        ] {
+            let source = format!(
+                "name: Fixed model filter\non:\n  {event}:\n    models:\n      - provider/model\n      - '{model}'\nif: false\nactions: [{{type: status, input: {{result: failure}}}}]\n"
+            );
+            let errors = compile(&source).unwrap_err();
+            assert_eq!(errors.len(), 1, "{event}, {model}: {errors:?}");
+            let error = &errors[0];
+            assert_eq!(error.code, DiagnosticCode::ConfigInvalidValue);
+            assert_eq!(
+                error.config_path.as_deref(),
+                Some(format!("on.{event}.models").as_str())
+            );
+            let span = error.span.unwrap();
+            assert_eq!(span.line, 6);
+            assert_eq!(span.column, 9);
+        }
+    }
+}
+
+#[test]
+fn recorded_model_identifiers_do_not_apply_authored_interpolation_rules() {
+    assert!(antiburn_checks::filters::is_model_identifier(
+        "provider/${{session.model}}"
+    ));
 }
 
 #[test]

@@ -192,6 +192,34 @@ async fn loopback_request(
     let request = fixtures::request(&capabilities.model);
     let expected_request = serde_json::to_value(&request).unwrap();
     let server = std::thread::spawn(move || {
+        if ollama {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut headers = Vec::new();
+            loop {
+                let mut buffer = [0; 4096];
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                headers.extend_from_slice(&buffer[..count]);
+                assert!(headers.len() < 8192);
+                if headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+            assert!(headers.starts_with("get /api/tags http/1.1\r\n"));
+            assert!(!headers.contains("authorization:"));
+            let tags = json!({"models": [{"name": "local-model", "digest": "synthetic-digest"}]})
+                .to_string();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{tags}",
+                tags.len()
+            )
+            .unwrap();
+        }
         let (mut socket, _) = listener.accept().unwrap();
         socket
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))

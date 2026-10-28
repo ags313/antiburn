@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stage {
+    BeforeActivationRegistration,
     BeforeCancellation,
     BeforeAnswer,
     AfterAnswer,
