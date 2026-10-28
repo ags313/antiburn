@@ -575,10 +575,20 @@ impl Installation {
             #[cfg(unix)]
             let owned = fs::read_link(&self.terminal).is_ok_and(|target| target == self.stable());
             #[cfg(windows)]
-            let owned = r
-                .terminal_sha256
-                .as_ref()
-                .is_some_and(|digest| hash(&self.terminal).is_ok_and(|current| current == *digest));
+            let owned = {
+                use std::os::windows::fs::MetadataExt;
+                let metadata = fs::symlink_metadata(&self.terminal)?;
+                match &r.terminal_sha256 {
+                    Some(expected)
+                        if metadata.is_file() && metadata.file_attributes() & 0x400 == 0 =>
+                    {
+                        hash(&self.terminal)
+                            .context("Cannot read legacy CLI command; cleanup deferred")?
+                            == *expected
+                    }
+                    _ => false,
+                }
+            };
             if owned {
                 #[cfg(unix)]
                 {
@@ -716,6 +726,31 @@ mod tests {
         assert!(f.i.resolve().is_ok());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_legacy_export_remains_retryable_until_the_handle_is_released() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let f = Fixture::new();
+        seed_legacy_export(&f);
+        let handle = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&f.i.terminal)
+            .unwrap();
+        let error = f.i.reconcile().unwrap_err();
+        assert!(error.to_string().contains("Cannot read legacy CLI command"));
+        assert!(!f.i.receipt().unwrap().terminal_removed);
+        assert!(present(&f.i.terminal).unwrap());
+        assert!(f.i.resolve().is_ok());
+
+        drop(handle);
+        f.i.reconcile().unwrap();
+        assert!(!present(&f.i.terminal).unwrap());
+        assert!(f.i.receipt().unwrap().terminal_removed);
+        assert!(f.i.resolve().is_ok());
+    }
+
     #[test]
     fn missing_owned_export_is_not_recreated() {
         let f = Fixture::new();
@@ -723,6 +758,20 @@ mod tests {
         fs::remove_file(&f.i.terminal).unwrap();
         f.i.reconcile().unwrap();
         assert!(!present(&f.i.terminal).unwrap());
+        assert!(f.i.receipt().unwrap().terminal_removed);
+        assert!(f.i.resolve().is_ok());
+    }
+
+    #[test]
+    fn replacement_directory_is_preserved_without_blocking_reconciliation() {
+        let f = Fixture::new();
+        seed_legacy_export(&f);
+        fs::remove_file(&f.i.terminal).unwrap();
+        fs::create_dir(&f.i.terminal).unwrap();
+        fs::write(f.i.terminal.join("keep"), b"user data").unwrap();
+        f.i.reconcile().unwrap();
+        f.i.reconcile().unwrap();
+        assert_eq!(fs::read(f.i.terminal.join("keep")).unwrap(), b"user data");
         assert!(f.i.receipt().unwrap().terminal_removed);
         assert!(f.i.resolve().is_ok());
     }
