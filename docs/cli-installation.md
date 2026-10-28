@@ -6,7 +6,7 @@ existing `antiburn` desktop/AppImage launcher remains untouched. Installation us
 only the packaged payload: no downloads, compilation, Node installation, network
 connection, administrator prompt, or shell-profile edits occur at startup.
 
-`antiburn-cli capabilities --json` returns the CLI package version and
+`antiburn capabilities --json` returns the CLI package version and
 `delivery_protocols: ["delivery-v1"]`. It reads no config or database, starts no
 file logging, and creates no profile files. `checks <session_id>` and the existing
 `--delivery-v1 --consumer ... --ack ...` arguments retain their existing behavior.
@@ -148,7 +148,7 @@ pnpm --filter @antiburn/desktop exec tauri build --features distribution \
 ```
 
 The script supports macOS, Windows MSVC and Linux GNU on x64/ARM64. It passes
-`cargo build --locked --release --target <triple> --bin antiburn-cli`, validates
+`cargo build --locked --release --target <triple> --bin antiburn`, validates
 Mach-O/PE/ELF architecture, and records native dependencies. macOS uses `otool`,
 Linux `readelf`, and Windows the installed Visual Studio `dumpbin`. Non-system
 unbundled dependencies fail packaging. Windows links the CRT statically so the

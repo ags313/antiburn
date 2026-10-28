@@ -5,7 +5,7 @@ These instructions apply to `apps/cli`.
 ## Purpose and boundary
 
 - Keep this standalone Rust app as the user-facing, agent-oriented Antiburn CLI.
-- Keep the public invocation `antiburn-cli checks <session_id>` and machine-readable JSON on stdout.
+- Keep the public invocation `antiburn checks <session_id>` and machine-readable JSON on stdout. Keep the Cargo package name `antiburn-cli` and Rust crate name `antiburn_cli`.
 - Keep the reusable Antiburn skill harness-neutral in `skills/antiburn/SKILL.md`. It asks for the active session ID; it does not name a harness environment variable or guess the agent or environment. Treat this as the canonical skill source; package helpers may copy it but must not author a separate version.
 - Read the Antiburn product database in read-only mode. Do not run migrations or write to the product database.
 - Read `session_evidence.evidence_json` and legacy `burn_check_assessment` rows separately. An absent legacy table is normal after retirement; a present malformed table or row remains an error. Keep raw evidence separate from persisted assessment rows and preserve their source labels. Omit raw evidence from stdout.

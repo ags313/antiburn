@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "antiburn-cli",
+    name = "antiburn",
     version,
     about = "Read Antiburn check updates for an agent session"
 )]

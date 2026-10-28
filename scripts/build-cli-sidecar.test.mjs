@@ -1,10 +1,24 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  artifactPaths,
   targets,
   validateArchitecture,
   validateNativeDependencies,
 } from "./build-cli-sidecar.mjs";
+
+test("build uses the public CLI artifact and stages the private payload name", () => {
+  assert.match(
+    artifactPaths("x86_64-unknown-linux-gnu").source,
+    /apps\/cli\/target\/sidecar-build\/x86_64-unknown-linux-gnu\/release\/antiburn$/,
+  );
+  const paths = artifactPaths("x86_64-unknown-linux-gnu", "/isolated/target");
+  assert.equal(paths.source, "/isolated/target/x86_64-unknown-linux-gnu/release/antiburn");
+  assert.match(paths.destination, /cli-payload\/antiburn-cli$/);
+  const windows = artifactPaths("aarch64-pc-windows-msvc", "/isolated/target");
+  assert.equal(windows.source, "/isolated/target/aarch64-pc-windows-msvc/release/antiburn.exe");
+  assert.match(windows.destination, /cli-payload[\\/]antiburn-cli\.exe$/);
+});
 
 test("CLI architecture rejects mislabeled binaries for all six release targets", () => {
   for (const target of targets) {

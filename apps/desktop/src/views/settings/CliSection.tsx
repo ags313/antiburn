@@ -184,7 +184,7 @@ export function CliSection() {
           label={
             <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
               <span className="inline-flex items-baseline gap-2">
-                <span>antiburn-cli</span>
+                <span>Antiburn CLI</span>
                 {state?.runtime && (
                   <span className="type-footnote text-label-secondary">
                     v{state.runtime.version}

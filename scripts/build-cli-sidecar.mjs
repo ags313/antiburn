@@ -14,6 +14,21 @@ export const targets = [
   "x86_64-unknown-linux-gnu",
 ];
 
+export function artifactPaths(
+  target,
+  targetDir = join(root, "apps/cli/target/sidecar-build"),
+) {
+  const windows = target.includes("windows");
+  return {
+    source: join(targetDir, target, "release", windows ? "antiburn.exe" : "antiburn"),
+    destination: join(
+      root,
+      "apps/desktop/src-tauri/cli-payload",
+      windows ? "antiburn-cli.exe" : "antiburn-cli",
+    ),
+  };
+}
+
 export function validateArchitecture(bytes, target) {
   if (!targets.includes(target))
     throw new Error(`Unsupported CLI target: ${target}`);
@@ -42,11 +57,12 @@ export function validateArchitecture(bytes, target) {
 export function build(target) {
   if (!targets.includes(target))
     throw new Error("Pass one supported --target triple");
-  const executable = target.includes("windows")
-    ? "antiburn-cli.exe"
-    : "antiburn-cli";
+  const paths = artifactPaths(target);
   const manifest = join(root, "apps/cli/Cargo.toml");
-  const env = { ...process.env };
+  const env = {
+    ...process.env,
+    CARGO_TARGET_DIR: join(root, "apps/cli/target/sidecar-build"),
+  };
   if (target.includes("windows")) {
     if (env.CARGO_ENCODED_RUSTFLAGS)
       env.CARGO_ENCODED_RUSTFLAGS += "\x1f-C\x1ftarget-feature=+crt-static";
@@ -63,20 +79,14 @@ export function build(target) {
       "--target",
       target,
       "--bin",
-      "antiburn-cli",
+      "antiburn",
     ],
     { stdio: "inherit", env },
   );
-  const source = join(
-    process.env.CARGO_TARGET_DIR || join(root, "apps/cli/target"),
-    target,
-    "release",
-    executable,
-  );
   const destination = join(root, "apps/desktop/src-tauri/cli-payload");
   mkdirSync(destination, { recursive: true });
-  copyFileSync(source, join(destination, executable));
-  auditDependencies(join(destination, executable), target, destination);
+  copyFileSync(paths.source, paths.destination);
+  auditDependencies(paths.destination, target, destination);
   finalize(target);
 }
 
@@ -156,11 +166,9 @@ function auditDependencies(binary, target, destination) {
 export function finalize(target) {
   if (!targets.includes(target))
     throw new Error("Pass one supported --target triple");
-  const executable = target.includes("windows")
-    ? "antiburn-cli.exe"
-    : "antiburn-cli";
+  const { destination: executablePath } = artifactPaths(target);
   const directory = join(root, "apps/desktop/src-tauri/cli-payload");
-  const bytes = readFileSync(join(directory, executable));
+  const bytes = readFileSync(executablePath);
   validateArchitecture(bytes, target);
   const version = /^version = "([^"]+)"/m.exec(
     readFileSync(join(root, "apps/cli/Cargo.toml"), "utf8"),
@@ -171,7 +179,7 @@ export function finalize(target) {
       {
         schema: 1,
         target,
-        executable,
+        executable: executablePath.split(/[\\/]/).at(-1),
         version,
         sha256: createHash("sha256").update(bytes).digest("hex"),
         delivery_protocols: ["delivery-v1"],

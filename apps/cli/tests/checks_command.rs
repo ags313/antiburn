@@ -12,6 +12,25 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 
 #[test]
+fn public_command_help_and_version_use_antiburn_name() {
+    let executable = env!("CARGO_BIN_EXE_antiburn");
+    let help = Command::new(executable).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.starts_with("Read Antiburn check updates"));
+    assert!(help.contains("Usage: antiburn "));
+    assert!(!help.contains("antiburn-cli"));
+
+    let version = Command::new(executable).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert!(
+        String::from_utf8(version.stdout)
+            .unwrap()
+            .starts_with("antiburn ")
+    );
+}
+
+#[test]
 fn checks_command_reads_the_selected_database() {
     let temp = tempdir().unwrap();
     let data_root = platform_data_root(temp.path());
@@ -352,7 +371,7 @@ fn config_file_can_override_the_release_database_location() {
     )
     .unwrap();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_antiburn-cli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_antiburn"));
     configure_data_directory(&mut command, temp.path(), &data_root);
     let output = command
         .arg("--config")
@@ -371,7 +390,7 @@ fn config_file_can_override_the_release_database_location() {
 }
 
 fn default_lookup_command(home: &std::path::Path, data_root: &std::path::Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_antiburn-cli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_antiburn"));
     configure_data_directory(&mut command, home, data_root);
     #[cfg(target_os = "windows")]
     {
@@ -576,7 +595,7 @@ fn delivery_call(
     consumer: &str,
     receipt: Option<&str>,
 ) -> Value {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_antiburn-cli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_antiburn"));
     configure_data_directory(&mut command, root, &platform_data_root(root));
     command.arg("--config").arg(config).args([
         "checks",
@@ -736,7 +755,7 @@ fn ordinary_yaml_reads_do_not_consume_native_delivery() {
         )
         .unwrap();
     let ordinary = || {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_antiburn-cli"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_antiburn"));
         configure_data_directory(&mut command, temp.path(), &platform_data_root(temp.path()));
         let output = command
             .arg("--config")
@@ -878,7 +897,7 @@ fn delivery_at_capacity_reclaims_legacy_state_without_database_writes() {
 #[test]
 fn capabilities_is_database_free_and_has_no_profile_side_effects() {
     let temp = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_antiburn-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_antiburn"))
         .args(["--config", "missing-config.json", "capabilities", "--json"])
         .env("HOME", temp.path())
         .env("USERPROFILE", temp.path())

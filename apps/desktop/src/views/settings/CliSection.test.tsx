@@ -195,7 +195,7 @@ describe("CLI Settings", () => {
       screen.getByText("Helps antiburn share check findings with your coding agents."),
     ).toBeInTheDocument()
     expect(screen.getByText("Managed automatically by antiburn.")).toBeInTheDocument()
-    expect(screen.getByText("v0.1.0").parentElement).toHaveTextContent("antiburn-cli")
+    expect(screen.getByText("v0.1.0").parentElement).toHaveTextContent("Antiburn CLI")
     openDetails()
     expect(screen.queryByText(/CLI version/)).not.toBeInTheDocument()
   })
@@ -294,6 +294,7 @@ describe("CLI Settings", () => {
   it("keeps technical details and maintenance actions out of the default view", async () => {
     await ready()
     expect(screen.getByRole("heading", { name: "CLI" })).toBeInTheDocument()
+    expect(screen.getByText("Antiburn CLI")).toBeInTheDocument()
     expect(screen.queryByText(/from your terminal/)).not.toBeInTheDocument()
     expect(screen.queryByText(/CLI version/)).not.toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "Repair" })).not.toBeInTheDocument()
