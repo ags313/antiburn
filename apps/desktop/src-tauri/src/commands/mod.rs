@@ -1977,7 +1977,7 @@ fn prompt_fix_outcome(
         }),
         Err(ControllerError::TargetExpired) => Ok(CopyPromptFixBurnCheckTargetOutcome::Expired),
         Err(ControllerError::TargetChanged) => Ok(CopyPromptFixBurnCheckTargetOutcome::Stale),
-        Err(ControllerError::TargetNotFound) => {
+        Err(ControllerError::TargetNotFound | ControllerError::CheckPromptUnavailable) => {
             Ok(CopyPromptFixBurnCheckTargetOutcome::Unavailable {
                 reason: PromptFixUnavailableReason::TargetNotFound,
             })
@@ -2006,7 +2006,6 @@ fn prompt_fix_outcome(
             Ok(CopyPromptFixBurnCheckTargetOutcome::Unavailable { reason })
         }
         Err(ControllerError::AutoFixUnavailable(_))
-        | Err(ControllerError::CheckPromptUnavailable)
         | Err(ControllerError::Conflict)
         | Err(ControllerError::ApplyFailed(_))
         | Err(ControllerError::RecoveryNeeded { .. })

@@ -196,9 +196,11 @@ them. It must not present a hypothesis as a fact or apply an unproved edit.
 Fallbacks retain the same source, agent, check, and protected-tool limits. They
 cannot supply exact advice that current evidence does not support.
 
-Both prompt operations can add up to three absolute paths resolved from the
-local session index. The prompt quotes and labels them as representative session
-evidence, not configuration edit targets. Non-file, relative, unresolved, duplicate,
+Each exact-target section can add up to three absolute paths from its own
+sessions in the local index. Shared resource prompts and inspection fallbacks
+can add up to three paths in total. The prompt quotes and labels paths as
+representative session evidence, not configuration edit targets. Non-file,
+relative, unresolved, duplicate,
 or oversized path candidates are omitted. Paths appear only in prompt text
 returned after the explicit copy action. They do not enter target or sample
 payloads, rendered details, analytics, logs, snapshots, finding IDs, action IDs,

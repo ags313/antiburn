@@ -419,6 +419,12 @@ fn expected_prompt_failures_map_to_closed_outcomes() {
         }
     ));
     assert!(matches!(
+        prompt_fix_outcome(Err(ControllerError::CheckPromptUnavailable)).unwrap(),
+        CopyPromptFixBurnCheckTargetOutcome::Unavailable {
+            reason: PromptFixUnavailableReason::TargetNotFound
+        }
+    ));
+    assert!(matches!(
         prompt_fix_outcome(Err(ControllerError::PromptUnavailable(
             antiburn_local::remediation::RemediationUnavailableReason::PromptSizeLimit
         )))
@@ -437,6 +443,7 @@ fn expected_prompt_failures_map_to_closed_outcomes() {
         }
     ));
     assert!(prompt_fix_outcome(Err(ControllerError::PersistenceFailed)).is_err());
+    assert!(prompt_fix_outcome(Err(ControllerError::Internal)).is_err());
 }
 
 #[test]

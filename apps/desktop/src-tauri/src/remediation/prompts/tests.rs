@@ -427,6 +427,85 @@ fn prompt_larger_than_watch_metadata_limit_stays_within_the_prompt_limit() {
 }
 
 #[test]
+fn exact_prompt_sections_keep_their_own_evidence_paths() {
+    let fixture = Fixture::new(&[]);
+    let sessions = [
+        "first-target",
+        "second-target",
+        "third-target",
+        "fourth-target",
+    ];
+    for session in sessions {
+        insights_report::tests::publish_reasoning_at_cwd(
+            &fixture.store,
+            session,
+            120,
+            120000,
+            &Path::new("/synthetic").join(session),
+            "max",
+        );
+        fixture
+            .store
+            .lock()
+            .execute(
+                "UPDATE session_evidence
+                    SET effective_reasoning_target_hash = ?1,
+                        effective_reasoning_scope = 'global', effective_reasoning = 'max'
+                  WHERE environment_key = 'native' AND agent = 'claude-code' AND session_id = ?2",
+                rusqlite::params![format!("reasoning-target-{session}"), session],
+            )
+            .unwrap();
+    }
+    let snapshot = fixture
+        .controller
+        .current_prompt_targets(
+            &fixture.store,
+            DetectorId::ModelOverthinking,
+            fixture.context(),
+        )
+        .unwrap();
+    assert_eq!(snapshot.targets.len(), sessions.len());
+    let ids = snapshot
+        .targets
+        .iter()
+        .map(stable_finding_id)
+        .collect::<Vec<_>>();
+    let copied = fixture
+        .controller
+        .copy_prompt_fix_burn_check_targets_current(
+            &fixture.store,
+            DetectorId::ModelOverthinking,
+            &ids,
+            fixture.context(),
+        )
+        .unwrap();
+    let sections = copied
+        .prompt
+        .split("Exact target ")
+        .skip(1)
+        .collect::<Vec<_>>();
+    assert_eq!(sections.len(), snapshot.targets.len());
+    for (target, section) in snapshot.targets.iter().zip(sections) {
+        let session = &target.findings[0].session_id;
+        let path = format!("/home/avery/.claude/{session}.jsonl");
+        assert!(
+            section.contains(&path),
+            "missing evidence path for {session}"
+        );
+        for other in sessions {
+            if other != session.as_str() {
+                let path = format!("/home/avery/.claude/{other}.jsonl");
+                assert!(
+                    !section.contains(&path),
+                    "unrelated evidence path for {other}"
+                );
+            }
+        }
+    }
+    assert!(copied.prompt.len() <= antiburn_local::remediation::MAX_PROMPT_BYTES);
+}
+
+#[test]
 fn aggregate_prompt_overflow_uses_the_bounded_check_fallback() {
     let fixture = Fixture::new(&[]);
     insights_report::tests::publish_reasoning_at_cwd(

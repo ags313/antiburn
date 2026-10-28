@@ -332,7 +332,7 @@ impl RemediationController {
         if fallback || targets.is_empty() {
             return self.format_current_prompt_fallback(detector, &paths);
         }
-        let base = if targets.len() > 1
+        let prompt = if targets.len() > 1
             && targets
                 .iter()
                 .all(|target| target.finding().is_advisory_resource())
@@ -361,13 +361,14 @@ impl RemediationController {
                         ))
                     })
                     .collect::<Result<Vec<_>, ControllerError>>()?;
-            format!(
+            let base = format!(
                 "{}\n\nUnused targets\n{}",
                 fallback_remediation_prompt(detector)
                     .map_err(ControllerError::PromptUnavailable)?
                     .into_string(),
                 items.join("\n")
-            )
+            );
+            prompt_with_evidence_paths(&base, &paths, None)
         } else {
             let sections = targets
                 .iter()
@@ -376,6 +377,14 @@ impl RemediationController {
                     let base = remediation_prompt(target.finding())
                         .map_err(ControllerError::PromptUnavailable)?
                         .into_string();
+                    let paths = representative_paths(
+                        store,
+                        target.evidence_sessions().into_iter().map(|sample| {
+                            SessionKey::new(sample.environment_key, sample.agent, sample.session_id)
+                        }),
+                    )?;
+                    let base = prompt_with_evidence_paths(&base, &paths, None)
+                        .map_err(ControllerError::PromptUnavailable)?;
                     if targets.len() == 1 {
                         Ok(base)
                     } else {
@@ -383,9 +392,9 @@ impl RemediationController {
                     }
                 })
                 .collect::<Result<Vec<_>, ControllerError>>()?;
-            sections.join("\n\n")
+            prompt_with_evidence_paths(&sections.join("\n\n"), &[], None)
         };
-        match prompt_with_evidence_paths(&base, &paths, None) {
+        match prompt {
             Ok(prompt) => Ok(prompt),
             Err(RemediationUnavailableReason::PromptSizeLimit) => {
                 self.format_current_prompt_fallback(detector, &paths)
