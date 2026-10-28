@@ -121,6 +121,7 @@ export async function assemble(output = defaultOutput) {
       for (const source of [
         'session-checks.mjs',
         'session-checks-validation.mjs',
+        'managed-connection.mjs',
         'native-hook.mjs',
       ])
         add(`${host}/lib/${source}`, await read(`packages/antiburn-plugin-core/${source}`))
@@ -185,6 +186,7 @@ export async function assemble(output = defaultOutput) {
         await read('packages/antiburn-plugin-core/session-checks-validation.mjs'),
       ],
       ['lib/native-hook.mjs', await read('packages/antiburn-plugin-core/native-hook.mjs')],
+      ['lib/managed-connection.mjs', await read('packages/antiburn-plugin-core/managed-connection.mjs')],
       ['LICENSE', license],
       [
         'README.md',

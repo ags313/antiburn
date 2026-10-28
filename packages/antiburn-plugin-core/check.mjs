@@ -19,6 +19,7 @@ const files = [
   ...(await collect(own)),
   ...integrations.filter((path) => /\.(?:mjs|d\.ts)$/.test(path)),
   join(root, 'scripts/assemble-antiburn-core-plugin.mjs'),
+  join(root, 'scripts/assemble-agent-integrations.mjs'),
   join(root, 'scripts/audit-antiburn-core-plugin.mjs'),
 ]
 function run(command, args) {

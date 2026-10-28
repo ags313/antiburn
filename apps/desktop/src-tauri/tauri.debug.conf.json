@@ -10,7 +10,8 @@
         "popover-peek-anchor",
         "checks-remediation",
         "checks-settings",
-        "cli-settings"
+        "cli-settings",
+        "agent-integrations-settings"
       ]
     }
   },

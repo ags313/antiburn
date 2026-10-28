@@ -11,7 +11,7 @@
     "dev:cli": "node scripts/run-tauri.mjs dev --with-cli --config src-tauri/tauri.debug.conf.json",
     "dev:bundle:cli": "node scripts/run-tauri.mjs build --debug --with-cli --config src-tauri/tauri.debug.conf.json",
     "dev:web": "vite",
-    "build": "vite build",
+    "build": "node ../../scripts/assemble-agent-integrations.mjs && vite build",
     "preview": "vite preview",
     "lint": "eslint .",
     "type-check": "tsc --build --force",

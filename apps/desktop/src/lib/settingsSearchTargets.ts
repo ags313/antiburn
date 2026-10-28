@@ -38,7 +38,15 @@ export const SETTINGS_SEARCH_TARGETS = {
   sourceAgents: {
     pane: "agents",
     label: "Coding agents",
-    aliases: ["harnesses", "enabled agents"],
+    aliases: [
+      "harnesses",
+      "enabled agents",
+      "integrations",
+      "connections",
+      "hooks",
+      "plugins",
+      "extensions",
+    ],
   },
   sourceRemoteHosts: {
     pane: "sessions",

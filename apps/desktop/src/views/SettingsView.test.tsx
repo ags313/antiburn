@@ -180,6 +180,7 @@ function mockCommands(overrides: Record<string, unknown> = {}) {
       case "list_repositories":
       case "list_scan_roots":
       case "refresh_repositories":
+      case "get_agent_integrations":
         return Promise.resolve([])
       default:
         return Promise.resolve(null)

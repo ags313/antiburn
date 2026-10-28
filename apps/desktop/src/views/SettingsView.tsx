@@ -92,7 +92,7 @@ export function SettingsView() {
         title="Agents"
         description="The coding agents antiburn scans for sessions to report on."
       >
-        <AgentsStepSettings titled />
+        <AgentsStepSettings titled manageConnections onOpenCli={() => session.setPane("cli")} />
       </Pane>
     ),
     sessions: () => (

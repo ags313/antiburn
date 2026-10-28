@@ -116,7 +116,9 @@ pub async fn repair_cli_installation(app: tauri::AppHandle) -> Result<CliInstall
     let result = tauri::async_runtime::spawn_blocking(move || {
         let i = installation(&worker_app)?;
         let diagnostic = i.reconcile().err().map(|e| e.to_string());
-        Ok(i.state(diagnostic))
+        let state = i.state(diagnostic);
+        let _ = app.emit_to("settings", "cli-install:state", &state);
+        Ok(state)
     })
     .await
     .map_err(|e| e.to_string())

@@ -103,6 +103,11 @@ deliberately not joined with the engine's workspace: the engine resolves under
 its own dependency boundary that keeps it free of any service of ours, and the
 shell's app-framework dependencies must not leak into that resolution.
 
+The desktop build also assembles the existing session-check adapters as a
+separate verified runtime payload. Automatic user-profile registration remains
+behind exact native compatibility gates. See [agent integrations](../../docs/agent-integrations.md)
+for ownership, recovery, runtime requirements, and the native acceptance ledger.
+
 ## Prerequisites
 
 - Rust, per [`rust-toolchain.toml`](../../rust-toolchain.toml)
