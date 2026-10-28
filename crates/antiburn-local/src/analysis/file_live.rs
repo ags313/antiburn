@@ -65,6 +65,8 @@ pub struct NativeFileRequest {
 #[derive(Debug, Clone)]
 pub struct NativeFilePage {
     pub cursor: NativeFileCursor,
+    /// Initial read state for retry when the host publishes only part of the first page.
+    pub initial_cursor: Option<NativeFileCursor>,
     pub results: Vec<NativeFileResult>,
     pub evidence: NativeEvidenceBatch,
     /// Known unsafe admission applies before the host accepts this page receipt.
@@ -337,6 +339,7 @@ fn read_page(
         );
     }
     let mut source = NativeFileSource::open(path, cursor.map(|cursor| &cursor.anchor))?;
+    let cold_read = cursor.is_none();
     let mut cursor = match cursor {
         Some(cursor) => cursor.clone(),
         None => {
@@ -372,6 +375,7 @@ fn read_page(
             }
         }
     };
+    let initial_cursor = cold_read.then(|| cursor.clone());
     if cursor.main_64_public_baseline_pending {
         cursor.evidence_baseline_offset = source.size;
         cursor.anchor.boundary = source.size;
@@ -661,6 +665,7 @@ fn read_page(
         },
         admission_failure: cursor.admission_failure.0.clone(),
         cursor,
+        initial_cursor,
         results,
         skipped_results,
         bytes_read: bytes.len() as u64,

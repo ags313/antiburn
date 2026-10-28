@@ -814,6 +814,7 @@ fn tracing_report_and_runtime_share_only_the_logical_check_reference() {
         name: SECRET.into(),
         aliases: Vec::new(),
         description: None,
+        is_local: active.compiled.is_local(),
         decision_name: None,
         trigger: None,
         source: InstalledCheckSource {

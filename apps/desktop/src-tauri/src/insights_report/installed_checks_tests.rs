@@ -106,6 +106,7 @@ pub(crate) fn definition(project: &str) -> InstalledCheckDefinition {
         name: "Failed retry loop".into(),
         aliases: vec!["repeated failures".into()],
         description: Some("Detects repeated failures without recovery.".into()),
+        is_local: false,
         decision_name: Some("review".into()),
         trigger: Some(InstalledCheckTrigger {
             event: InstalledCheckEvent::ToolResult,
@@ -179,6 +180,15 @@ fn activate(
         .unwrap();
     publish_runtime_definition(store, definition);
     (adapter, activation)
+}
+
+#[test]
+fn definition_metadata_preserves_a_single_model_decision_name() {
+    let store = store();
+    let (_, activation) = activate(&store, &definition("/workspace/demo"));
+    let metadata = crate::installed_checks::tests::definition_metadata_for_activation(&activation);
+    assert!(!metadata.is_local);
+    assert_eq!(metadata.decision_name.as_deref(), Some("review"));
 }
 
 fn publish_runtime_definition(store: &Store, definition: &InstalledCheckDefinition) {

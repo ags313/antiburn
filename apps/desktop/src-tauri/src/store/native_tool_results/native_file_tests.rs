@@ -1341,7 +1341,7 @@ fn parser_65_partial_first_page_retains_marker_and_makes_progress_on_the_same_pa
         store
             .lock()
             .query_row(
-                "SELECT cursor_json IS NULL AND pending = 1
+                "SELECT cursor_json IS NOT NULL AND pending = 1
         AND claim_fence IS NULL AND lease_expires_at_epoch IS NULL FROM native_file_delivery",
                 [],
                 |row| row.get::<_, bool>(0)
@@ -1369,6 +1369,106 @@ fn parser_65_partial_first_page_retains_marker_and_makes_progress_on_the_same_pa
             )
             .unwrap()
     );
+}
+
+#[test]
+fn cold_partial_publication_keeps_startup_state_and_live_appends_after_restart() {
+    use antiburn_local::analysis::file_live::NATIVE_FILE_STARTUP_BYTES;
+
+    let header = json!({"type":"session", "version":3, "id":"cold-retry", "timestamp":100});
+    let call = json!({
+        "type":"message", "id":"assistant-1", "parentId":"old-parent", "timestamp":200,
+        "message":{"role":"assistant", "stopReason":"toolUse", "content":(0..300).map(|index| json!({
+            "type":"toolCall", "id":format!("call-{index}"), "name":"bash",
+            "arguments":{"command":"synthetic command"}
+        })).collect::<Vec<_>>()}
+    });
+    let call = format!("{call}\n");
+    let startup_bytes = NATIVE_FILE_STARTUP_BYTES as usize;
+    let source = format!(
+        "{header}\n{}\n{call}{}\n",
+        " ".repeat(startup_bytes),
+        " ".repeat(startup_bytes - call.len() - 1)
+    );
+    let key = SessionKey::new("native", "pi", "cold-retry");
+    let (directory, store, input) = fixture_for_source(&source, key, SourceFormat::PiV3Jsonl);
+    let (claim, page) = next_page(&store, &input, 100);
+    assert!(claim.cursor_json.is_none());
+    assert_eq!(page.evidence.events.len(), 256);
+    assert!(page.has_more);
+    assert!(!page.history_complete);
+    assert!(page.admission_failure.is_none());
+    let baseline = page.baseline_offset;
+    let start = page.cursor.start_offset();
+    store
+        .publish_native_file_page(&claim, &page, &[], 100)
+        .unwrap();
+    assert_eq!(native_update_count(&store), 255);
+    let saved: Option<String> = store
+        .lock()
+        .query_row("SELECT cursor_json FROM native_file_delivery", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let saved: NativeFileCursor = serde_json::from_str(
+        &saved.expect("partial cold publication must retain initialized read state"),
+    )
+    .unwrap();
+    assert_eq!(saved.offset(), start);
+    assert_eq!(saved.baseline_offset(), baseline);
+    assert_eq!(saved.evidence_baseline_offset(), baseline);
+    append(
+        &input,
+        &format!(
+            "{}\n",
+            json!({
+                "type":"message", "id":"user-later", "parentId":"assistant-1", "timestamp":300,
+                "message":{"role":"user", "content":"New synthetic user input"}
+            })
+        ),
+    );
+    drop(store);
+
+    let store = Store::open(directory.path()).unwrap();
+    let mut finished = false;
+    for now in 101..121 {
+        let (claim, page) = next_page(&store, &input, now);
+        assert_eq!(page.baseline_offset, baseline);
+        assert_eq!(page.cursor.evidence_baseline_offset(), baseline);
+        assert_eq!(page.cursor.start_offset(), start);
+        assert!(page.admission_failure.is_none());
+        store
+            .publish_native_file_page(&claim, &page, &[], now)
+            .unwrap();
+        assert_unique_native_updates(&store);
+        finished = store
+            .lock()
+            .query_row("SELECT pending = 0 FROM native_file_delivery", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        if finished {
+            break;
+        }
+    }
+    assert!(finished);
+    assert_eq!(native_update_count(&store), 301);
+    let connection = store.lock();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM native_tool_result_current WHERE event_kind = 'tool_call'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        300
+    );
+    assert_eq!(connection.query_row(
+        "SELECT COUNT(*) FROM native_tool_result_publication WHERE outcome = 'update'
+            AND event_kind = 'user_message' AND live_eligible = 1 AND first_eligible_publication IS NOT NULL",
+        [], |row| row.get::<_, i64>(0),
+    ).unwrap(), 1);
 }
 
 fn expand_publication_cost(store: &Store) {

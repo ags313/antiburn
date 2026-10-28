@@ -85,6 +85,9 @@ and the older result seed boundary. A historical correction, parser upgrade, or
 restart cannot make them new live work. Missing first eligibility cannot authorize
 a new-kind trigger. Host attachment events use their exact activation, branch,
 incarnation, and attachment epoch instead of a fabricated native result.
+Partial first-page file publication retains the original startup position and
+live baseline across retry and restart. Later appends remain eligible; delivery
+limits do not move them into historical work or discard pending events.
 
 ### Reachable event families
 

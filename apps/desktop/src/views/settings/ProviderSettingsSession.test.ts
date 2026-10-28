@@ -10,6 +10,8 @@ import { providerSettingsFixture } from "./tests/providerSettingsFixture"
 const invoke = vi.hoisted(() => vi.fn())
 const removeLegacyKey = vi.hoisted(() => vi.fn())
 const confirmRemoval = vi.hoisted(() => vi.fn())
+const unsupportedModelMessage =
+  "This connection has no supported model profile or runner. Choose a supported provider and model."
 vi.mock("@tauri-apps/api/core", () => ({ invoke }))
 vi.mock("../../lib/checkAvailability", () => ({ removeTypeSafeApiKey: removeLegacyKey }))
 vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: confirmRemoval }))
@@ -142,7 +144,7 @@ it.each([
   "Credential access was cancelled. Use the connection again when ready.",
   "Credential storage matched more than one entry. Check the system credential store before retrying.",
   "Could not read the saved credential. Retry, or use Edit → Change to replace it.",
-  "The selected provider does not support this model or runner.",
+  unsupportedModelMessage,
   "The selected provider did not report usable model limits.",
   "Could not read model limits from the selected provider. Check the connection and try again.",
   "Could not cancel unfinished Burn Checks. Checks are paused. Retry the connection change.",
@@ -158,6 +160,42 @@ it("does not expose unapproved credential errors or diagnostic payloads", () => 
   ]) {
     expect(providerErrorMessage(error, "safe fallback")).toBe("safe fallback")
   }
+})
+
+it.each([unsupportedModelMessage, new Error(unsupportedModelMessage)])(
+  "keeps the unsupported-model error when testing an Ollama connection: %s",
+  async (error) => {
+    const session = new ProviderSettingsSession()
+    await session.refresh()
+    session.openEdit("local")
+    const draft = session.getSnapshot().drafts.local!.draft
+    invoke.mockRejectedValueOnce(error)
+    await session.run("test")
+    expect(invoke).toHaveBeenLastCalledWith("test_system_one_connection", { draft })
+    expect(session.getSnapshot()).toMatchObject({
+      error: unsupportedModelMessage,
+      errorLocation: "editor",
+      busy: false,
+      action: null,
+      drafts: { local: { tested: false } },
+    })
+  },
+)
+
+it.each([
+  "native error: credential-secret-sentinel account-sentinel -25308",
+  new Error("native error: credential-secret-sentinel account-sentinel -25308"),
+  { category: "platform", osStatus: -25308, secret: "credential-secret-sentinel" },
+])("sanitizes unknown errors when testing an Ollama connection: %j", async (error) => {
+  const session = new ProviderSettingsSession()
+  await session.refresh()
+  session.openEdit("local")
+  invoke.mockRejectedValueOnce(error)
+  await session.run("test")
+  expect(invoke.mock.calls.at(-1)?.[0]).toBe("test_system_one_connection")
+  expect(session.getSnapshot().error).toBe(
+    "Could not test the connection. Check the settings and try again.",
+  )
 })
 
 it.each([

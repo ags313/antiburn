@@ -1864,6 +1864,7 @@ fn definition_metadata(
         name,
         aliases: vec![definition.id.clone()],
         description,
+        is_local: matches!(&definition.state, DefinitionState::Ready(compiled) if compiled.is_local()),
         decision_name: match &definition.state {
             DefinitionState::Ready(compiled) => match compiled.decisions.as_slice() {
                 [decision] => Some(decision.name.clone()),
@@ -2020,6 +2021,7 @@ fn append_invalid_filenames(
                 .into_owned(),
             aliases: Vec::new(),
             description: None,
+            is_local: false,
             decision_name: None,
             trigger: None,
             source: InstalledCheckSource {
@@ -2106,6 +2108,7 @@ fn attach_directory_diagnostics(
                 name: "Checks folder".into(),
                 aliases: Vec::new(),
                 description: None,
+                is_local: false,
                 decision_name: None,
                 trigger: None,
                 source: InstalledCheckSource {
@@ -2481,4 +2484,4 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

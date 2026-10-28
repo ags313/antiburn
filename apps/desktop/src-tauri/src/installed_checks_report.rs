@@ -41,6 +41,7 @@ pub(crate) struct InstalledCheckDefinition {
     pub name: String,
     pub aliases: Vec<String>,
     pub description: Option<String>,
+    pub is_local: bool,
     pub decision_name: Option<String>,
     pub trigger: Option<InstalledCheckTrigger>,
     pub source: InstalledCheckSource,
@@ -600,7 +601,7 @@ fn runtime_diagnostics(
         .latest_decision
         .clone()
         .or_else(|| definition.decision_name.clone());
-    let local = definition.decision_name.is_none();
+    let local = definition.is_local;
     let source = definition.definition_sources.first().cloned();
     let failed = matches!(
         branch.latest_outcome.as_deref(),
@@ -1194,7 +1195,7 @@ fn current_sessions(
                             row.get::<_, String>(1)?,
                         ),
                         ready: row.get(2)?,
-                        checking: definition.decision_name.is_some() && row.get::<_, bool>(3)?,
+                        checking: !definition.is_local && row.get::<_, bool>(3)?,
                         data_can_arrive: row.get(4)?,
                         journal_owned: row.get(5)?,
                         catching_up: row.get(6)?,
@@ -1233,7 +1234,7 @@ fn current_branches(
     let work_available = current_activation(connection, definition)?;
     let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key)?;
     let ready = source_ready_at_sql(6, 7, 8, "?11");
-    let model_attempts = i32::from(definition.decision_name.is_some());
+    let model_attempts = i32::from(!definition.is_local);
     let mut statement = connection.prepare(&format!(
         "WITH ranked AS (
           SELECT c.*, ROW_NUMBER() OVER (
@@ -1307,7 +1308,7 @@ fn current_branches(
                     BranchResult {
                         branch,
                         checking: work_available
-                            && definition.decision_name.is_some()
+                            && !definition.is_local
                             && row.get::<_, bool>(1)?,
                         agent,
                         session_id,
@@ -1334,7 +1335,7 @@ fn current_branches(
     branches
         .into_iter()
         .map(|(mut branch, session)| {
-            if definition.decision_name.is_none() {
+            if definition.is_local {
                 branch.has_started = local_branch_started(
                     connection,
                     definition,
@@ -1404,7 +1405,7 @@ fn history_started(
             definition.generation,
             branch,
             session,
-            definition.decision_name.is_some(),
+            !definition.is_local,
         ],
         |row| row.get::<_, String>(0),
     )?;
@@ -2228,7 +2229,7 @@ pub(crate) fn read_evidence(
         };
         let prepared = match preparation {
             ReportPreparation::Local(prepared) => {
-                if definition.decision_name.is_some() || prepared.validate_for_resume().is_err() {
+                if !definition.is_local || prepared.validate_for_resume().is_err() {
                     return Ok(unavailable());
                 }
                 let Ok(candidate) = serde_json::from_str::<FrozenCandidate>(&frozen) else {
@@ -2248,7 +2249,7 @@ pub(crate) fn read_evidence(
                     occurrences: Vec::new(),
                 });
             }
-            ReportPreparation::Model(prepared) if definition.decision_name.is_some() => prepared,
+            ReportPreparation::Model(prepared) if !definition.is_local => prepared,
             ReportPreparation::Model(_) | ReportPreparation::Rejected(_) => {
                 return Ok(unavailable());
             }
@@ -2320,7 +2321,7 @@ pub(crate) fn read_evidence(
             occurrences: Vec::new(),
         });
     }
-    if definition.decision_name.is_none() {
+    if definition.is_local {
         return Ok(unavailable());
     }
     let Ok(candidate) = serde_json::from_str::<FrozenCandidate>(&frozen) else {

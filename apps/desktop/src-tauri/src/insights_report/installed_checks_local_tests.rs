@@ -68,8 +68,7 @@ pub(super) fn local_fixture_with_source(
     InstalledCheckDefinition,
 ) {
     let store = store();
-    let mut definition = definition("/workspace/demo");
-    definition.decision_name = None;
+    let definition = definition("/workspace/demo");
     let scope = scope("/workspace/demo");
     let adapter = Arc::new(
         StoreCheckStore::new(store.clone(), "local-report".into(), scope.clone()).unwrap(),
@@ -89,6 +88,10 @@ pub(super) fn local_fixture_with_source(
         bootstrap_publication: PublicationCursor(0),
     };
     assert!(activation.compiled.is_local());
+    let definition =
+        crate::installed_checks::tests::definition_metadata_for_activation(&activation);
+    assert!(definition.is_local);
+    assert_eq!(definition.decision_name, None);
     adapter
         .activate(
             &definition.check_id,

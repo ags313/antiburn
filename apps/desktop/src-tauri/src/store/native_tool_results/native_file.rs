@@ -3,7 +3,7 @@
 use antiburn_local::analysis::file_live::{NativeFileCursor, NativeFileReadError};
 use antiburn_local::analysis::{PARSER_REVISION, SourceFormat, ToolResultObservation};
 use antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::super::publications::PublicationPolicy;
@@ -337,8 +337,9 @@ impl Store {
             // Retain the old read position. Saved outputs make the next reconciliation advance.
             let retry_cursor = claim
                 .cursor()?
-                .map(|cursor| cursor.retry_json_after_page(&page.cursor))
-                .transpose()?;
+                .or_else(|| page.initial_cursor.clone())
+                .context("native file page has no retry state")?
+                .retry_json_after_page(&page.cursor)?;
             tx.execute("UPDATE native_file_delivery SET pending = 1, claim_fence = NULL, lease_expires_at_epoch = NULL,
                 next_attempt_at_epoch = ?4, cursor_json = ?5, parser_revision = ?6
                 WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3 AND claim_fence = ?7",

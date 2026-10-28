@@ -41,6 +41,25 @@ const CHECK: &str = include_str!(concat!(
     "/../../../crates/antiburn-checks/tests/fixtures/retry-review.yml"
 ));
 
+pub(crate) fn definition_metadata_for_activation(
+    activation: &EffectiveActivation,
+) -> InstalledCheckDefinition {
+    let definition = EffectiveDefinition {
+        id: activation.id.definition_id.clone(),
+        scope: activation.definition_scope,
+        source_paths: activation.source_paths.clone(),
+        content_revision: activation.revision,
+        state: DefinitionState::Ready(Box::new((*activation.compiled).clone())),
+    };
+    definition_metadata(
+        &activation.id.scope,
+        &definition,
+        &LifecycleState::Active(activation.clone()),
+        &Admission::Ready,
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 async fn disable_completion_notifies_waiters_without_regressing_the_boundary() {
     let state = InstalledChecks::default();

@@ -120,6 +120,7 @@ fn report_definition(active: &EffectiveActivation) -> InstalledCheckDefinition {
         name: "Host expressions".into(),
         aliases: vec![],
         description: None,
+        is_local: active.compiled.is_local(),
         decision_name: Some("review".into()),
         trigger: Some(InstalledCheckTrigger {
             event: InstalledCheckEvent::ToolResult,

@@ -131,6 +131,9 @@ non-window live candidates remain separate. Historical assessment requires
 explicit isolated replay.
 
 Native source delivery has reserved capacity independent of metric indexing.
+Partial first-page file publication retains the initialized startup position and
+EOF baseline. Retry and restart keep that boundary, so later appends remain live
+and pending output is not lost when the startup suffix moves.
 The worker alternates file and journal turns. Productive continuation is due
 immediately. Durable monotonic claim order rotates productive sources without
 requiring a clock tick and survives restart. Active sources and changed cursors

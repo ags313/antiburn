@@ -107,7 +107,7 @@ const safeErrors = new Set([
   "Could not restore the previous connection. Checks are paused. Retry the connection update in Settings → Checks.",
   "A connection update is incomplete. Retry it in Settings → Checks before removing a credential.",
   "The active model provider credential is missing. Update it in Settings → Checks.",
-  "The selected provider does not support this model or runner.",
+  "This connection has no supported model profile or runner. Choose a supported provider and model.",
   "The selected provider did not report usable model limits.",
   "Could not read model limits from the selected provider. Check the connection and try again.",
   "The connection revision limit was reached. Save a new connection.",

@@ -523,6 +523,35 @@ fn pinned_claude_results_resume_without_metrics_or_replay() {
 }
 
 #[test]
+fn first_page_retains_initialized_state_for_partial_publication_retry() {
+    let directory = TempDir::new().unwrap();
+    let input = input(
+        &directory,
+        "claude",
+        "scope-test",
+        SourceFormat::ClaudeJsonl,
+        include_str!(
+            "../../../tests/fixtures/claude_characterization/retained_native_results.jsonl"
+        ),
+    );
+    let first = read_native_file_page(&input, None, &|| false).unwrap();
+    let initial = restored(first.initial_cursor.as_ref().unwrap());
+    assert_eq!(initial.offset(), first.cursor.start_offset());
+    assert_eq!(initial.baseline_offset(), first.baseline_offset);
+    assert_eq!(
+        initial.evidence_baseline_offset(),
+        first.cursor.evidence_baseline_offset()
+    );
+    let retry = read_native_file_page(&input, Some(&initial), &|| false).unwrap();
+    assert!(retry.initial_cursor.is_none());
+    assert_eq!(
+        serde_json::to_value(&retry.evidence).unwrap(),
+        serde_json::to_value(&first.evidence).unwrap()
+    );
+    assert_eq!(retry.cursor.offset(), first.cursor.offset());
+}
+
+#[test]
 fn unfinished_result_is_pending_across_restart_and_becomes_live() {
     let directory = TempDir::new().unwrap();
     let fixture = include_str!(

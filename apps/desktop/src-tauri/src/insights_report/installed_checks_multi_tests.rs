@@ -40,8 +40,7 @@ fn fixture() -> (
     EvaluatedAssessment,
 ) {
     let store = store();
-    let mut definition = definition("/workspace/demo");
-    definition.decision_name = Some("first".into());
+    let definition = definition("/workspace/demo");
     let activation = EffectiveActivation {
         id: ActivationId {
             scope: scope("/workspace/demo"),
@@ -56,6 +55,10 @@ fn fixture() -> (
         bootstrap_observation_position: ObservationPosition(0),
         bootstrap_publication: Default::default(),
     };
+    let definition =
+        crate::installed_checks::tests::definition_metadata_for_activation(&activation);
+    assert!(!definition.is_local);
+    assert_eq!(definition.decision_name, None);
     let adapter = StoreCheckStore::new(
         store.clone(),
         "multi-report".into(),
@@ -186,6 +189,23 @@ fn multiple_inputs_keep_exact_status_provenance_after_settings_no_write_and_prun
     );
     save_preparation(&store, 1, &prepared);
     let report = rows(&store, std::slice::from_ref(&definition));
+    assert!(report[0].has_started);
+    assert_eq!(report[0].checking_count, 0);
+    assert_eq!(report[0].diagnostics.len(), 1);
+    let diagnostic = &report[0].diagnostics[0];
+    assert_eq!(diagnostic.code, "input-shortened");
+    for (label, expected) in [
+        ("Decision", "first"),
+        ("Provider", "Cloudflare"),
+        ("Model", "clef"),
+    ] {
+        assert!(
+            diagnostic
+                .details
+                .iter()
+                .any(|detail| detail.label == label && detail.value == expected)
+        );
+    }
     let target = report[0].targets[0].id.clone();
     let evidence = read_evidence(
         &store,
@@ -194,6 +214,13 @@ fn multiple_inputs_keep_exact_status_provenance_after_settings_no_write_and_prun
         &target,
     )
     .unwrap();
+    assert_eq!(evidence.status, BurnCheckEvidenceStatus::Available);
+    assert!(
+        evidence
+            .items
+            .iter()
+            .all(|item| item.reference != "local-context")
+    );
     for block in &prepared.decisions {
         assert_eq!(
             value(&evidence, &format!("original-input:{}", block.decision)),
@@ -325,6 +352,29 @@ fn multiple_inputs_keep_exact_status_provenance_after_settings_no_write_and_prun
             .status,
         BurnCheckEvidenceStatus::Unavailable
     );
+}
+
+#[test]
+fn multiple_decisions_without_saved_preparation_keep_legacy_source_evidence() {
+    let (store, definition, _, evaluated) = fixture();
+    accept_evaluated_with_message(
+        &store,
+        &definition,
+        "legacy",
+        1,
+        Some(StatusResult::Failure),
+        None,
+        &evaluated,
+    );
+    let report = rows(&store, std::slice::from_ref(&definition));
+    assert!(report[0].diagnostics.is_empty());
+    let evidence =
+        read_evidence(&store, &[definition], &request(), &report[0].targets[0].id).unwrap();
+    assert_eq!(evidence.status, BurnCheckEvidenceStatus::Available);
+    assert_eq!(evidence.items.len(), 2);
+    assert!(evidence.items.iter().all(|item| {
+        item.source_label.starts_with("Original source:") && item.limitation.is_some()
+    }));
 }
 
 #[test]
@@ -474,6 +524,10 @@ fn a_completed_sibling_does_not_stop_checking_before_the_candidate_settles() {
         rows(&store, std::slice::from_ref(&definition))[0].checking_count,
         1
     );
+    assert!(current_sessions(&store.lock(), &definition, &request()).unwrap()[0].checking);
+    let branches = current_branches(&store.lock(), &definition, &request()).unwrap();
+    assert!(branches[0].checking);
+    assert!(branches[0].has_started);
     store
         .lock()
         .execute("UPDATE burn_check_candidate SET state = 'dispatching'", [])
@@ -494,7 +548,9 @@ fn a_completed_sibling_does_not_stop_checking_before_the_candidate_settles() {
             [],
         )
         .unwrap();
-    assert_eq!(rows(&store, &[definition])[0].checking_count, 0);
+    let report = rows(&store, &[definition]);
+    assert_eq!(report[0].checking_count, 0);
+    assert!(report[0].has_started);
 }
 
 #[test]
