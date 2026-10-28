@@ -1293,6 +1293,23 @@ describe("SettingsView — window chrome", () => {
     expect(closeWindow).not.toHaveBeenCalled()
   })
 
+  it("keeps CLI in its own release-visible pane and routes search to Details", async () => {
+    render(<SettingsView />)
+    await screen.findByRole("switch", { name: "Start at login" })
+    expect(screen.queryByText("antiburn-cli")).not.toBeInTheDocument()
+    expect(INFO.debugBuild).toBe(false)
+    fireEvent.click(screen.getByRole("tab", { name: "CLI" }))
+    expect(await screen.findByRole("heading", { name: "CLI" })).toBeInTheDocument()
+    expect(screen.queryByRole("switch", { name: "Start at login" })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole("tab", { name: "General" }))
+    emit("settings:pane", "cli#cliCommand")
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Technical details" })).toHaveFocus(),
+    )
+    expect(invoke).not.toHaveBeenCalledWith("test_cli_installation")
+    expect(invoke).not.toHaveBeenCalledWith("repair_cli_installation")
+  })
+
   it("orders the sidebar with setup first and the explanatory panes last", async () => {
     render(<SettingsView />)
     await screen.findByRole("switch", { name: "Start at login" })
@@ -1305,6 +1322,7 @@ describe("SettingsView — window chrome", () => {
       "Notifications",
       "Usage",
       "Appearance",
+      "CLI",
       "Privacy",
       "About",
     ])

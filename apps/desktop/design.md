@@ -979,6 +979,35 @@ Notes for what isn't expressible as a token:
   before completing search focus. When Model usage has no visible content, its
   search result focuses the Model-based checks group without selecting a control.
   Keep the standard separation between groups.
+- **CLI settings pane** — present the CLI as an internal runtime managed by antiburn.
+  Add the purpose-led pane description: “Helps antiburn share check findings with
+  your coding agents.” The card explains automatic management by antiburn.
+  Place the secondary version beside `antiburn-cli` and keep green Installed beside the runtime
+  name, using compact icon-free status badges: `type-caption`, `font-medium!`,
+  `rounded-control`, `px-2`, `text-system-green`, `bg-system-green/10` and
+  `border-system-green/25`. Keep Test passed as plain green text without an icon. No vertical
+  padding; align badges to the title centre. Reserve the title slot for Installed;
+  show compact test results beside the maintenance buttons. Use body-sized warning text,
+  a state icon and `text-system-orange` below the description when recovery is needed.
+  Place a direct Repair action beside recovery warnings while details are collapsed.
+  Keep integration management out of the CLI pane. Use collapsed Technical details
+  with compact spacing and content aligned to the card text.
+  Technical details groups maintenance actions and startup-test
+  scope separately from location and diagnostics. Version does not repeat there.
+  Use Stethoscope for Test and Wrench for Repair; omit CLI from their button labels.
+  Place a square 32px ghost copy button immediately beside the location label with a 40px hit area.
+  Swap its copy glyph for a check on success and show “Copied!” in a reserved
+  adjacent slot with `gap-1` for two seconds. Announce the feedback, preserve the selectable
+  path on failure, and clear stale copy feedback when runtime status changes. Keep the compatibility export out of Settings: do not expose
+  terminal setup, export/removal controls or PATH status. A successful CLI execution test does not establish vendor integration
+  success. Use shared buttons, disclosure and Settings row treatments.
+  CLI maintenance buttons reserve `min-w-28` for one changing label and a 12px icon.
+  Use operation-specific busy labels and `LoaderCircle` with `motion-safe:animate-spin`.
+  Disable all CLI actions and reject repeat presses while an operation is pending.
+  Keep status text static. Announce Repair completion inline even if status is
+  unchanged, beneath maintenance controls; keep startup testing as an explicit next step.
+  Label raw troubleshooting output Diagnostic within Technical details. Show no success for
+  failed operations, and discard feedback when the underlying runtime status changes.
 - **Remote hosts in Settings** — keep the folder-access warning above all settings
   sections when access is needed. Place Remote hosts first among the Sources sections,
   before Scanning and Coding agents. Keep the introductory description inside the card, above
