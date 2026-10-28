@@ -5,7 +5,7 @@ export type PromotionAction =
   | { type: "external"; label: string; url: string }
   | { type: "app"; label: string; target: "settings"; pane: "usage" }
 
-export type PromotionMediaSource = {
+type PromotionMediaSource = {
   kind: "image" | "video"
   src: string
   poster?: string
@@ -28,7 +28,7 @@ export type PromotionStep = {
   description?: string
 }
 
-export type PromotionAnnouncement = {
+type PromotionAnnouncement = {
   eyebrow?: string
   title: string
   description: string
