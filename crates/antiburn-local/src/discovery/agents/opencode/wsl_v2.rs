@@ -41,13 +41,18 @@ impl ExportByteBudget {
     }
 
     fn charge(&self, count: usize) -> Result<(), CliBridgeError> {
-        match self
-            .remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                Some(remaining.saturating_sub(count))
-            }) {
-            Ok(remaining) if count <= remaining => Ok(()),
-            _ => Err(CliBridgeError::Oversized),
+        let mut remaining = self.remaining.load(Ordering::Relaxed);
+        loop {
+            match self.remaining.compare_exchange_weak(
+                remaining,
+                remaining.saturating_sub(count),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) if count <= remaining => return Ok(()),
+                Ok(_) => return Err(CliBridgeError::Oversized),
+                Err(actual) => remaining = actual,
+            }
         }
     }
 }
