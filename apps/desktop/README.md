@@ -407,6 +407,9 @@ paths, identifiers, exact tokens, or exact costs.
 
 ## Bundled promotions
 
+See the [promotion authoring guide](docs/promotions.md) for the YAML schema,
+actions, media rules, display lifecycle, analytics, and verification workflow.
+
 Promotions appear automatically. Detected Claude users also have a **Claude Mod**
 card above the sidebar’s Settings separator. It uses the same detection as Settings →
 Agents: Claude sessions, installation/sign-in, or Claude Desktop; a Pi-only login does not qualify.
@@ -435,9 +438,8 @@ the image source, pause playback, or reset its position. The optional `media.lig
 and legacy fallback. Video variants require their own poster. Explicit theme
 changes and system appearance changes select the source and poster together,
 resetting playback failure state without changing the display policy.
-The Claude Mod light variant uses the v14 H.264 MP4 at 800 × 416, 50fps,
-with no audio and fast-start metadata. Its matching PNG poster uses the same size.
-The approved dark GIF and poster remain unchanged. No command executes.
+Both Claude Mod themes use label-free H.264 MP4s at 800 × 416, 50fps,
+with no audio and fast-start metadata, plus matching PNG posters. No command executes.
 
 Automatic display waits for onboarding and foreground visibility. New users never
 receive a promo during the MAIN-window FTUE or in the same app session. Completion
