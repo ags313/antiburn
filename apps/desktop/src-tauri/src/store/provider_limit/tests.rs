@@ -2898,20 +2898,77 @@ fn all_history_paths_compare_range_size_with_a_large_catalog() {
 
 #[test]
 fn quota_history_index_upgrade_preserves_timed_usage() {
-    let store = memory_store();
-    let key = insert_session(&store, "index-upgrade");
-    observe_account(&store, &account('a'));
-    insert_turn(&store, &key, 100_123, 200_000);
-    let before = store.quota_turn_input(0, 1_000).unwrap().unwrap();
-    store
-        .lock()
-        .execute_batch("DROP INDEX turn_quota_published; PRAGMA user_version = 80;")
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    for migration in &crate::store::schema::MIGRATIONS[..80] {
+        connection.execute_batch(migration).unwrap();
+    }
+    connection.pragma_update(None, "user_version", 80).unwrap();
+    connection
+        .execute(
+            "INSERT INTO session (environment_key, agent, session_id, source_kind,
+                 source_label, first_seen_at, last_seen_at)
+             VALUES ('native', ?1, 'index-upgrade', 'inline', 'synthetic',
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [AGENT],
+        )
         .unwrap();
+    connection
+        .execute(
+            "INSERT INTO session_evidence (environment_key, agent, session_id,
+                 status, published_fence)
+             VALUES ('native', ?1, 'index-upgrade', 'ready', 1)",
+            [AGENT],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO turn (environment_key, agent, session_id, claim_fence,
+                 source_key, thread_id, turn_index, scope, role, ts_ms, model,
+                 input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+                 is_compaction_boundary)
+             VALUES ('native', ?1, 'index-upgrade', 1, 'synthetic', 'synthetic', 0,
+                 'main', 'assistant', 100123, ?2, 200000, 0, 0, 0, 0)",
+            params![AGENT, MODEL],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO provider_account_seen (agent, provider, account_key,
+                 first_seen_epoch, last_seen_epoch) VALUES (?1, ?2, ?3, 1, 1)",
+            params![AGENT, PROVIDER, account('a')],
+        )
+        .unwrap();
+    connection
+        .execute_batch(antiburn_local::analysis::TURN_RECORDED_COST_SQL)
+        .unwrap();
+    let before = read_quota_turn_input(&connection, 0, 1_000, 1_000, MAX_QUOTA_TURNS)
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.rows.len(), 1);
+    assert!(!before.rows[0].timed_tokens.is_empty());
+    let store = Store::from_connection(
+        connection,
+        Path::new("/tmp/antiburn-provider-limit-test").into(),
+    )
+    .unwrap();
     store.migrate().unwrap();
-    store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 81);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        crate::store::schema::MIGRATIONS.len() as i64
+    );
+    let index_exists: bool = store
+        .lock()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'turn_quota_published')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(index_exists);
     let after = store.quota_turn_input(0, 1_000).unwrap().unwrap();
     assert_eq!(after.rows.len(), before.rows.len());
+    assert_eq!(after.known_accounts, before.known_accounts);
     for (after, before) in after.rows.iter().zip(&before.rows) {
         assert_eq!(after.turn_count, before.turn_count);
         assert_eq!(after.timed_tokens, before.timed_tokens);

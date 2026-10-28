@@ -3485,6 +3485,7 @@ async fn fork_parent_session_id_for(log: &SessionLog, preview: Option<&str>) -> 
             agent: AgentKind::OpenCode,
             db_path,
             session_id,
+            ..
         } => {
             antiburn_local::discovery::agents::opencode::db_fork_parent(
                 db_path.clone(),

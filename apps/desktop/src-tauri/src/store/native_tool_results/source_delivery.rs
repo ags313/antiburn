@@ -1,5 +1,8 @@
 //! Source-owned claims, leases, and publication receipts.
 
+use crate::store::selected_source::{
+    LIVE_ACTIVATION_SQL, OPENCODE_V1_SOURCE_SQL, ROOT_SESSION_SQL,
+};
 use anyhow::Result;
 use rusqlite::{OptionalExtension, Transaction, params};
 
@@ -37,15 +40,7 @@ pub(crate) fn next_live_source_in(
                       WHERE s.environment_key = 'native' AND s.wsl_distro IS NULL
                         AND s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'
                         AND s.cwd IS NOT NULL AND s.cwd <> ''
-                        AND EXISTS(SELECT 1 FROM burn_check_activation a
-                          WHERE a.enabled = 1
-                            AND json_extract(a.activation_scope_key, '$.environment') = s.environment_key
-                            AND json_extract(a.activation_scope_key, '$.session_cwd') = s.cwd
-                            AND json_extract(a.activation_scope_key, '$.run') = 'Live')
-                        AND NOT EXISTS(SELECT 1 FROM session_relation r
-                          WHERE r.environment_key = s.environment_key AND r.agent = s.agent
-                            AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
-                              OR (r.related_id = s.session_id AND r.kind = 'subagent')))
+                        AND ({LIVE_ACTIVATION_SQL}) AND ({ROOT_SESSION_SQL})
                  ), journal_rows AS (
                      SELECT 'journal' AS family, s.environment_key, s.agent, s.session_id,
                             s.updated_at_epoch, d.service_ticket,
@@ -57,18 +52,9 @@ pub(crate) fn next_live_source_in(
                             s.source_generation
                        FROM session s LEFT JOIN opencode_journal_delivery d
                          USING(environment_key, agent, session_id)
-                      WHERE s.environment_key = 'native' AND s.agent = 'opencode'
-                        AND s.source_kind = 'providerDb' AND s.wsl_distro IS NULL
+                       WHERE ({OPENCODE_V1_SOURCE_SQL}) AND s.wsl_distro IS NULL
                         AND s.cwd IS NOT NULL AND s.cwd <> ''
-                        AND NOT EXISTS(SELECT 1 FROM session_relation r
-                          WHERE r.environment_key = s.environment_key AND r.agent = s.agent
-                            AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
-                              OR (r.related_id = s.session_id AND r.kind = 'subagent')))
-                        AND EXISTS(SELECT 1 FROM burn_check_activation a
-                          WHERE a.enabled = 1
-                            AND json_extract(a.activation_scope_key, '$.environment') = s.environment_key
-                            AND json_extract(a.activation_scope_key, '$.session_cwd') = s.cwd
-                            AND json_extract(a.activation_scope_key, '$.run') = 'Live')
+                        AND ({ROOT_SESSION_SQL}) AND ({LIVE_ACTIVATION_SQL})
                  ), eligible AS (
                      SELECT family, environment_key, agent, session_id,
                             updated_at_epoch, service_ticket FROM file_rows
@@ -93,8 +79,14 @@ pub(crate) fn next_live_source_in(
                  SELECT family, environment_key, agent, session_id FROM eligible
                   ORDER BY {order} LIMIT 1"
             ),
-            params![antiburn_local::analysis::PARSER_REVISION, now, now - antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS],
+            params![
+                antiburn_local::analysis::PARSER_REVISION,
+                now,
+                now - antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS
+            ],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?)
 }
+#[path = "opencode_v2.rs"]
+pub(crate) mod opencode_v2;

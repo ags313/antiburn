@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use antiburn_local::analysis::{ModelControlObservation, SourceFormat};
 use antiburn_local::model::AgentKind;
@@ -64,13 +64,22 @@ impl VendorRemediationPolicy for ClaudePolicy {
     }
 
     fn managed_configuration_present(&self, home: &Path) -> bool {
-        [
-            home.join(".claude/managed-settings.json"),
-            PathBuf::from("/etc/claude-code/managed-settings.json"),
-            PathBuf::from("/Library/Application Support/ClaudeCode/managed-settings.json"),
+        if home
+            .join(".claude/managed-settings.json")
+            .try_exists()
+            .unwrap_or(true)
+        {
+            return true;
+        }
+        #[cfg(not(test))]
+        return [
+            Path::new("/etc/claude-code/managed-settings.json"),
+            Path::new("/Library/Application Support/ClaudeCode/managed-settings.json"),
         ]
         .iter()
-        .any(|path| path.try_exists().unwrap_or(true))
+        .any(|path| path.try_exists().unwrap_or(true));
+        #[cfg(test)]
+        false
     }
 
     fn publication_setting_observed(

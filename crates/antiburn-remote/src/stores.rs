@@ -187,7 +187,7 @@ fn candidate_session_id(agent: AgentKind, home: &Path, source: &SessionSource) -
 /// Accept only the source shapes that the desktop can analyze from a copy.
 fn store_source(agent: AgentKind, home: &Path, source: &SessionSource) -> Option<StoreSource> {
     match (agent, source) {
-        (AgentKind::Cursor, SessionSource::Inline { label, content }) => {
+        (AgentKind::Cursor, SessionSource::Inline { label, content, .. }) => {
             let root = home.join(".cursor").join("projects");
             let relative = cursor_relative(home, Path::new(label))?;
             Some(StoreSource::CursorTranscript {
@@ -340,6 +340,7 @@ async fn source_updated_at(source: &SessionSource) -> Option<i64> {
             agent: AgentKind::OpenCode,
             db_path,
             session_id,
+            ..
         } => {
             // Same cluster activity timestamp listing uses. Do not use the
             // opencode.db filesystem mtime: a WAL write can leave that file old
@@ -354,6 +355,7 @@ async fn source_updated_at(source: &SessionSource) -> Option<i64> {
             agent: AgentKind::Antigravity,
             db_path,
             session_id,
+            ..
         } => {
             // Same combined db + WAL + brain transcript mtime listing uses.
             antiburn_local::discovery::agents::antigravity::db_session_updated_at(
@@ -583,6 +585,7 @@ mod tests {
                     agent: AgentKind::Antigravity,
                     db_path,
                     session_id: session_id.to_owned(),
+                    source_format: Some(antiburn_local::analysis::SourceFormat::AntigravitySqlite),
                 })
             } else {
                 DirectSessionSource::Unsupported

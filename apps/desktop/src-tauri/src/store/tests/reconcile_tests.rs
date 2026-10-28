@@ -64,7 +64,7 @@ fn parser_50_requeues_legacy_path_only_reads_and_rejects_their_resume_state() {
     }
     let before = store.session_source_state(&record.key).unwrap().unwrap();
     let revisions = projection_revisions();
-    assert_eq!(revisions.parser_revision, 60);
+    assert_eq!(revisions.parser_revision, 64);
     assert_eq!(revisions.evidence_schema_revision, 22);
     assert_eq!(
         store
@@ -107,7 +107,7 @@ fn parser_53_requeues_completed_omp_sessions() {
         )
         .unwrap();
     let revisions = crate::analysis::projection_revisions();
-    assert_eq!(revisions.parser_revision, 60);
+    assert_eq!(revisions.parser_revision, 64);
     store
         .lock()
         .execute(
@@ -145,11 +145,10 @@ fn parser_53_requeues_completed_omp_sessions() {
     );
 }
 
-/// Parser revision 54 adds the cost that OpenCode records for local-provider
-/// models. A completed OpenCode session from revision 53 has an unchanged
-/// database, so only the revision change can requeue it.
+/// An older completed OpenCode session has an unchanged database.
+/// The parser revision change alone must requeue it.
 #[test]
-fn parser_54_requeues_completed_opencode_sessions() {
+fn parser_revision_requeues_completed_opencode_sessions() {
     let store = store();
     let mut opencode = session("ses_local_model", 1_000);
     opencode.key.agent = "opencode".to_owned();
@@ -163,7 +162,7 @@ fn parser_54_requeues_completed_opencode_sessions() {
         )
         .unwrap();
     let revisions = crate::analysis::projection_revisions();
-    assert_eq!(revisions.parser_revision, 60);
+    assert_eq!(revisions.parser_revision, 64);
     store
         .lock()
         .execute(
@@ -226,7 +225,7 @@ fn reconciling_backfills_existing_pi_sessions_with_current_revisions() {
         ProjectionRevisions {
             parser_revision: crate::analysis::projection_revisions().parser_revision,
             analyzer_revision: 25,
-            metrics_schema_revision: 9,
+            metrics_schema_revision: antiburn_local::analysis::METRICS_SCHEMA_REVISION,
             evidence_schema_revision: 22,
         }
     );

@@ -800,6 +800,7 @@ mod tests {
         log.source = SessionSource::Inline {
             label: SESSION_ID.into(),
             content: format!("{}\n", fixture.user_event()),
+            source_format: None,
         };
         let prepared = prepare_description(
             log,
@@ -819,6 +820,7 @@ mod tests {
         log.source = SessionSource::Inline {
             label: String::new(),
             content: String::new(),
+            source_format: None,
         };
         let skipped =
             prepare_description(log, fixture.home(), HashSet::new(), None, None, false).await;

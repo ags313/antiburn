@@ -16,9 +16,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::analysis::evidence::SessionCoverageRecord;
 use crate::analysis::evidence_query::{FenceScope, TurnFacts, query_turn_facts};
 use crate::analysis::interface::{ContentPart, NormalizedRecord, RecordSink, SessionSummary};
-use crate::analysis::model::{
-    CompactionTrigger, EventSource, NormalizedEvent, Role, is_subagent_launch_tool,
-};
+use crate::analysis::model::{CompactionTrigger, EventSource, NormalizedEvent, Role};
 
 #[cfg(test)]
 mod native_content_tests {
@@ -412,7 +410,7 @@ ALTER TABLE turn_content ADD COLUMN normalized_fields_json TEXT
 
 /// DDL that adds [`TurnRow::recorded_cost_micros`]. Existing rows have no
 /// recorded cost until a full parse replaces them.
-pub const TURN_SCHEMA_V12_SQL: &str = r#"
+pub const TURN_RECORDED_COST_SQL: &str = r#"
 ALTER TABLE turn ADD COLUMN recorded_cost_micros INTEGER
     CHECK (recorded_cost_micros IS NULL OR recorded_cost_micros >= 0);
 "#;
@@ -422,6 +420,11 @@ CREATE INDEX turn_content_source_page
     ON turn (environment_key, agent, session_id, claim_fence, source_key, turn_index);
 CREATE INDEX turn_content_recent_page
     ON turn (environment_key, agent, session_id, claim_fence, turn_index DESC, source_key DESC);
+"#;
+
+pub const TURN_SCHEMA_V12_SQL: &str = r#"
+ALTER TABLE turn ADD COLUMN accounting_json TEXT
+    CHECK (accounting_json IS NULL OR (json_valid(accounting_json) AND length(CAST(accounting_json AS BLOB)) <= 8192));
 "#;
 
 /// DDL for the `session_coverage` table: one row per `(environment_key,
@@ -513,6 +516,7 @@ pub const TURN_MIGRATIONS: &[&str] = &[
     TURN_SCHEMA_V10_SQL,
     TURN_SCHEMA_V11_SQL,
     TURN_SCHEMA_V12_SQL,
+    TURN_RECORDED_COST_SQL,
 ];
 
 /// Number of rows a [`TurnRowSink`] buffers before it writes them, unless the
@@ -554,6 +558,7 @@ impl TurnScope {
 /// [`insert_turn_rows`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnRow {
+    pub accounting: Option<super::StepAccounting>,
     pub source_key: String,
     pub thread_id: String,
     pub turn_index: u64,
@@ -588,9 +593,8 @@ pub struct TurnRow {
     /// The name of `event.tools`'s last entry, when the event carries any
     /// tool call. Mirrors `observe_parent_fields`'s `slot.last_tool`.
     pub last_tool: Option<String>,
-    /// The count of `event.tools` entries whose name is a subagent launch
-    /// (`"task"` or `"agent"`, case-insensitive; see
-    /// [`crate::analysis::model::is_subagent_launch_tool`]). Mirrors
+    /// The proven launch count, or the legacy tool-name count from
+    /// [`NormalizedEvent::subagent_launch_count`]. Mirrors
     /// `observe_parent_fields`'s `slot.subagent_launches`.
     pub subagent_launches: u32,
     /// This turn's captured message content, when the source adapter emitted
@@ -652,6 +656,7 @@ pub fn turn_row_from_event(event: &NormalizedEvent, source_key: &str, turn_index
         EventSource::Parent => (TurnScope::Main, None),
     };
     TurnRow {
+        accounting: event.accounting.clone(),
         source_key: source_key.to_owned(),
         thread_id,
         turn_index,
@@ -679,13 +684,7 @@ pub fn turn_row_from_event(event: &NormalizedEvent, source_key: &str, turn_index
         compaction_post_tokens: event.compaction_post_tokens,
         has_thinking: event.has_thinking,
         last_tool: event.tools.last().map(|tool| tool.name.clone()),
-        subagent_launches: event
-            .tools
-            .iter()
-            .filter(|tool| is_subagent_launch_tool(&tool.name))
-            .count()
-            .try_into()
-            .unwrap_or(u32::MAX),
+        subagent_launches: event.subagent_launch_count(),
         content: Vec::new(),
     }
 }
@@ -960,11 +959,11 @@ const INSERT_TURN_SQL: &str = "INSERT INTO turn (
     is_compaction_boundary, message_id, uuid, parent_uuid,
     compaction_trigger, compaction_pre_tokens, compaction_post_tokens,
     has_thinking, last_tool, subagent_launches, provider, api, cache_write_1h_tokens,
-    recorded_cost_micros
+    accounting_json, recorded_cost_micros
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-    ?32
+    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
+    ?33
 )";
 
 const INSERT_TURN_CONTENT_SQL: &str = "INSERT INTO turn_content (
@@ -987,6 +986,12 @@ pub fn insert_turn_rows(
     let mut statement = conn.prepare(INSERT_TURN_SQL)?;
     let mut content_statement = conn.prepare(INSERT_TURN_CONTENT_SQL)?;
     for row in rows {
+        let accounting = row
+            .accounting
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         statement.execute(params![
             key.environment_key,
             key.agent,
@@ -1019,6 +1024,7 @@ pub fn insert_turn_rows(
             row.provider,
             row.api,
             row.cache_write_1h_tokens as i64,
+            accounting,
             row.recorded_cost_micros
                 .map(|micros| i64::try_from(micros).unwrap_or(i64::MAX)),
         ])?;
@@ -1041,6 +1047,10 @@ pub fn insert_turn_rows(
                             || !part.metadata.user_answers.is_empty()
                             || !part.metadata.plan_references.is_empty()
                             || part.metadata.user_text_history.is_some()
+                            || part.metadata.user_text_origin.is_some()
+                            || part.metadata.outcome.is_some()
+                            || part.metadata.provider_executed.is_some()
+                            || part.metadata.tool_output_field.is_some()
                             || part.metadata.recorded_skill_result.is_some())
                         .then_some(&metadata_fields)
                     })
@@ -1745,6 +1755,7 @@ mod tests {
 
     fn sample_row(turn_index: u64) -> TurnRow {
         TurnRow {
+            accounting: None,
             source_key: "s1".to_owned(),
             thread_id: "s1".to_owned(),
             turn_index,
@@ -1790,8 +1801,8 @@ mod tests {
         // Stop before V7 through V12 so the test can apply each in isolation.
         // V7 adds routes, V8 adds one-hour cache writes, and V9 adds content
         // authority/tool identities. V10 adds normalized tool-input fields.
-        // V12 adds the recorded cost.
-        for migration in &TURN_MIGRATIONS[..TURN_MIGRATIONS.len() - 6] {
+        // The recorded cost is an additional column in this database.
+        for migration in &TURN_MIGRATIONS[..TURN_MIGRATIONS.len() - 7] {
             conn.execute_batch(migration).unwrap();
         }
         conn.execute_batch(
@@ -1809,6 +1820,7 @@ mod tests {
         conn.execute_batch(TURN_SCHEMA_V10_SQL).unwrap();
         conn.execute_batch(TURN_SCHEMA_V11_SQL).unwrap();
         conn.execute_batch(TURN_SCHEMA_V12_SQL).unwrap();
+        conn.execute_batch(TURN_RECORDED_COST_SQL).unwrap();
         let key = TurnSessionKey {
             environment_key: "native",
             agent: "pi",
@@ -1819,6 +1831,7 @@ mod tests {
         assert_eq!(rows[0].input_tokens, 100);
         assert_eq!(rows[0].provider, None);
         assert_eq!(rows[0].api, None);
+        assert!(rows[0].accounting.is_none());
         let facts = query_turn_facts(&conn, &key, &FenceScope::single(1)).unwrap();
         assert_eq!(facts.repeated_context_accounting, None);
         assert!(facts.repeated_context_incomplete);

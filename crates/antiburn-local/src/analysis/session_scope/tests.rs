@@ -66,6 +66,116 @@ fn builder_for_source(boundary: u64, format: SourceFormat) -> SessionScopeBuilde
     .unwrap()
 }
 
+#[test]
+fn scope_uses_each_producers_user_authority_without_source_overrides() {
+    for format in [
+        SourceFormat::OpenCodeSqliteV2,
+        SourceFormat::OpenCodeV2SessionExport,
+        SourceFormat::ClaudeJsonl,
+    ] {
+        let mut unknown = part(1, ContentKind::UserText, "Unproven user-slot text");
+        unknown.part.authority = ContentAuthority::Unknown;
+        let mut scope = builder_for_source(1, format);
+        scope
+            .push_page(
+                page(
+                    vec![part(0, ContentKind::UserText, "Proven user text"), unknown],
+                    false,
+                ),
+                false,
+            )
+            .unwrap();
+        let snapshot = scope.finish().unwrap();
+        assert_eq!(snapshot.values(), &[json!("Proven user text")]);
+        assert_eq!(snapshot.occurrences()[0].authority, ScopeAuthority::User);
+        assert!(
+            snapshot
+                .limitations()
+                .contains(&ScopeMissingReason::UnresolvedInfluence)
+        );
+    }
+}
+
+#[test]
+fn accepted_user_slot_text_keeps_its_role_without_human_scope_authority() {
+    for format in [
+        SourceFormat::OpenCodeSqliteV2,
+        SourceFormat::OpenCodeV2SessionExport,
+        SourceFormat::ClaudeJsonl,
+    ] {
+        let mut accepted = part(0, ContentKind::UserText, "Remediation reference: ABR-exact");
+        accepted.part.metadata.user_text_origin = Some(UserTextOrigin::AcceptedUserSlot);
+        let encoded = serde_json::to_vec(&accepted.part.metadata).unwrap();
+        accepted.part.metadata = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(accepted.part.authority, ContentAuthority::User);
+        assert_eq!(
+            accepted
+                .part
+                .metadata
+                .selected(SCOPE_SELECTION)
+                .user_text_origin,
+            Some(UserTextOrigin::AcceptedUserSlot)
+        );
+        let mut scope = builder_for_source(0, format);
+        scope.push_page(page(vec![accepted], false), false).unwrap();
+        let snapshot = scope.finish().unwrap();
+        assert_eq!(
+            snapshot.values(),
+            &[json!("Remediation reference: ABR-exact")]
+        );
+        assert_eq!(
+            snapshot.occurrences()[0].authority,
+            ScopeAuthority::UnknownInfluence
+        );
+        assert!(
+            snapshot
+                .limitations()
+                .contains(&ScopeMissingReason::UnresolvedInfluence)
+        );
+        assert!(
+            snapshot
+                .limitations()
+                .contains(&ScopeMissingReason::NoUserContext)
+        );
+        assert!(!snapshot.source_complete);
+    }
+}
+
+#[test]
+fn accepted_user_slot_text_does_not_replace_an_earlier_scope_authority() {
+    let mut accepted = part(1, ContentKind::UserText, "Accepted API request");
+    accepted.part.metadata.user_text_origin = Some(UserTextOrigin::AcceptedUserSlot);
+    let mut scope = builder_for_source(1, SourceFormat::ClaudeJsonl);
+    scope
+        .push_page(
+            page(
+                vec![
+                    part(0, ContentKind::UserText, "Keep billing unchanged"),
+                    accepted,
+                ],
+                false,
+            ),
+            false,
+        )
+        .unwrap();
+    let snapshot = scope.finish().unwrap();
+    assert_eq!(snapshot.occurrences()[0].authority, ScopeAuthority::User);
+    assert_eq!(
+        snapshot.occurrences()[1].authority,
+        ScopeAuthority::UnknownInfluence
+    );
+    assert!(
+        !snapshot
+            .limitations()
+            .contains(&ScopeMissingReason::NoUserContext)
+    );
+    assert!(
+        snapshot
+            .limitations()
+            .contains(&ScopeMissingReason::UnresolvedInfluence)
+    );
+}
+
 fn generated_context(skill: bool) -> PublishedContentPart {
     let text = if skill {
         "<skill>\n<name>verify</name>\n<path>/synthetic/verify/SKILL.md</path>\nCheck the sample.\n</skill>"

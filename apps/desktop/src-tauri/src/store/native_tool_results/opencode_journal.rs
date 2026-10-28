@@ -8,6 +8,9 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use super::super::publications::{
     PublicationPolicy, ToolResultBatch, publish_coverage_in, reconcile_with_policy,
 };
+use crate::store::selected_source::{
+    LIVE_ACTIVATION_SQL, OPENCODE_V1_SOURCE_SQL, ROOT_SESSION_SQL,
+};
 use crate::store::{Incarnation, SessionKey, Store};
 
 #[path = "journal/message_removals.rs"]
@@ -17,27 +20,22 @@ const JOURNAL_POLL_SECS: i64 = 1;
 const DORMANT_POLL_SECS: i64 = 30;
 const MAX_READ_ATTEMPTS: i64 = 5;
 
-const CANDIDATES: &str = "WITH source_sessions AS (
-    SELECT s.*, NOT EXISTS(SELECT 1 FROM session_relation r
-        WHERE r.environment_key = s.environment_key AND r.agent = s.agent
-           AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
-             OR (r.related_id = s.session_id AND r.kind = 'subagent'))) AS main_session
-       FROM session s WHERE s.environment_key = 'native' AND s.agent = 'opencode'
-         AND s.source_kind = 'providerDb' AND s.wsl_distro IS NULL
+fn candidates_sql() -> String {
+    format!(
+        "WITH source_sessions AS (
+    SELECT s.*, ({ROOT_SESSION_SQL}) AS main_session
+       FROM session s WHERE ({OPENCODE_V1_SOURCE_SQL}) AND s.wsl_distro IS NULL
          AND s.cwd IS NOT NULL AND s.cwd <> ''
-         AND EXISTS(SELECT 1 FROM burn_check_activation a
-           WHERE a.enabled = 1 AND json_extract(a.activation_scope_key, '$.environment') = s.environment_key
-             AND json_extract(a.activation_scope_key, '$.session_cwd') = s.cwd
-             AND json_extract(a.activation_scope_key, '$.run') = 'Live')
+         AND ({LIVE_ACTIVATION_SQL})
 ), candidates AS (
     SELECT s.environment_key, s.agent, s.session_id, s.incarnation, s.source_label,
            s.cwd, s.source_generation, s.updated_at_epoch,
            d.cursor_json, d.baseline_sequence, d.retry_count, d.observed_generation,
            d.pending, d.blocked, d.lease_expires_at_epoch, d.next_attempt_at_epoch,
               d.service_ticket, d.history_gap, d.last_error, s.main_session,
-           (d.incarnation IS NULL OR d.incarnation <> s.incarnation
-               OR d.source_label <> s.source_label OR d.cwd IS NOT s.cwd
-               OR d.parser_revision <> ?1 OR d.main_session <> s.main_session) AS reset
+            (d.incarnation IS NULL OR d.incarnation <> s.incarnation
+                OR d.source_label <> s.source_label OR d.cwd IS NOT s.cwd
+                OR d.parser_revision <> ?1 OR d.main_session <> s.main_session) AS reset
       FROM source_sessions s LEFT JOIN opencode_journal_delivery d
         ON d.environment_key = s.environment_key AND d.agent = s.agent
        AND d.session_id = s.session_id
@@ -50,7 +48,9 @@ const CANDIDATES: &str = "WITH source_sessions AS (
      WHERE (reset AND updated_at_epoch >= ?3)
         OR (NOT reset AND blocked = 0 AND (pending = 1
             OR observed_generation <> source_generation OR next_attempt_at_epoch IS NOT NULL))
-)";
+)"
+    )
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct OpenCodeJournalClaim {
@@ -150,7 +150,7 @@ impl Store {
         let candidate = tx
             .query_row(
                 &format!(
-                    "{CANDIDATES}
+                    "{}
             SELECT environment_key, agent, session_id, incarnation, source_label, cwd,
                    source_generation, cursor_json, baseline_sequence,
                     COALESCE(retry_count, 0), reset, observed_generation, history_gap, main_session,
@@ -158,7 +158,8 @@ impl Store {
                         'journal-main-session-unavailable'), 0)
               FROM scheduled WHERE due_at <= ?2
                ORDER BY {order} service_ticket, session_id
-             LIMIT 1"
+             LIMIT 1",
+                    candidates_sql()
                 ),
                 params![PARSER_REVISION, now, now - ACTIVE_SESSION_WINDOW_SECS],
                 |row| {
@@ -286,7 +287,7 @@ impl Store {
             .or(claim.baseline_sequence)
             .unwrap_or(page.snapshot_end);
         let mut batch = ToolResultBatch {
-            source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2,
+            source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
             results: page.results.clone(),
             complete: false,
         };
@@ -320,7 +321,9 @@ impl Store {
                 baseline: Some(baseline),
                 history_complete: Some(history_complete),
                 gap_reason,
+                gap_kind: Default::default(),
                 suppress_coverage: false,
+                live_eligible: None,
             },
         )?;
         let pending = page.has_more || generation != claim.source_generation;
@@ -381,7 +384,7 @@ impl Store {
                 generation,
                 claim.claim_fence,
                 &ToolResultBatch {
-                    source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2,
+                    source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
                     results: Vec::new(),
                     complete: false,
                 },
@@ -456,10 +459,7 @@ impl Store {
 
     pub(crate) fn next_opencode_journal_attempt(&self, now: i64) -> Result<Option<i64>> {
         Ok(self.lock().query_row(
-            &format!(
-                "{CANDIDATES}
-            SELECT MIN(due_at) FROM scheduled"
-            ),
+            &format!("{} SELECT MIN(due_at) FROM scheduled", candidates_sql()),
             params![PARSER_REVISION, now, now - ACTIVE_SESSION_WINDOW_SECS],
             |row| row.get(0),
         )?)

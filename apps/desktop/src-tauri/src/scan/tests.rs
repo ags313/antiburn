@@ -239,6 +239,7 @@ async fn opencode_probe_coalesces_newer_snapshots_and_keeps_new_sessions_first()
             agent: AgentKind::OpenCode,
             db_path: std::path::PathBuf::from("/tmp/opencode.db"),
             session_id: session_id.into(),
+            source_format: Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1),
         },
         updated_at,
         environment: DiscoveryEnvironment::Native,
@@ -292,6 +293,7 @@ fn only_native_direct_agents_are_eligible_for_indexed_title_lookups() {
             source: SessionSource::Inline {
                 label: "synthetic".into(),
                 content: String::new(),
+                source_format: None,
             },
             updated_at: None,
             environment: DiscoveryEnvironment::Native,
@@ -324,6 +326,7 @@ fn opencode_provider_sessions_skip_the_all_titles_inventory_query() {
             agent: AgentKind::OpenCode,
             db_path: std::path::PathBuf::from("/tmp/opencode.db"),
             session_id: "ses_recent".into(),
+            source_format: Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1),
         },
         updated_at: Some(100),
         environment: DiscoveryEnvironment::Native,
@@ -769,6 +772,7 @@ async fn describing_an_opencode_provider_db_does_not_render_the_transcript() {
             agent: AgentKind::OpenCode,
             db_path: db_path.clone(),
             session_id: session_id.to_string(),
+            source_format: Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1),
         },
         updated_at: Some(120),
         environment: DiscoveryEnvironment::Native,
@@ -796,6 +800,7 @@ async fn describing_an_opencode_fork_finds_its_parent_without_rendering_either_t
             agent: AgentKind::OpenCode,
             db_path: db_path.clone(),
             session_id: child_id.to_string(),
+            source_format: Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1),
         },
         updated_at: Some(220),
         environment: DiscoveryEnvironment::Native,
@@ -826,6 +831,7 @@ async fn a_consumed_provider_db_preview_is_rendered() {
             agent: AgentKind::OpenCode,
             db_path: db_path.clone(),
             session_id: session_id.to_string(),
+            source_format: Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1),
         },
         updated_at: Some(120),
         environment: DiscoveryEnvironment::Native,
@@ -852,6 +858,7 @@ async fn an_inline_claude_subagent_is_rejected_on_the_scan_path() {
         source: SessionSource::Inline {
             label: "inline-subagent".to_string(),
             content: content.to_string(),
+            source_format: None,
         },
         updated_at: Some(1_800_000_000),
         environment: DiscoveryEnvironment::Native,
@@ -908,6 +915,7 @@ async fn an_empty_session_id_is_skipped() {
         source: SessionSource::Inline {
             label: String::new(),
             content: "{}".to_string(),
+            source_format: None,
         },
         updated_at: None,
         environment: DiscoveryEnvironment::Native,
@@ -1239,6 +1247,7 @@ async fn the_current_window_filter_always_keeps_an_unknown_activity_source() {
         source: SessionSource::Inline {
             label: "inline".into(),
             content: String::new(),
+            source_format: None,
         },
         updated_at: Some(1_000),
         environment: DiscoveryEnvironment::Native,
@@ -1271,6 +1280,7 @@ async fn the_found_counts_report_each_agent_once_after_the_current_window_filter
         source: SessionSource::Inline {
             label: label.into(),
             content: String::new(),
+            source_format: None,
         },
         updated_at: Some(now),
         environment: DiscoveryEnvironment::Native,
@@ -1727,6 +1737,7 @@ async fn initial_duplicate_database_sources_choose_the_same_physical_source_in_a
             agent: AgentKind::OpenCode,
             db_path: path.into(),
             session_id: "same-session".into(),
+            source_format: Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1),
         },
         updated_at: Some(1_000),
         environment: DiscoveryEnvironment::Native,
@@ -1761,6 +1772,7 @@ fn inline_admission_guard_uses_the_parsed_session_identity() {
         source: SessionSource::Inline {
             label: "claude-fork-job:child".into(),
             content: r#"{"sessionId":"child","type":"user","cwd":"/repo","message":{"role":"user","content":"Check the build"}}"#.into(),
+            source_format: None,
         },
         updated_at: Some(1_000),
         environment: DiscoveryEnvironment::Native,
@@ -1796,6 +1808,7 @@ async fn description_dispatch_serializes_parsed_identity_across_source_labels() 
         source: SessionSource::Inline {
             label: label.into(),
             content: format!(r#"{{"sessionId":"{id}","type":"user","cwd":"/repo"}}"#),
+            source_format: None,
         },
         updated_at: Some(1_000),
         environment: DiscoveryEnvironment::Native,
@@ -1845,6 +1858,7 @@ fn physical_database_rebind_rejects_an_attempt_from_the_old_database() {
             agent: AgentKind::OpenCode,
             db_path: path.into(),
             session_id: "rebound-session".into(),
+            source_format: Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1),
         },
         updated_at: Some(1_000),
         environment: DiscoveryEnvironment::Native,
@@ -1864,6 +1878,47 @@ fn physical_database_rebind_rejects_an_attempt_from_the_old_database() {
         SessionCommitOutcome::Upserted(_)
     ));
     row.title = Some("stale first database".into());
+    assert!(matches!(
+        store.upsert_session_if_current(&old, &row, &[]).unwrap(),
+        SessionCommitOutcome::Rejected(_)
+    ));
+    assert_eq!(
+        store.session_records_for_session_keys(&[row.key]).unwrap()[0].title,
+        None
+    );
+}
+
+#[test]
+fn opencode_format_change_fences_an_attempt_bound_to_v1() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory(home.path()).unwrap();
+    let make_log = |source_format| SessionLog {
+        agent_type: AgentKind::OpenCode,
+        source: SessionSource::ProviderDb {
+            agent: AgentKind::OpenCode,
+            db_path: "/same/opencode.db".into(),
+            session_id: "format-switch".into(),
+            source_format: Some(source_format),
+        },
+        updated_at: Some(1_000),
+        environment: DiscoveryEnvironment::Native,
+    };
+    let v1 = make_log(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1);
+    let v2 = make_log(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2);
+    let epoch = store.capture_destructive_write_epoch();
+    let mut row = record(AgentKind::OpenCode.slug(), "format-switch", Some(1_000));
+    let old = session_write_guard(&store, &v1, &row.key, epoch).unwrap();
+    let current = session_write_guard(&store, &v2, &row.key, epoch).unwrap();
+
+    row.source_kind = "providerDb".into();
+    row.source_label = v2.source_label();
+    assert!(matches!(
+        store
+            .upsert_session_if_current(&current, &row, &[])
+            .unwrap(),
+        SessionCommitOutcome::Upserted(_)
+    ));
+    row.title = Some("stale V1 source".into());
     assert!(matches!(
         store.upsert_session_if_current(&old, &row, &[]).unwrap(),
         SessionCommitOutcome::Rejected(_)
@@ -2028,6 +2083,7 @@ fn source_kinds_are_stable_wire_strings() {
         source_kind(&SessionSource::Inline {
             label: "opencode:x".into(),
             content: String::new(),
+            source_format: None,
         }),
         "inline"
     );
@@ -2036,6 +2092,7 @@ fn source_kinds_are_stable_wire_strings() {
             agent: AgentKind::OpenCode,
             db_path: "/tmp/opencode.db".into(),
             session_id: "x".into(),
+            source_format: Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1),
         }),
         "providerDb"
     );
@@ -2049,6 +2106,7 @@ fn a_provider_database_session_recovers_its_id_from_the_source() {
             agent: AgentKind::OpenCode,
             db_path: "/tmp/opencode.db".into(),
             session_id: "ses_123".into(),
+            source_format: Some(antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1),
         },
         updated_at: Some(1_000),
         environment: Default::default(),

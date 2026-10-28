@@ -211,7 +211,7 @@
         "state": "unsupported"
       },
       "ordering": "monotonic",
-      "parserRevision": 60,
+      "parserRevision": 64,
       "sourceAcceptance": "unvalidated",
       "sourceKind": "jsonl"
     },
@@ -4323,7 +4323,5 @@
     "model": "gpt-test",
     "sessionId": "malformed_between_valid"
   },
-  "partialReasons": [
-    "MalformedRecord"
-  ]
+  "partialReasons": ["MalformedRecord"]
 }

@@ -5,7 +5,7 @@ use crate::{
     store::{FencedTurnRowStore, SessionKey, SessionRecord, Store},
 };
 use antiburn_local::{
-    analysis::TurnRowStore,
+    analysis::{SourceFormat, TurnRowStore},
     discovery::{
         Explorers, SessionSource,
         source_version::{
@@ -56,6 +56,11 @@ fn cached_source(agent: AgentKind, session_id: &str, primary: PathBuf) -> Sessio
             agent,
             db_path: primary,
             session_id: session_id.to_owned(),
+            source_format: match agent {
+                AgentKind::OpenCode => Some(SourceFormat::OpenCodeSqliteV1),
+                AgentKind::Antigravity => Some(SourceFormat::AntigravitySqlite),
+                _ => None,
+            },
         },
         _ => SessionSource::File(primary),
     }
@@ -697,25 +702,30 @@ pub fn run_pass(
         }
         let writer: Arc<dyn TurnRowStore> =
             Arc::new(FencedTurnRowStore::new(store, record.key.clone(), fence));
-        analysis::analyze_located_for_evidence(
-            agent,
-            &record.key.session_id,
-            analysis::ClaimedSource {
-                fingerprint: record.source_fingerprint,
-                generation: 0,
-            },
-            signal,
-            Some(writer),
-            parent,
-            analysis::LocatedTranscripts {
-                source: cached_source(
+        crate::insights_worker::run_pass_with_writer(signal.clone(), writer, |writer| {
+            Box::pin(async move {
+                analysis::analyze_located_for_evidence(
                     agent,
                     &record.key.session_id,
-                    PathBuf::from(record.source_label),
-                ),
-                children,
-            },
-        )
+                    analysis::ClaimedSource {
+                        fingerprint: record.source_fingerprint,
+                        generation: 0,
+                    },
+                    signal,
+                    Some(writer),
+                    parent,
+                    analysis::LocatedTranscripts {
+                        source: cached_source(
+                            agent,
+                            &record.key.session_id,
+                            PathBuf::from(record.source_label),
+                        ),
+                        children,
+                    },
+                )
+                .await
+            })
+        })
         .await
     })
 }

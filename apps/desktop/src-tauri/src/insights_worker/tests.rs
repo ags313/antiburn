@@ -13,6 +13,7 @@ use crate::store::EvidenceStatus;
 use crate::store::{Remediation, RemediationEvidenceGuard, RemediationState};
 
 mod resume_tests;
+mod supervision_tests;
 
 #[tokio::test]
 async fn reserved_live_turns_alternate_source_families_without_projection_work() {
@@ -237,7 +238,11 @@ async fn live_journal_delivery_runs_while_evidence_and_verification_stay_ready()
                 &runner,
                 &|_| {},
                 &|_, _| {},
-                &|| {},
+                &WorkProgress {
+                    claimed: &|| {},
+                    published: &|| {},
+                    authorities: Arc::new(tokio::sync::Mutex::new(None)),
+                },
                 &|| async {
                     Ok(journal::tests::run_page(&store, journal_source.clone(), 100).await)
                 },
@@ -318,6 +323,8 @@ fn projection_publication_leaves_native_file_results_to_delivery() {
     pass.native_tool_result_source_format =
         Some(antiburn_local::analysis::SourceFormat::ClaudeJsonl);
     pass.tool_result_observations = vec![antiburn_local::analysis::ToolResultObservation {
+        outcome: None,
+        provider_executed: None,
         context: None,
         source_format: antiburn_local::analysis::SourceFormat::ClaudeJsonl,
         session_id: claim.key.session_id.clone(),
@@ -352,6 +359,33 @@ fn projection_publication_leaves_native_file_results_to_delivery() {
         store.evidence(&claim.key).unwrap().unwrap().status,
         EvidenceStatus::Ready
     );
+}
+
+#[test]
+fn publication_keeps_the_configuration_attribution_prepared_by_the_worker() {
+    let store = store();
+    let claim = claim(&store, "prepared-attribution", 100);
+    let record = store.session(&claim.key).unwrap().unwrap();
+    let mut pass = published_pass(&record);
+    pass.analysis.analyzed_generation = claim.source_generation;
+    let attribution = crate::remediation::PublicationConfigAttribution {
+        model: Some((
+            "synthetic-target".into(),
+            "project".into(),
+            "prepared-model".into(),
+        )),
+        ..Default::default()
+    };
+    assert!(
+        apply_outcome_with_attribution(&store, &claim, &pass, 100, Some(&attribution))
+            .unwrap()
+            .applied
+    );
+    let model: String = store.lock().query_row(
+        "SELECT effective_model FROM session_evidence WHERE session_id = 'prepared-attribution'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(model, "prepared-model");
 }
 
 /// Like [`published_pass`], but for a generic-JSONL agent (Copilot):
@@ -478,7 +512,7 @@ fn published_status_classifies_capability_sets_against_detector_prerequisites() 
     for source_format in [
         antiburn_local::analysis::SourceFormat::ClaudeJsonl,
         antiburn_local::analysis::SourceFormat::CodexRolloutJsonl,
-        antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2,
+        antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
         antiburn_local::analysis::SourceFormat::PiV3Jsonl,
         antiburn_local::analysis::SourceFormat::CursorCliAgentJsonl,
         antiburn_local::analysis::SourceFormat::CursorCliStoreDb,
@@ -1275,12 +1309,11 @@ fn backlog_transitions_report_once_per_busy_stretch() {
     // One worker going idle while the other is still busy reports nothing.
     assert_eq!(handle.note_backlog_idle(), None);
     let drained = handle.note_backlog_idle();
-    assert!(matches!(drained, Some((2, _))));
+    assert!(matches!(drained, Some((2, _, false))));
 
-    // The stretch reset when it drained: a later stretch that processes
-    // nothing reports nothing when it goes idle.
+    // A failed first item must also announce that the pool is idle.
     assert_eq!(handle.note_backlog_busy(&store), Some(2));
-    assert_eq!(handle.note_backlog_idle(), None);
+    assert!(matches!(handle.note_backlog_idle(), Some((0, _, false))));
 }
 
 #[test]

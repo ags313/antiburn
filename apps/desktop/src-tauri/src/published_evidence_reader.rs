@@ -10,6 +10,7 @@ use antiburn_checks::source::{
 use sha2::{Digest, Sha256};
 
 use crate::store::native_tool_results::ToolResultPublicationOutcome;
+use crate::store::native_tool_results::publications::PublicationGapKind;
 use crate::store::{SessionKey, Store, native_tool_results::ToolResultPublication};
 
 const FIRST_TERMINAL_PUBLICATION_SQL: &str = "SELECT MIN(p.publication_sequence)
@@ -81,20 +82,22 @@ impl<'a> StorePublishedEvidenceReader<'a> {
     }
 
     fn live_publication(&self, publication: &ToolResultPublication) -> Result<bool, SourceError> {
+        let root_session = crate::store::selected_source::ROOT_SESSION_SQL;
         self.store
             .lock()
             .query_row(
-                "SELECT (COALESCE(?4, ?5 > (SELECT MIN(p.source_generation)
+                &format!("SELECT (COALESCE(?4, ?5 > (SELECT MIN(p.source_generation)
                    FROM native_tool_result_publication p
                    WHERE p.environment_key = ?1 AND p.agent = ?2 AND p.session_id = ?3))
                    AND (?6 IS NULL OR EXISTS(SELECT 1 FROM burn_check_session_attachment t
                      JOIN session s ON s.environment_key = ?1 AND s.agent = ?2 AND s.session_id = ?3
                      WHERE t.check_id = ?6 AND t.activation_scope_key = ?7 AND t.generation = ?8
-                       AND t.branch_key = ?9 AND t.incarnation = s.incarnation)))
+                       AND t.branch_key = ?9 AND t.incarnation = s.incarnation
+                       AND s.wsl_distro IS NULL AND ({root_session}))))
                    OR EXISTS(SELECT 1 FROM burn_check_observation o
                      JOIN burn_check_activation a USING(check_id, activation_scope_key)
                      WHERE o.check_id = ?6 AND o.activation_scope_key = ?7 AND a.generation = ?8 AND a.enabled = 1
-                       AND o.session_key_json = ?9 AND o.native_identity = ?10)",
+                       AND o.session_key_json = ?9 AND o.native_identity = ?10)"),
                 rusqlite::params![
                     publication.session.environment_key,
                     publication.session.agent,
@@ -163,24 +166,29 @@ impl<'a> StorePublishedEvidenceReader<'a> {
         &self,
         session: &SessionKey,
     ) -> Result<Vec<SourceEvent>, SourceError> {
+        let v2_format =
+            serde_json::to_string(&antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2)
+                .map_err(|error| SourceError::Reader(error.to_string()))?;
         let sequences = self.store.lock().prepare(
             "SELECT c.publication_sequence FROM native_tool_result_current c
                JOIN native_tool_result_publication p USING(publication_sequence)
                JOIN session s ON s.environment_key = c.environment_key AND s.agent = c.agent
                  AND s.session_id = c.session_id
-              WHERE c.environment_key = ?1 AND c.agent = ?2 AND c.session_id = ?3
+               WHERE c.environment_key = ?1 AND c.agent = ?2 AND c.session_id = ?3
+                 AND (s.source_format IS NULL OR s.source_format <> ?4)
                 AND c.is_removed = 0 AND json_extract(c.payload_json, '$.finality') = 1
                 AND (p.session_incarnation IS NULL OR
                   (p.session_incarnation = s.incarnation AND p.project_cwd IS s.cwd))
-              ORDER BY COALESCE(json_extract(c.payload_json, '$.context.result_position.FileBytes.record_start'),
-                  json_extract(c.payload_json, '$.context.result_position.Jsonl.record_index'),
-                  json_extract(c.payload_json, '$.context.result_position.OpenCodeEvent.sequence')) DESC,
-                COALESCE(json_extract(c.payload_json, '$.context.result_position.FileBytes.item_index'),
-                  json_extract(c.payload_json, '$.context.result_position.Jsonl.item_index'),
-                  json_extract(c.payload_json, '$.context.result_position.OpenCodeEvent.item_index')) DESC
+               ORDER BY COALESCE(json_extract(c.payload_json, '$.context.result_position.FileBytes.record_start'),
+                   json_extract(c.payload_json, '$.context.result_position.Jsonl.record_index'),
+                    json_extract(c.payload_json, '$.context.result_position.OpenCodeEvent.sequence')) DESC,
+                 COALESCE(json_extract(c.payload_json, '$.context.result_position.FileBytes.item_index'),
+                   json_extract(c.payload_json, '$.context.result_position.Jsonl.item_index'),
+                    json_extract(c.payload_json, '$.context.result_position.OpenCodeEvent.item_index')) DESC
               LIMIT 40",
         ).and_then(|mut statement| statement.query_map(
-            rusqlite::params![session.environment_key, session.agent, session.session_id],
+            rusqlite::params![session.environment_key, session.agent, session.session_id,
+                v2_format],
             |row| row.get::<_, i64>(0),
         )?.collect::<rusqlite::Result<Vec<_>>>())
             .map_err(|error| SourceError::Reader(error.to_string()))?;
@@ -349,6 +357,18 @@ fn publication_event(
                 category: result.tool_category.map(category_name),
                 arguments: result.arguments,
                 content: result.content,
+                outcome: result
+                    .outcome
+                    .map(|outcome| {
+                        let mut value = serde_json::to_value(outcome)?;
+                        if let serde_json::Value::Object(fields) = &mut value {
+                            fields.retain(|_, value| !value.is_null());
+                        }
+                        Ok::<_, serde_json::Error>(value)
+                    })
+                    .transpose()
+                    .map_err(|error| SourceError::Reader(error.to_string()))?,
+                provider_executed: result.provider_executed,
                 status: match result.status {
                     antiburn_local::analysis::ToolResultStatus::Success => {
                         PublishedResultStatus::Completed
@@ -379,11 +399,18 @@ fn publication_event(
             })?)
             .map_err(|error| SourceError::Reader(error.to_string()))?,
         },
-        ToolResultPublicationOutcome::CoverageGap => PublishedEvidenceChange::Gap {
-            reason: publication
+        ToolResultPublicationOutcome::CoverageGap => {
+            let reason = publication
                 .gap_reason
-                .unwrap_or_else(|| "published source membership is incomplete".to_owned()),
-        },
+                .unwrap_or_else(|| "published source membership is incomplete".to_owned());
+            match publication.gap_kind {
+                PublicationGapKind::Invalidated => PublishedEvidenceChange::Gap { reason },
+                PublicationGapKind::Partial => PublishedEvidenceChange::PartialGap { reason },
+                PublicationGapKind::SegmentReset => {
+                    PublishedEvidenceChange::SegmentReset { reason }
+                }
+            }
+        }
         ToolResultPublicationOutcome::CoverageRestored => PublishedEvidenceChange::CoverageRestored,
     };
     Ok(PublishedEvidenceEvent {

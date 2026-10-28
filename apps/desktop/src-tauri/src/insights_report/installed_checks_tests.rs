@@ -14,6 +14,9 @@ use serde_json::json;
 use super::*;
 use crate::store::burn_checks::{BurnCheckCandidateClaim, StoreCheckStore};
 
+#[path = "installed_checks_opencode_v2_tests.rs"]
+mod opencode_v2;
+
 pub(crate) fn definition(project: &str) -> InstalledCheckDefinition {
     InstalledCheckDefinition {
         effective_id: format!("private:{project}:retry"),
@@ -86,6 +89,46 @@ fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
             &LifecycleTransition::Activated(activation.clone()),
             Some(&activation),
         )
+        .unwrap();
+    let mut connection = store.lock();
+    let mut runtime_definitions = connection
+        .prepare(
+            "SELECT check_id, activation_scope_key, generation, definition_revision, name, availability
+             FROM burn_check_runtime_definition",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            let availability: String = row.get(5)?;
+            Ok(antiburn_checks_store::RuntimeDefinition {
+                check_id: row.get(0)?,
+                activation_scope_key: row.get(1)?,
+                generation: row.get(2)?,
+                definition_revision: row.get(3)?,
+                name: row.get(4)?,
+                availability: match availability.as_str() {
+                    "paused" => antiburn_checks_store::DefinitionAvailability::Paused,
+                    "invalid" => antiburn_checks_store::DefinitionAvailability::Invalid,
+                    "unsupported" => antiburn_checks_store::DefinitionAvailability::Unsupported,
+                    _ => antiburn_checks_store::DefinitionAvailability::Available,
+                },
+            })
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    runtime_definitions.retain(|saved| {
+        saved.check_id != definition.check_id
+            || saved.activation_scope_key != definition.activation_scope_key
+    });
+    runtime_definitions.push(antiburn_checks_store::RuntimeDefinition {
+        check_id: definition.check_id.clone(),
+        activation_scope_key: definition.activation_scope_key.clone(),
+        generation: definition.generation,
+        definition_revision: definition.definition_revision.clone(),
+        name: definition.name.clone(),
+        availability: antiburn_checks_store::DefinitionAvailability::Available,
+    });
+    antiburn_checks_store::replace_runtime_definitions(&mut connection, &runtime_definitions)
         .unwrap();
 }
 
@@ -1609,9 +1652,11 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
         let journal = agent == "opencode";
         store.lock().execute(
             "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
-              cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation)
-             VALUES ('native', ?1, 'main', ?2, 'test', '/workspace/demo', 100, 100, '', '', 7)",
-            params![agent, if journal { "providerDb" } else { "file" }],
+              cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation, source_format)
+             VALUES ('native', ?1, 'main', ?2, ?3, '/workspace/demo', 100, 100, '', '', 7, ?4)",
+            params![agent, if journal { "providerDb" } else { "file" },
+                if journal { "opencode:main" } else { "test" },
+                journal.then(|| serde_json::to_string(&antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1).unwrap())],
         ).unwrap();
         let mut request = request();
         request.computed_at_epoch = 280;
@@ -1663,9 +1708,13 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
                 &format!(
                     "INSERT INTO {table} (environment_key, agent, session_id, incarnation,
               source_label, cwd, parser_revision, pending, {extra})
-             VALUES ('native', ?1, 'main', 7, 'test', '/workspace/demo', ?2, 1, 1)"
+             VALUES ('native', ?1, 'main', 7, ?3, '/workspace/demo', ?2, 1, 1)"
                 ),
-                params![agent, PARSER_REVISION],
+                params![
+                    agent,
+                    PARSER_REVISION,
+                    if journal { "opencode:main" } else { "test" }
+                ],
             )
             .unwrap();
         assert_eq!(

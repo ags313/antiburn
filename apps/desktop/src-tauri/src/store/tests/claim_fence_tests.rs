@@ -38,8 +38,8 @@ fn a_pass_from_before_a_clear_cannot_touch_the_new_claim() {
     stale_writer.write_turn_rows(&[turn_row(0)]).unwrap();
 
     clear_and_rediscover(&store, "fence-across-clear");
-    // The stale pass keeps reading, and its next batch lands on the new row.
-    stale_writer.write_turn_rows(&[turn_row(1)]).unwrap();
+    assert!(stale_writer.write_turn_rows(&[turn_row(1)]).is_err());
+    assert_eq!(rows_at(&store, &key, stale.claim_fence), 0);
 
     let current = store
         .claim_next_evidence(&["claude-code"], 101, 300)
@@ -79,12 +79,13 @@ fn rows_from_a_cancelled_pass_before_a_clear_are_not_published() {
     let (record, stale) = claimed_projection(&store, "cancelled-across-clear", 100, 300);
     let key = record.key.clone();
     let stale_writer = FencedTurnRowStore::new(store.clone(), key.clone(), stale.claim_fence);
-
-    clear_and_rediscover(&store, "cancelled-across-clear");
     stale_writer
         .write_turn_rows(&[turn_row(0), turn_row(1)])
         .unwrap();
-    // The worker cancels the stale pass here, without a cleanup.
+
+    clear_and_rediscover(&store, "cancelled-across-clear");
+    assert!(stale_writer.write_turn_rows(&[turn_row(2)]).is_err());
+    assert_eq!(rows_at(&store, &key, stale.claim_fence), 0);
     assert!(!store.renew_evidence_lease(&stale, 102, 300).unwrap());
 
     let current = store
@@ -142,16 +143,16 @@ fn v71_starts_the_fence_counter_above_every_stored_fence() {
             [],
         )
         .unwrap();
-    // A row an abandoned pass left at a higher fence than the evidence row.
-    // The insert lists only columns that exist at version 70.
+    // Use the v70 columns for a row an abandoned pass leaves at a higher fence.
     connection
-        .execute_batch(
-            "INSERT INTO turn (
-                 environment_key, agent, session_id, claim_fence, source_key, thread_id,
-                 turn_index, scope, role, model, input_tokens, cache_read_tokens,
-                 cache_write_tokens, output_tokens, is_compaction_boundary
-             ) VALUES ('native', 'claude-code', 'v71', 9, 'v71', 'v71', 0, 'main',
-                       'assistant', 'claude-sonnet-4-6', 1, 0, 0, 1, 0);",
+        .execute(
+            "INSERT INTO turn (environment_key, agent, session_id, claim_fence,
+                               source_key, thread_id, turn_index, scope, role,
+                               input_tokens, cache_read_tokens, cache_write_tokens,
+                               output_tokens, is_compaction_boundary)
+             VALUES ('native', 'claude-code', 'v71', 9, 'v71', 'v71', 0, 'main',
+                     'assistant', 10, 0, 0, 5, 0)",
+            [],
         )
         .unwrap();
 

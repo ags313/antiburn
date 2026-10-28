@@ -133,6 +133,10 @@ pub struct ToolResultObservation {
     /// Immutable request prefix and source admission. Old payloads stay unavailable.
     #[serde(default)]
     pub context: Option<ToolResultContext>,
+    #[serde(default)]
+    pub outcome: Option<crate::analysis::NativeToolOutcome>,
+    #[serde(default)]
+    pub provider_executed: Option<bool>,
 }
 
 /// Source-proven context at one logical result's first terminal position.
@@ -215,17 +219,25 @@ impl UserMessage {
                 UserMessagePosition::Jsonl { .. },
                 UserMessageOrigin::CodexRetainedUserText
             ) | (
-                SourceFormat::OpenCodeSqliteV2,
+                SourceFormat::OpenCodeSqliteV1,
                 UserMessagePosition::OpenCodeSqlite { .. },
                 UserMessageOrigin::OpenCodeUserText
             ) | (
-                SourceFormat::OpenCodeSqliteV2,
+                SourceFormat::OpenCodeSqliteV1,
                 UserMessagePosition::OpenCodeEvent { .. },
+                UserMessageOrigin::OpenCodeUserText
+            ) | (
+                SourceFormat::OpenCodeSqliteV2,
+                UserMessagePosition::OpenCodeV2Event { .. },
                 UserMessageOrigin::OpenCodeUserText
             ) | (
                 SourceFormat::PiV3Jsonl,
                 UserMessagePosition::Jsonl { .. },
                 UserMessageOrigin::PiUserContent
+            ) | (
+                SourceFormat::CursorIdeComposer,
+                UserMessagePosition::Jsonl { .. },
+                UserMessageOrigin::CursorDesktopUserContent
             )
         );
         let byte_contract_matches = matches!(self.position,
@@ -309,6 +321,8 @@ pub enum UserMessagePosition {
     OpenCodeSqlite { created_at_ms: i64 },
     /// Durable journal position at which the complete native request is visible.
     OpenCodeEvent { sequence: u64 },
+    /// Durable V2 event position at which the delivered request is visible.
+    OpenCodeV2Event { sequence: u64 },
 }
 
 /// Native field pattern that identifies user-slot content without sender attribution.
@@ -322,6 +336,8 @@ pub enum UserMessageOrigin {
     OpenCodeUserText,
     /// Pi's user-role message content, including extension and API messages.
     PiUserContent,
+    /// Cursor Desktop user text from the ordered native bubble list.
+    CursorDesktopUserContent,
 }
 
 /// Native proof that the request belongs to the main session.
@@ -354,6 +370,8 @@ pub enum ToolResultPosition {
     },
     /// Durable per-session OpenCode journal sequence and item order within it.
     OpenCodeEvent { sequence: u64, item_index: u32 },
+    /// Durable per-session OpenCode V2 event sequence and item order.
+    OpenCodeV2Event { sequence: u64, item_index: u32 },
 }
 
 /// The mutation applied to one logical result.
@@ -537,6 +555,7 @@ impl ContentPart {
 
 /// Source authority for one private content part. `Unknown` means the source
 /// did not establish who supplied the text; consumers must not infer it.
+/// A user role does not prove that a human supplied or approved the text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentAuthority {
     User,
@@ -545,6 +564,13 @@ pub enum ContentAuthority {
     Developer,
     Tool,
     Unknown,
+}
+
+/// The producer identifies an accepted request slot, not its human sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserTextOrigin {
+    AcceptedUserSlot,
 }
 
 impl ContentAuthority {
@@ -633,6 +659,7 @@ pub enum EvidenceObservation {
         parent_call_id: Option<String>,
         child_model: Option<String>,
         provenance: RelationProvenance,
+        config_binding: Option<crate::analysis::SubagentConfigBinding>,
     },
     /// A native call result identifies a model used by its child.
     SubagentModel {
@@ -775,9 +802,20 @@ pub struct SessionSummary {
     pub late_tools: Vec<(usize, ToolCall)>,
     pub initial_context: Option<InitialContextBreakdown>,
     pub skill_descriptions: HashMap<String, String>,
+    pub accounting: Option<crate::analysis::SourceAccounting>,
 }
 
 pub trait RecordSink {
+    /// The reader proves that this source is a child of the requested parent.
+    fn source_member(&mut self, _session_id: &str, _label: &str) {}
+
+    /// A database reader starts one native session within its shared snapshot.
+    fn begin_source(&mut self, _session_id: &str) {}
+
+    /// The reader finishes that native session before starting another one.
+    /// The final `finish` call still supplies the inclusive summary.
+    fn source_summary(&mut self, _session_id: &str, _summary: SessionSummary) {}
+
     /// Projection-only consumers can leave journal delivery to its durable reader.
     fn tool_results_requested(&self) -> bool {
         true
@@ -856,6 +894,7 @@ impl SessionCollector {
             }
         }
         Ok(NormalizedSession {
+            accounting: summary.accounting,
             agent: self.agent,
             session_id: self.session_id,
             events: self.events,
@@ -968,6 +1007,7 @@ pub trait SessionReader: Send + Sync {
         let session = self.normalize(input)?;
         let NormalizedSession {
             events,
+            accounting,
             cache_write_tokens_available,
             context_window,
             context_window_source,
@@ -978,6 +1018,7 @@ pub trait SessionReader: Send + Sync {
             sink.record(NormalizedRecord::MetricsEvent(Box::new(event)));
         }
         sink.finish(SessionSummary {
+            accounting,
             cache_write_tokens_available,
             context_window,
             context_window_source,
