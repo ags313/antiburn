@@ -597,13 +597,17 @@ async fn four_native_agents_prepare_publish_and_report_without_invented_authorit
         let prompt = controller
             .copy_prompt_fix_burn_check_target(&store, &target.action_id)
             .unwrap();
-        assert!(prompt.prompt.contains(&format!("Agent: {agent:?}")));
+        assert!(
+            prompt.prompt.contains(&format!("Agent: {agent:?}")),
+            "{agent}: {}",
+            prompt.prompt
+        );
         assert!(
             prompt
                 .prompt
                 .contains("We do not know if it had the same text when the action happened.")
         );
-        assert!(prompt.prompt.contains("Remediation reference: ABR-"));
+        assert!(!prompt.prompt.contains("Remediation reference: ABR-"));
         record.source_fingerprint = Some("native-v2".into());
         record.activity_cursor = "native-v2".into();
         store
@@ -622,12 +626,16 @@ async fn four_native_agents_prepare_publish_and_report_without_invented_authorit
         );
         assert!(stale_evidence.decision_proof.is_none());
         assert!(stale_evidence.items.is_empty());
+        let stale_prompt = controller
+            .copy_prompt_fix_burn_check_target(&store, &target.action_id)
+            .unwrap();
         assert!(
-            controller
-                .copy_prompt_fix_burn_check_target(&store, &target.action_id)
-                .is_err(),
-            "{agent} stale target must not produce a prompt"
+            stale_prompt
+                .prompt
+                .contains("does not establish the selected target"),
+            "{agent} stale target must use inspection-only text"
         );
+        assert!(!stale_prompt.prompt.contains("Remediation reference: ABR-"));
         assert!(
             !store
                 .complete_burn_check_assessment(
