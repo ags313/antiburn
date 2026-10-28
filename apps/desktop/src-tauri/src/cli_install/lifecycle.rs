@@ -313,6 +313,29 @@ fn sync_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn retry_startup(
+    mut operation: impl FnMut() -> Result<()>,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if !matches!(
+                    error.downcast_ref::<std::fs::TryLockError>(),
+                    Some(std::fs::TryLockError::WouldBlock)
+                ) || remaining.is_zero()
+                {
+                    return Err(error);
+                }
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
+            }
+        }
+    }
+}
+
 impl Installation {
     fn stable(&self) -> PathBuf {
         self.root.join("bin").join(file_name())
@@ -491,6 +514,10 @@ impl Installation {
                 diagnostic: diagnostic.or_else(|| Some(error.to_string())),
             },
         }
+    }
+
+    pub fn reconcile_at_startup(&self) -> Result<()> {
+        retry_startup(|| self.reconcile(), std::time::Duration::from_secs(5))
     }
 
     pub fn reconcile(&self) -> Result<()> {
@@ -844,6 +871,82 @@ mod tests {
         drop(guard);
         assert_eq!(f.i.resolve().unwrap().sha256, runtime.sha256);
         f.i.reconcile().unwrap();
+    }
+
+    #[test]
+    fn startup_retries_after_a_concurrent_readiness_lock_is_released() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let f = Fixture::new();
+        let readiness_lock = f.i.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (blocked_tx, blocked_rx) = mpsc::channel();
+            let (released_tx, released_rx) = mpsc::channel();
+            let installation = &f.i;
+            let startup = scope.spawn(move || {
+                let mut attempts = 0;
+                let result = retry_startup(
+                    || {
+                        attempts += 1;
+                        let result = installation.reconcile();
+                        if attempts == 1 {
+                            assert!(result.is_err());
+                            blocked_tx.send(()).unwrap();
+                            released_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        }
+                        result
+                    },
+                    Duration::from_secs(5),
+                );
+                (result, attempts)
+            });
+            blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(!f.i.root.join("receipt.json").exists());
+            drop(readiness_lock);
+            released_tx.send(()).unwrap();
+            let (result, attempts) = startup.join().unwrap();
+            result.unwrap();
+            assert_eq!(attempts, 2);
+        });
+        assert!(f.i.resolve().is_ok());
+        f.i.reconcile_at_startup().unwrap();
+    }
+
+    #[test]
+    fn startup_lock_wait_is_bounded_and_does_not_publish_without_a_lock() {
+        let f = Fixture::new();
+        let _lock = f.i.lock().unwrap();
+        let mut attempts = 0;
+        let result = retry_startup(
+            || {
+                attempts += 1;
+                f.i.reconcile()
+            },
+            std::time::Duration::ZERO,
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+        assert!(!f.i.root.join("receipt.json").exists());
+        assert!(!f.i.stable().exists());
+    }
+
+    #[test]
+    fn startup_does_not_retry_payload_or_ownership_errors() {
+        let f = Fixture::new();
+        fs::write(f.i.payload.join(file_name()), b"corrupt").unwrap();
+        let mut attempts = 0;
+        let error = retry_startup(
+            || {
+                attempts += 1;
+                f.i.reconcile()
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("corrupt"));
+        assert_eq!(attempts, 1);
+        assert!(!f.i.root.join("receipt.json").exists());
     }
 
     #[test]

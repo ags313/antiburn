@@ -36,9 +36,13 @@ recreated, and fresh installations do not create these terminal directories.
 Failed cleanup remains retryable on the next launch or Repair.
 
 An advisory OS file lock serializes startup, Repair, Test, and resolver reads
-across Antiburn processes. Lock contention returns immediately with a retryable
-busy diagnostic. The lock file remains on disk; its lifetime is the OS handle,
-so a crashed process cannot leave a stale held lock.
+across Antiburn processes. Startup reconciliation retries only lock contention
+for up to five seconds, at 50 ms intervals on a background worker, so concurrent
+integration readiness reads do not cancel automatic installation. Ownership,
+payload and other errors are not retried. Interactive operations and resolver
+reads still return immediately with a retryable busy diagnostic. The lock file
+remains on disk; its lifetime is the OS handle, so a crashed process cannot leave
+a stale held lock.
 
 A schema-checked receipt records the fixed product identity, active and pending
 manifests, previous manifest, compatibility export ownership and state. Paths derive

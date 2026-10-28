@@ -49,7 +49,7 @@ pub fn start(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         if let Ok(i) = installation(&app) {
-            let diagnostic = i.reconcile().err().map(|e| e.to_string());
+            let diagnostic = i.reconcile_at_startup().err().map(|e| e.to_string());
             if let Some(error) = &diagnostic {
                 tracing::warn!(event = "cli_installation_unavailable", error = %error);
             }
