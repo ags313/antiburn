@@ -158,11 +158,12 @@ test("reduced motion and failed animation retain a full-bleed accessible poster"
   await expect(media).toHaveAttribute("role", "img")
   await expect(media).toHaveAttribute("aria-label", /.+/)
   const image = media.locator("img")
-  await expect(image).toHaveAttribute("src", /claude-mod-poster/)
+  await expect(image).toHaveAttribute("src", /claude-mod-desktop-dark-no-label-poster/)
   await page.emulateMedia({ reducedMotion: "no-preference" })
-  await expect(image).toHaveAttribute("src", /claude-mod-promo.*\.gif/)
-  await image.dispatchEvent("error")
-  await expect(image).toHaveAttribute("src", /claude-mod-poster/)
+  const darkVideo = media.locator("video")
+  await expect(darkVideo).toHaveCSS("visibility", "visible")
+  await darkVideo.dispatchEvent("error")
+  await expect(image).toHaveAttribute("src", /claude-mod-desktop-dark-no-label-poster/)
   await expect(media.locator("img")).toBeVisible()
   await expect(media.locator("img")).toHaveCSS("object-fit", "cover")
   expect(await media.boundingBox()).toEqual(before)
@@ -273,9 +274,7 @@ for (const reduced of [false, true]) {
   })
 }
 
-test("light v14 video and poster switch together while dark media stays unchanged", async ({
-  page,
-}) => {
+test("label-free videos and posters switch together between themes", async ({ page }) => {
   await page.emulateMedia({ colorScheme: "light" })
   await page.goto(
     "/tests/visual/?surface=main&theme=light&scale=100&state=populated&onboarding=complete",
@@ -283,11 +282,14 @@ test("light v14 video and poster switch together while dark media stays unchange
   const panel = page.locator(".promotion-panel")
   await expect(panel).toBeVisible()
   const video = panel.locator("video")
-  await expect(video).toHaveAttribute("src", /claude-mod-light-v14.*\.mp4/)
-  await expect(video).toHaveAttribute("poster", /claude-mod-light-v14-poster.*\.png/)
+  await expect(video).toHaveAttribute("src", /claude-mod-desktop-light-no-label-800.*\.mp4/)
+  await expect(video).toHaveAttribute(
+    "poster",
+    /claude-mod-desktop-light-no-label-poster.*\.png/,
+  )
   await expect(panel.locator(".promotion-poster")).toHaveAttribute(
     "src",
-    /claude-mod-light-v14-poster.*\.png/,
+    /claude-mod-desktop-light-no-label-poster.*\.png/,
   )
   await expect
     .poll(() => video.evaluate((node: HTMLVideoElement) => node.currentTime))
@@ -303,15 +305,26 @@ test("light v14 video and poster switch together while dark media stays unchange
   await page.evaluate(() => {
     document.documentElement.dataset.theme = "dark"
   })
-  await expect(panel.locator("video")).toHaveCount(0)
-  await expect(panel.locator(".promotion-media img")).toHaveAttribute(
-    "src",
-    /claude-mod-promo.*\.gif/,
+  await expect(video).toHaveAttribute("src", /claude-mod-desktop-dark-no-label-800.*\.mp4/)
+  await expect(video).toHaveAttribute(
+    "poster",
+    /claude-mod-desktop-dark-no-label-poster.*\.png/,
   )
+  await expect(panel.locator(".promotion-poster")).toHaveAttribute(
+    "src",
+    /claude-mod-desktop-dark-no-label-poster.*\.png/,
+  )
+  await expect
+    .poll(() => video.evaluate((node: HTMLVideoElement) => node.currentTime))
+    .toBeGreaterThan(0)
+  await expect(video).toHaveAttribute("loop", "")
   await page.evaluate(() => {
     document.documentElement.dataset.theme = "light"
   })
-  await expect(video).toHaveAttribute("poster", /claude-mod-light-v14-poster.*\.png/)
+  await expect(video).toHaveAttribute(
+    "poster",
+    /claude-mod-desktop-light-no-label-poster.*\.png/,
+  )
   await page.emulateMedia({ reducedMotion: "reduce" })
   await expect(video).toHaveCSS("visibility", "hidden")
   await expect.poll(() => video.evaluate((node: HTMLVideoElement) => node.paused)).toBe(true)
@@ -320,10 +333,11 @@ test("light v14 video and poster switch together while dark media stays unchange
     delete document.documentElement.dataset.theme
   })
   await page.emulateMedia({ colorScheme: "dark" })
-  await expect(panel.locator("video")).toHaveCount(0)
+  await expect(video).toHaveAttribute("src", /claude-mod-desktop-dark-no-label-800.*\.mp4/)
+  await expect(video).toHaveCSS("visibility", "hidden")
   await expect(panel.locator(".promotion-media img")).toHaveAttribute(
     "src",
-    /claude-mod-poster.*\.png/,
+    /claude-mod-desktop-dark-no-label-poster.*\.png/,
   )
 })
 
