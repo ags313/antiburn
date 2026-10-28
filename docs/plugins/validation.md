@@ -48,11 +48,20 @@ artifact; all 26 installed files match, including after reinstall, and removal
 passes. These local transports do not certify hosted delivery.
 
 Scoped formatting and JavaScript lint pass. The lockfile-pinned secret scan
-passes. The full-tree quality command exits 1: score 99 against the required 100,
-with zero errors and 16 warnings, all in unchanged files. This gate remains open;
-no unrelated quality fixes or threshold changes are included. No fresh native
-SDK TypeScript check was run; runtime and type files are unchanged from the
-merged baseline, whose report also left fresh SDK coverage open.
+passes. The initial full-tree quality check failed at 99 against the required 100. Follow-up fixes merge duplicate imports, remove unnecessary spreads,
+make existing hook fallbacks explicit and preserve discovery JSON output without
+console logging. The full-tree gate now passes at 100 with seven warnings and
+zero errors; no thresholds or suppressions changed. The 61 shared-core tests,
+17 CI-runner tests, 267 development tests and scoped shared-core/assembler
+JavaScript type checks pass. The public artifact remains unchanged.
+No fresh native SDK TypeScript check was run; the merged baseline also left
+fresh SDK coverage open.
+
+A disposable hosted candidate-branch installation passes fresh installation,
+already-current update, reinstall and removal. Every installed public file
+matches the immutable 0.2.6 artifact (26 files). This verifies candidate-branch
+delivery, not an older-version hosted upgrade or the permanent main route after
+promotion. The pre-push local upgrade evidence above retains its local scope.
 
 Full native Desktop acceptance of the changed meters remains open: continuous
 resize, 59/60/61-column transitions, both layouts and themes, reduced motion,
