@@ -52,7 +52,7 @@ export function integrationBadge(
   return null
 }
 
-export function integrationDescription(status: IntegrationStatus, name = "your agent"): string {
+function integrationDescription(status: IntegrationStatus, name = "your agent"): string {
   if (status.reason === "development_build")
     return "Integration setup is available in packaged builds."
   if (status.reason === "startup_pending") return "Antiburn is preparing integrations…"
