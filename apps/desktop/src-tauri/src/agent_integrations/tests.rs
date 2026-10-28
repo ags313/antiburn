@@ -2,11 +2,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::discovery::{Profile, Runtime};
+#[cfg(target_os = "macos")]
+use super::IntegrationPhase;
+use super::Vendor;
+#[cfg(target_os = "macos")]
+use super::discovery::Profile;
+use super::discovery::Runtime;
 use super::lifecycle::{Installation, accepted_route, render_config};
 use super::process::NativeRunner;
 use super::transaction;
-use super::{IntegrationPhase, Vendor};
 
 struct Fixture {
     _temp: tempfile::TempDir,
