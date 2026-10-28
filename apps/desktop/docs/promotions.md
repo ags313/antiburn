@@ -1,8 +1,8 @@
 # Bundled desktop promotions
 
 Promotions are bundled content rendered by shared announcement and setup panels.
-They are not fetched from a server. The Claude Mod sidebar launcher is a separate,
-campaign-specific entry point into that shared renderer.
+They are not fetched from a server. An optional YAML `sidebar` block defines a mini panel that opens its enclosing
+promotion through the same shared renderer.
 
 ## YAML schema version 1
 
@@ -16,6 +16,17 @@ revision: 1
 analytics:
   campaign: claude_mod
 title: antiburn Claude Mod
+
+sidebar:
+  title: Claude Mod
+  description: Usage, resets, and pace above your prompt.
+  link_label: Find out more
+  badge: NEW
+  icon: claude-code
+  priority: 0
+  audience:
+    type: detected_agents
+    agents: [claude-code]
 
 screens:
   announcement:
@@ -79,6 +90,7 @@ contain non-whitespace text. Content is plain text, not Markdown or HTML.
 | `title`                | Required; catalog title, separate from each screen's title.                                                                      |
 | `development_only`     | Optional boolean. Production builds exclude definitions marked `true`.                                                           |
 | `analytics`            | Optional mapping containing only `campaign`; currently only `claude_mod` is registered. Omit it for no promotion events.         |
+| `sidebar`              | Optional sidebar mini panel. Requires `title`, `description`, and `audience`; see the sidebar schema below.                      |
 | `screens.announcement` | Required; requires `title` and `description`. Optional `eyebrow`, `media`, `features`, `primary_action`, and `secondary_action`. |
 | `screens.setup`        | Optional; requires `title`, `description`, and a `steps` list. Allows `secondary_action`.                                        |
 | `features[]`           | Requires `icon`, `title`, and `description`. Icons are `gauge` or `clock`.                                                       |
@@ -86,6 +98,38 @@ contain non-whitespace text. Content is plain text, not Markdown or HTML.
 
 The schema permits empty feature and step lists. Keep content short and check the
 fixed panel at small window sizes; validation does not enforce a copy-length budget.
+
+### Sidebar mini-panel schema
+
+Omit `sidebar` for a promotion with no sidebar entry. Its announcement remains
+available to the automatic display flow. When present, `sidebar` accepts only:
+
+| Field         | Contract                                                                                                                                                                                                                                |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `title`       | Required nonempty plain text for the card heading.                                                                                                                                                                                      |
+| `description` | Required nonempty plain text below the heading.                                                                                                                                                                                         |
+| `link_label`  | Optional nonempty plain text appended inline with an arrow. Omission hides both.                                                                                                                                                        |
+| `badge`       | Optional nonempty plain text, such as `NEW`. Omission hides the badge. Viewing, clicking, and restarting do not remove it.                                                                                                              |
+| `icon`        | One optional string: an existing agent slug, such as `claude-code` or `codex`, or the generic value `megaphone`. Defaults to `megaphone`; unknown values are rejected. Icon choice does not restrict the audience.                      |
+| `priority`    | Optional safe integer, including negative values. Defaults to `0`; higher values win.                                                                                                                                                   |
+| `audience`    | Required mapping: `{ type: all }` or `{ type: detected_agents, agents: [claude-code, codex] }`. Detected-agent lists must be nonempty and use known agent slugs; any matching agent qualifies. The `all` variant accepts no agent list. |
+
+Agent slugs come from `AGENT_SLUGS` in `src/lib/presentation/agents.ts`.
+`icon` is a single scalar, not separate agent/generic fields or an asset path.
+A vendor-neutral card can omit its icon and badge:
+
+```yaml
+sidebar:
+  title: A new feature
+  description: Discover what is available.
+  link_label: Find out more
+  priority: 10
+  audience:
+    type: all
+```
+
+This card uses the generic megaphone and qualifies without agent detection.
+A vendor icon is also allowed with `type: all`; targeting is independent of artwork.
 
 ### Actions
 
@@ -168,18 +212,32 @@ Local state belongs to the app profile:
 | `antiburn.promotions.ftue.v1`            | First-run completion time used by the automatic delay.                      |
 | `antiburn.promotions.launcher-opened.v1` | Launcher activation history; does not control the NEW badge.                |
 
-### Claude Mod sidebar entry point
+### Sidebar selection and opening
 
-The card above Settings appears for detected Claude users: Claude sessions,
-installation/sign-in, or Claude Desktop. Pi-only sign-in does not qualify.
-Agent visibility switches do not hide it. Unknown or failed detection without
-other evidence keeps it hidden.
+The sidebar shows one eligible card above Settings. A definition qualifies when it
+has `sidebar` content, is not development-only, and its audience matches. The
+highest `sidebar.priority` wins; ties use ascending promotion ID, independent of
+folder order. A missing or ineligible higher-priority card lets the next eligible
+card appear. If none qualify, no card appears. Selection updates from existing
+session-count and live-detection subscriptions, without additional scans or
+provider refreshes. It does not depend on seen or launcher activation history.
 
-The card opens the existing announcement without changing the selected app view.
-It is hidden during onboarding and becomes available immediately after completion,
-bypassing the automatic delay for deliberate opens. Its NEW badge stays visible
-after clicks, dismissal, and restarts for as long as the card remains available.
-Adding another YAML definition does not create another sidebar card.
+The card opens its enclosing definition's `screens.announcement` by passing that
+definition's top-level `id` to `openFromLauncher`. No separate target or React
+mapping is needed. Adding the next promo with a higher-priority eligible `sidebar`
+block replaces the current card; removing that block reveals the next eligible
+card. Keep titles, badge text, and inline labels short and check narrow windows.
+
+The shipped Claude Mod definition targets `claude-code`. It uses the same shared
+Agents detection: sessions, installation/sign-in, or Claude Desktop. Pi-only
+sign-in does not qualify. Agent visibility switches do not hide it. Unknown or
+failed detection without other evidence keeps it hidden. For agents without a
+provider meter, discovered sessions establish detection.
+
+The card is hidden during onboarding and becomes available immediately after
+completion, bypassing the automatic delay for deliberate opens. It keeps the
+selected app view. Sidebar priority and audience apply only to the card; automatic
+announcement selection, display timing, and seen-state persistence are unchanged.
 
 Pointer opening reveals the panel from the bottom-left corner over 180 ms.
 Keyboard opening is immediate; reduced motion uses a 100 ms fade. Manual dismissal
@@ -220,7 +278,7 @@ and [analytics architecture](../../../docs/analytics.md).
 3. Run the catalog, session, timing, panel, and media tests from `apps/desktop`:
 
    ```sh
-   node node_modules/vitest/vitest.mjs run tests/promotionCatalog.test.ts src/lib/promotions/PromotionSession.test.ts src/lib/promotions/PromotionTiming.test.ts src/components/promotions/PromotionPanel.test.tsx src/components/promotions/PromotionMedia.test.tsx
+   node node_modules/vitest/vitest.mjs run tests/promotionCatalog.test.ts src/lib/promotions/PromotionSession.test.ts src/lib/promotions/PromotionTiming.test.ts src/components/promotions/PromotionPanel.test.tsx src/components/promotions/PromotionMedia.test.tsx src/components/promotions/PromotionLauncher.test.tsx
    node node_modules/@playwright/test/cli.js test --config tests/visual/promotions.config.ts
    ```
 

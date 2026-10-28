@@ -1647,12 +1647,16 @@ The main-window promotion panel uses a 320 × 440 logical-pixel frame in both
 announcement and setup views. It sits 8px from the left and bottom window edges,
 covering the sidebar footer while open. The covered footer stays hidden and leaves
 the tab order until the panel closes. Settings remains below the footer separator.
-Detected Claude users have a Claude Mod card above the Settings separator.
+One YAML-defined promo card appears above the Settings separator when its audience
+matches. Highest priority wins, with ascending promotion ID as the tie-breaker.
+The shipped Claude Mod card targets detected Claude users.
 Use `rounded-popover`, `surface-card`, `space-md` padding and `space-xs` between
-its content rows. The header uses a 14px orange Claude mark, a `type-body font-medium`
-label and a neutral NEW badge. The `type-caption` subtitle uses `label-secondary`
+its content rows. The header uses a 14px icon, a `type-body font-medium` label,
+and an optional neutral badge. YAML `icon` accepts an agent slug or `megaphone`;
+omission uses the generic megaphone in secondary ink. The Claude mark keeps its
+orange. Let the heading wrap within the card. The `type-caption` subtitle uses `label-secondary`
 and wraps naturally: Usage, resets, and pace above your prompt.
-Keep this in one text block. Append Find out more with a 12px right arrow inline,
+Keep this in one text block. Append the optional YAML link label with a 12px right arrow inline,
 using `font-medium`, secondary `label-secondary` ink and a `space-xs` label-to-icon gap. Keep the
 affordance label and arrow together as the description wraps.
 Keep it inside the single card button. Use `space-md` between the card and separator
@@ -1671,7 +1675,7 @@ standard keyboard focus. NEW uses `type-caption`, `rounded-control`,
 `surface-secondary` and `label-secondary`, with a `space-lg` (16px) height.
 Keep the header and subtitle clear of clipping.
 Hide the launcher during FTUE; allow manual opening after completion while preserving
-the automatic cooldown. The NEW badge remains visible until the promo card is removed.
+the automatic cooldown. A configured badge remains visible while its card is available; omission hides it.
 Keep the action after activation. Restore focus to it after manual dismissal.
 What’s new is reserved for recent changes. Small windows constrain the frame and scroll only
 its content. The media cell uses a 32:15 ratio (150px tall at the default width) and bottom-aligned cover fitting.

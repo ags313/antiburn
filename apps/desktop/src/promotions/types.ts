@@ -45,6 +45,16 @@ export type PromotionSetup = {
   secondary_action?: PromotionAction
 }
 
+export type PromotionSidebar = {
+  title: string
+  description: string
+  link_label?: string
+  badge?: string
+  icon: string
+  priority: number
+  audience: { type: "all" } | { type: "detected_agents"; agents: string[] }
+}
+
 export type PromotionDefinition = {
   schema_version: 1
   id: string
@@ -52,6 +62,7 @@ export type PromotionDefinition = {
   title: string
   development_only?: boolean
   analytics?: { campaign: PromotionCampaign }
+  sidebar?: PromotionSidebar
   screens: {
     announcement: PromotionAnnouncement
     setup?: PromotionSetup

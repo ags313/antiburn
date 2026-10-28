@@ -1,5 +1,6 @@
 import { parseDocument } from "yaml"
 import { isAllowedPromotionUrl } from "./links"
+import { AGENT_SLUGS } from "../lib/presentation/agents"
 
 import type {
   PromotionAction,
@@ -7,6 +8,7 @@ import type {
   PromotionFeature,
   PromotionMedia,
   PromotionSetup,
+  PromotionSidebar,
   PromotionStep,
 } from "./types"
 
@@ -186,11 +188,71 @@ function optionalAction(
   return entry[key] === undefined ? undefined : action(entry[key], `${location}.${key}`)
 }
 
+function agentSlug(value: unknown, location: string): string {
+  const slug = text(value, location)
+  if (!AGENT_SLUGS.includes(slug)) fail(location, "expected a known agent slug")
+  return slug
+}
+
+function sidebarAudience(value: unknown): PromotionSidebar["audience"] {
+  const location = "sidebar.audience"
+  const entry = object(value, location, ["type", "agents"], ["type"])
+  if (entry.type === "all") {
+    object(value, location, ["type"], ["type"])
+    return { type: "all" }
+  }
+  if (entry.type !== "detected_agents")
+    fail(`${location}.type`, "expected all or detected_agents")
+  if (!Array.isArray(entry.agents) || entry.agents.length === 0)
+    fail(`${location}.agents`, "expected a non-empty list of known agent slugs")
+  return {
+    type: "detected_agents",
+    agents: entry.agents.map((agent, index) =>
+      agentSlug(agent, `${location}.agents[${index}]`),
+    ),
+  }
+}
+
+function parseSidebar(value: unknown): PromotionSidebar {
+  const entry = object(
+    value,
+    "sidebar",
+    ["title", "description", "link_label", "badge", "icon", "priority", "audience"],
+    ["title", "description", "audience"],
+  )
+  const priority = entry.priority === undefined ? 0 : entry.priority
+  if (!Number.isSafeInteger(priority)) fail("sidebar.priority", "expected a safe integer")
+  const icon =
+    entry.icon === undefined || entry.icon === "megaphone"
+      ? "megaphone"
+      : agentSlug(entry.icon, "sidebar.icon")
+  return {
+    title: text(entry.title, "sidebar.title"),
+    description: text(entry.description, "sidebar.description"),
+    ...(entry.link_label === undefined
+      ? {}
+      : { link_label: text(entry.link_label, "sidebar.link_label") }),
+    ...(entry.badge === undefined ? {} : { badge: text(entry.badge, "sidebar.badge") }),
+    icon,
+    priority: priority as number,
+    audience: sidebarAudience(entry.audience),
+  }
+}
+
 export function validatePromotionDefinition(value: unknown): PromotionDefinition {
   const root = object(
     value,
     "root",
-    ["schema_version", "id", "revision", "title", "development_only", "analytics", "screens"],
+    [
+      "schema_version",
+      "id",
+      "revision",
+      "title",
+      "development_only",
+      "analytics",
+      "sidebar",
+      "screens",
+    ],
     ["schema_version", "id", "revision", "title", "screens"],
   )
   if (root.schema_version !== 1) fail("schema_version", "only version 1 is supported")
@@ -312,6 +374,7 @@ export function validatePromotionDefinition(value: unknown): PromotionDefinition
     title: text(root.title, "title"),
     ...(root.development_only === undefined ? {} : { development_only: root.development_only }),
     ...(analytics ? { analytics } : {}),
+    ...(root.sidebar === undefined ? {} : { sidebar: parseSidebar(root.sidebar) }),
     screens: { announcement, ...(setup ? { setup } : {}) },
   }
 }

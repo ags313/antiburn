@@ -5,6 +5,17 @@ analytics:
   campaign: claude_mod
 title: antiburn Claude Mod
 
+sidebar:
+  title: Claude Mod
+  description: Usage, resets, and pace above your prompt.
+  link_label: Find out more
+  badge: NEW
+  icon: claude-code
+  priority: 0
+  audience:
+    type: detected_agents
+    agents: [claude-code]
+
 screens:
   announcement:
     eyebrow: Now available

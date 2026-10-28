@@ -261,3 +261,83 @@ it("preserves content that resembles an internal asset binding", async () => {
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+describe("promotion sidebar schema", () => {
+  const sidebar = {
+    title: "New feature",
+    description: "A feature for everyone.",
+    audience: { type: "all" },
+  }
+
+  it("keeps sidebar-free definitions compatible and normalizes sidebar defaults", () => {
+    expect(validatePromotionDefinition(baseDefinition()).sidebar).toBeUndefined()
+    expect(validatePromotionDefinition(baseDefinition({ sidebar })).sidebar).toEqual({
+      ...sidebar,
+      icon: "megaphone",
+      priority: 0,
+    })
+  })
+
+  it.each(["megaphone", "claude-code", "codex", "cursor"])(
+    "accepts the single icon value %s independently of audience",
+    (icon) => {
+      expect(
+        validatePromotionDefinition(baseDefinition({ sidebar: { ...sidebar, icon } })).sidebar
+          ?.icon,
+      ).toBe(icon)
+    },
+  )
+
+  it("accepts agent targeting, optional copy, and negative priority", () => {
+    const configured = {
+      ...sidebar,
+      icon: "megaphone",
+      badge: "NEW",
+      link_label: "Explore",
+      priority: -10,
+      audience: { type: "detected_agents", agents: ["claude-code", "codex"] },
+    }
+    expect(
+      validatePromotionDefinition(baseDefinition({ sidebar: configured })).sidebar,
+    ).toEqual(configured)
+  })
+
+  it.each([
+    ["unknown field", { ...sidebar, target: "other" }],
+    ["missing audience", { title: "Title", description: "Description" }],
+    ["missing title", { description: "Description", audience: { type: "all" } }],
+    ["blank description", { ...sidebar, description: " " }],
+    ["blank badge", { ...sidebar, badge: " " }],
+    ["blank link label", { ...sidebar, link_label: " " }],
+    ["unknown icon", { ...sidebar, icon: "unknown-agent" }],
+    ["nested icon", { ...sidebar, icon: { agent: "claude-code" } }],
+    ["fractional priority", { ...sidebar, priority: 1.5 }],
+    ["unsafe priority", { ...sidebar, priority: Number.MAX_SAFE_INTEGER + 1 }],
+    ["string priority", { ...sidebar, priority: "10" }],
+    ["null priority", { ...sidebar, priority: null }],
+    ["unknown audience", { ...sidebar, audience: { type: "unknown" } }],
+    [
+      "agents on all audience",
+      { ...sidebar, audience: { type: "all", agents: ["claude-code"] } },
+    ],
+    ["empty agent audience", { ...sidebar, audience: { type: "detected_agents", agents: [] } }],
+    ["missing agent list", { ...sidebar, audience: { type: "detected_agents" } }],
+    [
+      "unknown agent",
+      { ...sidebar, audience: { type: "detected_agents", agents: ["unknown"] } },
+    ],
+    ["unknown audience field", { ...sidebar, audience: { type: "all", surprise: true } }],
+  ])("rejects %s", (_label, value) => {
+    expect(() => validatePromotionDefinition(baseDefinition({ sidebar: value }))).toThrow(
+      "sidebar",
+    )
+  })
+
+  it("includes the production sidebar in the generated catalog", async () => {
+    const module = await generatePromotionModule({ production: true })
+    expect(module.code).toContain('"sidebar":{"title":"Claude Mod"')
+    expect(module.code).toContain(
+      '"audience":{"type":"detected_agents","agents":["claude-code"]}',
+    )
+  })
+})

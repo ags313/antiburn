@@ -5,7 +5,7 @@ import { flushSync } from "react-dom"
 import promotionCatalog from "virtual:promotions"
 import { PromotionSession } from "../lib/promotions/PromotionSession"
 import { promotionEnvironment } from "../lib/promotions/promotionEnvironment"
-import { ClaudeModLauncher } from "../components/promotions/ClaudeModLauncher"
+import { PromotionLauncher } from "../components/promotions/PromotionLauncher"
 import { PromotionHost } from "../components/promotions/PromotionHost"
 
 import { SidebarNav, type SidebarNavItem } from "../components/ui/SidebarNav"
@@ -322,7 +322,7 @@ export function MainWindowView({ sections }: { sections?: readonly MainWindowSec
             className="main-window-sidebar min-h-0 flex-1"
             beforeFooter={
               !sections && !onboardingBlocked ? (
-                <ClaudeModLauncher
+                <PromotionLauncher
                   session={promotionSession}
                   onOpen={closeNavigation}
                   buttonRef={promotionLauncherRef}

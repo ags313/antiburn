@@ -410,8 +410,18 @@ paths, identifiers, exact tokens, or exact costs.
 See the [promotion authoring guide](docs/promotions.md) for the YAML schema,
 actions, media rules, display lifecycle, analytics, and verification workflow.
 
-Promotions appear automatically. Detected Claude users also have a **Claude Mod**
-card above the sidebar’s Settings separator. It uses the same detection as Settings →
+Promotions appear automatically. An optional YAML `sidebar` block supplies a
+mini panel above Settings. The generic launcher shows one audience-matching,
+non-development promotion: highest priority first, then ascending promotion ID.
+Card copy, optional badge/link label, icon, priority, and audience come from YAML.
+The single optional `icon` string accepts existing agent slugs or `megaphone`
+(the default); artwork and audience are independent. Audiences support everyone
+or any specified detected agent. Clicking opens the enclosing promotion by ID.
+Definitions without `sidebar` create no card. A future eligible promo with higher
+priority replaces the current card without React changes. Sidebar selection does
+not change automatic announcement selection or timing.
+
+The shipped Claude Mod card targets detected Claude users. It uses the same detection as Settings →
 Agents: Claude sessions, installation/sign-in, or Claude Desktop; a Pi-only login does not qualify.
 Agent visibility switches do not hide the action. Unknown or failed detection without
 other evidence keeps it hidden. The action opens the Claude Mod announcement directly,
