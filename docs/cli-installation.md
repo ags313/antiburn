@@ -73,6 +73,9 @@ and replacement/removal. Only Antiburn writers participate in the advisory lock.
 
 On POSIX, redirected ancestors, other-user ownership, and group/other write access
 are rejected (root-owned platform ancestors and sticky temporary roots are allowed).
+The desktop creates new app-data directories with mode `0700`, including under a
+group-writable umask such as `002`. Existing directory permissions are preserved;
+an existing insecure ancestor still requires the user to correct its policy.
 macOS rejects extended ACLs on managed destinations; Linux rejects extended POSIX
 ACLs. Existing policy is preserved rather than relaxed. On Windows, reparse points,
 other-user ownership, readonly files, protected/unsupported ACLs and unrelated write

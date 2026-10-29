@@ -964,6 +964,20 @@ mod tests {
     }
 
     #[test]
+    fn state_reports_current_resolution_after_lock_contention() {
+        let f = Fixture::new();
+        f.i.reconcile().unwrap();
+        let lock = f.i.lock().unwrap();
+        let busy = f.i.state(None);
+        assert!(busy.runtime.is_none());
+        assert!(busy.diagnostic.unwrap().contains("busy"));
+        drop(lock);
+        let ready = f.i.state(None);
+        assert!(ready.runtime.is_some());
+        assert!(ready.diagnostic.is_none());
+    }
+
+    #[test]
     fn altered_receipt_or_immutable_bytes_cannot_authorize_runtime() {
         let f = Fixture::new();
         f.i.reconcile().unwrap();

@@ -55,13 +55,9 @@ pub fn start(app: &tauri::AppHandle) {
 
 #[tauri::command]
 pub async fn get_cli_install_state(app: tauri::AppHandle) -> Result<CliInstallState, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let i = installation(&app)?;
-        let diagnostic = resolve_cli(&app).err();
-        Ok(i.state(diagnostic))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || Ok(installation(&app)?.state(None)))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

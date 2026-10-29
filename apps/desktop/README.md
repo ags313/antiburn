@@ -406,8 +406,9 @@ as its default. Each window owns one surface until the shell releases it.
 ## CLI runtime
 
 Distribution builds package and automatically stage a durable per-user `antiburn-cli`.
-General → Command line reports runtime and terminal export status and offers Repair
-and Remove terminal command. Shell PATH setup stays separate. See the
+Settings → CLI reports runtime status and offers Test, Repair, and a copyable
+location under Technical details. The app does not publish a terminal command or
+change PATH. See the
 [CLI ownership and acceptance contract](../../docs/cli-installation.md).
 
 ## Known gaps
