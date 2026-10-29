@@ -1296,10 +1296,11 @@ describe("SettingsView — window chrome", () => {
   it("keeps CLI in its own release-visible pane and routes search to Details", async () => {
     render(<SettingsView />)
     await screen.findByRole("switch", { name: "Start at login" })
-    expect(screen.queryByText("antiburn-cli")).not.toBeInTheDocument()
+    expect(screen.queryByText("Antiburn CLI")).not.toBeInTheDocument()
     expect(INFO.debugBuild).toBe(false)
     fireEvent.click(screen.getByRole("tab", { name: "CLI" }))
     expect(await screen.findByRole("heading", { name: "CLI" })).toBeInTheDocument()
+    expect(screen.getByText("Antiburn CLI")).toBeInTheDocument()
     expect(screen.queryByRole("switch", { name: "Start at login" })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole("tab", { name: "General" }))
     emit("settings:pane", "cli#cliCommand")

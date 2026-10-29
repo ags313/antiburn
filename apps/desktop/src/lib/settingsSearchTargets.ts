@@ -5,8 +5,8 @@ import { isSettingsPane, type SettingsPane } from "./settingsPanes"
 export const SETTINGS_SEARCH_TARGETS = {
   cliCommand: {
     pane: "cli",
-    label: "antiburn-cli",
-    aliases: ["CLI", "internal runtime", "test CLI", "repair CLI"],
+    label: "Antiburn CLI",
+    aliases: ["CLI", "antiburn-cli", "internal runtime", "test CLI", "repair CLI"],
   },
   trayIcon: {
     pane: "general",
