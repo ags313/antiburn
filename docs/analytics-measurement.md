@@ -1203,8 +1203,9 @@ arbitrary payload properties.
   only after capabilities validation. No arbitrary failure reasons or new wire
   properties enter the payload.
 - **Privacy and rollout:** Existing consent, disabled-build, endpoint, identity
-  rotation and delivery rules apply. No paths, versions, digests, session IDs,
-  output or diagnostic strings are sent. Reports begin with the first shipping
+  rotation and delivery rules apply. This event adds no CLI paths, CLI versions,
+  payload digests, command output or diagnostic strings. Standard analytics envelope
+  fields still apply. Reports begin with the first shipping
   build containing this producer; earlier Settings views are not a baseline for
   installation success. Validate fixed payloads, completed success/failure paths,
   no-analytics builds, opt-out gates and the event catalog contract.

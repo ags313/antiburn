@@ -266,7 +266,9 @@ event catalog before release.
 ### Private CLI operation outcomes
 
 Anonymised analytics may record completion of automatic CLI startup reconciliation
-and explicit Test or Repair. The event carries only the fixed operation
-(`startup`, `test`, `repair`) and outcome (`succeeded`, `failed`). It contains no
-paths, CLI versions, hashes, session identifiers, command output or diagnostic
-messages. Existing analytics opt-out and build configuration gates apply.
+and explicit Test or Repair. The event adds only the fixed operation
+(`startup`, `test`, `repair`) and outcome (`succeeded`, `failed`). It adds no
+CLI paths, CLI versions, payload digests, command output or diagnostic messages.
+Standard analytics envelope fields still apply, including the app version and
+random installation and analytics-session identifiers. Existing analytics opt-out
+and build configuration gates apply.
