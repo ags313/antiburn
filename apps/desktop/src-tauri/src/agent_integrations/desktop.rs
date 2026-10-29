@@ -18,6 +18,14 @@ struct Controller {
     pending: AtomicBool,
 }
 
+struct RunningGuard<'a>(&'a AtomicBool);
+
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 fn unavailable(reason: &str) -> Vec<IntegrationStatus> {
     Vendor::ALL
         .into_iter()
@@ -62,6 +70,7 @@ fn request_reconcile(app: &tauri::AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
         let controller = app.state::<Controller>();
         loop {
+            let running = RunningGuard(&controller.running);
             controller.pending.store(false, Ordering::Release);
             let started = Instant::now();
             let cli = loop {
@@ -78,7 +87,7 @@ fn request_reconcile(app: &tauri::AppHandle) {
             if let Ok(mut snapshot) = controller.statuses.lock() {
                 *snapshot = statuses;
             }
-            controller.running.store(false, Ordering::Release);
+            drop(running);
             let _ = app.emit_to("settings", "agent-integrations:changed", ());
             if !controller.pending.load(Ordering::Acquire)
                 || controller.running.swap(true, Ordering::AcqRel)
@@ -168,6 +177,7 @@ pub async fn get_agent_integrations(
                 .map(|snapshot| snapshot.clone())
                 .map_err(|_| "Integration status is unavailable.".to_owned());
         }
+        let running = RunningGuard(&controller.running);
         let cli = (controller.resolver)(&app).ok();
         let result = reconcile(&app, cli.as_ref(), Some(Action::Inspect));
         if let Ok(statuses) = &result
@@ -175,7 +185,7 @@ pub async fn get_agent_integrations(
         {
             *snapshot = statuses.clone();
         }
-        controller.running.store(false, Ordering::Release);
+        drop(running);
         if controller.pending.load(Ordering::Acquire) {
             request_reconcile(&app);
         }
@@ -196,6 +206,7 @@ async fn change(app: tauri::AppHandle, action: Action) -> Result<Vec<Integration
         if controller.running.swap(true, Ordering::AcqRel) {
             return Err("Integration setup is already running.".into());
         }
+        let running = RunningGuard(&controller.running);
         let cli = (controller.resolver)(&app).ok();
         let result = reconcile(&app, cli.as_ref(), Some(action));
         if let Ok(statuses) = &result
@@ -203,7 +214,7 @@ async fn change(app: tauri::AppHandle, action: Action) -> Result<Vec<Integration
         {
             *snapshot = statuses.clone();
         }
-        controller.running.store(false, Ordering::Release);
+        drop(running);
         let _ = app.emit_to("settings", "agent-integrations:changed", ());
         if controller.pending.load(Ordering::Acquire) {
             request_reconcile(&app);
@@ -229,4 +240,22 @@ pub async fn remove_agent_integration(
     vendor: Vendor,
 ) -> Result<Vec<IntegrationStatus>, String> {
     change(app, Action::Remove(vendor)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn running_flag_is_released_when_a_task_panics() {
+        let running = AtomicBool::new(true);
+        let result = std::panic::catch_unwind(|| {
+            let _running = RunningGuard(&running);
+            panic!("fixture task panic");
+        });
+        assert!(result.is_err());
+        assert!(!running.swap(true, Ordering::AcqRel));
+        drop(RunningGuard(&running));
+        assert!(!running.load(Ordering::Acquire));
+    }
 }

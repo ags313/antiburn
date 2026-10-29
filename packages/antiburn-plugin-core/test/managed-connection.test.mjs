@@ -198,3 +198,41 @@ test('desktop payload contains only complete runtime adapters, without public Cl
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('desktop assembly rejects a missing or repeated managed marker before publishing', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'antiburn-managed-marker-')))
+  try {
+    await mkdir(join(root, 'scripts'))
+    await mkdir(join(root, 'packages/antiburn-plugin-core'), { recursive: true })
+    await writeFile(
+      join(root, 'scripts/assemble-agent-integrations.mjs'),
+      await readFile(
+        new URL('../../../scripts/assemble-agent-integrations.mjs', import.meta.url),
+      ),
+    )
+    for (const name of [
+      'core.mjs',
+      'discovery.mjs',
+      'probe.mjs',
+      'session-checks.mjs',
+      'session-checks-validation.mjs',
+      'native-hook.mjs',
+    ])
+      await writeFile(join(root, 'packages/antiburn-plugin-core', name), 'export {}')
+    const { assembleAgentIntegrations: assemble } = await import(
+      pathToFileURL(join(root, 'scripts/assemble-agent-integrations.mjs'))
+    )
+    const marker = 'const MANAGED_BY_DESKTOP = false'
+    for (const source of ['const MANAGED_BY_DESKTOP=false', `${marker}\n${marker}`]) {
+      await writeFile(
+        join(root, 'packages/antiburn-plugin-core/managed-connection.mjs'),
+        source,
+      )
+      const output = join(root, 'payload')
+      await assert.rejects(assemble(output), /Expected exactly one desktop managed marker/)
+      await assert.rejects(readFile(join(output, 'manifest.json')), { code: 'ENOENT' })
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

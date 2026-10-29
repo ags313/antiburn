@@ -2,7 +2,10 @@ import { fireEvent, render, screen, within } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest"
 
 import type { IntegrationPhase, IntegrationStatus } from "../../../../lib/agentIntegrationsIpc"
-import { integrationBadge } from "../../../settings/AgentConnectionDetails"
+import {
+  AgentConnectionDetails,
+  integrationBadge,
+} from "../../../settings/AgentConnectionDetails"
 import { AgentSettingsList, type AgentSettingsRow } from "./AgentSettingsList"
 
 const status: IntegrationStatus = {
@@ -305,6 +308,22 @@ describe("expanded Agents rows", () => {
 })
 
 describe("integration badge semantics", () => {
+  it("explains automatic updates for a missing runtime without an unavailable refresh action", () => {
+    render(
+      <AgentConnectionDetails
+        status={{ ...status, phase: "unavailable", reason: "managed_cli_unavailable" }}
+        name="Codex"
+        busy={false}
+        shared={false}
+        onOpenCli={vi.fn()}
+        onFocusIntegration={vi.fn()}
+      />,
+    )
+    expect(
+      screen.getByText(/Repair it in CLI settings. This status updates automatically./),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Refresh status" })).not.toBeInTheDocument()
+  })
   it.each<[IntegrationPhase, boolean, string | null]>([
     ["registered", true, "success"],
     ["active", true, "success"],

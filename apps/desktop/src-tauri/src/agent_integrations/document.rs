@@ -246,6 +246,16 @@ pub fn remove(bytes: &[u8], delta: &Delta) -> Result<Vec<u8>> {
         return Err("owned_entry_changed");
     }
     let mut output = bytes.to_vec();
+    if !delta.inserted.ends_with(',') {
+        let mut parser = Parser {
+            bytes,
+            index: start + inserted.len(),
+        };
+        parser.space()?;
+        if bytes.get(parser.index) == Some(&b',') {
+            output.remove(parser.index);
+        }
+    }
     output.drain(start..start + inserted.len());
     parse(&output)?;
     Ok(output)
@@ -369,6 +379,32 @@ mod tests {
             r#"{"hooks":{"test":[]},"unrelated":false}"#
         );
         assert!(remove(updated.replace("owned", "changed").as_bytes(), &delta).is_err());
+    }
+
+    #[test]
+    fn removal_preserves_siblings_added_after_an_initially_sole_entry() {
+        let (array, delta) = append(
+            br#"{"hooks":{"test":[]}}"#,
+            &["hooks".into(), "test".into()],
+            serde_json::json!({"command":"owned"}),
+        )
+        .unwrap();
+        let array = String::from_utf8(array).unwrap().replace(
+            "]}",
+            " /* keep before */ , // keep after\n{\"command\":\"user\"}]}",
+        );
+        assert_eq!(
+            String::from_utf8(remove(array.as_bytes(), &delta).unwrap()).unwrap(),
+            "{\"hooks\":{\"test\":[ /* keep before */  // keep after\n{\"command\":\"user\"}]}}"
+        );
+        let (object, delta) = insert_member(b"{}", "owned", Value::Bool(true)).unwrap();
+        let object = String::from_utf8(object)
+            .unwrap()
+            .replace("}", " /* keep before */ , // keep after\n\"user\":true}");
+        assert_eq!(
+            String::from_utf8(remove(object.as_bytes(), &delta).unwrap()).unwrap(),
+            "{ /* keep before */  // keep after\n\"user\":true}"
+        );
     }
 
     #[test]

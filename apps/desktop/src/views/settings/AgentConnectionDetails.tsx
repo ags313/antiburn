@@ -59,7 +59,7 @@ function integrationDescription(status: IntegrationStatus, name = "your agent"):
   if (status.reason === "compatible_node_22_required")
     return "Antiburn needs Node.js 22 or later. Install it, then reopen Antiburn."
   if (status.reason === "managed_cli_unavailable")
-    return "Antiburn’s internal runtime is unavailable. Repair it in CLI settings, then refresh."
+    return "Antiburn’s internal runtime is unavailable. Repair it in CLI settings. This status updates automatically."
   if (status.phase === "unavailable" && status.reason === "setup_not_registered")
     return `Antiburn integration hasn’t been set up for ${name}. Reopen Antiburn to retry automatic setup.`
   switch (status.phase) {

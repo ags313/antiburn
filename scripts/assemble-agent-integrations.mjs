@@ -80,11 +80,12 @@ export async function assembleAgentIntegrations(output = defaultOutput) {
     'managed-connection.mjs',
   ]) {
     let contents = await read(`packages/antiburn-plugin-core/${name}`)
-    if (name === 'managed-connection.mjs')
-      contents = contents.replace(
-        'const MANAGED_BY_DESKTOP = false',
-        'const MANAGED_BY_DESKTOP = true',
-      )
+    if (name === 'managed-connection.mjs') {
+      const marker = 'const MANAGED_BY_DESKTOP = false'
+      if (contents.split(marker).length !== 2)
+        throw new Error('Expected exactly one desktop managed marker')
+      contents = contents.replace(marker, 'const MANAGED_BY_DESKTOP = true')
+    }
     for (const vendor of ['claude', 'codex', 'cursor', 'opencode', 'pi'])
       add(`${vendor}/lib/${name}`, contents)
   }
