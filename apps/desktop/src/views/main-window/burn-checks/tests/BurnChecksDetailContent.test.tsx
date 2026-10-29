@@ -80,7 +80,7 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
   ] as const
 
   it.each(smartChecks)(
-    "classifies the %s batch prompt without serializing target metadata",
+    "classifies the %s check prompt without serializing target metadata",
     async (detector, check) => {
       render(
         <CheckPromptAction
@@ -91,7 +91,8 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
       )
       fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
       await screen.findByRole("button", { name: "Copied" })
-      expect(commands.copyBatch).toHaveBeenCalledWith([target.actionId])
+      expect(commands.copyFallback).toHaveBeenCalledWith(detector)
+      expect(commands.copyBatch).not.toHaveBeenCalled()
       expect(commands.noteInteraction.mock.calls).toEqual([
         [{ kind: "burnCheckPromptPrepared", check, outcome: "ready" }],
         [{ kind: "burnCheckPromptCopied", check }],
@@ -133,7 +134,7 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
   })
 
   it.each(smartChecks)(
-    "classifies %s prompt preparation and only its first clipboard success",
+    "classifies each %s prompt preparation and successful clipboard write",
     async (detector, check) => {
       const surfaces = ["check", "target"] as const
       for (const surface of surfaces) {
@@ -169,8 +170,11 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
         expect(commands.writeClipboardText).toHaveBeenCalledTimes(3)
         expect(
           surface === "check" ? commands.copyFallback : commands.copy,
-        ).toHaveBeenCalledOnce()
+        ).toHaveBeenCalledTimes(3)
         expect(commands.noteInteraction.mock.calls).toEqual([
+          [{ kind: "burnCheckPromptPrepared", check, outcome: "ready" }],
+          [{ kind: "burnCheckPromptPrepared", check, outcome: "ready" }],
+          [{ kind: "burnCheckPromptCopied", check }],
           [{ kind: "burnCheckPromptPrepared", check, outcome: "ready" }],
           [{ kind: "burnCheckPromptCopied", check }],
         ])
@@ -621,8 +625,8 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
     expect(snooze.compareDocumentPosition(fix) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
     expect(fix.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
     fireEvent.click(action)
-    await waitFor(() => expect(commands.copyBatch).toHaveBeenCalledWith(["action-fresh"]))
-    expect(commands.writeClipboardText).toHaveBeenCalledWith("Batch backend prompt")
+    await waitFor(() => expect(commands.copyFallback).toHaveBeenCalledWith("oldModelUsage"))
+    expect(commands.writeClipboardText).toHaveBeenCalledWith("Inspect representative evidence.")
     expect(screen.getByRole("region", { name: "Burn check details" })).toHaveTextContent(
       "1 failed · 2 passed",
     )
@@ -663,7 +667,7 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
     expect(watermarks?.querySelector('[data-agent-icon="codex"]')).toBeInTheDocument()
   })
 
-  it("includes all listed targets in a large check prompt", async () => {
+  it("requests the current whole-check prompt instead of rendered target handles", async () => {
     const targets = Array.from({ length: 13 }, (_, index) => ({
       ...target,
       findingId: `finding-${index}`,
@@ -673,11 +677,8 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Copy fix prompt" }))
 
-    await waitFor(() =>
-      expect(commands.copyBatch).toHaveBeenCalledWith(
-        Array.from({ length: 13 }, (_, index) => `action-${index}`),
-      ),
-    )
+    await waitFor(() => expect(commands.copyFallback).toHaveBeenCalledWith("oldModelUsage"))
+    expect(commands.copyBatch).not.toHaveBeenCalled()
   })
 
   it("shows session cards with authoritative impact and project identity", async () => {

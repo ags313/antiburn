@@ -15,6 +15,7 @@ mod opencode_v2_subagent_tests;
 mod opencode_v2_tests;
 #[cfg(test)]
 mod opencode_v2_watch_tests;
+mod prompts;
 mod recovery;
 mod scope_evidence;
 mod stored;
@@ -1460,33 +1461,8 @@ impl RemediationController {
         store: &Store,
         action_id: &str,
     ) -> Result<PromptFixResult, ControllerError> {
-        let now = now_epoch();
-        let target = self.cached_target(store, action_id, now)?;
-        self.revalidate(&target)?;
-        let base_prompt = remediation_prompt(target.finding())
-            .map_err(ControllerError::PromptUnavailable)?
-            .into_string();
-        let paths = representative_paths(
-            store,
-            target.findings.iter().map(|finding| {
-                SessionKey::new(
-                    finding.environment_key.as_str(),
-                    finding.agent.as_str(),
-                    finding.session_id.as_str(),
-                )
-            }),
-        )?;
-        let (reference, prompt_group_id) =
-            self.prompt_reference_for_targets(store, std::slice::from_ref(&target))?;
-        let prompt = prompt_with_evidence_paths(&base_prompt, &paths, Some(&reference))
-            .map_err(ControllerError::PromptUnavailable)?;
-        let (watches, prompt) = self.persist_prompt_watches(
-            store,
-            std::slice::from_ref(&target),
-            prompt_group_id.as_deref(),
-            &prompt,
-            now,
-        )?;
+        let target = self.cached_target(store, action_id, now_epoch())?;
+        let (watches, prompt) = self.copy_current_prompt_for_cached_targets(store, &[target])?;
         let watch = watches
             .into_iter()
             .next()
@@ -2072,69 +2048,6 @@ impl RemediationController {
         })
     }
 
-    pub fn copy_prompt_fix_burn_check(
-        &self,
-        store: &Store,
-        detector: DetectorId,
-        context: BurnCheckTargetContext,
-    ) -> Result<CheckPromptFixResult, ControllerError> {
-        if !store
-            .check_enabled(detector)
-            .map_err(|_| ControllerError::PersistenceFailed)?
-            || !smart_check_master_available(store, detector)
-        {
-            return Err(ControllerError::CheckPromptUnavailable);
-        }
-        let targets = self.list_burn_check_targets(store, detector, context)?;
-        let now = now_epoch();
-        if targets.targets.is_empty() {
-            if detector == DetectorId::IgnoredInstructions {
-                return Ok(CheckPromptFixResult {
-                    prompt: fallback_remediation_prompt(detector)
-                        .map_err(ControllerError::PromptUnavailable)?
-                        .into_string(),
-                });
-            }
-            return Err(ControllerError::CheckPromptUnavailable);
-        }
-        if targets.truncated {
-            let base = fallback_remediation_prompt(detector)
-                .map_err(ControllerError::PromptUnavailable)?
-                .into_string();
-            let paths = representative_paths(
-                store,
-                targets.sample_sessions.iter().map(|sample| {
-                    SessionKey::new(&sample.environment_key, &sample.agent, &sample.session_id)
-                }),
-            )?;
-            let selected = targets
-                .targets
-                .iter()
-                .map(|target| self.cached_target(store, &target.action_id, now))
-                .collect::<Result<Vec<_>, _>>()?;
-            let (reference, prompt_group_id) =
-                self.prompt_reference_for_targets(store, &selected)?;
-            let prompt = prompt_with_evidence_paths(&base, &paths, Some(&reference))
-                .map_err(ControllerError::PromptUnavailable)?;
-            let (_, prompt) = self.persist_prompt_watches(
-                store,
-                &selected,
-                prompt_group_id.as_deref(),
-                &prompt,
-                now,
-            )?;
-            return Ok(CheckPromptFixResult { prompt });
-        }
-        self.copy_prompt_fix_burn_check_targets(
-            store,
-            &targets
-                .targets
-                .into_iter()
-                .map(|target| target.action_id)
-                .collect::<Vec<_>>(),
-        )
-    }
-
     pub fn copy_prompt_fix_burn_check_targets(
         &self,
         store: &Store,
@@ -2151,106 +2064,7 @@ impl RemediationController {
             }
             targets.push(self.cached_target(store, action_id, now)?);
         }
-        let detector = targets[0].finding().detector;
-        if targets
-            .iter()
-            .any(|target| target.finding().detector != detector)
-        {
-            return Err(ControllerError::CheckPromptUnavailable);
-        }
-
-        // Validate every selected identity before this action records any watch.
-        self.revalidate_all(&targets)?;
-
-        if targets
-            .iter()
-            .all(|target| target.finding().is_advisory_resource())
-        {
-            let (reference, prompt_group_id) =
-                self.prompt_reference_for_targets(store, &targets)?;
-            let base = fallback_remediation_prompt(detector)
-                .map_err(ControllerError::PromptUnavailable)?
-                .into_string();
-            let paths = representative_paths(
-                store,
-                targets.iter().flat_map(|target| {
-                    target.evidence_sessions().into_iter().map(|sample| {
-                        SessionKey::new(sample.environment_key, sample.agent, sample.session_id)
-                    })
-                }),
-            )?;
-            let base = prompt_with_evidence_paths(&base, &paths, None)
-                .map_err(ControllerError::PromptUnavailable)?;
-            let items =
-                targets
-                    .iter()
-                    .enumerate()
-                    .map(|(index, target)| {
-                        remediation_prompt(target.finding())
-                            .map_err(ControllerError::PromptUnavailable)?;
-                        let display = target
-                            .finding()
-                            .display()
-                            .map_err(ControllerError::PromptUnavailable)?;
-                        let resource = display.facts.labels.first().ok_or(
-                            ControllerError::PromptUnavailable(
-                                RemediationUnavailableReason::EssentialIdentityUnavailable,
-                            ),
-                        )?;
-                        let resource = serde_json::to_string(resource)
-                            .map_err(|_| ControllerError::Internal)?;
-                        Ok(format!(
-                            "{}. Agent: {}; scope: {}; resource: {resource}",
-                            index + 1,
-                            display.agent.slug(),
-                            target.scope_kind,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, ControllerError>>()?;
-            let prompt = prompt_with_evidence_paths(
-                &format!("{base}\n\nUnused targets\n{}", items.join("\n")),
-                &[],
-                Some(&reference),
-            )
-            .map_err(ControllerError::PromptUnavailable)?;
-            let (_, prompt) = self.persist_prompt_watches(
-                store,
-                &targets,
-                prompt_group_id.as_deref(),
-                &prompt,
-                now,
-            )?;
-            return Ok(CheckPromptFixResult { prompt });
-        }
-
-        let (reference, prompt_group_id) = self.prompt_reference_for_targets(store, &targets)?;
-        let mut prompt_parts = Vec::with_capacity(targets.len());
-        for target in &targets {
-            let base = remediation_prompt(target.finding())
-                .map_err(ControllerError::PromptUnavailable)?
-                .into_string();
-            let paths = representative_paths(
-                store,
-                target.findings.iter().map(|finding| {
-                    SessionKey::new(
-                        finding.environment_key.as_str(),
-                        finding.agent.as_str(),
-                        finding.session_id.as_str(),
-                    )
-                }),
-            )?;
-            prompt_parts.push((base, paths));
-        }
-        let mut sections = Vec::with_capacity(targets.len());
-        for (index, (base, paths)) in prompt_parts.into_iter().enumerate() {
-            let prompt = prompt_with_evidence_paths(&base, &paths, None)
-                .map_err(ControllerError::PromptUnavailable)?;
-            sections.push(format!("Exact target {}\n{prompt}", index + 1));
-        }
-        let prompt = prompt_with_evidence_paths(&sections.join("\n\n"), &[], Some(&reference))
-            .map_err(ControllerError::PromptUnavailable)?;
-        let (_, prompt) =
-            self.persist_prompt_watches(store, &targets, prompt_group_id.as_deref(), &prompt, now)?;
+        let (_, prompt) = self.copy_current_prompt_for_cached_targets(store, &targets)?;
         Ok(CheckPromptFixResult { prompt })
     }
 
@@ -3238,35 +3052,6 @@ impl RemediationController {
         .map_err(|_| ControllerError::Internal)
     }
 
-    /// Revalidates a whole batch with one report reduce per distinct context,
-    /// instead of one reduce per target.
-    fn revalidate_all(&self, targets: &[CachedTarget]) -> Result<(), ControllerError> {
-        let mut reports: Vec<(BurnCheckTargetContext, insights_report::ReducedReport)> = Vec::new();
-        for target in targets {
-            let Some(resource) = &target.resource else {
-                self.revalidate(target)?;
-                continue;
-            };
-            let index = match reports
-                .iter()
-                .position(|(context, _)| *context == resource.context)
-            {
-                Some(index) => index,
-                None => {
-                    reports.push((
-                        resource.context.clone(),
-                        self.reduce_resource_report(&resource.context)?,
-                    ));
-                    reports.len() - 1
-                }
-            };
-            if !resource_is_current(&reports[index].1, resource) {
-                return Err(ControllerError::TargetChanged);
-            }
-        }
-        Ok(())
-    }
-
     fn revalidate(&self, target: &CachedTarget) -> Result<(), ControllerError> {
         if let Some(resource) = &target.resource {
             let report = self.reduce_resource_report(&resource.context)?;
@@ -3538,131 +3323,6 @@ impl RemediationController {
         }
     }
 
-    fn prompt_reference_for_targets(
-        &self,
-        store: &Store,
-        targets: &[CachedTarget],
-    ) -> Result<(String, Option<String>), ControllerError> {
-        if targets.is_empty() {
-            let group = random_id().map_err(|_| ControllerError::Internal)?;
-            return Ok((group.clone(), Some(group.clone())));
-        }
-        let existing = targets
-            .iter()
-            .map(|target| {
-                store
-                    .latest_action_remediation_for_target(
-                        target.environment_key(),
-                        target.agent.slug(),
-                        &target.scope_kind,
-                        &target.scope_key,
-                        &target.target_key,
-                    )
-                    .map_err(|_| ControllerError::Internal)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let active = existing
-            .iter()
-            .filter_map(Option::as_ref)
-            .filter(|watch| watch.state != RemediationState::Recurred)
-            .collect::<Vec<_>>();
-        if active.is_empty() {
-            let group = random_id().map_err(|_| ControllerError::Internal)?;
-            return Ok((group.clone(), Some(group)));
-        }
-        if active
-            .iter()
-            .any(|watch| watch.state != RemediationState::WaitingForPromptUse)
-        {
-            return Err(ControllerError::CheckPromptUnavailable);
-        }
-        let first_group = active[0].prompt_group_id.clone();
-        if let Some(group) = first_group.as_ref().filter(|group| {
-            active
-                .iter()
-                .all(|watch| watch.prompt_group_id.as_deref() == Some(group.as_str()))
-        }) {
-            return Ok((group.clone(), Some(group.clone())));
-        }
-        if targets.len() == 1 && active.len() == 1 {
-            return Ok((active[0].remediation_id.clone(), None));
-        }
-        Err(ControllerError::CheckPromptUnavailable)
-    }
-
-    fn persist_prompt_watches(
-        &self,
-        store: &Store,
-        targets: &[CachedTarget],
-        prompt_group_id: Option<&str>,
-        prompt: &str,
-        now: i64,
-    ) -> Result<(Vec<RemediationRecord>, String), ControllerError> {
-        if !prompt_watch_supported(targets.iter().map(|target| target.finding().detector)) {
-            return Ok((Vec::new(), prompt.to_owned()));
-        }
-        let detector = targets
-            .first()
-            .map(|target| target.finding().detector)
-            .ok_or(ControllerError::TargetNotFound)?;
-        let (enabled, check_preferences_revision) = store
-            .check_preferences_snapshot()
-            .map_err(|_| ControllerError::PersistenceFailed)?;
-        if !enabled.contains(&detector) {
-            return Err(ControllerError::TargetNotFound);
-        }
-        let smart_master_generation = smart_check_master_generation(store, detector);
-        if !smart_check_master_available(store, detector) {
-            return Err(ControllerError::TargetNotFound);
-        }
-        let watch_inputs = targets
-            .iter()
-            .map(|target| {
-                let (mut remediation, guards) = self.watch_input(
-                    target,
-                    RemediationState::WaitingForPromptUse,
-                    None,
-                    now,
-                    prompt_group_id,
-                )?;
-                let mut result: serde_json::Value = serde_json::from_str(&remediation.result_json)
-                    .map_err(|_| ControllerError::Internal)?;
-                result["promptText"] = serde_json::Value::String(prompt.to_owned());
-                remediation.result_json = result.to_string();
-                Ok((remediation, guards))
-            })
-            .collect::<Result<Vec<_>, ControllerError>>()?;
-        let watches = store
-            .create_or_reuse_remediations_for_enabled_check(
-                &watch_inputs,
-                detector,
-                check_preferences_revision,
-                smart_master_generation.as_deref(),
-            )
-            .map_err(|_| ControllerError::PersistenceFailed)?
-            .ok_or(ControllerError::TargetChanged)?;
-        for (target, watch) in targets.iter().zip(watches.iter()) {
-            self.persist_display_snapshot(
-                store,
-                watch,
-                target,
-                "action",
-                now.saturating_mul(1_000),
-            )?;
-        }
-        let stored_prompt = watches
-            .first()
-            .and_then(|watch| stored_string(&watch.result_json, "promptText"))
-            .ok_or(ControllerError::PersistenceFailed)?;
-        if watches.iter().any(|watch| {
-            stored_string(&watch.result_json, "promptText").as_deref()
-                != Some(stored_prompt.as_str())
-        }) {
-            return Err(ControllerError::PersistenceFailed);
-        }
-        Ok((watches, stored_prompt))
-    }
-
     #[cfg(all(test, not(windows)))]
     fn start_watch(
         &self,
@@ -3784,14 +3444,6 @@ fn display_config_file(path: &Path, home: &Path) -> String {
     path.strip_prefix(home)
         .map(|relative| format!("~/{}", relative.display()))
         .unwrap_or_else(|_| path.display().to_string())
-}
-
-fn stored_string(value: &str, key: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(value)
-        .ok()?
-        .get(key)?
-        .as_str()
-        .map(str::to_owned)
 }
 
 const fn remediation_policy_is_current(definition: &WatchDefinition) -> bool {

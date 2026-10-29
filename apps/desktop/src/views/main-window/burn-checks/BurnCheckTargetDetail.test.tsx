@@ -1201,7 +1201,7 @@ describe("BurnCheckTargetDetail", () => {
     )
     fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
     expect(await screen.findByRole("button", { name: "Copied" })).toBeVisible()
-    expect(copyPromptFixBurnCheckTarget).toHaveBeenCalledWith("action-fresh")
+    expect(copyPromptFixBurnCheckTarget).toHaveBeenCalledWith("scopeCreep", "finding-stable")
     expect(writeClipboardText).toHaveBeenCalledWith(prompt)
   })
   it("renders recorded task and work citations with future guidance", async () => {
@@ -1420,7 +1420,10 @@ describe("BurnCheckTargetDetail", () => {
     expect(screen.queryByText("work-citation")).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
     expect(await screen.findByRole("button", { name: "Copied" })).toBeVisible()
-    expect(copyPromptFixBurnCheckTarget).toHaveBeenCalledWith("action-fresh")
+    expect(copyPromptFixBurnCheckTarget).toHaveBeenCalledWith(
+      "skillOpportunities",
+      "finding-stable",
+    )
     expect(writeClipboardText).toHaveBeenCalledWith(prompt)
     expect(refresh).toHaveBeenCalledOnce()
     expect(view.container).not.toHaveTextContent(
