@@ -117,7 +117,7 @@ pub async fn repair_cli_installation(app: tauri::AppHandle) -> Result<CliInstall
         let i = installation(&worker_app)?;
         let diagnostic = i.reconcile().err().map(|e| e.to_string());
         let state = i.state(diagnostic);
-        let _ = app.emit_to("settings", "cli-install:state", &state);
+        let _ = worker_app.emit_to("settings", "cli-install:state", &state);
         Ok(state)
     })
     .await
