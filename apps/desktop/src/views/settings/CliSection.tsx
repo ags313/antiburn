@@ -76,9 +76,7 @@ export function CliSection() {
   const result =
     testResult?.key === key && testResult.sha256 === state?.runtime?.sha256 ? testResult : null
   const detail = error || state?.diagnostic || result?.error
-  const needsRepair = Boolean(
-    error || state?.diagnostic || result?.error || (state && !state.runtime),
-  )
+  const needsRepair = Boolean(error || state?.diagnostic || (state && !state.runtime))
   const StatusIcon = needsRepair ? TriangleAlert : Circle
   const status =
     busy === "test"
@@ -269,12 +267,22 @@ export function CliSection() {
                       )}
                       {busy === "repair" ? "Repairing…" : "Repair"}
                     </PushButton>
-                    {(busy === "test" || busy === "repair" || (result && !result.error)) && (
+                    {(busy === "test" || busy === "repair" || result) && (
                       <p
                         role="status"
-                        className={busy ? "text-label-secondary" : "text-system-green"}
+                        className={
+                          busy
+                            ? "text-label-secondary"
+                            : result?.error
+                              ? "text-system-orange"
+                              : "text-system-green"
+                        }
                       >
-                        {busy ? status : "Test passed"}
+                        {busy
+                          ? status
+                          : result?.error
+                            ? "Couldn’t start the CLI. Try Repair."
+                            : "Test passed"}
                       </p>
                     )}
                   </div>

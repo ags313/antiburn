@@ -332,6 +332,7 @@ describe("CLI Settings", () => {
     await ready()
     fireEvent.click(testButton())
     expect(await screen.findByText("Couldn’t start the CLI. Try Repair.")).toBeInTheDocument()
+    expect(screen.getByText("Installed")).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "Technical details" }))
     expect(screen.queryByRole("alert")).not.toBeInTheDocument()
     expect(repairButton()).toBeEnabled()

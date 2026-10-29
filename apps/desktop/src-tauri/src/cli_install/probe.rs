@@ -1,8 +1,8 @@
-use std::{process::Stdio, time::Duration};
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use antiburn_local::platform::process::{BoundedOutputOptions, bounded_headless_output_with_stdin};
+use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
-use tokio::{io::AsyncReadExt, process::Command};
 
 use super::CliRuntime;
 
@@ -20,71 +20,43 @@ pub async fn test(runtime: &CliRuntime) -> Result<()> {
     run(runtime, DEADLINE).await
 }
 
-async fn read_output(stream: impl tokio::io::AsyncRead + Unpin) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    stream
-        .take(OUTPUT_LIMIT + 1)
-        .read_to_end(&mut bytes)
-        .await?;
-    ensure!(
-        bytes.len() as u64 <= OUTPUT_LIMIT,
-        "CLI test output is too large"
-    );
-    Ok(bytes)
-}
-
 async fn run(runtime: &CliRuntime, deadline: Duration) -> Result<()> {
     ensure!(
         runtime.executable.is_absolute(),
         "CLI test requires an absolute path"
     );
-    let mut command = Command::new(&runtime.executable);
-    command
-        .args(["capabilities", "--json"])
-        .env("PATH", "")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    command.creation_flags(0x08000000);
-    let mut child = command
-        .spawn()
-        .context("Could not start the installed CLI")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("CLI test stdout is unavailable")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("CLI test stderr is unavailable")?;
-    let result = tokio::time::timeout(deadline, async {
-        tokio::try_join!(
-            async { child.wait().await.context("Cannot wait for CLI test") },
-            read_output(stdout),
-            read_output(stderr),
-        )
-    })
-    .await;
-    let (status, stdout, stderr) = match result {
-        Ok(Ok(output)) => output,
-        other => {
-            let _ = child.kill().await;
-            match other {
-                Ok(Err(error)) => return Err(error),
-                _ => bail!("CLI test timed out"),
-            }
+    let output = bounded_headless_output_with_stdin(
+        &runtime.executable,
+        &["capabilities", "--json"],
+        None,
+        BoundedOutputOptions {
+            timeout: deadline,
+            max_stdout_bytes: OUTPUT_LIMIT as usize,
+            max_stderr_bytes: 0,
+            env: &[("PATH", "")],
+            env_remove: &[],
+            current_dir: None,
+        },
+    )
+    .await
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            anyhow::anyhow!("CLI test timed out")
+        } else {
+            anyhow::Error::new(error).context("Could not complete the installed CLI test")
         }
-    };
+    })?;
+    ensure!(!output.stdout_truncated, "CLI test output is too large");
     ensure!(
-        status.success(),
-        "CLI test exited unsuccessfully ({status})"
-    );
-    ensure!(
-        stderr.is_empty(),
+        !output.stderr_truncated,
         "CLI test returned unexpected diagnostics"
     );
+    ensure!(
+        output.status.success(),
+        "CLI test exited unsuccessfully ({})",
+        output.status
+    );
+    let stdout = output.stdout;
     let capabilities: Capabilities =
         serde_json::from_slice(&stdout).context("CLI test returned invalid capabilities")?;
     ensure!(
@@ -140,9 +112,12 @@ mod tests {
 
     #[tokio::test]
     async fn bounds_output_and_execution_time() {
-        let output = fixture("while :; do printf '0123456789'; done", DEADLINE)
-            .await
-            .unwrap_err();
+        let output = fixture(
+            "i=0; while [ \"$i\" -lt 900 ]; do printf '0123456789'; i=$((i+1)); done",
+            DEADLINE,
+        )
+        .await
+        .unwrap_err();
         assert!(output.to_string().contains("too large"));
         let timeout = fixture("while :; do :; done", Duration::from_millis(50))
             .await

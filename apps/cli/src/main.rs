@@ -6,13 +6,7 @@ use tokio::io::AsyncWriteExt;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let cli = antiburn_cli::cli::Cli::parse();
-    if !matches!(cli.command, antiburn_cli::cli::Command::Capabilities { .. })
-        && let Err(error) = antiburn_cli::init_tracing()
-    {
-        report_error(&format!("antiburn: file tracing unavailable: {error}")).await;
-    }
-
-    let response = match antiburn_cli::run(cli).await {
+    let response = match antiburn_cli::run_with_tracing(cli).await {
         Ok(response) => response,
         Err(error) => {
             tracing::error!(event = "cli_command_failed", error = %error);

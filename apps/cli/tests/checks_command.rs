@@ -52,6 +52,52 @@ fn terminal_setup_commands_are_unavailable() {
 }
 
 #[test]
+fn checks_logs_use_configured_storage_and_logging_failure_is_nonfatal() {
+    let temp = tempdir().unwrap();
+    let data_root = platform_data_root(temp.path());
+    let database_dir = data_root.join("ai.antiburn.desktop");
+    std::fs::create_dir_all(&database_dir).unwrap();
+    create_fixture_database(&database_dir.join("antiburn.sqlite3"));
+    let generation = temp.path().join("versions/synthetic-generation");
+    std::fs::create_dir_all(&generation).unwrap();
+    let executable = generation.join(if cfg!(windows) {
+        "antiburn-cli.exe"
+    } else {
+        "antiburn-cli"
+    });
+    std::fs::copy(env!("CARGO_BIN_EXE_antiburn"), &executable).unwrap();
+    let config = temp.path().join("custom.json");
+    let log = temp.path().join("diagnostics/calls.log");
+    for (log_file, succeeds) in [(log.as_path(), true), (temp.path(), false)] {
+        std::fs::write(&config, json!({"data_root":data_root,"state_file":temp.path().join("state.json"),"log_file":log_file}).to_string()).unwrap();
+        let mut command = Command::new(&executable);
+        configure_data_directory(&mut command, temp.path(), &data_root);
+        let output = command
+            .arg("--config")
+            .arg(&config)
+            .args(["checks", "argument-session"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+        if succeeds {
+            assert!(
+                std::fs::read_to_string(&log)
+                    .unwrap()
+                    .contains("checks_lookup_completed")
+            );
+        } else {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("file tracing unavailable"));
+        }
+    }
+    assert!(!generation.join("calls.log").exists());
+}
+
+#[test]
 fn checks_command_reads_the_selected_database() {
     let temp = tempdir().unwrap();
     let data_root = platform_data_root(temp.path());
@@ -421,7 +467,8 @@ fn default_lookup_command(home: &std::path::Path, data_root: &std::path::Path) -
             &config_path,
             json!({
                 "data_root": data_root,
-                "state_file": home.join("cli-state.json")
+                "state_file": home.join("cli-state.json"),
+                "log_file": home.join("calls.log")
             })
             .to_string(),
         )

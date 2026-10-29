@@ -10,7 +10,7 @@ const MAX_BINARY: u64 = 256 * 1024 * 1024;
 const MAX_JSON: u64 = 16 * 1024;
 const IDENTITY: &str = "ai.antiburn.desktop.cli";
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub schema: u32,
@@ -226,6 +226,8 @@ fn check_ancestors(path: &Path) -> Result<()> {
         if let Ok(m) = fs::symlink_metadata(ancestor) {
             #[cfg(windows)]
             super::windows::check_ancestor(ancestor, &m)?;
+            #[cfg(target_os = "macos")]
+            super::macos::check_ancestor(ancestor)?;
             ensure!(
                 m.is_dir() && !m.file_type().is_symlink(),
                 "CLI directory ancestor is redirected"
@@ -564,18 +566,24 @@ impl Installation {
             !present(&self.stable())? || self.owned_entry(&self.stable(), &r),
             "Runtime destination is unrelated or changed; preserve it for review"
         );
-        // Persist both generations before the stable entry changes.
-        r.pending = Some(m.clone());
-        self.save(&r)?;
-        self.publish(&self.stable(), &m, &r)?;
-        if let Some(active) = r.active.take()
-            && active.sha256 != m.sha256
-        {
-            r.previous = Some(active);
+        safe_dir(parent(&self.stable())?, true)?;
+        let current = r.pending.is_none()
+            && r.active.as_ref() == Some(&m)
+            && self.matches(&self.stable(), &m);
+        if !current {
+            // Persist both generations before the stable entry changes.
+            r.pending = Some(m.clone());
+            self.save(&r)?;
+            self.publish(&self.stable(), &m, &r)?;
+            if let Some(active) = r.active.take()
+                && active.sha256 != m.sha256
+            {
+                r.previous = Some(active);
+            }
+            r.active = Some(m.clone());
+            r.pending = None;
+            self.save(&r)?;
         }
-        r.active = Some(m.clone());
-        r.pending = None;
-        self.save(&r)?;
         if let Some(obsolete) = obsolete
             && obsolete.sha256 != m.sha256
             && r.previous
@@ -698,6 +706,113 @@ mod tests {
         fs::remove_dir_all(&f.i.payload).unwrap();
         assert_eq!(f.i.resolve().unwrap().executable, first.executable);
         assert!(!first.executable.starts_with(&f.i.payload));
+    }
+
+    #[test]
+    fn healthy_reconciliation_does_not_replace_the_receipt() {
+        let f = Fixture::new();
+        f.i.reconcile().unwrap();
+        let path = f.i.root.join("receipt.json");
+        let file = File::open(&path).unwrap();
+        let before = file.metadata().unwrap();
+        let bytes = fs::read(&path).unwrap();
+        f.i.reconcile().unwrap();
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(before.ino(), after.ino());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn healthy_reconciliation_rejects_a_redirected_stable_parent() {
+        let f = Fixture::new();
+        f.i.reconcile().unwrap();
+        let receipt = fs::read(f.i.root.join("receipt.json")).unwrap();
+        let bin = f.i.stable().parent().unwrap().to_path_buf();
+        let outside = f.i.payload.join("redirected-bin");
+        fs::rename(&bin, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &bin).unwrap();
+        assert!(f.i.matches(
+            &f.i.stable(),
+            f.i.receipt().unwrap().active.as_ref().unwrap()
+        ));
+        assert!(
+            f.i.reconcile()
+                .unwrap_err()
+                .to_string()
+                .contains("redirected")
+        );
+        assert_eq!(fs::read(f.i.root.join("receipt.json")).unwrap(), receipt);
+        assert_eq!(fs::read_link(&bin).unwrap(), outside);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ancestor_acls_preserve_safe_entries_and_reject_mutation_grants() {
+        use std::process::Command;
+        let f = Fixture::new();
+        let ancestor = f.i.root.parent().unwrap();
+        safe_dir(ancestor, true).unwrap();
+        for rule in ["everyone deny delete", "everyone allow read"] {
+            assert!(
+                Command::new("/bin/chmod")
+                    .args(["+a", rule])
+                    .arg(ancestor)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            f.i.reconcile().unwrap();
+            assert!(
+                Command::new("/bin/chmod")
+                    .arg("-N")
+                    .arg(ancestor)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        for permission in ["delete_child", "add_file", "writesecurity", "chown"] {
+            let rule = format!("everyone allow {permission}");
+            assert!(
+                Command::new("/bin/chmod")
+                    .args(["+a", &rule])
+                    .arg(ancestor)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let before = Command::new("/bin/ls")
+                .arg("-lde")
+                .arg(ancestor)
+                .output()
+                .unwrap()
+                .stdout;
+            assert!(f.i.reconcile().unwrap_err().to_string().contains("ACL"));
+            assert_eq!(
+                Command::new("/bin/ls")
+                    .arg("-lde")
+                    .arg(ancestor)
+                    .output()
+                    .unwrap()
+                    .stdout,
+                before
+            );
+            assert!(
+                Command::new("/bin/chmod")
+                    .arg("-N")
+                    .arg(ancestor)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        f.i.reconcile().unwrap();
     }
 
     #[test]

@@ -40,10 +40,6 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
-pub fn init_tracing() -> std::io::Result<()> {
-    logging::init()
-}
-
 #[derive(Debug, serde::Serialize)]
 pub struct Capabilities {
     pub version: &'static str,
@@ -89,6 +85,14 @@ impl Response {
 }
 
 pub async fn run(cli: cli::Cli) -> Result<Response, CliError> {
+    run_command(cli, false).await
+}
+
+pub async fn run_with_tracing(cli: cli::Cli) -> Result<Response, CliError> {
+    run_command(cli, true).await
+}
+
+async fn run_command(cli: cli::Cli, tracing: bool) -> Result<Response, CliError> {
     let cli::Cli { config, command } = cli;
     if matches!(command, Command::Capabilities { .. }) {
         return Ok(Response::Capabilities(Capabilities {
@@ -109,6 +113,16 @@ pub async fn run(cli: cli::Cli) -> Result<Response, CliError> {
     let config = config::Config::load(config)
         .await
         .map_err(CliError::runtime)?;
+
+    if tracing {
+        let tracing = config
+            .log_path()
+            .map_err(std::io::Error::other)
+            .and_then(|path| logging::init(&path));
+        if let Err(error) = tracing {
+            eprintln!("antiburn: file tracing unavailable: {error}");
+        }
+    }
 
     if delivery_v1 {
         let consumer =
