@@ -30,7 +30,7 @@ The shared `antiburn-cli-runtime` crate owns private-runtime filesystem policy.
 The desktop adapter calls it without a Tauri or product-database dependency in
 the shared library. The standalone CLI does not provide installation controls.
 
-Reconciliation retires legacy exports only when the receipt records prior
+Reconciliation creates no new terminal-export ownership claims. It retires legacy exports only when a receipt from an earlier implementation records prior
 ownership. On macOS/Linux the legacy path is `~/.local/bin/antiburn-cli`; on
 Windows it is `%LOCALAPPDATA%\antiburn\bin\antiburn-cli.exe`. Source/debug
 profiles use the identifier-scoped `cli/terminal` directory. A POSIX link must
@@ -76,7 +76,8 @@ are rejected (root-owned platform ancestors and sticky temporary roots are allow
 The desktop creates new app-data directories with mode `0700`, including under a
 group-writable umask such as `002`. Existing directory permissions are preserved;
 an existing insecure ancestor still requires the user to correct its policy.
-macOS rejects extended ACLs on managed destinations; Linux rejects extended POSIX
+Healthy reconciliation verifies the runtime without rewriting an unchanged receipt.
+macOS inspects ancestor ACLs for mutation grants to unrelated principals and preserves safe deny-only/read grants. It rejects extended ACLs on managed destinations; Linux rejects extended POSIX
 ACLs. Existing policy is preserved rather than relaxed. On Windows, reparse points,
 other-user ownership, readonly files, protected/unsupported ACLs and unrelated write
 ACEs are rejected on managed destinations. Ancestors permit platform-owned roots,
@@ -94,6 +95,11 @@ Actual Gatekeeper behavior still requires downloaded-build acceptance below.
 
 Source and debug builds stage the internal runtime only through explicit Repair. All files stay under the identifier-scoped `cli`
 directory.
+Run `pnpm --filter @antiburn/desktop dev:cli` for a source launch with the host
+CLI payload prepared and resource-mapped, or `dev:bundle:cli` for a debug bundle.
+These explicit commands compile the native CLI and then launch/build with both
+debug and sidecar configurations. Normal `dev` and `dev:bundle` do not prepare a
+payload; Repair requires one. Cross-target development requests are rejected.
 Use disposable profiles for development; do not exercise this against vendor
 configuration or the production Antiburn profile.
 
@@ -214,7 +220,7 @@ The ignored backend test
 locally after generating a native payload. It copies into a temporary root,
 removes its synthetic bundle, and invokes only capabilities with an empty PATH.
 It is not signed-download, GUI, Gatekeeper, Windows, Linux or vendor-context proof.
-Installation has local diagnostic tracing and existing Settings visibility
-analytics; no dedicated first-party installation-success/adoption event is added.
-That intentional measurement gap prevents treating Settings visibility or payload
-presence as proof of successful native/vendor execution.
+Installation has local diagnostic tracing and the privacy-safe
+`antiburn.cli_operation_completed` event for startup, Test and Repair outcomes.
+It carries only closed operation/result labels. Settings visibility, payload
+presence and startup/Test success do not prove successful vendor execution.

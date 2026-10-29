@@ -1,5 +1,6 @@
 mod probe;
 
+use crate::analytics::{self, event::CliOperation};
 pub use antiburn_cli_runtime::{CliInstallState, CliRuntime};
 use antiburn_cli_runtime::{Installation, file_name};
 use tauri::{Emitter, Manager};
@@ -42,15 +43,42 @@ pub fn start(app: &tauri::AppHandle) {
         return;
     }
     let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        if let Ok(i) = installation(&app) {
+    tauri::async_runtime::spawn(async move {
+        let worker_app = app.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let i = installation(&worker_app)?;
             let diagnostic = i.reconcile_at_startup().err().map(|e| e.to_string());
-            if let Some(error) = &diagnostic {
-                tracing::warn!(event = "cli_installation_unavailable", error = %error);
+            Ok(i.state(diagnostic))
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|result| result);
+        let result = complete(result, healthy, |succeeded| {
+            analytics::record_cli_operation(&app, CliOperation::Startup, succeeded)
+        });
+        match result {
+            Ok(state) => {
+                if let Some(error) = &state.diagnostic {
+                    tracing::warn!(event = "cli_installation_unavailable", error = %error);
+                }
+                let _ = app.emit_to("settings", "cli-install:state", state);
             }
-            let _ = app.emit_to("settings", "cli-install:state", i.state(diagnostic));
+            Err(error) => tracing::warn!(event = "cli_installation_unavailable", error = %error),
         }
     });
+}
+
+fn healthy(state: &CliInstallState) -> bool {
+    state.runtime.is_some() && state.diagnostic.is_none()
+}
+
+fn complete<T>(
+    result: Result<T, String>,
+    successful: impl FnOnce(&T) -> bool,
+    record: impl FnOnce(bool),
+) -> Result<T, String> {
+    record(result.as_ref().is_ok_and(successful));
+    result
 }
 
 #[tauri::command]
@@ -62,24 +90,54 @@ pub async fn get_cli_install_state(app: tauri::AppHandle) -> Result<CliInstallSt
 
 #[tauri::command]
 pub async fn test_cli_installation(app: tauri::AppHandle) -> Result<CliRuntime, String> {
-    let (_lock, runtime) = tauri::async_runtime::spawn_blocking(move || {
-        installation(&app)?
-            .runtime_for_test()
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
-    probe::test(&runtime).await.map_err(|e| e.to_string())?;
-    Ok(runtime)
+    let worker_app = app.clone();
+    let result = async {
+        let (_lock, runtime) = tauri::async_runtime::spawn_blocking(move || {
+            installation(&worker_app)?
+                .runtime_for_test()
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        probe::test(&runtime).await.map_err(|e| e.to_string())?;
+        Ok(runtime)
+    }
+    .await;
+    complete(
+        result,
+        |_| true,
+        |succeeded| analytics::record_cli_operation(&app, CliOperation::Test, succeeded),
+    )
 }
 
 #[tauri::command]
 pub async fn repair_cli_installation(app: tauri::AppHandle) -> Result<CliInstallState, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let i = installation(&app)?;
+    let worker_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let i = installation(&worker_app)?;
         let diagnostic = i.reconcile().err().map(|e| e.to_string());
         Ok(i.state(diagnostic))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
+    .and_then(|result| result);
+    complete(result, healthy, |succeeded| {
+        analytics::record_cli_operation(&app, CliOperation::Repair, succeeded)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_records_one_outcome_and_preserves_the_result() {
+        for result in [Ok(true), Ok(false), Err("worker failed".to_owned())] {
+            let expected = result.clone();
+            let mut outcomes = Vec::new();
+            let output = complete(result, |value| *value, |outcome| outcomes.push(outcome));
+            assert_eq!(output, expected);
+            assert_eq!(outcomes, vec![expected.is_ok_and(|value| value)]);
+        }
+    }
 }
