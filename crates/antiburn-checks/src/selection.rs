@@ -1,19 +1,24 @@
-//! Pure per-branch tool-result filtering and rolling candidate selection.
+//! Per-branch event filtering and bounded candidate selection.
 
 use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::compiler::{CompiledCheck, RollingWindow, ToolCategory, ToolResultStatus};
+use crate::compiler::{
+    CompiledCheck, EventFilters, RollingWindow, ToolCategory, ToolResultStatus, TriggerFamily,
+};
 use crate::definition_lifecycle::EffectiveActivation;
 use crate::domain::{
     BranchId, EvidenceDependency, EvidenceVersion, FrozenCandidate, FrozenContext, Message,
     NativeOrderKey, Observation, ObservationKind, ObservationPosition,
 };
+use crate::filters::{
+    AttributionScope, FilterDiagnostic, evaluate_attribution_filters, evaluate_path_filters,
+};
 use crate::preparation::{ConditionOutcome, evaluate_trigger_condition};
 
-/// Maximum number of finalized tool results retained for one branch.
+/// Maximum number of selected messages retained for one branch.
 pub const MAX_WINDOW_MESSAGES: usize = 40;
 /// Maximum number of source identities retained for one branch and activation.
 pub const MAX_SEEN_RESULTS_PER_BRANCH: usize = 4096;
@@ -29,13 +34,16 @@ pub struct SelectionState {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BranchSelection {
-    /// Selected finalized results in the order accepted by the source adapter.
+    /// Selected messages in the order accepted by the source adapter.
     pub results: VecDeque<SelectedMessage>,
     /// Whether the latest source snapshot proved complete membership for this branch.
     pub coverage_complete: bool,
     /// Whether identity tracking reached its limit and now rejects unseen results.
     #[serde(default)]
     pub identity_limit_reached: bool,
+    /// Latest model, mode, or path rejection, retained across restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_filter_diagnostic: Option<FilterDiagnostic>,
 }
 
 impl Default for BranchSelection {
@@ -44,14 +52,15 @@ impl Default for BranchSelection {
             results: VecDeque::new(),
             coverage_complete: true,
             identity_limit_reached: false,
+            last_filter_diagnostic: None,
         }
     }
 }
 
-/// Latest committed source version for one logical result identity.
+/// Latest committed source version for one logical event identity.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SeenResult {
-    /// Whether a terminal result or removal prevents another first-terminal trigger.
+    /// Whether first eligibility or removal prevents another trigger for this identity.
     pub terminal_seen: bool,
     /// Highest producer revision observed for this identity.
     pub revision: u64,
@@ -93,7 +102,7 @@ pub struct SelectedMessage {
     pub version: EvidenceVersion,
     /// Source-native order retained across corrections.
     pub native_order: NativeOrderKey,
-    /// Immutable normalized result value.
+    /// Immutable normalized message value.
     pub message: Message,
     /// Whether the source proved the selected result complete.
     pub complete: bool,
@@ -106,6 +115,8 @@ pub enum SelectionOutcome {
     Updated,
     /// The result did not match the effective tool/status filters.
     Filtered,
+    /// Captured model, mode, or path facts did not satisfy a filter.
+    FilterRejected(FilterDiagnostic),
     /// The pre-selection condition rejected the trigger before window counting.
     ConditionFiltered(ConditionOutcome),
     /// Matching evidence is incomplete and cannot be assessed.
@@ -117,50 +128,95 @@ pub enum SelectionOutcome {
 }
 
 impl SelectionState {
-    /// Applies one observation and freezes a candidate once the minimum is met.
-    ///
-    /// Historical tool results at or before activation bootstrap never enter a
-    /// fresh rolling window. User messages may update frozen context on either
-    /// side of that boundary. Published results use `apply_published` to track
-    /// progress, corrections, and removals.
+    /// Applies one event and freezes a candidate when its selection rules pass.
+    /// Historical evidence cannot enter a fresh window. Published events use
+    /// `apply_published` to retain progress, corrections, and removals.
     pub fn apply(
         &mut self,
         activation: &EffectiveActivation,
         observation: &Observation,
     ) -> SelectionOutcome {
-        if let ObservationKind::UserMessage(_) = observation.kind {
-            return SelectionOutcome::Updated;
+        self.apply_with_inventories(activation, observation, &mut || {
+            Ok::<_, std::convert::Infallible>(None)
+        })
+        .unwrap_or_else(|never| match never {})
+    }
+
+    fn apply_with_inventories<E>(
+        &mut self,
+        activation: &EffectiveActivation,
+        observation: &Observation,
+        capture: &mut impl FnMut() -> Result<Option<crate::context::CurrentInventories>, E>,
+    ) -> Result<SelectionOutcome, E> {
+        if matches!(observation.kind, ObservationKind::Other) {
+            return Ok(SelectionOutcome::Updated);
         }
-        let ObservationKind::ToolResult {
-            message,
-            category,
-            status,
-        } = &observation.kind
-        else {
-            return SelectionOutcome::Updated;
-        };
         if is_historical(activation, observation) {
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         }
-        let category = parse_category(category);
-        let Some(status) = parse_status(status) else {
-            return SelectionOutcome::Filtered;
-        };
-        if !matches_filters(&activation.compiled, category, status) {
-            return SelectionOutcome::Filtered;
+        let matches = evaluate_event_filters(&activation.compiled, observation);
+        if let Err(diagnostic) = matches {
+            self.branches
+                .entry(observation.branch.clone())
+                .or_default()
+                .last_filter_diagnostic = Some(diagnostic.clone());
+            return Ok(SelectionOutcome::FilterRejected(diagnostic));
         }
+        if matches == Ok(false) {
+            return Ok(SelectionOutcome::Filtered);
+        }
+        self.branches
+            .entry(observation.branch.clone())
+            .or_default()
+            .last_filter_diagnostic = None;
 
         let coverage_complete = self
             .branches
             .get(&observation.branch)
             .is_none_or(|branch| branch.coverage_complete);
         let Some(mut context) = trigger_context(observation, coverage_complete) else {
-            return SelectionOutcome::Incomplete;
+            return Ok(SelectionOutcome::Incomplete);
         };
+        let demand = activation.compiled.current_inventory_demand();
+        if demand.condition
+            && let Some(inventories) = capture()?
+        {
+            inventories.merge_into(&mut context.value);
+        }
         let condition = evaluate_trigger_condition(&activation.compiled, &context.value);
         if condition != ConditionOutcome::Matched {
-            return SelectionOutcome::ConditionFiltered(condition);
+            return Ok(SelectionOutcome::ConditionFiltered(condition));
         }
+
+        let Some(message) = observation_message(observation) else {
+            if demand.candidate
+                && !demand.condition
+                && let Some(inventories) = capture()?
+            {
+                inventories.merge_into(&mut context.value);
+            }
+            let mut dependencies = context.dependencies.clone();
+            dependencies.sort();
+            dependencies.dedup();
+            let messages = Vec::new();
+            let fingerprint = candidate_fingerprint(
+                &activation.id,
+                &observation.branch,
+                observation.position,
+                &messages,
+                &context,
+                &dependencies,
+            );
+            return Ok(SelectionOutcome::Candidate(Box::new(FrozenCandidate {
+                activation: activation.id.clone(),
+                branch: observation.branch.clone(),
+                trigger_position: observation.position,
+                messages,
+                context,
+                dependencies,
+                fingerprint,
+            })));
+        };
 
         let branch = self.branches.entry(observation.branch.clone()).or_default();
         let config = activation.compiled.trigger.window.unwrap_or(RollingWindow {
@@ -187,7 +243,13 @@ impl SelectionState {
             }
         }
         if branch.results.len() < usize::from(config.minimum) {
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
+        }
+        if demand.candidate
+            && !demand.condition
+            && let Some(inventories) = capture()?
+        {
+            inventories.merge_into(&mut context.value);
         }
         let mut dependencies = branch
             .results
@@ -224,7 +286,7 @@ impl SelectionState {
             &context,
             &dependencies,
         );
-        SelectionOutcome::Candidate(Box::new(FrozenCandidate {
+        Ok(SelectionOutcome::Candidate(Box::new(FrozenCandidate {
             activation: activation.id.clone(),
             branch: observation.branch.clone(),
             trigger_position: observation.position,
@@ -232,10 +294,10 @@ impl SelectionState {
             context,
             dependencies,
             fingerprint,
-        }))
+        })))
     }
 
-    /// Applies one published result without treating a correction as a new trigger.
+    /// Applies one published event without treating a correction as a new trigger.
     pub fn apply_published(
         &mut self,
         activation: &EffectiveActivation,
@@ -243,6 +305,26 @@ impl SelectionState {
         revision: u64,
         observation: &Observation,
     ) -> SelectionOutcome {
+        self.apply_published_with_inventories(
+            activation,
+            identity,
+            revision,
+            observation,
+            &mut || Ok::<_, std::convert::Infallible>(None),
+        )
+        .unwrap_or_else(|never| match never {})
+    }
+
+    /// Captures current inventories only when selection needs them.
+    /// Discard this selection state if capture returns an error.
+    pub fn apply_published_with_inventories<E>(
+        &mut self,
+        activation: &EffectiveActivation,
+        identity: &str,
+        revision: u64,
+        observation: &Observation,
+        capture: &mut impl FnMut() -> Result<Option<crate::context::CurrentInventories>, E>,
+    ) -> Result<SelectionOutcome, E> {
         let key = (observation.branch.clone(), identity.to_owned());
         if !self.seen_results.contains_key(&key)
             && self
@@ -250,7 +332,7 @@ impl SelectionState {
                 .get(&observation.branch)
                 .is_some_and(|branch| branch.identity_limit_reached)
         {
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         }
         if !self.accepts_update(
             &observation.branch,
@@ -258,16 +340,16 @@ impl SelectionState {
             revision,
             &observation.version,
         ) {
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         }
         if !self.seen_results.contains_key(&key)
             && self.identity_count(&observation.branch) >= MAX_SEEN_RESULTS_PER_BRANCH
         {
             self.mark_identity_limit(&observation.branch);
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         }
         let previous = self.seen_results.get(&key).cloned();
-        let terminal = matches!(observation.kind, ObservationKind::ToolResult { .. });
+        let terminal = !matches!(observation.kind, ObservationKind::Other);
         self.seen_results.insert(
             key.clone(),
             SeenResult {
@@ -286,13 +368,13 @@ impl SelectionState {
         if terminal && is_historical(activation, observation) {
             self.discard_result(&observation.branch, identity);
             self.set_membership(&key, ResultMembership::Historical);
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         }
         if previous.as_ref().is_none_or(|seen| !seen.terminal_seen) {
             if !terminal {
-                return SelectionOutcome::Updated;
+                return Ok(SelectionOutcome::Updated);
             }
-            let outcome = self.apply(activation, observation);
+            let outcome = self.apply_with_inventories(activation, observation, capture)?;
             let membership = match outcome {
                 SelectionOutcome::Candidate(_) | SelectionOutcome::Updated => {
                     ResultMembership::Selected
@@ -300,24 +382,32 @@ impl SelectionState {
                 _ => ResultMembership::Excluded,
             };
             self.set_membership(&key, membership);
-            return outcome;
+            return Ok(outcome);
         }
         let previous = previous.expect("a terminal result was recorded");
-        self.apply_correction(activation, &key, &previous, observation)
+        if matches!(
+            activation.compiled.trigger.family,
+            TriggerFamily::ResponseCycle(_) | TriggerFamily::Session { .. }
+        ) {
+            self.set_membership(&key, ResultMembership::Retired);
+            return Ok(SelectionOutcome::Updated);
+        }
+        self.apply_correction(activation, &key, &previous, observation, capture)
     }
 
-    fn apply_correction(
+    fn apply_correction<E>(
         &mut self,
         activation: &EffectiveActivation,
         key: &(BranchId, String),
         previous: &SeenResult,
         observation: &Observation,
-    ) -> SelectionOutcome {
+        capture: &mut impl FnMut() -> Result<Option<crate::context::CurrentInventories>, E>,
+    ) -> Result<SelectionOutcome, E> {
         if matches!(
             previous.membership,
             ResultMembership::Historical | ResultMembership::Retired | ResultMembership::Removed
         ) {
-            return SelectionOutcome::Updated;
+            return Ok(SelectionOutcome::Updated);
         }
         let selected = self
             .branches
@@ -327,22 +417,37 @@ impl SelectionState {
             .branches
             .get(&observation.branch)
             .is_none_or(|branch| branch.coverage_complete);
-        let matches = matches!(&observation.kind, ObservationKind::ToolResult { category, status, .. }
-            if parse_status(status).is_some_and(|status| matches_filters(&activation.compiled, parse_category(category), status)))
-            && trigger_context(observation, coverage_complete).is_some_and(|context| {
-                evaluate_trigger_condition(&activation.compiled, &context.value)
-                    == ConditionOutcome::Matched
-            });
+        let filter_result = evaluate_event_filters(&activation.compiled, observation);
+        self.branches
+            .entry(observation.branch.clone())
+            .or_default()
+            .last_filter_diagnostic = filter_result.as_ref().err().cloned();
+        let filters_match = filter_result == Ok(true);
+        let matches = if filters_match
+            && let Some(mut context) = trigger_context(observation, coverage_complete)
+        {
+            if activation.compiled.current_inventory_demand().condition
+                && let Some(inventories) = capture()?
+            {
+                inventories.merge_into(&mut context.value);
+            }
+            evaluate_trigger_condition(&activation.compiled, &context.value)
+                == ConditionOutcome::Matched
+        } else {
+            false
+        };
         if !matches {
             self.discard_result(&observation.branch, &key.1);
             self.set_membership(key, ResultMembership::Excluded);
-            return SelectionOutcome::Updated;
+            return Ok(filter_result
+                .err()
+                .map_or(SelectionOutcome::Updated, SelectionOutcome::FilterRejected));
         }
         if previous.membership == ResultMembership::Unknown && !selected {
             // An older checkpoint cannot distinguish an excluded result from a retired result.
             self.set_membership(key, ResultMembership::Retired);
             self.mark_coverage_gap(&observation.branch);
-            return SelectionOutcome::WindowInvalidated;
+            return Ok(SelectionOutcome::WindowInvalidated);
         }
         if previous.native_order != observation.native_order || !selected {
             self.retire_window(&observation.branch);
@@ -351,11 +456,10 @@ impl SelectionState {
                 .or_default()
                 .coverage_complete = false;
             self.set_membership(key, ResultMembership::Retired);
-            return SelectionOutcome::WindowInvalidated;
+            return Ok(SelectionOutcome::WindowInvalidated);
         }
-        let ObservationKind::ToolResult { message, .. } = &observation.kind else {
-            unreachable!("matching evidence is a terminal result")
-        };
+        let message =
+            observation_message(observation).expect("matching window evidence is a message");
         let selected = self
             .branches
             .get_mut(&observation.branch)
@@ -368,7 +472,7 @@ impl SelectionState {
         selected.message = message.clone();
         selected.complete = observation.complete;
         self.set_membership(key, ResultMembership::Selected);
-        SelectionOutcome::Updated
+        Ok(SelectionOutcome::Updated)
     }
 
     fn set_membership(&mut self, key: &(BranchId, String), membership: ResultMembership) {
@@ -392,6 +496,22 @@ impl SelectionState {
                     || (revision == seen.revision
                         && seen.membership != ResultMembership::Removed
                         && *version != seen.version)
+            })
+    }
+
+    pub(crate) fn is_normalized_duplicate(
+        &self,
+        branch: &BranchId,
+        identity: &str,
+        revision: u64,
+        version: &EvidenceVersion,
+    ) -> bool {
+        self.seen_results
+            .get(&(branch.clone(), identity.to_owned()))
+            .is_some_and(|seen| {
+                revision == seen.revision
+                    && seen.membership != ResultMembership::Removed
+                    && *version == seen.version
             })
     }
 
@@ -491,18 +611,41 @@ impl SelectionState {
 
 fn is_historical(activation: &EffectiveActivation, observation: &Observation) -> bool {
     observation.position <= activation.bootstrap_observation_position
-        || observation
-            .first_terminal_publication
-            .is_some_and(|cursor| cursor <= activation.bootstrap_publication)
+        || if matches!(observation.kind, ObservationKind::ToolResult { .. }) {
+            observation
+                .first_terminal_publication
+                .is_some_and(|cursor| cursor <= activation.bootstrap_publication)
+        } else {
+            observation
+                .first_eligible_publication
+                .is_none_or(|cursor| cursor <= activation.bootstrap_publication)
+        }
+}
+
+fn observation_message(observation: &Observation) -> Option<&Message> {
+    match &observation.kind {
+        ObservationKind::UserMessage(message)
+        | ObservationKind::AssistantMessage(message)
+        | ObservationKind::ToolCall(message)
+        | ObservationKind::ToolResult { message, .. } => Some(message),
+        _ => None,
+    }
 }
 
 fn trigger_context(observation: &Observation, coverage_complete: bool) -> Option<FrozenContext> {
-    let ObservationKind::ToolResult { message, .. } = &observation.kind else {
-        return None;
-    };
     let mut context = observation.context.clone();
     let roots = context.value.as_object_mut()?;
-    roots.insert("message".into(), message.value.clone());
+    if let Some(message) = observation_message(observation) {
+        roots.insert("message".into(), message.value.clone());
+        roots.remove("turn");
+    } else {
+        roots.remove("message");
+        if let ObservationKind::TurnEnd { turn } = &observation.kind {
+            roots.insert("turn".into(), turn.clone());
+        } else {
+            roots.remove("turn");
+        }
+    }
     roots.remove("window");
     if let Some(session) = roots
         .get_mut("session")
@@ -535,6 +678,142 @@ fn matches_filters(
             .statuses
             .as_ref()
             .is_none_or(|statuses| statuses.contains(&status))
+}
+
+fn evaluate_message_filters(
+    check: &CompiledCheck,
+    message: &serde_json::Value,
+) -> Result<(), FilterDiagnostic> {
+    evaluate_attribution_filters(
+        check.trigger.models.as_deref(),
+        check.trigger.fast_mode,
+        AttributionScope::Message,
+        message,
+    )?;
+    evaluate_path_filters(
+        check.trigger.paths.as_deref(),
+        check.trigger.paths_ignore.as_deref(),
+        message,
+    )
+}
+
+fn evaluate_event_filters(
+    check: &CompiledCheck,
+    observation: &Observation,
+) -> Result<bool, FilterDiagnostic> {
+    match (&check.trigger.family, &observation.kind) {
+        (
+            TriggerFamily::Messages {
+                tool_result: true, ..
+            },
+            ObservationKind::ToolResult {
+                message,
+                category,
+                status,
+            },
+        ) => {
+            if !parse_status(status)
+                .is_some_and(|status| matches_filters(check, parse_category(category), status))
+            {
+                return Ok(false);
+            }
+            evaluate_message_filters(check, &message.value)?;
+            Ok(true)
+        }
+        (
+            TriggerFamily::Messages {
+                user_message: Some(filters),
+                ..
+            },
+            ObservationKind::UserMessage(message),
+        )
+        | (
+            TriggerFamily::Messages {
+                assistant_message: Some(filters),
+                ..
+            },
+            ObservationKind::AssistantMessage(message),
+        )
+        | (
+            TriggerFamily::Messages {
+                tool_call: Some(filters),
+                ..
+            },
+            ObservationKind::ToolCall(message),
+        ) => {
+            if filters.tools.as_ref().is_some_and(|tools| {
+                !message.value["tool"]["category"]
+                    .as_str()
+                    .and_then(parse_category)
+                    .is_some_and(|category| tools.contains(&category))
+            }) {
+                return Ok(false);
+            }
+            evaluate_scoped_filters(filters, AttributionScope::Message, &message.value)?;
+            evaluate_path_filters(
+                filters.paths.as_deref(),
+                filters.paths_ignore.as_deref(),
+                &message.value,
+            )?;
+            Ok(true)
+        }
+        (TriggerFamily::ResponseCycle(filters), ObservationKind::TurnEnd { turn }) => {
+            if filters.statuses.as_ref().is_some_and(|statuses| {
+                !turn["status"]
+                    .as_str()
+                    .and_then(parse_status)
+                    .is_some_and(|status| statuses.contains(&status))
+            }) {
+                return Ok(false);
+            }
+            evaluate_scoped_filters(filters, AttributionScope::Turn, turn)?;
+            Ok(true)
+        }
+        (
+            TriggerFamily::Session {
+                session_start: Some(filters),
+                ..
+            },
+            ObservationKind::SessionStart { reason },
+        ) => {
+            if filters
+                .reasons
+                .as_ref()
+                .is_some_and(|reasons| !reasons.contains(reason))
+            {
+                return Ok(false);
+            }
+            evaluate_scoped_filters(
+                filters,
+                AttributionScope::Session,
+                &observation.context.value["session"],
+            )?;
+            Ok(true)
+        }
+        (
+            TriggerFamily::Session {
+                session_idle: Some(filters),
+                ..
+            },
+            ObservationKind::SessionIdle { .. },
+        ) => {
+            evaluate_scoped_filters(
+                filters,
+                AttributionScope::Session,
+                &observation.context.value["session"],
+            )?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn evaluate_scoped_filters(
+    filters: &EventFilters,
+    scope: AttributionScope,
+    value: &serde_json::Value,
+) -> Result<(), FilterDiagnostic> {
+    evaluate_attribution_filters(filters.models.as_deref(), filters.fast_mode, scope, value)
 }
 
 fn parse_category(value: &str) -> Option<ToolCategory> {
@@ -595,6 +874,19 @@ fn candidate_fingerprint(
                 update_string(&mut hasher, id);
                 update_string(&mut hasher, &version.0);
             }
+            EvidenceDependency::SourceEvidence { id, version } => {
+                hasher.update([3]);
+                update_string(&mut hasher, id);
+                update_string(&mut hasher, &version.0);
+            }
+            EvidenceDependency::SessionActivity {
+                attachment_epoch,
+                activity_revision,
+            } => {
+                hasher.update([4]);
+                update_string(&mut hasher, attachment_epoch);
+                hasher.update(activity_revision.to_be_bytes());
+            }
         }
     }
     hasher.finalize().into()
@@ -615,7 +907,7 @@ mod tests {
     use crate::domain::{ActivationId, EvidenceVersion, Generation, NativeOrderKey};
 
     fn activation() -> EffectiveActivation {
-        let source = "name: Retry\non:\n  tool_result:\n  window: {size: 3, min: 3}\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {items: \"${{ window.messages }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n";
+        let source = "name: Retry\non:\n  tool_result:\n  window: {size: 3, min: 3}\ndecisions:\n  review:\n    input: {items: \"${{ window.messages }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n";
         EffectiveActivation {
             id: ActivationId {
                 scope: Default::default(),
@@ -634,6 +926,7 @@ mod tests {
 
     fn result(position: u64) -> Observation {
         Observation {
+            first_eligible_publication: None,
             position: ObservationPosition(position),
             branch: BranchId("main-session".to_owned()),
             native_order: NativeOrderKey(format!("native-{position}")),
@@ -674,6 +967,51 @@ mod tests {
             .iter()
             .map(|item| item.message.id.as_str())
             .collect()
+    }
+
+    #[test]
+    fn normalized_duplicate_admission_excludes_old_revisions_and_removal_tombstones() {
+        let branch = BranchId("main-session".into());
+        let version = EvidenceVersion("normalized-version".into());
+        let changed_version = EvidenceVersion("changed-normalized-version".into());
+        for membership in [
+            ResultMembership::Unknown,
+            ResultMembership::Historical,
+            ResultMembership::Excluded,
+            ResultMembership::Selected,
+            ResultMembership::Retired,
+            ResultMembership::Removed,
+        ] {
+            for terminal_seen in [false, true] {
+                let mut state = SelectionState::default();
+                state.seen_results.insert(
+                    (branch.clone(), "member".into()),
+                    SeenResult {
+                        terminal_seen,
+                        revision: 2,
+                        version: version.clone(),
+                        native_order: NativeOrderKey("native-order".into()),
+                        membership,
+                    },
+                );
+                assert!(!state.accepts_update(&branch, "member", 2, &version));
+                assert_eq!(
+                    state.is_normalized_duplicate(&branch, "member", 2, &version),
+                    membership != ResultMembership::Removed
+                );
+                assert!(!state.is_normalized_duplicate(&branch, "member", 1, &version));
+                assert!(!state.accepts_update(&branch, "member", 1, &version));
+                assert!(!state.is_normalized_duplicate(&branch, "member", 2, &changed_version));
+                assert_eq!(
+                    state.accepts_update(&branch, "member", 2, &changed_version),
+                    membership != ResultMembership::Removed
+                );
+                assert!(!state.is_normalized_duplicate(&branch, "member", 3, &version));
+                assert!(state.accepts_update(&branch, "member", 3, &version));
+                assert!(!state.is_normalized_duplicate(&branch, "unseen", 2, &version));
+                assert!(state.accepts_update(&branch, "unseen", 2, &version));
+            }
+        }
     }
 
     #[test]

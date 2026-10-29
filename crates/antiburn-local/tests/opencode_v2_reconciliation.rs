@@ -51,6 +51,7 @@ fn put(connection: &Connection, id: &str, kind: &str, seq: i64, data: Value) {
 
 fn target() -> ToolResultObservation {
     ToolResultObservation {
+        facts: None,
         source_format: SourceFormat::OpenCodeSqliteV2,
         session_id: "session".into(),
         record_id: Some("message".into()),

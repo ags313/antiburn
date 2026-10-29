@@ -690,8 +690,8 @@ fn conflicting_duplicate_source_outcomes_are_rejected_without_publishing() {
 #[test]
 fn current_resume_revisions_reject_each_prior_batch_revision() {
     let current = crate::analysis::resume_revisions();
-    assert_eq!(current.snapshot_revision, 21);
-    assert_eq!(current.parser_revision, 64);
+    assert_eq!(current.snapshot_revision, 25);
+    assert_eq!(current.parser_revision, 67);
     assert_eq!(current.analyzer_revision, 25);
     assert_eq!(current.metrics_schema_revision, 10);
     assert_eq!(current.evidence_schema_revision, 22);
@@ -707,8 +707,8 @@ fn current_resume_revisions_reject_each_prior_batch_revision() {
     for field in 0..6 {
         let mut stale = stored.clone();
         match field {
-            0 => stale.snapshot_revision = 20,
-            1 => stale.parser_revision = 61,
+            0 => stale.snapshot_revision = 24,
+            1 => stale.parser_revision = 66,
             2 => stale.analyzer_revision = 24,
             3 => stale.metrics_schema_revision = 9,
             4 => stale.evidence_schema_revision = 21,
@@ -717,6 +717,35 @@ fn current_resume_revisions_reject_each_prior_batch_revision() {
         }
         assert!(!current.matches(&stale), "accepted stale revision {field}");
     }
+}
+
+#[test]
+fn parser_64_batch_resume_is_rejected_and_purged_without_removing_current_state() {
+    let store = store();
+    let (record, _claim) = claimed_projection(&store, "parser-65-batch-resume", 100, 60);
+    let current = crate::analysis::resume_revisions();
+    assert_eq!(current.parser_revision, 67);
+    let mut old = sample_resume("parser-64");
+    old.parser_revision = 64;
+    assert!(!current.matches(&old));
+    {
+        let connection = store.lock();
+        let key = turn_session_key(&record.key);
+        insert_source_resume(&connection, &key, "parser-64", &old).unwrap();
+        insert_source_resume(&connection, &key, "parser-65", &sample_resume("parser-65")).unwrap();
+    }
+    assert_eq!(store.purge_stale_source_resume(current).unwrap(), 1);
+    let connection = store.lock();
+    let key = turn_session_key(&record.key);
+    assert!(
+        query_source_resume(&connection, &key, "parser-64")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        query_source_resume(&connection, &key, "parser-65").unwrap(),
+        Some(sample_resume("parser-65"))
+    );
 }
 
 #[test]

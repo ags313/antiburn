@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 /// A session identity includes the execution environment, agent, and session ID. IDs
 /// can repeat across agents or environments. `Ord` supplies deterministic full-identity
 /// ordering.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct SessionKey {
     pub environment_key: String,
     pub agent: String,

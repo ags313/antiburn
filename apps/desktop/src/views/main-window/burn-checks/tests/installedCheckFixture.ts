@@ -76,7 +76,7 @@ export const installedCheckEvidenceFixture: BurnCheckTargetEvidencePayload = {
       startLine: null,
       endLine: null,
       excerpt: JSON.stringify(installedCheckAssessedInputFixture),
-      explanation: "These are the decision input values used for this assessment.",
+      explanation: "These are the decision input values used for this check.",
       limitation:
         "Input was shortened under the check's fitting rules. Omitted records and text were not assessed.",
     },

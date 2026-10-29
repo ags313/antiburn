@@ -38,7 +38,6 @@ const wins = [
 ]
 
 const presentation: ChecksPresentation = {
-  checking: [],
   activeAssessed: [failure, ...wins],
   activeUnavailable: [],
   snoozed: [],
@@ -127,7 +126,6 @@ describe("Checks", () => {
   it("uses failure, pass, and neutral border tones from assessed outcomes", () => {
     const passedCategory = category("sessionsOverDepth")
     const passedPresentation: ChecksPresentation = {
-      checking: [],
       activeAssessed: [passedCategory],
       activeUnavailable: [],
       snoozed: [],
@@ -165,7 +163,6 @@ describe("Checks", () => {
       estimatedTokenBurnBasisPoints: null,
     })
     const unassessedPresentation: ChecksPresentation = {
-      checking: [],
       activeAssessed: [],
       activeUnavailable: [unassessedCategory],
       snoozed: [],
@@ -399,34 +396,6 @@ describe("Checks", () => {
     expect(screen.queryByRole("button")).not.toBeInTheDocument()
   })
 
-  it("shows in-progress checks with neutral checking text", () => {
-    render(
-      <ChecksPeek
-        presentation={{
-          ...presentation,
-          failures: [],
-          wins: [],
-          checking: [
-            category("scopeCreep", {
-              clean: 0,
-              estimatedTokenBurnBasisPoints: null,
-              lifecycle: null,
-              checking: true,
-            }),
-          ],
-        }}
-      />,
-    )
-    const row = screen.getByText("Scope creep").closest<HTMLElement>(".grid")!
-    expect(within(row).getByText("Checking")).toBeVisible()
-    expect(
-      screen.getByRole("heading", { name: "Checking" }).closest("section"),
-    ).toContainElement(row)
-    expect(screen.queryByRole("heading", { name: "Passed checks" })).not.toBeInTheDocument()
-    expect(row.querySelector(".lucide-loader-circle")).not.toBeInTheDocument()
-    expect(within(row).queryByText("0% estimated burn")).not.toBeInTheDocument()
-  })
-
   it("shows the queued check count below the hero", () => {
     render(<ChecksPeek presentation={presentation} pendingEvidence={12} />)
 
@@ -560,7 +529,6 @@ describe("Checks", () => {
       <ChecksPeek
         presentation={{
           activeAssessed: wins,
-          checking: [],
           activeUnavailable: [],
           snoozed: [],
           failures: [],
@@ -579,8 +547,8 @@ describe("Checks", () => {
         }}
       />,
     )
-    expect(screen.getByText("No issues found")).toBeInTheDocument()
-    expect(screen.getByText("No issues found")).toHaveClass("text-label")
+    expect(screen.getByText("No issues in available results")).toBeInTheDocument()
+    expect(screen.getByText("No issues in available results")).toHaveClass("text-label")
     const passingIcon = container.querySelector(".lucide-circle-check")
     expect(passingIcon).toBeInTheDocument()
     expect(passingIcon).toHaveAttribute("width", "24")
@@ -590,7 +558,6 @@ describe("Checks", () => {
       <ChecksPeek
         presentation={{
           activeAssessed: [category("sessionsOverDepth", { clean: 8, unavailable: 4 })],
-          checking: [],
           activeUnavailable: [],
           snoozed: [],
           failures: [],
@@ -609,7 +576,7 @@ describe("Checks", () => {
         }}
       />,
     )
-    expect(screen.getByText("No issues found")).toBeInTheDocument()
+    expect(screen.getByText("No issues in available results")).toBeInTheDocument()
     expect(screen.queryByText("More evidence is needed")).not.toBeInTheDocument()
     expect(screen.getAllByText("Passed")).toHaveLength(1)
     expect(screen.queryByText("Passed where assessed")).not.toBeInTheDocument()

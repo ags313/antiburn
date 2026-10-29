@@ -1,5 +1,6 @@
 //! Fenced capture progress for OpenCode V2 event sessions.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 
 use antiburn_local::analysis::opencode_v2_capture::{
@@ -14,11 +15,12 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::super::publications::{
     PublicationGapKind, PublicationPolicy, ToolResultBatch, ToolResultBatchRef,
-    publish_coverage_with_kind_in, reconcile_borrowed_with_policy, reconcile_with_policy,
+    publish_coverage_with_kind_in, reconcile_with_policy,
 };
 use crate::store::native_tool_results::opencode_v2_status::{
     OpenCodeV2SourceStatus, SOURCE_SQL, upsert_source_status_in,
 };
+use crate::store::native_tool_results::trace_effects::{InvalidationEffects, PublicationEffects};
 use crate::store::selected_source::{
     LIVE_ACTIVATION_SQL, native_opencode_sqlite_format, opencode_v2_source_label,
 };
@@ -252,6 +254,8 @@ impl Store {
         let mut connection = self.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut claims = Vec::with_capacity(records.len());
+        let after_cursor = PublicationEffects::head(&tx)?;
+        let effects = Cell::new(InvalidationEffects::default());
         let mut seen = std::collections::HashSet::new();
         for record in records {
             ensure!(
@@ -266,10 +270,17 @@ impl Store {
         for claim in &claims {
             if let Some((pending, reason)) = pending_scope_retirement(&tx, claim)? {
                 let mut remaining = MAX_RETIREMENT_RESULTS;
-                if !retire_scope_bindings(&tx, &pending, &reason, &mut remaining)? {
+                if !retire_scope_bindings(&tx, &pending, &reason, &mut remaining, &effects)? {
                     clear_scope_retirement(&tx, &pending)?;
                 }
+                let summary = PublicationEffects::collect(&tx, after_cursor, effects.get())?;
                 tx.commit()?;
+                summary.trace(
+                    "capture_retention",
+                    trace_gap_reason(&reason),
+                    Some(pending.claim_fence),
+                    Some(pending.source_generation),
+                );
                 return Ok(OpenCodeV2ReconciliationPreparation::Progress);
             }
         }
@@ -308,11 +319,19 @@ impl Store {
             drop(statement);
             if overflow {
                 for rowid in oldest {
-                    retire_stored_binding(&tx, claim, rowid, "v2-current-retention")?;
+                    retire_stored_binding(&tx, claim, rowid, "v2-current-retention")?
+                        .record(Some(&effects));
                 }
-                publish_gap(&tx, claim, "v2-current-retention")?;
+                publish_gap(&tx, claim, "v2-current-retention")?.record(Some(&effects));
                 save_capture_status(&tx, claim, OpenCodeV2SourceStatus::CaptureGap, now)?;
+                let summary = PublicationEffects::collect(&tx, after_cursor, effects.get())?;
                 tx.commit()?;
+                summary.trace(
+                    "capture_retention",
+                    "current_retention",
+                    Some(claim.claim_fence),
+                    Some(claim.source_generation),
+                );
                 return Ok(OpenCodeV2ReconciliationPreparation::Progress);
             }
         }
@@ -337,6 +356,8 @@ impl Store {
             return Ok(OpenCodeV2ReconciliationPreparation::Fenced);
         }
         let mut pending_claims = Vec::new();
+        let after_cursor = PublicationEffects::head(&tx)?;
+        let effects = Cell::new(InvalidationEffects::default());
         for claim in claims {
             if !retirement_session_matches(&tx, claim)? {
                 return Ok(OpenCodeV2ReconciliationPreparation::Fenced);
@@ -360,13 +381,15 @@ impl Store {
         let mut remaining = MAX_RETIREMENT_RESULTS;
         let mut pending = false;
         for claim in pending_claims {
-            let more = retire_scope_bindings(&tx, claim, reason, &mut remaining)?;
+            let more = retire_scope_bindings(&tx, claim, reason, &mut remaining, &effects)?;
             if !more {
                 clear_scope_retirement(&tx, claim)?;
             }
             pending |= more;
         }
+        let summary = PublicationEffects::collect(&tx, after_cursor, effects.get())?;
         tx.commit()?;
+        summary.trace("capture_retention", trace_gap_reason(reason), None, None);
         Ok(if pending {
             OpenCodeV2ReconciliationPreparation::Progress
         } else {
@@ -404,7 +427,7 @@ impl Store {
                    FROM native_tool_result_current c JOIN session s
                      USING (environment_key, agent, session_id)
                   WHERE c.environment_key = ?1 AND c.agent = ?2 AND c.session_id = ?3
-                    AND c.source_format = ?4 AND c.is_removed = 0
+                     AND c.source_format = ?4 AND c.is_removed = 0 AND c.event_kind = 'tool_result'
                     AND s.source_kind = 'providerDb' AND s.source_label = ?5 AND s.cwd = ?6
                     AND s.wsl_distro IS NULL ORDER BY c.native_identity LIMIT ?7",
             )?;
@@ -432,6 +455,7 @@ impl Store {
 
     /// Clears capture leases left by a worker that stopped.
     pub(crate) fn recover_opencode_v2_capture_claims(&self, now: i64) -> Result<usize> {
+        let started = std::time::Instant::now();
         ensure!(now >= 0, "V2 capture recovery time must be non-negative");
         let mut connection = self.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -446,9 +470,11 @@ impl Store {
                 .query_map([], |row| Ok((claim_from_row(row)?, row.get::<_, i64>(13)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let after_cursor = PublicationEffects::head(&tx)?;
+        let mut effects = InvalidationEffects::default();
         for (claim, lease_expires_at_epoch) in &claims {
             if capture_session_matches(&tx, claim)? {
-                publish_gap(
+                effects += publish_gap(
                     &tx,
                     claim,
                     if *lease_expires_at_epoch <= now {
@@ -473,7 +499,18 @@ impl Store {
                 ],
             )?;
         }
+        let summary = PublicationEffects::collect(&tx, after_cursor, effects)?;
         tx.commit()?;
+        summary.trace("capture_recovery", "lease_recovery", None, None);
+        if !claims.is_empty() {
+            ::tracing::debug!(
+                event = "opencode_v2_capture_recovery",
+                status = "committed",
+                recovered_claims = claims.len(),
+                expired_claims = claims.iter().filter(|(_, expiry)| *expiry <= now).count(),
+                elapsed_ms = started.elapsed().as_millis() as u64
+            );
+        }
         Ok(claims.len())
     }
 
@@ -586,6 +623,7 @@ impl Store {
         now: i64,
         lease_secs: i64,
     ) -> Result<Option<Vec<OpenCodeV2CaptureClaim>>> {
+        let started = std::time::Instant::now();
         ensure!(
             !starts.is_empty() && starts.len() <= MAX_CAPTURE_STARTS,
             "invalid V2 capture set size"
@@ -643,6 +681,8 @@ impl Store {
             }
         }
         let mut claims = Vec::with_capacity(starts.len());
+        let after_cursor = PublicationEffects::head(&tx)?;
+        let mut effects = InvalidationEffects::default();
         for start in starts {
             let previous_fence: Option<i64> = tx
                 .query_row(
@@ -706,7 +746,7 @@ impl Store {
                 last_sequence: start.baseline_sequence,
                 history_gap: true,
             };
-            publish_gap(&tx, &claim, "cold-attach")?;
+            effects += publish_gap(&tx, &claim, "cold-attach")?;
             attach_live_checks(&tx, &claim)?;
             save_capture_status(&tx, &claim, OpenCodeV2SourceStatus::Live, now)?;
             claims.push(claim);
@@ -716,7 +756,26 @@ impl Store {
         {
             return Ok(None);
         }
+        let summary = PublicationEffects::collect(&tx, after_cursor, effects)?;
         tx.commit()?;
+        summary.trace(
+            if snapshot.is_some() {
+                "capture_reconciliation"
+            } else {
+                "capture_attachment"
+            },
+            "capture_start",
+            None,
+            None,
+        );
+        ::tracing::debug!(
+            event = "opencode_v2_capture_started",
+            status = "committed",
+            claims = claims.len(),
+            reconciled = snapshot.is_some(),
+            bindings = snapshot.map_or(0, |snapshot| snapshot.bindings.len()),
+            elapsed_ms = started.elapsed().as_millis() as u64
+        );
         Ok(Some(claims))
     }
 
@@ -754,6 +813,7 @@ impl Store {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) fn advance_opencode_v2_capture(
         &self,
         claim: &OpenCodeV2CaptureClaim,
@@ -762,57 +822,171 @@ impl Store {
         now: i64,
         lease_secs: i64,
     ) -> Result<bool> {
+        let batch = antiburn_local::analysis::NativeEvidenceBatch {
+            source_format: SourceFormat::OpenCodeSqliteV2,
+            events: result
+                .iter()
+                .map(|result| antiburn_local::analysis::NativeEvidenceEvent {
+                    fact: antiburn_local::analysis::NativeEvidenceFact::Message(
+                        antiburn_local::analysis::NativeMessageObservation::ToolResult(
+                            (*result).clone(),
+                        ),
+                    ),
+                    live_eligible: true,
+                })
+                .collect(),
+            history_complete: result
+                .is_some_and(|r| r.context.as_ref().is_some_and(|c| c.complete_through_event)),
+        };
+        self.advance_opencode_v2_evidence(claim, sequence, &batch, now, lease_secs)
+    }
+
+    pub(crate) fn validate_opencode_v2_idle_frontier(
+        &self,
+        claims: &[OpenCodeV2CaptureClaim],
+        boundaries: &std::collections::HashMap<String, Option<u64>>,
+        now: i64,
+    ) -> Result<bool> {
+        let mut connection = self.lock();
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !claims_valid(&tx, claims, now, true)? {
+            return Ok(false);
+        }
+        for claim in claims {
+            let Some(boundary) = boundaries.get(&claim.key.session_id) else {
+                continue;
+            };
+            let last: Option<u64> = tx.query_row(
+                "SELECT last_sequence FROM opencode_v2_capture
+                WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+                params![
+                    claim.key.environment_key,
+                    claim.key.agent,
+                    claim.key.session_id
+                ],
+                |r| r.get(0),
+            )?;
+            if last < *boundary {
+                continue;
+            }
+            let receipt = serde_json::to_string(&(&claim.capture_epoch, claim.claim_fence, last))?;
+            super::super::observers::rebind_source_in(
+                &tx,
+                &claim.key,
+                SourceFormat::OpenCodeSqliteV2,
+            )?;
+            super::super::observers::frontier_in(&tx, &claim.key, &receipt, true, now * 1000)?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn advance_opencode_v2_evidence(
+        &self,
+        claim: &OpenCodeV2CaptureClaim,
+        sequence: u64,
+        batch: &antiburn_local::analysis::NativeEvidenceBatch,
+        now: i64,
+        lease_secs: i64,
+    ) -> Result<bool> {
+        let started = std::time::Instant::now();
+        use antiburn_local::analysis::{NativeEvidenceFact, NativeMessageObservation};
+        ensure!(
+            batch.source_format == SourceFormat::OpenCodeSqliteV2,
+            "V2 evidence format mismatch"
+        );
+        for event in &batch.events {
+            let position = match &event.fact {
+                NativeEvidenceFact::Message(message) => {
+                    super::super::evidence::message_payload(message).position()
+                }
+                NativeEvidenceFact::ResponseCycle(cycle) => cycle.position,
+                NativeEvidenceFact::Activity(activity) => activity.position,
+                NativeEvidenceFact::SessionSelection(selection) => selection.position,
+                NativeEvidenceFact::MessageRemoval(removal) => removal.position,
+                NativeEvidenceFact::AdmissionFailure(failure) => failure.position,
+            };
+            if !matches!(position, ToolResultPosition::OpenCodeV2Event { sequence: native, .. }
+                if native == sequence || (!event.live_eligible && native < sequence))
+            {
+                return Ok(false);
+            }
+        }
+        let results = batch
+            .events
+            .iter()
+            .filter_map(|event| match &event.fact {
+                NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(result)) => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         ensure!(lease_secs > 0, "V2 capture lease must be positive");
         let lease_expiry = now
             .checked_add(lease_secs)
             .context("V2 capture lease overflow")?;
         let sequence_sql = sqlite_sequence(Some(sequence))?.context("missing V2 event sequence")?;
-        // The capture epoch validates result-less event order in memory.
-        let Some(result) = result else {
-            return Ok(true);
-        };
-        if claim
-            .baseline_sequence
-            .is_some_and(|baseline| sequence <= baseline)
-            || result.source_format != SourceFormat::OpenCodeSqliteV2
-            || !matches!(result.position, ToolResultPosition::OpenCodeV2Event { sequence: n, .. } if n == sequence)
-            || result.session_id != claim.key.session_id
-            || result.record_id.as_deref().is_none_or(str::is_empty)
-            || result.call_id.as_deref().is_none_or(str::is_empty)
-            || !result.finality
-            || result.change != ToolResultChange::Update
-        {
+        if !batch.events.is_empty() && {
+            claim
+                .baseline_sequence
+                .is_some_and(|baseline| sequence <= baseline)
+        } {
             return Ok(false);
+        }
+        for result in &results {
+            if result.source_format != SourceFormat::OpenCodeSqliteV2
+                || !matches!(result.position, ToolResultPosition::OpenCodeV2Event { sequence: n, .. } if n == sequence)
+                || result.session_id != claim.key.session_id
+                || result.record_id.as_deref().is_none_or(str::is_empty)
+                || result.call_id.as_deref().is_none_or(str::is_empty)
+                || !result.finality
+                || result.change != ToolResultChange::Update
+            {
+                return Ok(false);
+            }
         }
         let mut connection = self.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !claims_valid(&tx, std::slice::from_ref(claim), now, true)? {
             return Ok(false);
         }
-        let (baseline_sequence, last_sequence): (Option<i64>, Option<i64>) = tx.query_row(
-            "SELECT baseline_sequence, last_sequence FROM opencode_v2_capture
+        let (baseline_sequence, last_sequence, history_gap): (Option<i64>, Option<i64>, bool) = tx
+            .query_row(
+                "SELECT baseline_sequence, last_sequence, history_gap FROM opencode_v2_capture
               WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
                 AND capture_epoch = ?4 AND claim_fence = ?5",
-            params![
-                claim.key.environment_key,
-                claim.key.agent,
-                claim.key.session_id,
-                claim.capture_epoch,
-                claim.claim_fence
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+                params![
+                    claim.key.environment_key,
+                    claim.key.agent,
+                    claim.key.session_id,
+                    claim.capture_epoch,
+                    claim.claim_fence
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
         if baseline_sequence != sqlite_sequence(claim.baseline_sequence)?
             || sequence_sql <= baseline_sequence.unwrap_or(-1)
             || last_sequence.is_some_and(|last| sequence_sql <= last)
         {
             return Ok(false);
         }
-        let publish_result = match existing_terminal_matches(&tx, &claim.key, result)? {
-            Some(false) => return Ok(false),
-            Some(true) => false,
-            None => true,
-        };
+        let mut admitted = batch.clone();
+        let after_cursor = PublicationEffects::head(&tx)?;
+        let effects = Cell::new(InvalidationEffects::default());
+        admitted.events.clear();
+        for event in &batch.events {
+            if let NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(result)) =
+                &event.fact
+            {
+                match existing_terminal_matches(&tx, &claim.key, result)? {
+                    Some(false) => return Ok(false),
+                    Some(true) => continue,
+                    None => {}
+                }
+            }
+            admitted.events.push(event.clone());
+        }
         tx.execute(
             "UPDATE opencode_v2_capture SET last_sequence = ?6,
                     lease_expires_at_epoch = ?7
@@ -828,23 +1002,57 @@ impl Store {
                 lease_expiry
             ],
         )?;
-        if publish_result {
-            let batch = ToolResultBatchRef {
-                source_format: SourceFormat::OpenCodeSqliteV2,
-                results: std::slice::from_ref(result),
-                complete: false,
+        let mut coverage_transition = false;
+        let mut coverage_complete = !history_gap;
+        if !admitted.events.is_empty() {
+            // A partial capture needs explicit proof; tool-local limits do not break a complete capture.
+            let has_new_result = admitted.events.iter().any(|event| {
+                matches!(
+                    event.fact,
+                    NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(_))
+                )
+            });
+            let capture_proven = !history_gap
+                || (has_new_result
+                    && results.iter().all(|result| {
+                        result.context.as_ref().is_some_and(|context| {
+                            context.main_session && context.complete_through_event
+                        })
+                    }));
+            let complete = batch.history_complete && capture_proven;
+            coverage_transition = history_gap == complete;
+            coverage_complete = complete;
+            let limit_message_history = |message: &mut NativeMessageObservation| match message {
+                NativeMessageObservation::User(message) => {
+                    message.context.complete_through_event &= complete
+                }
+                NativeMessageObservation::Public(message) => {
+                    if let Some(context) = &mut message.context {
+                        context.complete_through_event &= complete;
+                    }
+                }
+                NativeMessageObservation::ToolResult(_) => {}
             };
-            let complete = result
-                .context
-                .as_ref()
-                .is_some_and(|context| context.main_session && context.complete_through_event);
-            reconcile_borrowed_with_policy(
+            for event in &mut admitted.events {
+                match &mut event.fact {
+                    NativeEvidenceFact::Message(message) => limit_message_history(message),
+                    NativeEvidenceFact::ResponseCycle(cycle) => {
+                        cycle.context.complete_through_event &= complete;
+                        for message in &mut cycle.messages {
+                            restore_frozen_member_context_in(&tx, claim, message)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let consumed = super::super::evidence::reconcile_evidence_in(
                 &tx,
                 &claim.key,
                 current_source_generation(&tx, &claim.key)?,
                 claim.claim_fence,
-                batch,
+                &admitted,
                 PublicationPolicy {
+                    invalidation_effects: Some(&effects),
                     baseline: claim.baseline_sequence,
                     history_complete: Some(complete),
                     gap_reason: (!complete).then_some("v2-history-incomplete"),
@@ -852,7 +1060,12 @@ impl Store {
                     live_eligible: Some(true),
                     ..PublicationPolicy::default()
                 },
+                now * 1000,
             )?;
+            ensure!(
+                consumed,
+                "V2 message removal exceeds one captured event budget"
+            );
             tx.execute(
                 "UPDATE opencode_v2_capture SET history_gap = ?6
                       WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
@@ -867,7 +1080,27 @@ impl Store {
                 ],
             )?;
         }
+        let summary = PublicationEffects::collect(&tx, after_cursor, effects.get())?;
         tx.commit()?;
+        summary.trace(
+            "live_capture",
+            "native_event",
+            Some(claim.claim_fence),
+            Some(claim.source_generation),
+        );
+        if summary.through_cursor > summary.after_cursor {
+            ::tracing::debug!(
+                event = "opencode_v2_evidence_published",
+                status = "committed",
+                claim_fence = claim.claim_fence,
+                capture_source_generation = claim.source_generation,
+                events = admitted.events.len(),
+                duplicate_events = batch.events.len() - admitted.events.len(),
+                coverage_complete,
+                coverage_transition,
+                elapsed_ms = started.elapsed().as_millis() as u64
+            );
+        }
         Ok(true)
     }
 
@@ -881,11 +1114,25 @@ impl Store {
         let mut connection = self.lock();
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut released = 0;
+        let mut transitions = 0;
         let mut retirement_remaining = MAX_RETIREMENT_RESULTS;
+        let after_cursor = PublicationEffects::head(&tx)?;
+        let effects = Cell::new(InvalidationEffects::default());
         for claim in claims {
             if !capture_claims_match(&tx, std::slice::from_ref(claim), now, false)? {
                 continue;
             }
+            let leased: bool = tx.query_row(
+                "SELECT lease_expires_at_epoch IS NOT NULL FROM opencode_v2_capture
+                WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+                params![
+                    claim.key.environment_key,
+                    claim.key.agent,
+                    claim.key.session_id
+                ],
+                |row| row.get(0),
+            )?;
+            transitions += usize::from(leased);
             let retire_scope = scope_retirement_reason(reason);
             let session_matches = if retire_scope {
                 retirement_session_matches(&tx, claim)?
@@ -894,9 +1141,9 @@ impl Store {
             };
             if session_matches {
                 if retire_scope {
-                    retire_scope_bindings(&tx, claim, reason, &mut retirement_remaining)?;
+                    retire_scope_bindings(&tx, claim, reason, &mut retirement_remaining, &effects)?;
                 }
-                publish_gap(&tx, claim, reason)?;
+                publish_gap(&tx, claim, reason)?.record(Some(&effects));
                 let status = match reason {
                     "event-version-unsupported" => OpenCodeV2SourceStatus::VersionUnsupported,
                     "source-limit" | "recovery-capacity" => OpenCodeV2SourceStatus::SourceLimit,
@@ -922,9 +1169,77 @@ impl Store {
             )?;
             released += 1;
         }
+        let summary = PublicationEffects::collect(&tx, after_cursor, effects.get())?;
         tx.commit()?;
+        summary.trace("capture_gap", trace_gap_reason(reason), None, None);
+        if transitions > 0 {
+            ::tracing::debug!(
+                event = "opencode_v2_capture_gap",
+                reason = trace_gap_reason(reason),
+                released_claims = transitions,
+                status = "lease_released"
+            );
+        }
         Ok(released)
     }
+}
+
+fn restore_frozen_member_context_in(
+    tx: &Transaction<'_>,
+    claim: &OpenCodeV2CaptureClaim,
+    message: &mut antiburn_local::analysis::NativeMessageObservation,
+) -> Result<()> {
+    use antiburn_local::analysis::{
+        NativeMessageObservation, PublicMessageObservation, UserMessageObservation,
+    };
+
+    let (identity, revision, kind) = {
+        let payload = super::super::evidence::message_payload(message);
+        (
+            payload.identity()?,
+            i64::try_from(payload.revision())?,
+            payload.kind(),
+        )
+    };
+    let stored: Option<String> = tx
+        .query_row(
+            "SELECT c.payload_json FROM native_tool_result_current c
+         JOIN native_tool_result_publication p USING(publication_sequence)
+         WHERE c.environment_key = ?1 AND c.agent = ?2 AND c.session_id = ?3
+           AND c.source_format = ?4 AND c.native_identity = ?5 AND c.native_revision = ?6
+           AND c.event_kind = ?7 AND c.is_removed = 0
+           AND p.session_incarnation = ?8 AND p.project_cwd IS ?9",
+            params![
+                claim.key.environment_key,
+                claim.key.agent,
+                claim.key.session_id,
+                serde_json::to_string(&SourceFormat::OpenCodeSqliteV2)?,
+                identity,
+                revision,
+                kind.name(),
+                claim.incarnation.0,
+                claim.cwd
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        // The evidence writer rejects missing or changed members.
+        return Ok(());
+    };
+    // Member contexts stay frozen at publication; the cycle owns its later request prefix.
+    match message {
+        NativeMessageObservation::User(message) => {
+            message.context = serde_json::from_str::<UserMessageObservation>(&stored)?.context;
+        }
+        NativeMessageObservation::Public(message) => {
+            message.context = serde_json::from_str::<PublicMessageObservation>(&stored)?.context;
+        }
+        NativeMessageObservation::ToolResult(message) => {
+            message.context = serde_json::from_str::<ToolResultObservation>(&stored)?.context;
+        }
+    }
+    Ok(())
 }
 
 fn result_identity(result: &ToolResultObservation) -> Result<String> {
@@ -1123,6 +1438,7 @@ fn retire_scope_bindings(
     claim: &OpenCodeV2CaptureClaim,
     reason: &str,
     remaining: &mut usize,
+    effects: &Cell<InvalidationEffects>,
 ) -> Result<bool> {
     let mut statement = tx.prepare(
         "SELECT c.rowid FROM native_tool_result_current c INDEXED BY native_tool_result_current_session
@@ -1151,7 +1467,7 @@ fn retire_scope_bindings(
     drop(statement);
     *remaining -= rowids.len();
     for rowid in rowids {
-        retire_stored_binding(tx, claim, rowid, reason)?;
+        retire_stored_binding(tx, claim, rowid, reason)?.record(Some(effects));
     }
     Ok(tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM native_tool_result_current c
@@ -1178,16 +1494,18 @@ fn retire_stored_binding(
     claim: &OpenCodeV2CaptureClaim,
     rowid: i64,
     reason: &str,
-) -> Result<()> {
+) -> Result<InvalidationEffects> {
     let generation = current_source_generation(tx, &claim.key)?;
     let inserted = tx.execute(
         "INSERT INTO native_tool_result_publication (
            outcome, environment_key, agent, session_id, source_format, native_identity,
            native_position_json, native_revision, payload_json, complete, source_generation,
-           claim_fence, live_eligible, gap_reason, project_cwd, session_incarnation)
+            claim_fence, live_eligible, gap_reason, project_cwd, session_incarnation,
+            event_kind, first_eligible_publication, owner_message_id)
          SELECT 'removal', c.environment_key, c.agent, c.session_id, c.source_format,
             c.native_identity, c.native_position_json, c.native_revision, c.payload_json, 0, ?6, ?7, 0, ?8,
-           COALESCE(p.project_cwd, ?9), COALESCE(p.session_incarnation, ?10)
+           COALESCE(p.project_cwd, ?9), COALESCE(p.session_incarnation, ?10),
+           c.event_kind, c.first_eligible_publication, c.owner_message_id
            FROM native_tool_result_current c
            JOIN native_tool_result_publication p ON p.publication_sequence = c.publication_sequence
           WHERE c.rowid = ?1 AND c.environment_key = ?2
@@ -1211,7 +1529,7 @@ fn retire_stored_binding(
         publication_sequence = ?2, source_generation = ?3, claim_fence = ?4 WHERE rowid = ?1",
         params![rowid, tx.last_insert_rowid(), generation, claim.claim_fence],
     )?;
-    Ok(())
+    super::super::evidence::invalidate_native_dependents_in(tx, &claim.key)
 }
 
 fn current_cwd(tx: &Transaction<'_>, key: &SessionKey) -> Result<Option<String>> {
@@ -1253,7 +1571,7 @@ fn reconcile_capture_bindings(
             .query_row(
                 "SELECT payload_json FROM native_tool_result_current
               WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-                AND source_format = ?4 AND native_identity = ?5 AND is_removed = 0",
+                 AND source_format = ?4 AND native_identity = ?5 AND is_removed = 0 AND event_kind = 'tool_result'",
                 params![
                     claim.key.environment_key,
                     claim.key.agent,
@@ -1278,7 +1596,7 @@ fn reconcile_capture_bindings(
         let count: usize = tx.query_row(
             "SELECT COUNT(*) FROM (SELECT 1 FROM native_tool_result_current
               WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-                AND source_format = ?4 AND is_removed = 0 LIMIT ?5)",
+                 AND source_format = ?4 AND is_removed = 0 AND event_kind = 'tool_result' LIMIT ?5)",
             params![
                 claim.key.environment_key,
                 claim.key.agent,
@@ -1342,7 +1660,7 @@ fn existing_terminal_matches(
         "SELECT CASE WHEN is_removed = 0 THEN payload_json END, is_removed,
                 json_extract(native_identity, '$[2]') FROM native_tool_result_current
           WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3 AND source_format = ?4
-            AND native_identity >= ?5 AND native_identity < ?6 ORDER BY native_identity",
+             AND event_kind = 'tool_result' AND native_identity >= ?5 AND native_identity < ?6 ORDER BY native_identity",
     )?;
     let mut rows = statement.query(params![
         key.environment_key,
@@ -1572,7 +1890,82 @@ fn capture_session_matches(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim)
     )?)
 }
 
-fn publish_gap(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim, reason: &str) -> Result<()> {
+fn invalidate_selected_generic_dependents(
+    tx: &Transaction<'_>,
+    claim: &OpenCodeV2CaptureClaim,
+) -> Result<InvalidationEffects> {
+    let affected = "WITH affected AS (
+        SELECT d.candidate_id FROM burn_check_candidate_dependency d
+        JOIN burn_check_candidate q ON q.candidate_id = d.candidate_id
+        JOIN burn_check_observation o
+          ON o.check_id = q.check_id AND o.activation_scope_key = q.activation_scope_key
+            AND o.observation_id = d.observation_id AND o.session_key_json = d.session_key_json
+            AND o.source_format = d.source_format AND o.event_kind = d.event_kind
+        JOIN native_tool_result_publication p ON p.publication_sequence = o.publication_sequence
+          AND p.native_identity = o.native_identity AND p.source_format = o.source_format
+          AND p.event_kind = o.event_kind
+        WHERE d.session_key_json = ?1 AND d.dependency_binding_json IS NULL
+          AND p.environment_key = ?2 AND p.agent = ?3 AND p.session_id = ?4
+          AND o.source_format = ?5
+          AND o.event_kind IN ('user_message', 'assistant_message', 'tool_call', 'response_cycle')
+          AND p.project_cwd IS ?6 AND p.session_incarnation = ?7
+    )";
+    let mut counts = [0; 3];
+    for (count, update) in counts.iter_mut().zip([
+        "UPDATE burn_check_candidate SET state = 'stale'
+          WHERE candidate_id IN (SELECT candidate_id FROM affected)
+            AND state IN ('pending', 'claimed', 'dispatching', 'answered')",
+        "UPDATE burn_check_assessment_history SET evidence_valid = 0
+          WHERE evidence_valid = 1 AND candidate_id IN (SELECT candidate_id FROM affected)",
+        "UPDATE burn_check_current_status SET evidence_valid = 0
+          WHERE evidence_valid = 1 AND assessment_id IN (SELECT assessment_id FROM burn_check_assessment_history
+            WHERE candidate_id IN (SELECT candidate_id FROM affected))",
+    ]) {
+        *count = tx.execute(
+            &format!("{affected} {update}"),
+            params![
+                claim.key.to_identity_json(),
+                claim.key.environment_key,
+                claim.key.agent,
+                claim.key.session_id,
+                serde_json::to_string(&SourceFormat::OpenCodeSqliteV2)?,
+                claim.cwd,
+                claim.incarnation.0
+            ],
+        )?;
+    }
+    Ok(InvalidationEffects {
+        unfinished_stale: counts[0],
+        accepted_evidence_revoked: counts[1],
+        current_status_revoked: counts[2],
+    })
+}
+
+fn publish_gap(
+    tx: &Transaction<'_>,
+    claim: &OpenCodeV2CaptureClaim,
+    reason: &str,
+) -> Result<InvalidationEffects> {
+    // Reconciliation can prove only tool results. Keep other identities unavailable after a gap.
+    tx.execute(
+        "UPDATE native_tool_result_current AS c SET is_removed = 1, complete = 0
+          WHERE c.environment_key = ?1 AND c.agent = ?2 AND c.session_id = ?3
+            AND c.source_format = ?4 AND c.is_removed = 0
+            AND c.event_kind IN ('user_message', 'assistant_message', 'tool_call', 'response_cycle')
+            AND EXISTS (SELECT 1 FROM native_tool_result_publication p
+              WHERE p.publication_sequence = c.publication_sequence
+                AND p.project_cwd IS ?5 AND p.session_incarnation = ?6)",
+        params![
+            claim.key.environment_key,
+            claim.key.agent,
+            claim.key.session_id,
+            serde_json::to_string(&SourceFormat::OpenCodeSqliteV2)?,
+            claim.cwd,
+            claim.incarnation.0
+        ],
+    )?;
+    let mut effects = invalidate_selected_generic_dependents(tx, claim)?;
+    effects += super::super::observers::break_continuity_in(tx, &claim.key)?;
     let batch = ToolResultBatchRef {
         source_format: SourceFormat::OpenCodeSqliteV2,
         results: &[],
@@ -1587,7 +1980,8 @@ fn publish_gap(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim, reason: &st
         false,
         Some(reason),
         PublicationGapKind::SegmentReset,
-    )
+    )?;
+    Ok(effects)
 }
 
 fn attach_live_checks(tx: &Transaction<'_>, claim: &OpenCodeV2CaptureClaim) -> Result<()> {
@@ -1627,6 +2021,27 @@ fn valid_gap_reason(reason: &str) -> bool {
         && reason
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn trace_gap_reason(reason: &str) -> &'static str {
+    match reason {
+        "session-moved" => "session_moved",
+        "session-deleted" => "session_deleted",
+        "source-scope-changed" => "source_scope_changed",
+        "source-detached" => "source_detached",
+        "capture-lease-lost" => "capture_lease_lost",
+        "session-event-sequence-gap" => "session_event_sequence_gap",
+        "event-version-unsupported" => "event_version_unsupported",
+        "source-limit" => "source_limit",
+        "event-join-gap" => "event_join_gap",
+        "event-feed-ended" => "event_feed_ended",
+        "event-feed-error" => "event_feed_error",
+        "checks-disabled" => "checks_disabled",
+        "worker-stopped" => "worker_stopped",
+        "recovery-capacity" => "recovery_capacity",
+        "v2-current-retention" => "current_retention",
+        _ => "other_capture_gap",
+    }
 }
 
 fn save_capture_status(

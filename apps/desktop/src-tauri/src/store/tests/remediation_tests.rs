@@ -95,7 +95,6 @@ fn enroll_prompt_batch(
             inputs,
             antiburn_local::insights::DetectorId::UnusedBuiltInTools,
             revision,
-            None,
             |records| Ok(records.to_vec()),
         )
         .unwrap()
@@ -183,7 +182,7 @@ fn v43_adds_remediation_and_model_attribution() {
     connection.pragma_update(None, "user_version", 42).unwrap();
     let store =
         Store::from_connection(connection, Path::new("/tmp/remediation-v43").into()).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 86);
+    assert_eq!(store.schema_version().unwrap(), 92);
     let connection = store.lock();
     let columns: i64 = connection
         .query_row(
@@ -242,7 +241,7 @@ fn v44_adds_nullable_snapshots_and_strict_contributions_without_backfill() {
 
     let store =
         Store::from_connection(connection, Path::new("/tmp/remediation-v44").into()).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 86);
+    assert_eq!(store.schema_version().unwrap(), 92);
     assert!(store.remediation_display_snapshot("old").unwrap().is_none());
     let connection = store.lock();
     let strict: i64 = connection
@@ -264,7 +263,7 @@ fn v46_adds_reasoning_attribution_without_rewriting_model_columns() {
     connection.pragma_update(None, "user_version", 45).unwrap();
     let store =
         Store::from_connection(connection, Path::new("/tmp/remediation-v46").into()).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 86);
+    assert_eq!(store.schema_version().unwrap(), 92);
     let columns: i64 = store
         .lock()
         .query_row(
@@ -1483,7 +1482,6 @@ fn prompt_enrollment_finish_error_rolls_back_rows_and_snapshots() {
         &inputs,
         antiburn_local::insights::DetectorId::UnusedBuiltInTools,
         revision,
-        None,
         |records| -> anyhow::Result<()> {
             assert_eq!(records[0].as_ref().unwrap().remediation_id, "first");
             assert_eq!(records[1].as_ref().unwrap().remediation_id, "second");
@@ -1515,7 +1513,6 @@ fn concurrent_prompt_enrollment_finishes_with_the_actual_attempt_ids() {
                         &[input],
                         antiburn_local::insights::DetectorId::UnusedBuiltInTools,
                         revision,
-                        None,
                         |records| {
                             let record = records[0].as_ref().unwrap();
                             Ok((
@@ -1556,7 +1553,6 @@ fn prompt_enrollment_does_not_store_fresh_64_kib_outputs() {
                 &[prompt_enrollment(id, "target")],
                 antiburn_local::insights::DetectorId::UnusedBuiltInTools,
                 revision,
-                None,
                 |records| {
                     let suffix = format!(
                         "{id}: Remediation reference: ABR-{}",
@@ -1695,7 +1691,6 @@ fn prompt_enrollment_rejects_stale_evidence_before_reuse_or_admission() {
                 &[existing, new],
                 antiburn_local::insights::DetectorId::UnusedBuiltInTools,
                 revision,
-                None,
                 |_| -> anyhow::Result<()> { panic!("a stale guard must skip finish") },
             )
             .unwrap();
@@ -1720,7 +1715,6 @@ fn prompt_enrollment_rejects_stale_evidence_before_reuse_or_admission() {
                     std::slice::from_ref(&valid),
                     antiburn_local::insights::DetectorId::UnusedBuiltInTools,
                     revision,
-                    None,
                     |_| -> anyhow::Result<()> { panic!("stale evidence must skip finish") },
                 )
                 .unwrap()
@@ -1745,34 +1739,18 @@ fn prompt_enrollment_rejects_stale_evidence_before_reuse_or_admission() {
 }
 
 #[test]
-fn prompt_enrollment_rejects_stale_check_policy_and_master_generation() {
+fn prompt_enrollment_rejects_stale_or_disabled_check_policy() {
     let store = store();
     let detector = antiburn_local::insights::DetectorId::UnusedBuiltInTools;
     let revision = store.check_preferences_revision().unwrap();
     let inputs = [prompt_enrollment("new", "target")];
-    for (expected_revision, generation) in [(revision + 1, None), (revision, Some("missing"))] {
-        assert!(
-            store
-                .enroll_prompt_remediations_for_enabled_check(
-                    &inputs,
-                    detector,
-                    expected_revision,
-                    generation,
-                    |_| -> anyhow::Result<()> { panic!("stale policy must skip finish") },
-                )
-                .unwrap()
-                .is_none()
-        );
-    }
-    store.set_internal_value("internal:burnChecksEnabledAtEpochV1", "current");
     assert!(
         store
             .enroll_prompt_remediations_for_enabled_check(
                 &inputs,
                 detector,
-                revision,
-                Some("old"),
-                |_| -> anyhow::Result<()> { panic!("stale generation must skip finish") },
+                revision + 1,
+                |_| -> anyhow::Result<()> { panic!("stale policy must skip finish") },
             )
             .unwrap()
             .is_none()
@@ -1785,7 +1763,6 @@ fn prompt_enrollment_rejects_stale_check_policy_and_master_generation() {
                 &inputs,
                 detector,
                 disabled_revision,
-                Some("current"),
                 |_| -> anyhow::Result<()> { panic!("a disabled check must skip finish") },
             )
             .unwrap()
@@ -1800,7 +1777,6 @@ fn prompt_enrollment_rejects_stale_check_policy_and_master_generation() {
                 &inputs,
                 detector,
                 enabled_revision,
-                Some("current"),
                 |records| Ok(records[0].as_ref().unwrap().remediation_id.clone()),
             )
             .unwrap(),
@@ -1836,7 +1812,6 @@ fn prompt_enrollment_validates_waiting_action_inputs_and_bounded_safe_documents(
                     &[input],
                     antiburn_local::insights::DetectorId::UnusedBuiltInTools,
                     revision,
-                    None,
                     |_| -> anyhow::Result<()> { panic!("invalid input must skip finish") },
                 )
                 .is_err(),

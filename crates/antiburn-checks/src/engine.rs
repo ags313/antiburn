@@ -6,26 +6,41 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::Value;
 
-use crate::actions::{ActionPlanningError, plan_status_actions};
+use crate::actions::{ActionPlanningError, plan_status_actions_with_budget};
 use crate::check_store::{
     AcceptanceOutcome, AssessmentAcceptance, AttemptFailure, CandidateClaim, CandidateId,
-    CheckStore, ClaimOutcome, ClaimedCandidate, EvaluatedCandidate, RecoveryWork, SourceProgress,
-    StoreError,
+    CheckStore, ClaimOutcome, ClaimedCandidate, DecisionProgress, DecisionProgressState,
+    EvaluatedAssessment, RecoveryWork, SourceProgress, StoreError, validate_decision_progress,
 };
+use crate::decision::DecisionAttempt;
+pub use crate::decision::DecisionInput;
 use crate::definition_lifecycle::EffectiveActivation;
-use crate::domain::{ActivationId, BranchId, FrozenCandidate, ObservationPosition};
-use crate::fit::{
-    FitReport, PreparationFailure, PreparationFailureCode, PreparationFailureContext,
-    PreparationRecord, PreparedDecision,
+use crate::domain::{
+    ActivationId, BranchId, EvidenceVersion, FrozenCandidate, Observation, ObservationPosition,
 };
-use crate::preparation::{PreparationOutcome, prepare_decision_input};
+use crate::expression_eval::EvaluationBudget;
+use crate::fit::{
+    PreparationFailure, PreparationFailureCode, PreparationFailureContext, PreparationRecord,
+};
+use crate::preparation::{PreparationOutcome, prepare_decision_input_with_budget};
+use crate::prepared_assessment::PreparedAssessment;
+use crate::results::DecisionResult;
 use crate::selection::SelectionOutcome;
-use crate::source::{CommittedSourceObservation, SourceBatch, SourceEvent};
+use crate::source::{CommittedSourceObservation, PublicationCursor, SourceBatch, SourceEvent};
 
+#[path = "engine_local.rs"]
+mod local;
+#[path = "engine/model.rs"]
+mod model;
 #[path = "engine_source_refresh.rs"]
 mod source_refresh;
+#[cfg(test)]
+#[path = "engine/test_support.rs"]
+pub(crate) mod test_support;
+use model::{bounded_failure, incompatible_preparation, prepare_all_inputs};
 
 /// Maximum number of pending candidates retained in memory.
 pub const MAX_PENDING_CANDIDATES: usize = 128;
@@ -44,27 +59,50 @@ pub enum ExecutionPolicy {
 
 /// A boxed evaluator future. The future owns all admission waits and provider I/O.
 pub type DecisionFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<EvaluatedCandidate, EvaluationFailure>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<DecisionResult, EvaluationFailure>> + Send + 'a>>;
 
 /// One bounded evaluation task returned to the coordinator for concurrent polling.
 pub type EvaluationTask<'a> =
-    Pin<Box<dyn Future<Output = Result<RunSettlement, StoreError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<RunSettlement, EvaluationTaskError>> + Send + 'a>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvaluationTaskError {
+    pub source: StoreError,
+    pub attempts: u64,
+    pub new_intents: u64,
+    pub intent_commit_uncertain: bool,
+}
+
+impl std::fmt::Display for EvaluationTaskError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+impl std::error::Error for EvaluationTaskError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparationValidationPurpose {
+    Dispatch,
+    Publication,
+}
 
 /// A model-backed evaluator for one already-frozen candidate.
 pub trait DecisionEvaluator: Send + Sync {
+    /// Checks local runtime gates without provider preparation or discovery.
+    fn local_execution_is_current(&self, _activation: &EffectiveActivation) -> bool {
+        true
+    }
+
     /// Validates and freezes provider input before durable dispatch intent.
     fn prepare(
         &self,
-        _activation: &EffectiveActivation,
-        input: Value,
-    ) -> Result<PreparedDecision, PreparationFailure> {
-        Ok(PreparedDecision {
-            profile: "unbounded-v1".into(),
-            input,
-            request: None,
-            report: FitReport::default(),
-        })
-    }
+        activation: &EffectiveActivation,
+        inputs: Vec<DecisionInput>,
+        evaluation_budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure>;
 
     /// Observes a new preparation after its current claim is saved.
     /// Saved retries and recovery do not call this hook.
@@ -73,36 +111,18 @@ pub trait DecisionEvaluator: Send + Sync {
     /// Fences incompatible saved provider profiles before dispatch or recovery.
     fn validate_prepared(
         &self,
-        _activation: &EffectiveActivation,
-        _prepared: &PreparedDecision,
-    ) -> Result<(), PreparationFailure> {
-        Ok(())
-    }
+        activation: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        purpose: PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure>;
 
     /// Evaluates the exact persisted preparation. Simple adapters use its input.
     fn evaluate_prepared<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
         candidate: &'a FrozenCandidate,
-        prepared: &'a PreparedDecision,
-        attempt_number: u8,
-    ) -> DecisionFuture<'a> {
-        self.evaluate(activation, candidate, &prepared.input, attempt_number)
-    }
-
-    /// Evaluates the compiled Choice with one durable, numbered provider attempt.
-    ///
-    /// Implementations must return promptly. Provider admission and transport
-    /// waits belong inside the returned future so the coordinator can poll this
-    /// task beside source pages, other evaluations, and cancellation.
-    /// `attempt_number` is the persisted dispatch number, including after restart.
-    /// The engine owns retries; each call must send at most one attempt.
-    fn evaluate<'a>(
-        &'a self,
-        activation: &'a EffectiveActivation,
-        candidate: &'a FrozenCandidate,
-        prepared_input: &'a Value,
-        attempt_number: u8,
+        prepared: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a>;
 }
 
@@ -150,7 +170,9 @@ pub struct RunSettlement {
     /// Semantic engine outcome.
     pub outcome: RunOutcome,
     /// Provider attempts consumed by the evaluator.
-    pub attempts: u8,
+    pub attempts: u64,
+    /// Committed intents created by this task, excluding saved attempts.
+    pub new_intents: u64,
 }
 
 /// Explicit result of adding a frozen candidate to bounded pending state.
@@ -179,6 +201,8 @@ pub enum RunOutcome {
     NotAssessed(String),
     /// The candidate failed without writing a status.
     Failed(String),
+    /// The finite replay allowance ended before another intent.
+    LimitReached,
 }
 
 /// Result of reserving a due candidate for asynchronous evaluation.
@@ -205,6 +229,8 @@ pub struct BatchOutcome {
     pub overflowed: usize,
     /// Conditions that filtered observations before window counting or queue mutation.
     pub condition_outcomes: Vec<(ObservationPosition, crate::preparation::ConditionOutcome)>,
+    /// Model, mode, and path rejections for committed observations.
+    pub filter_outcomes: Vec<(ObservationPosition, crate::filters::FilterDiagnostic)>,
 }
 
 /// A bounded, thread-safe scheduler. Persistence remains the source of truth.
@@ -214,13 +240,14 @@ pub struct CheckEngine<S, E> {
     state: Arc<Mutex<SchedulerState>>,
     selectors: Mutex<BTreeMap<ActivationId, SourceProgress>>,
     policy: ExecutionPolicy,
-    maximum_attempts: u8,
 }
 
 struct InFlightGuard {
     state: Arc<Mutex<SchedulerState>>,
     key: ScheduleKey,
     finished: bool,
+    release_branch_on_drop: bool,
+    safe_release: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl InFlightGuard {
@@ -232,11 +259,21 @@ impl InFlightGuard {
         state.in_flight.remove(&self.key);
         state.active_count = state.active_count.saturating_sub(1);
         self.finished = true;
+        self.safe_release = None;
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
+        if self.release_branch_on_drop {
+            if !self.finished
+                && let Some(release) = self.safe_release.take()
+            {
+                release();
+            }
+            self.finish();
+            return;
+        }
         if !self.finished {
             let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
             // Keep this branch reserved after cancellation. The Store has no settled
@@ -268,15 +305,32 @@ struct ScheduleKey {
 struct PendingCandidate {
     candidate: FrozenCandidate,
     compiled: Arc<crate::compiler::CompiledCheck>,
+    resumed: bool,
 }
 
 enum PreflightOutcome {
-    Ready(PreparedDecision),
+    Ready(PreparedAssessment),
     Settled(RunSettlement),
     Stale,
 }
 
-impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
+enum PageInvalidation {
+    Upsert {
+        identity: String,
+        version: EvidenceVersion,
+        source_evidence_version: Option<EvidenceVersion>,
+    },
+    NativeUpsert {
+        identity: String,
+        version: EvidenceVersion,
+    },
+    Removal {
+        identity: String,
+    },
+    Branch,
+}
+
+impl<S: CheckStore + 'static, E: DecisionEvaluator> CheckEngine<S, E> {
     /// Creates a coordinator over the desktop Store and decision evaluator.
     #[must_use]
     pub fn new(store: Arc<S>, evaluator: Arc<E>) -> Self {
@@ -286,24 +340,12 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
     /// Creates a coordinator with an explicit scheduling policy.
     #[must_use]
     pub fn with_policy(store: Arc<S>, evaluator: Arc<E>, policy: ExecutionPolicy) -> Self {
-        Self::with_policy_and_attempt_limit(store, evaluator, policy, 2)
-    }
-
-    /// Creates a coordinator with an explicit per-candidate attempt bound.
-    #[must_use]
-    pub fn with_policy_and_attempt_limit(
-        store: Arc<S>,
-        evaluator: Arc<E>,
-        policy: ExecutionPolicy,
-        maximum_attempts: u8,
-    ) -> Self {
         Self {
             store,
             evaluator,
             state: Arc::new(Mutex::new(SchedulerState::default())),
             selectors: Mutex::new(BTreeMap::new()),
             policy,
-            maximum_attempts,
         }
     }
 
@@ -350,6 +392,20 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         activation: &EffectiveActivation,
         page: &SourceBatch,
     ) -> Result<BatchOutcome, StoreError> {
+        self.apply_source_page_with_inventories(activation, page, &mut |_, _| Ok(None))
+    }
+
+    /// Freezes demanded current inventories without changing native observations.
+    pub fn apply_source_page_with_inventories(
+        &self,
+        activation: &EffectiveActivation,
+        page: &SourceBatch,
+        capture: &mut impl FnMut(
+            PublicationCursor,
+            &Observation,
+        )
+            -> Result<Option<crate::context::CurrentInventories>, StoreError>,
+    ) -> Result<BatchOutcome, StoreError> {
         let mut selectors = self
             .selectors
             .lock()
@@ -368,7 +424,8 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         let mut committed_observations = Vec::new();
         let mut candidates = Vec::new();
         let mut condition_outcomes = Vec::new();
-        let mut invalidations = Vec::<(usize, crate::domain::BranchId, Option<String>)>::new();
+        let mut filter_outcomes = Vec::new();
+        let mut invalidations = Vec::<(usize, BranchId, PageInvalidation)>::new();
         let mut reset_branches = BTreeSet::new();
         let mut applied_page = page.clone();
         for (page_index, event) in applied_page.events.iter_mut().enumerate() {
@@ -376,6 +433,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 SourceEvent::Ignored { .. } => {}
                 SourceEvent::Observation {
                     cursor,
+                    source_evidence_version,
                     identity,
                     revision,
                     observation: draft,
@@ -386,6 +444,24 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                         *revision,
                         &draft.version,
                     ) {
+                        // A native binding can change without a new public projection.
+                        if let Some(version) = source_evidence_version
+                            && next.selection.is_normalized_duplicate(
+                                &draft.branch,
+                                identity,
+                                *revision,
+                                &draft.version,
+                            )
+                        {
+                            invalidations.push((
+                                page_index,
+                                draft.branch.clone(),
+                                PageInvalidation::NativeUpsert {
+                                    identity: identity.clone(),
+                                    version: version.clone(),
+                                },
+                            ));
+                        }
                         *event = SourceEvent::Ignored { cursor: *cursor };
                         continue;
                     }
@@ -399,39 +475,39 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                     );
                     next.observation_position = position;
                     let observation = (**draft).clone().commit(position);
-                    let seen_key = (observation.branch.clone(), identity.clone());
-                    if next
-                        .selection
-                        .seen_results
-                        .get(&seen_key)
-                        .is_some_and(|previous| {
-                            *revision > previous.revision
-                                || (*revision == previous.revision
-                                    && observation.version != previous.version)
-                        })
-                    {
-                        invalidations.push((
-                            page_index,
-                            observation.branch.clone(),
-                            Some(identity.clone()),
-                        ));
-                    }
-                    let selection = next.selection.apply_published(
+                    invalidations.push((
+                        page_index,
+                        observation.branch.clone(),
+                        PageInvalidation::Upsert {
+                            identity: identity.clone(),
+                            version: observation.version.clone(),
+                            source_evidence_version: source_evidence_version.clone(),
+                        },
+                    ));
+                    let selection = next.selection.apply_published_with_inventories(
                         activation,
                         identity,
                         *revision,
                         &observation,
-                    );
+                        &mut || capture(*cursor, &observation),
+                    )?;
                     let window_invalidated = selection == SelectionOutcome::WindowInvalidated;
                     match selection {
                         SelectionOutcome::Candidate(candidate) => {
-                            candidates.push((*candidate, page_index))
+                            candidates.push((*candidate, page_index, identity.clone()))
                         }
                         SelectionOutcome::ConditionFiltered(condition) => {
                             condition_outcomes.push((position, condition))
                         }
+                        SelectionOutcome::FilterRejected(diagnostic) => {
+                            filter_outcomes.push((position, diagnostic))
+                        }
                         SelectionOutcome::WindowInvalidated => {
-                            invalidations.push((page_index, observation.branch.clone(), None));
+                            invalidations.push((
+                                page_index,
+                                observation.branch.clone(),
+                                PageInvalidation::Branch,
+                            ));
                         }
                         _ => {}
                     }
@@ -453,14 +529,20 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                         *event = SourceEvent::Ignored { cursor: *cursor };
                         continue;
                     }
-                    invalidations.push((page_index, branch.clone(), Some(identity.clone())));
+                    invalidations.push((
+                        page_index,
+                        branch.clone(),
+                        PageInvalidation::Removal {
+                            identity: identity.clone(),
+                        },
+                    ));
                 }
                 SourceEvent::Gap { branch, .. } => {
                     next.selection.mark_coverage_gap(branch);
                 }
                 SourceEvent::UnsafeUpdate { branch, .. }
                 | SourceEvent::SegmentReset { branch, .. } => {
-                    invalidations.push((page_index, branch.clone(), None));
+                    invalidations.push((page_index, branch.clone(), PageInvalidation::Branch));
                     reset_branches.insert(branch.clone());
                     next.selection.reset_segment(branch);
                 }
@@ -469,20 +551,33 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 }
             }
         }
-        candidates.retain(|(candidate, candidate_index)| {
-            !invalidations.iter().any(|(change_index, branch, identity)| {
+        candidates.retain(|(candidate, candidate_index, candidate_identity)| {
+            !invalidations.iter().any(|(change_index, branch, change)| {
                 change_index > candidate_index
                     && branch == &candidate.branch
-                    && identity.as_ref().is_none_or(|identity| {
-                        candidate.dependencies.iter().any(|dependency| {
-                            matches!(dependency, crate::domain::EvidenceDependency::Message { id, .. } if id == identity)
-                        })
-                    })
+                    && match change {
+                        PageInvalidation::Upsert { identity, version, source_evidence_version } => candidate.dependencies.iter().any(|dependency| {
+                            match dependency {
+                                crate::domain::EvidenceDependency::Message { id, version: saved_version } if id == identity => saved_version != version,
+                                crate::domain::EvidenceDependency::SourceEvidence { id, version: saved_version } if id == identity => {
+                                    if id == candidate_identity { saved_version != version } else { source_evidence_version.as_ref().is_some_and(|native_version| saved_version != native_version) }
+                                },
+                                _ => false,
+                            }
+                        }),
+                        PageInvalidation::NativeUpsert { identity, version } => candidate.dependencies.iter().any(|dependency| {
+                            matches!(dependency, crate::domain::EvidenceDependency::SourceEvidence { id, version: saved_version } if id == identity && id != candidate_identity && saved_version != version)
+                        }),
+                        PageInvalidation::Removal { identity } => candidate.dependencies.iter().any(|dependency| {
+                            matches!(dependency, crate::domain::EvidenceDependency::Message { id, .. } | crate::domain::EvidenceDependency::SourceEvidence { id, .. } if id == identity)
+                        }),
+                        PageInvalidation::Branch => true,
+                    }
             })
         });
         let candidates = candidates
             .into_iter()
-            .map(|(candidate, _)| candidate)
+            .map(|(candidate, _, _)| candidate)
             .collect::<Vec<_>>();
         next.publication_cursor = page.next;
         if let Err(error) = self.store.apply_source_page(
@@ -512,9 +607,10 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             coalesced: 0,
             overflowed: 0,
             condition_outcomes,
+            filter_outcomes,
         };
         for candidate in candidates {
-            match self.enqueue(activation, candidate.clone()) {
+            match self.enqueue(activation, candidate.clone())? {
                 EnqueueOutcome::Queued => {}
                 EnqueueOutcome::Coalesced => outcome.coalesced += 1,
                 EnqueueOutcome::Overflow => {
@@ -526,14 +622,16 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         Ok(outcome)
     }
 
-    /// Reloads durable pending work after restart in bounded pages.
+    /// Removes proven terminal queue entries and reloads unfinished work in bounded pages.
     pub fn recover_pending(&self) -> Result<BatchOutcome, StoreError> {
+        self.prune_terminal_pending()?;
         let mut outcome = BatchOutcome {
             observations: 0,
             candidates: 0,
             coalesced: 0,
             overflowed: 0,
             condition_outcomes: Vec::new(),
+            filter_outcomes: Vec::new(),
         };
         let mut after = None;
         loop {
@@ -545,24 +643,97 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             }
             for record in records {
                 let activation = record.activation;
-                let candidate = match record.work {
-                    RecoveryWork::Pending(candidate) => candidate,
+                let (candidate, resumed) = match record.work {
+                    RecoveryWork::Pending { candidate, resumed } => (candidate, resumed),
                     RecoveryWork::Answered { claimed, evaluated } => {
                         after = Some(claimed.id.clone());
-                        evaluated
-                            .validate(&activation.compiled)
-                            .map_err(|error| StoreError {
-                                message: error.message,
-                            })?;
-                        let actions = plan_status_actions(
+                        if activation.compiled.is_local()
+                            && !self.evaluator.local_execution_is_current(&activation)
+                        {
+                            continue;
+                        }
+                        if let Err(error) = evaluated.validate_for_declarations(
+                            &activation.compiled.decisions,
+                            &activation.compiled.question_requirements(),
+                        ) {
+                            self.store.record_evaluation_failure(
+                                &claimed,
+                                &EvaluationDiagnostic {
+                                    code: EvaluationFailureCode::InvalidDecision,
+                                    detail: error.to_string(),
+                                },
+                            )?;
+                            continue;
+                        }
+                        let preparation = self.store.load_preparation(&claimed)?;
+                        if !activation.compiled.is_local() {
+                            let progress = self.store.load_decision_progress(&claimed)?;
+                            let validated = validate_decision_progress(
+                                &activation.compiled.decisions,
+                                &activation.compiled.question_requirements(),
+                                &progress,
+                            );
+                            let complete = matches!(&validated, Ok(validated) if matches!(&validated.state, DecisionProgressState::Complete(saved) if saved == &evaluated));
+                            let prepared = match preparation.as_ref() {
+                                Some(PreparationRecord::Ready(prepared))
+                                    if complete
+                                        && prepared
+                                            .validate_for_declarations(
+                                                &activation.compiled.decisions,
+                                            )
+                                            .is_ok() =>
+                                {
+                                    prepared
+                                }
+                                _ => {
+                                    self.store.record_preparation_rejection(&claimed, &incompatible_preparation("The saved answer does not match complete durable decision progress and preparation."))?;
+                                    continue;
+                                }
+                            };
+                            model::publish_model(
+                                self.store.as_ref(),
+                                self.evaluator.as_ref(),
+                                &activation,
+                                &claimed,
+                                prepared,
+                                evaluated,
+                            )?;
+                            continue;
+                        }
+                        let mut budget = match restored_evaluation_budget(
+                            &activation.compiled,
+                            preparation.as_ref(),
+                        ) {
+                            Ok(budget) => budget,
+                            Err(error) => {
+                                self.store.record_evaluation_failure(&claimed, &error)?;
+                                continue;
+                            }
+                        };
+                        let actions = match plan_status_actions_with_budget(
                             &activation.compiled.actions,
                             &claimed.candidate.context.value,
-                            &evaluated.choices,
+                            &evaluated,
                             claimed.prior_status,
-                        )
-                        .map_err(|error| StoreError {
-                            message: error.message,
-                        })?;
+                            &mut budget,
+                        ) {
+                            Ok(actions) => actions,
+                            Err(error) => {
+                                self.store.record_evaluation_failure(
+                                    &claimed,
+                                    &EvaluationDiagnostic {
+                                        code: EvaluationFailureCode::ActionFailed,
+                                        detail: error.message,
+                                    },
+                                )?;
+                                continue;
+                            }
+                        };
+                        if activation.compiled.is_local()
+                            && !self.evaluator.local_execution_is_current(&activation)
+                        {
+                            continue;
+                        }
                         self.store.accept(&AssessmentAcceptance {
                             claimed,
                             evaluated,
@@ -573,7 +744,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 };
                 after = Some(CandidateId::from(&candidate));
                 outcome.candidates += 1;
-                match self.enqueue(&activation, candidate.clone()) {
+                match self.enqueue_with_resume(&activation, candidate.clone(), resumed)? {
                     EnqueueOutcome::Queued => {}
                     EnqueueOutcome::Coalesced => outcome.coalesced += 1,
                     EnqueueOutcome::Overflow => {
@@ -587,43 +758,66 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
     }
 
     /// Coalesces windows and retains separate non-window candidates in source order.
+    ///
+    /// # Errors
+    /// Returns a Store error if terminal-state lookup fails before queue admission.
     pub fn enqueue(
         &self,
         activation: &EffectiveActivation,
         candidate: FrozenCandidate,
-    ) -> EnqueueOutcome {
+    ) -> Result<EnqueueOutcome, StoreError> {
+        self.enqueue_with_resume(activation, candidate, false)
+    }
+
+    fn enqueue_with_resume(
+        &self,
+        activation: &EffectiveActivation,
+        candidate: FrozenCandidate,
+        resumed: bool,
+    ) -> Result<EnqueueOutcome, StoreError> {
+        let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
+        if state.pending.values().map(BTreeMap::len).sum::<usize>() >= MAX_PENDING_CANDIDATES {
+            drop(state);
+            self.prune_terminal_pending()?;
+            state = self.state.lock().expect("scheduler mutex is not poisoned");
+        }
         let key = ScheduleKey {
             activation: candidate.activation.clone(),
             branch: candidate.branch.clone(),
         };
-        let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
-        let coalesces = activation.compiled.trigger.window.is_some();
-        let existing = state.pending.get(&key);
-        if existing.is_some_and(|queue| queue.contains_key(&candidate.trigger_position)) {
-            return EnqueueOutcome::Queued;
+        let coalesces = !resumed && activation.compiled.trigger.window.is_some();
+        if let Some(existing) = state
+            .pending
+            .get_mut(&key)
+            .and_then(|queue| queue.get_mut(&candidate.trigger_position))
+        {
+            existing.resumed |= resumed;
+            return Ok(EnqueueOutcome::Queued);
         }
-        let replaces = coalesces && existing.is_some_and(|queue| !queue.is_empty());
+        let existing = state.pending.get(&key);
+        let replaces = coalesces
+            && existing.is_some_and(|queue| queue.values().any(|pending| !pending.resumed));
         let needs_ticket = existing.is_none_or(BTreeMap::is_empty);
         if !replaces
             && state.pending.values().map(BTreeMap::len).sum::<usize>() >= MAX_PENDING_CANDIDATES
         {
-            return EnqueueOutcome::Overflow;
+            return Ok(EnqueueOutcome::Overflow);
         }
         let queue = state.pending.entry(key.clone()).or_default();
         if replaces {
-            if queue
-                .last_key_value()
-                .is_some_and(|(position, _)| *position > candidate.trigger_position)
-            {
-                return EnqueueOutcome::Coalesced;
+            if queue.last_key_value().is_some_and(|(position, pending)| {
+                !pending.resumed && *position > candidate.trigger_position
+            }) {
+                return Ok(EnqueueOutcome::Coalesced);
             }
-            queue.clear();
+            queue.retain(|_, pending| pending.resumed);
         }
         queue.insert(
             candidate.trigger_position,
             PendingCandidate {
                 candidate,
                 compiled: Arc::clone(&activation.compiled),
+                resumed,
             },
         );
         if needs_ticket {
@@ -632,10 +826,52 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             state.service_tickets.insert(key.clone(), ticket);
         }
         if replaces {
-            EnqueueOutcome::Coalesced
+            Ok(EnqueueOutcome::Coalesced)
         } else {
-            EnqueueOutcome::Queued
+            Ok(EnqueueOutcome::Queued)
         }
+    }
+
+    fn prune_terminal_pending(&self) -> Result<(), StoreError> {
+        let candidate_ids = self
+            .state
+            .lock()
+            .expect("scheduler mutex is not poisoned")
+            .pending
+            .values()
+            .flat_map(BTreeMap::values)
+            .map(|pending| CandidateId::from(&pending.candidate))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if candidate_ids.is_empty() {
+            return Ok(());
+        }
+        let mut terminal = BTreeSet::new();
+        for batch in candidate_ids.chunks(MAX_PENDING_CANDIDATES) {
+            let found = self.store.load_terminal_candidate_ids(batch)?;
+            if found.iter().any(|id| !batch.contains(id)) {
+                return Err(StoreError {
+                    message: "terminal candidate lookup returned an unrequested identity".into(),
+                });
+            }
+            terminal.extend(found);
+        }
+        let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
+        let mut empty_keys = Vec::new();
+        state.pending.retain(|key, queue| {
+            queue.retain(|_, pending| !terminal.contains(&CandidateId::from(&pending.candidate)));
+            if queue.is_empty() {
+                empty_keys.push(key.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for key in empty_keys {
+            state.service_tickets.remove(&key);
+        }
+        Ok(())
     }
 
     /// Reserves the earliest due candidate and returns its evaluation future.
@@ -648,7 +884,7 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         activation: &EffectiveActivation,
         now_unix_ms: u64,
     ) -> Result<StartOutcome<'_>, StoreError> {
-        self.start_one_due_with_attempt_limit(activation, now_unix_ms, self.maximum_attempts)
+        self.start_one_due_with_attempt_limit(activation, now_unix_ms, u64::MAX)
     }
 
     /// Reserves one candidate with a caller-supplied remaining attempt budget.
@@ -656,9 +892,15 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         &self,
         activation: &EffectiveActivation,
         now_unix_ms: u64,
-        maximum_attempts: u8,
+        maximum_new_intents: u64,
     ) -> Result<StartOutcome<'_>, StoreError> {
-        self.start_one_due_matching(activation, now_unix_ms, maximum_attempts, |_| true)
+        self.start_one_due_matching(
+            activation,
+            now_unix_ms,
+            maximum_new_intents,
+            |_| true,
+            Arc::clone(&self.evaluator),
+        )
     }
 
     /// Starts only branches whose startup attachment has committed.
@@ -668,18 +910,52 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         now_unix_ms: u64,
         branches: &BTreeSet<BranchId>,
     ) -> Result<StartOutcome<'_>, StoreError> {
-        self.start_one_due_matching(activation, now_unix_ms, self.maximum_attempts, |branch| {
-            branches.contains(branch)
-        })
+        self.start_one_due_matching(
+            activation,
+            now_unix_ms,
+            u64::MAX,
+            |branch| branches.contains(branch),
+            Arc::clone(&self.evaluator),
+        )
     }
 
-    fn start_one_due_matching(
+    /// Starts ready branches with one evaluator for the complete assessment.
+    ///
+    /// Preparation and validation run before this method returns. The returned
+    /// task owns the evaluator, including every allowed retry, and does not borrow
+    /// the engine. The caller can run this method on a blocking preparation worker.
+    pub fn start_one_due_for_branches_with_evaluator(
         &self,
         activation: &EffectiveActivation,
         now_unix_ms: u64,
-        maximum_attempts: u8,
+        branches: &BTreeSet<BranchId>,
+        evaluator: Arc<E>,
+    ) -> Result<StartOutcome<'static>, StoreError>
+    where
+        S: 'static,
+        E: 'static,
+    {
+        self.start_one_due_matching(
+            activation,
+            now_unix_ms,
+            u64::MAX,
+            |branch| branches.contains(branch),
+            evaluator,
+        )
+    }
+
+    fn start_one_due_matching<'task>(
+        &self,
+        activation: &EffectiveActivation,
+        now_unix_ms: u64,
+        maximum_new_intents: u64,
         ready: impl Fn(&BranchId) -> bool,
-    ) -> Result<StartOutcome<'_>, StoreError> {
+        evaluator: Arc<E>,
+    ) -> Result<StartOutcome<'task>, StoreError>
+    where
+        S: 'task,
+        E: 'task,
+    {
         let (key, pending) = {
             let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
             if state.active_count >= MAX_IN_FLIGHT_EVALUATIONS {
@@ -693,6 +969,11 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 .filter(|(key, _)| {
                     !state.in_flight.contains(*key)
                         && (self.policy == ExecutionPolicy::SequentialReplay
+                            || state.pending.get(*key).is_some_and(|queue| {
+                                queue
+                                    .first_key_value()
+                                    .is_some_and(|(_, pending)| pending.resumed)
+                            })
                             || state
                                 .cooldown_until_unix_ms
                                 .get(*key)
@@ -747,6 +1028,8 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
             state: Arc::clone(&self.state),
             key: key.clone(),
             finished: false,
+            release_branch_on_drop: pending.compiled.is_local(),
+            safe_release: None,
         };
         let pending_release = self
             .state
@@ -793,232 +1076,18 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                 return Err(error);
             }
         };
-        let prepared_input = match self.prepare_claimed(activation, &pending, &claimed) {
-            Ok(PreflightOutcome::Ready(prepared)) => prepared,
-            Ok(PreflightOutcome::Settled(settlement)) => {
-                self.clear_ticket_if_idle(&key);
-                let mut guard = guard;
-                guard.finish();
-                return Ok(StartOutcome::Started(Box::pin(
-                    async move { Ok(settlement) },
-                )));
-            }
-            Ok(PreflightOutcome::Stale) => {
-                let mut guard = guard;
-                guard.finish();
-                return Ok(StartOutcome::Stale);
-            }
-            Err(error) => {
-                return Err(self.restore_pre_dispatch(key, pending, claimed, guard, error));
-            }
-        };
-        let cooldown = if self.policy == ExecutionPolicy::SequentialReplay {
-            std::time::Duration::ZERO
-        } else {
-            pending.compiled.trigger.cooldown
-        };
-        match self.store.record_dispatch_intent(
-            &claimed,
+        if pending.compiled.is_local() {
+            return self.start_local(activation, now_unix_ms, pending, claimed, guard, evaluator);
+        }
+        self.start_model(
+            activation,
             now_unix_ms,
-            cooldown,
-            claimed.next_attempt,
-        ) {
-            Ok(ClaimOutcome::Current) => {}
-            Ok(ClaimOutcome::Stale) => {
-                self.clear_ticket_if_idle(&key);
-                let mut guard = guard;
-                guard.finish();
-                return Ok(StartOutcome::Stale);
-            }
-            Err(error) => {
-                return Err(self.restore_pre_dispatch(key, pending, claimed, guard, error));
-            }
-        }
-        {
-            let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
-            if state
-                .pending
-                .get(&key)
-                .is_some_and(|queue| !queue.is_empty())
-            {
-                let ticket = state.next_service_ticket;
-                state.next_service_ticket = state.next_service_ticket.saturating_add(1);
-                state.service_tickets.insert(key.clone(), ticket);
-            } else {
-                state.service_tickets.remove(&key);
-            }
-            if self.policy == ExecutionPolicy::Live {
-                state.recent_dispatches = if state.recent_dispatches >= 3 {
-                    0
-                } else {
-                    state.recent_dispatches + 1
-                };
-            }
-        }
-        {
-            let mut state = self.state.lock().expect("scheduler mutex is not poisoned");
-            let cooldown_ms = u64::try_from(cooldown.as_millis()).unwrap_or(u64::MAX);
-            state
-                .cooldown_until_unix_ms
-                .insert(key.clone(), now_unix_ms.saturating_add(cooldown_ms));
-        }
-        let evaluator = Arc::clone(&self.evaluator);
-        let store = Arc::clone(&self.store);
-        let activation = activation.clone();
-        let task: EvaluationTask<'_> = Box::pin(async move {
-            let mut guard = guard;
-            let mut attempt_number = claimed.next_attempt;
-            let evaluated = loop {
-                match evaluator
-                    .evaluate_prepared(
-                        &activation,
-                        &pending.candidate,
-                        &prepared_input,
-                        attempt_number,
-                    )
-                    .await
-                {
-                    Ok(mut evaluated) => {
-                        evaluated.attempts = attempt_number;
-                        break Ok(evaluated);
-                    }
-                    Err(mut error) => {
-                        if store.record_attempt_failure(
-                            &claimed,
-                            attempt_number,
-                            error.kind,
-                            &EvaluationDiagnostic {
-                                code: error.code,
-                                detail: error.detail.clone(),
-                            },
-                        )? == ClaimOutcome::Stale
-                        {
-                            guard.finish();
-                            return Ok(RunSettlement {
-                                outcome: RunOutcome::Stale,
-                                attempts: attempt_number,
-                            });
-                        }
-                        if error.kind == AttemptFailure::SafeTransient
-                            && attempt_number < maximum_attempts.min(2)
-                        {
-                            attempt_number += 1;
-                            if store.record_dispatch_intent(
-                                &claimed,
-                                now_unix_ms,
-                                cooldown,
-                                attempt_number,
-                            )? == ClaimOutcome::Stale
-                            {
-                                guard.finish();
-                                return Ok(RunSettlement {
-                                    outcome: RunOutcome::Stale,
-                                    attempts: attempt_number - 1,
-                                });
-                            }
-                        } else {
-                            error.attempts = attempt_number;
-                            break Err(error);
-                        }
-                    }
-                }
-            };
-            let outcome = match evaluated {
-                Ok(evaluated) => {
-                    let attempts = evaluated.attempts;
-                    if let Err(error) = evaluated.validate(&pending.compiled) {
-                        let recorded = store.record_attempt_failure(
-                            &claimed,
-                            attempts,
-                            AttemptFailure::Permanent,
-                            &EvaluationDiagnostic {
-                                code: EvaluationFailureCode::InvalidDecision,
-                                detail: error.message.clone(),
-                            },
-                        )?;
-                        let terminal = store.record_evaluation_failure(
-                            &claimed,
-                            &EvaluationDiagnostic {
-                                code: EvaluationFailureCode::InvalidDecision,
-                                detail: error.message.clone(),
-                            },
-                        )?;
-                        guard.finish();
-                        return Ok(RunSettlement {
-                            outcome: if recorded == ClaimOutcome::Stale
-                                || terminal == ClaimOutcome::Stale
-                            {
-                                RunOutcome::Stale
-                            } else {
-                                RunOutcome::Failed(error.message)
-                            },
-                            attempts,
-                        });
-                    }
-                    store.record_answer(&claimed, &evaluated)?;
-                    match plan_status_actions(
-                        &pending.compiled.actions,
-                        &pending.candidate.context.value,
-                        &evaluated.choices,
-                        claimed.prior_status,
-                    ) {
-                        Ok(actions) => {
-                            let accepted = store.accept(&AssessmentAcceptance {
-                                claimed,
-                                evaluated,
-                                actions,
-                            })?;
-                            RunSettlement {
-                                outcome: match accepted {
-                                    AcceptanceOutcome::Accepted
-                                    | AcceptanceOutcome::AlreadyAccepted => RunOutcome::Accepted,
-                                    AcceptanceOutcome::Deferred => RunOutcome::Deferred,
-                                    AcceptanceOutcome::Stale => RunOutcome::Stale,
-                                },
-                                attempts,
-                            }
-                        }
-                        Err(error) => {
-                            let recorded = store.record_evaluation_failure(
-                                &claimed,
-                                &EvaluationDiagnostic {
-                                    code: EvaluationFailureCode::ActionFailed,
-                                    detail: error.message.clone(),
-                                },
-                            )?;
-                            RunSettlement {
-                                outcome: if recorded == ClaimOutcome::Stale {
-                                    RunOutcome::Stale
-                                } else {
-                                    RunOutcome::Failed(error.message)
-                                },
-                                attempts,
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    let recorded = store.record_evaluation_failure(
-                        &claimed,
-                        &EvaluationDiagnostic {
-                            code: error.code,
-                            detail: error.detail.clone(),
-                        },
-                    )?;
-                    RunSettlement {
-                        outcome: if recorded == ClaimOutcome::Stale {
-                            RunOutcome::Stale
-                        } else {
-                            RunOutcome::Failed(error.detail)
-                        },
-                        attempts: error.attempts,
-                    }
-                }
-            };
-            guard.finish();
-            Ok(outcome)
-        });
-        Ok(StartOutcome::Started(task))
+            maximum_new_intents,
+            pending,
+            claimed,
+            guard,
+            evaluator,
+        )
     }
 
     fn prepare_claimed(
@@ -1026,63 +1095,57 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
         activation: &EffectiveActivation,
         pending: &PendingCandidate,
         claimed: &ClaimedCandidate,
+        evaluator: &E,
+        attempts: u64,
+        purpose: PreparationValidationPurpose,
     ) -> Result<PreflightOutcome, StoreError> {
-        let context = PreparationFailureContext {
-            decision: Some(pending.compiled.decision.name.clone()),
-            field: Some(format!("decisions.{}", pending.compiled.decision.name)),
-            ..Default::default()
-        };
         let preparation = if let Some(saved) = self.store.load_preparation(claimed)? {
             saved
-        } else if claimed.next_attempt > 1 {
-            PreparationRecord::Rejected(PreparationFailure {
-                code: PreparationFailureCode::IncompatibleProfile,
-                detail: "The original provider request is unavailable for this retry.".into(),
-                report: None,
-                context: context.clone().into(),
-            })
+        } else if attempts > 0 || purpose == PreparationValidationPurpose::Publication {
+            PreparationRecord::Rejected(incompatible_preparation(
+                "The original preparation is unavailable.",
+            ))
         } else {
-            let prepared = match prepare_decision_input(&pending.compiled, &pending.candidate) {
-                PreparationOutcome::Ready(input) => self.evaluator.prepare(activation, input),
-                PreparationOutcome::Skipped => Err(PreparationFailure {
-                    code: PreparationFailureCode::ConditionFalse,
-                    detail: "condition was false".into(),
-                    report: None,
-                    context: context.clone().into(),
-                }),
-                PreparationOutcome::Unavailable(detail) => Err(PreparationFailure {
-                    code: PreparationFailureCode::InputUnavailable,
-                    detail,
-                    report: None,
-                    context: context.clone().into(),
-                }),
-                PreparationOutcome::Failed(detail) => Err(PreparationFailure {
-                    code: PreparationFailureCode::InvalidInput,
-                    detail,
-                    report: None,
-                    context: context.into(),
-                }),
-            };
-            let record = match prepared {
+            let prepared = prepare_all_inputs(&pending.compiled, &pending.candidate).and_then(
+                |(inputs, budget)| {
+                    let saved_budget = budget.clone();
+                    let prepared = evaluator.prepare(activation, inputs, budget)?;
+                    if prepared.evaluation_budget != saved_budget {
+                        return Err(incompatible_preparation(
+                            "Provider preparation changed the shared expression budget.",
+                        ));
+                    }
+                    prepared
+                        .validate_for_declarations(&pending.compiled.decisions)
+                        .map_err(|error| incompatible_preparation(&error.to_string()))?;
+                    Ok(prepared)
+                },
+            );
+            let record = crate::preparation::bounded_preparation_record(match prepared {
                 Ok(prepared) => PreparationRecord::Ready(prepared),
                 Err(error) => PreparationRecord::Rejected(error),
-            };
+            });
             if self.store.record_preparation(claimed, &record)? == ClaimOutcome::Stale {
                 return Ok(PreflightOutcome::Stale);
             }
-            self.evaluator.preparation_recorded(&record);
+            evaluator.preparation_recorded(&record);
             record
         };
         let prepared = match preparation {
-            PreparationRecord::Ready(prepared) => self
-                .evaluator
-                .validate_prepared(activation, &prepared)
+            PreparationRecord::Ready(prepared) => prepared
+                .validate_for_declarations(&pending.compiled.decisions)
+                .map_err(|error| incompatible_preparation(&error.to_string()))
+                .and_then(|()| evaluator.validate_prepared(activation, &prepared, purpose))
                 .map(|()| prepared),
             PreparationRecord::Rejected(error) => Err(error),
+            PreparationRecord::Local(_) => Err(incompatible_preparation(
+                "A local preparation cannot evaluate a model decision.",
+            )),
         };
         match prepared {
             Ok(prepared) => Ok(PreflightOutcome::Ready(prepared)),
             Err(error) => {
+                let error = bounded_failure(error);
                 let recorded = self.store.record_preparation_rejection(claimed, &error)?;
                 Ok(PreflightOutcome::Settled(RunSettlement {
                     outcome: if recorded == ClaimOutcome::Stale {
@@ -1092,10 +1155,15 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
                     } else {
                         RunOutcome::NotAssessed(error.detail)
                     },
-                    attempts: claimed.next_attempt - 1,
+                    attempts,
+                    new_intents: 0,
                 }))
             }
         }
+    }
+
+    fn mark_started(&self, key: &ScheduleKey, now_unix_ms: u64, cooldown: std::time::Duration) {
+        mark_scheduler_started(&self.state, key, now_unix_ms, cooldown, self.policy);
     }
 
     fn restore_pre_dispatch(
@@ -1144,9 +1212,78 @@ impl<S: CheckStore, E: DecisionEvaluator> CheckEngine<S, E> {
     }
 }
 
+fn mark_scheduler_started(
+    state: &Mutex<SchedulerState>,
+    key: &ScheduleKey,
+    now_unix_ms: u64,
+    cooldown: std::time::Duration,
+    policy: ExecutionPolicy,
+) {
+    let mut state = state.lock().expect("scheduler mutex is not poisoned");
+    if state
+        .pending
+        .get(key)
+        .is_some_and(|queue| !queue.is_empty())
+    {
+        let ticket = state.next_service_ticket;
+        state.next_service_ticket = state.next_service_ticket.saturating_add(1);
+        state.service_tickets.insert(key.clone(), ticket);
+    } else {
+        state.service_tickets.remove(key);
+    }
+    if policy == ExecutionPolicy::Live {
+        state.recent_dispatches = if state.recent_dispatches >= 3 {
+            0
+        } else {
+            state.recent_dispatches + 1
+        };
+    }
+    let cooldown_ms = u64::try_from(cooldown.as_millis()).unwrap_or(u64::MAX);
+    state
+        .cooldown_until_unix_ms
+        .insert(key.clone(), now_unix_ms.saturating_add(cooldown_ms));
+}
+
+fn restored_evaluation_budget(
+    compiled: &crate::compiler::CompiledCheck,
+    preparation: Option<&PreparationRecord>,
+) -> Result<EvaluationBudget, EvaluationDiagnostic> {
+    if compiled.is_local() {
+        let Some(PreparationRecord::Local(prepared)) = preparation else {
+            return Err(EvaluationDiagnostic {
+                code: EvaluationFailureCode::ActionFailed,
+                detail: "A saved local answer requires its original local preparation.".into(),
+            });
+        };
+        prepared
+            .validate_for_resume()
+            .map_err(|error| EvaluationDiagnostic {
+                code: EvaluationFailureCode::ActionFailed,
+                detail: error.detail,
+            })?;
+        return Ok(prepared.evaluation_budget.clone());
+    }
+    let Some(PreparationRecord::Ready(prepared)) = preparation else {
+        return Err(EvaluationDiagnostic {
+            code: EvaluationFailureCode::ActionFailed,
+            detail: "A saved model answer requires its original model preparation.".into(),
+        });
+    };
+    prepared
+        .validate_for_declarations(&compiled.decisions)
+        .map_err(|error| EvaluationDiagnostic {
+            code: EvaluationFailureCode::ActionFailed,
+            detail: error.to_string(),
+        })?;
+    Ok(prepared.evaluation_budget.clone())
+}
+
 fn restore_pending(state: &mut SchedulerState, key: ScheduleKey, pending: PendingCandidate) {
     let queue = state.pending.entry(key).or_default();
-    if pending.compiled.trigger.window.is_some() && !queue.is_empty() {
+    if !pending.resumed
+        && pending.compiled.trigger.window.is_some()
+        && queue.values().any(|entry| !entry.resumed)
+    {
         return;
     }
     queue
@@ -1173,7 +1310,7 @@ fn validate_source_page(progress: &SourceProgress, page: &SourceBatch) -> Result
         }
         previous = cursor;
     }
-    if page.next != previous {
+    if page.next < previous || (!page.events.is_empty() && page.next != previous) {
         return Err(StoreError {
             message: "source page cursor does not match its final event".to_owned(),
         });
@@ -1194,6 +1331,13 @@ impl From<ActionPlanningError> for EvaluationFailure {
 
 #[cfg(test)]
 mod tests {
+    mod assessment_budget;
+    mod inventory_freeze;
+    mod local;
+    mod multi_decision;
+    mod preparation_limits;
+    mod queue_pruning;
+    mod selected_evaluator;
     mod selection_live;
 
     use std::collections::BTreeMap;
@@ -1204,8 +1348,8 @@ mod tests {
 
     use serde_json::json;
 
+    use super::test_support::{test_answer, test_prepare, test_validate};
     use super::*;
-    use crate::actions::ChoiceResult;
     use crate::check_store::{CandidateClaim, CandidateId, ClaimedCandidate};
     use crate::compiler::compile;
     use crate::definition_lifecycle::EffectiveActivation;
@@ -1213,6 +1357,7 @@ mod tests {
         EvidenceDependency, EvidenceVersion, FrozenContext, Generation, Message, NativeOrderKey,
         ObservationDraft, ObservationKind, ObservationPosition,
     };
+    use crate::fit::FitReport;
     use crate::source::{PublicationCursor, SourceBatch, SourceEvent};
 
     #[derive(Clone)]
@@ -1233,6 +1378,38 @@ mod tests {
         load_barrier: Mutex<Option<Arc<Barrier>>>,
         applied_pages: Mutex<usize>,
         cooldown_until_unix_ms: Mutex<u64>,
+        terminal: Mutex<BTreeSet<CandidateId>>,
+        overflowed: Mutex<Vec<CandidateId>>,
+        fail_terminal_lookup: Mutex<bool>,
+        claim_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
+        terminal_lookup_calls: Mutex<Vec<Vec<CandidateId>>>,
+        fail_terminal_lookup_on_call: Mutex<Option<usize>>,
+        terminal_lookup_extra_id: Mutex<Option<CandidateId>>,
+        activations: Mutex<BTreeMap<ActivationId, EffectiveActivation>>,
+        local_answers: Mutex<BTreeMap<CandidateId, SavedLocalAnswer>>,
+        local_starts: Mutex<Vec<(u64, Duration)>>,
+        local_failures: Mutex<Vec<String>>,
+        fail_local_start: Mutex<bool>,
+        stale_local_start: Mutex<bool>,
+        fail_preparation_rejection: Mutex<bool>,
+        fail_preparation_load: Mutex<bool>,
+        fail_acceptance: Mutex<bool>,
+        fail_local_failure_write: Mutex<bool>,
+        acceptance_override: Mutex<Option<AcceptanceOutcome>>,
+        preparations: Mutex<BTreeMap<CandidateId, PreparationRecord>>,
+        decision_progress: Mutex<BTreeMap<CandidateId, DecisionProgress>>,
+        fail_intent_on_call: Mutex<Option<usize>>,
+        fail_answer: Mutex<bool>,
+        stale_answer: Mutex<bool>,
+        evaluation_failures: Mutex<Vec<EvaluationDiagnostic>>,
+    }
+
+    #[derive(Clone)]
+    struct SavedLocalAnswer {
+        activation: EffectiveActivation,
+        claimed: ClaimedCandidate,
+        preparation: PreparationRecord,
+        evaluated: EvaluatedAssessment,
     }
 
     impl Default for FakeStore {
@@ -1249,6 +1426,30 @@ mod tests {
                 load_barrier: Mutex::new(None),
                 applied_pages: Mutex::new(0),
                 cooldown_until_unix_ms: Mutex::new(0),
+                terminal: Mutex::new(BTreeSet::new()),
+                overflowed: Mutex::new(Vec::new()),
+                fail_terminal_lookup: Mutex::new(false),
+                claim_barriers: Mutex::new(None),
+                terminal_lookup_calls: Mutex::new(Vec::new()),
+                fail_terminal_lookup_on_call: Mutex::new(None),
+                terminal_lookup_extra_id: Mutex::new(None),
+                activations: Mutex::new(BTreeMap::new()),
+                local_answers: Mutex::new(BTreeMap::new()),
+                local_starts: Mutex::new(Vec::new()),
+                local_failures: Mutex::new(Vec::new()),
+                fail_local_start: Mutex::new(false),
+                stale_local_start: Mutex::new(false),
+                fail_preparation_rejection: Mutex::new(false),
+                fail_preparation_load: Mutex::new(false),
+                fail_acceptance: Mutex::new(false),
+                fail_local_failure_write: Mutex::new(false),
+                acceptance_override: Mutex::new(None),
+                preparations: Mutex::new(BTreeMap::new()),
+                decision_progress: Mutex::new(BTreeMap::new()),
+                fail_intent_on_call: Mutex::new(None),
+                fail_answer: Mutex::new(false),
+                stale_answer: Mutex::new(false),
+                evaluation_failures: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1256,16 +1457,55 @@ mod tests {
     impl CheckStore for FakeStore {
         fn release_pre_dispatch_claim(
             &self,
-            _: &ClaimedCandidate,
+            claimed: &ClaimedCandidate,
         ) -> Result<ClaimOutcome, StoreError> {
+            if let Some(progress) = self.decision_progress.lock().unwrap().get(&claimed.id) {
+                if progress.attempts.iter().any(|row| {
+                    matches!(
+                        row.outcome,
+                        crate::check_store::DecisionAttemptOutcome::DispatchIntent
+                    )
+                }) {
+                    return Err(StoreError {
+                        message: "cannot release an unresolved intent".into(),
+                    });
+                }
+                if !progress.attempts.is_empty()
+                    && !self.terminal.lock().unwrap().contains(&claimed.id)
+                    && !self.local_answers.lock().unwrap().contains_key(&claimed.id)
+                    && let Some(activation) = self
+                        .activations
+                        .lock()
+                        .unwrap()
+                        .get(&claimed.candidate.activation)
+                        .cloned()
+                {
+                    let mut pending = self.pending.lock().unwrap();
+                    if !pending
+                        .iter()
+                        .any(|record| record.candidate.fingerprint == claimed.candidate.fingerprint)
+                    {
+                        pending.push(PendingCandidate {
+                            activation,
+                            candidate: claimed.candidate.clone(),
+                        });
+                    }
+                }
+            }
             Ok(ClaimOutcome::Current)
         }
         fn activate(
             &self,
             _: &str,
             _: &crate::definition_lifecycle::LifecycleTransition,
-            _: Option<&EffectiveActivation>,
+            activation: Option<&EffectiveActivation>,
         ) -> Result<(), StoreError> {
+            if let Some(activation) = activation {
+                self.activations
+                    .lock()
+                    .unwrap()
+                    .insert(activation.id.clone(), activation.clone());
+            }
             Ok(())
         }
 
@@ -1343,7 +1583,14 @@ mod tests {
             Ok(())
         }
 
-        fn record_overflow(&self, _: &FrozenCandidate) -> Result<(), StoreError> {
+        fn record_overflow(&self, candidate: &FrozenCandidate) -> Result<(), StoreError> {
+            let id = CandidateId::from(candidate);
+            self.overflowed.lock().unwrap().push(id.clone());
+            self.terminal.lock().unwrap().insert(id.clone());
+            self.pending
+                .lock()
+                .unwrap()
+                .retain(|record| CandidateId::from(&record.candidate) != id);
             Ok(())
         }
 
@@ -1353,15 +1600,47 @@ mod tests {
             now_unix_ms: u64,
             bypass_check_cooldown: bool,
         ) -> Result<CandidateClaim, StoreError> {
+            let barriers = self.claim_barriers.lock().unwrap().take();
+            if let Some((entered, release)) = barriers {
+                entered.wait();
+                release.wait();
+            }
+            if self
+                .terminal
+                .lock()
+                .unwrap()
+                .contains(&CandidateId::from(candidate))
+            {
+                return Ok(CandidateClaim::Stale);
+            }
+            let local_busy = {
+                let answers = self.local_answers.lock().unwrap();
+                let terminal = self.terminal.lock().unwrap();
+                answers.iter().any(|(id, saved)| {
+                    saved.claimed.candidate.activation == candidate.activation
+                        && saved.claimed.candidate.branch == candidate.branch
+                        && !terminal.contains(id)
+                })
+            };
+            if local_busy {
+                return Ok(CandidateClaim::NotDue {
+                    retry_at_unix_ms: now_unix_ms.saturating_add(1000),
+                });
+            }
             let retry_at = *self.cooldown_until_unix_ms.lock().unwrap();
-            if !bypass_check_cooldown && now_unix_ms < retry_at {
+            let resumed = self
+                .decision_progress
+                .lock()
+                .unwrap()
+                .get(&CandidateId::from(candidate))
+                .is_some_and(|progress| !progress.attempts.is_empty());
+            if !bypass_check_cooldown && !resumed && now_unix_ms < retry_at {
                 return Ok(CandidateClaim::NotDue {
                     retry_at_unix_ms: retry_at,
                 });
             }
             Ok(CandidateClaim::Claimed(Box::new(ClaimedCandidate {
                 fence: 1,
-                next_attempt: 1,
                 id: CandidateId::from(candidate),
                 candidate: candidate.clone(),
                 prior_status: None,
@@ -1373,9 +1652,24 @@ mod tests {
             claimed: &ClaimedCandidate,
             attempted_at_unix_ms: u64,
             cooldown: Duration,
-            _: u8,
+            attempt: &DecisionAttempt,
         ) -> Result<ClaimOutcome, StoreError> {
             *self.dispatches.lock().unwrap() += 1;
+            if *self.fail_intent_on_call.lock().unwrap() == Some(*self.dispatches.lock().unwrap()) {
+                return Err(StoreError {
+                    message: "injected intent write failure".into(),
+                });
+            }
+            self.decision_progress
+                .lock()
+                .unwrap()
+                .entry(claimed.id.clone())
+                .or_default()
+                .attempts
+                .push(crate::check_store::SavedDecisionAttempt {
+                    attempt: attempt.clone(),
+                    outcome: crate::check_store::DecisionAttemptOutcome::DispatchIntent,
+                });
             *self.cooldown_until_unix_ms.lock().unwrap() = attempted_at_unix_ms
                 .saturating_add(u64::try_from(cooldown.as_millis()).unwrap_or(u64::MAX));
             self.pending
@@ -1385,19 +1679,208 @@ mod tests {
             Ok(ClaimOutcome::Current)
         }
 
-        fn record_answer(
+        fn load_preparation(
             &self,
-            _: &ClaimedCandidate,
-            _: &EvaluatedCandidate,
-        ) -> Result<(), StoreError> {
-            Ok(())
+            claimed: &ClaimedCandidate,
+        ) -> Result<Option<PreparationRecord>, StoreError> {
+            if *self.fail_preparation_load.lock().unwrap() {
+                return Err(StoreError {
+                    message: "injected preparation read failure".into(),
+                });
+            }
+            Ok(self
+                .preparations
+                .lock()
+                .unwrap()
+                .get(&claimed.id)
+                .cloned()
+                .or_else(|| {
+                    self.local_answers
+                        .lock()
+                        .unwrap()
+                        .get(&claimed.id)
+                        .map(|saved| saved.preparation.clone())
+                }))
+        }
+
+        fn load_decision_progress(
+            &self,
+            claimed: &ClaimedCandidate,
+        ) -> Result<DecisionProgress, StoreError> {
+            Ok(self
+                .decision_progress
+                .lock()
+                .unwrap()
+                .get(&claimed.id)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        fn record_preparation(
+            &self,
+            claimed: &ClaimedCandidate,
+            preparation: &PreparationRecord,
+        ) -> Result<ClaimOutcome, StoreError> {
+            self.preparations
+                .lock()
+                .unwrap()
+                .insert(claimed.id.clone(), preparation.clone());
+            Ok(ClaimOutcome::Current)
+        }
+
+        fn record_local_start(
+            &self,
+            claimed: &ClaimedCandidate,
+            now_unix_ms: u64,
+            cooldown: Duration,
+            preparation: &crate::fit::LocalPreparation,
+        ) -> Result<ClaimOutcome, StoreError> {
+            if *self.fail_local_start.lock().unwrap() {
+                return Err(StoreError {
+                    message: "injected local start failure".into(),
+                });
+            }
+            if *self.stale_local_start.lock().unwrap() {
+                self.terminal.lock().unwrap().insert(claimed.id.clone());
+                return Ok(ClaimOutcome::Stale);
+            }
+            preparation
+                .validate_for_resume()
+                .map_err(|error| StoreError {
+                    message: error.detail,
+                })?;
+            let activation = self
+                .activations
+                .lock()
+                .unwrap()
+                .get(&claimed.candidate.activation)
+                .cloned()
+                .expect("register local activation");
+            assert!(activation.compiled.is_local());
+            let mut answers = self.local_answers.lock().unwrap();
+            if self.terminal.lock().unwrap().contains(&claimed.id) {
+                return Ok(ClaimOutcome::Stale);
+            }
+            if let Some(saved) = answers.get(&claimed.id) {
+                assert_eq!(saved.claimed, *claimed);
+                assert_eq!(
+                    saved.preparation,
+                    PreparationRecord::Local(preparation.clone())
+                );
+                return Ok(ClaimOutcome::Current);
+            }
+            assert_eq!(preparation.started_at_unix_ms, now_unix_ms);
+            answers.insert(
+                claimed.id.clone(),
+                SavedLocalAnswer {
+                    activation,
+                    claimed: claimed.clone(),
+                    preparation: PreparationRecord::Local(preparation.clone()),
+                    evaluated: EvaluatedAssessment::local(),
+                },
+            );
+            self.local_starts
+                .lock()
+                .unwrap()
+                .push((now_unix_ms, cooldown));
+            *self.cooldown_until_unix_ms.lock().unwrap() =
+                now_unix_ms.saturating_add(u64::try_from(cooldown.as_millis()).unwrap());
+            self.pending
+                .lock()
+                .unwrap()
+                .retain(|pending| CandidateId::from(&pending.candidate) != claimed.id);
+            Ok(ClaimOutcome::Current)
+        }
+
+        fn record_decision_answer(
+            &self,
+            claimed: &ClaimedCandidate,
+            attempt: &DecisionAttempt,
+            answer: &DecisionResult,
+        ) -> Result<ClaimOutcome, StoreError> {
+            if *self.fail_answer.lock().unwrap() {
+                return Err(StoreError {
+                    message: "injected answer write failure".into(),
+                });
+            }
+            self.decision_progress
+                .lock()
+                .unwrap()
+                .get_mut(&claimed.id)
+                .unwrap()
+                .attempts
+                .iter_mut()
+                .find(|row| row.attempt == *attempt)
+                .unwrap()
+                .outcome = crate::check_store::DecisionAttemptOutcome::Answer(answer.clone());
+            if let Some(activation) = self
+                .activations
+                .lock()
+                .unwrap()
+                .get(&claimed.candidate.activation)
+                .cloned()
+            {
+                let progress = self
+                    .decision_progress
+                    .lock()
+                    .unwrap()
+                    .get(&claimed.id)
+                    .cloned()
+                    .unwrap();
+                let validated = validate_decision_progress(
+                    &activation.compiled.decisions,
+                    &activation.compiled.question_requirements(),
+                    &progress,
+                )?;
+                if let DecisionProgressState::Complete(evaluated) = validated.state {
+                    self.local_answers.lock().unwrap().insert(
+                        claimed.id.clone(),
+                        SavedLocalAnswer {
+                            activation,
+                            claimed: claimed.clone(),
+                            preparation: self
+                                .preparations
+                                .lock()
+                                .unwrap()
+                                .get(&claimed.id)
+                                .cloned()
+                                .unwrap(),
+                            evaluated,
+                        },
+                    );
+                }
+            }
+            Ok(if *self.stale_answer.lock().unwrap() {
+                ClaimOutcome::Stale
+            } else {
+                ClaimOutcome::Current
+            })
         }
 
         fn accept(
             &self,
             assessment: &AssessmentAcceptance,
         ) -> Result<AcceptanceOutcome, StoreError> {
+            if *self.fail_acceptance.lock().unwrap() {
+                return Err(StoreError {
+                    message: "injected acceptance write failure".into(),
+                });
+            }
+            if let Some(outcome) = *self.acceptance_override.lock().unwrap() {
+                return Ok(outcome);
+            }
             self.accepted.lock().unwrap().push(assessment.clone());
+            if self
+                .local_answers
+                .lock()
+                .unwrap()
+                .contains_key(&assessment.claimed.id)
+            {
+                self.terminal
+                    .lock()
+                    .unwrap()
+                    .insert(assessment.claimed.id.clone());
+            }
             Ok(AcceptanceOutcome::Accepted)
         }
 
@@ -1408,77 +1891,187 @@ mod tests {
         ) -> Result<Vec<crate::check_store::RecoveryRecord>, StoreError> {
             let mut records = self.pending.lock().unwrap().clone();
             records.sort_by_key(|record| CandidateId::from(&record.candidate));
-            Ok(records
+            let mut recovery = records
                 .into_iter()
                 .filter(|record| {
                     after.is_none_or(|after| CandidateId::from(&record.candidate) > *after)
                 })
-                .take(limit)
                 .map(|record| crate::check_store::RecoveryRecord {
                     activation: record.activation,
-                    work: RecoveryWork::Pending(record.candidate),
+                    work: RecoveryWork::Pending {
+                        resumed: self
+                            .decision_progress
+                            .lock()
+                            .unwrap()
+                            .get(&CandidateId::from(&record.candidate))
+                            .is_some_and(|progress| !progress.attempts.is_empty()),
+                        candidate: record.candidate,
+                    },
                 })
-                .collect())
+                .collect::<Vec<_>>();
+            let terminal = self.terminal.lock().unwrap().clone();
+            recovery.extend(
+                self.local_answers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(id, _)| {
+                        after.is_none_or(|after| *id > after) && !terminal.contains(*id)
+                    })
+                    .map(|(_, saved)| crate::check_store::RecoveryRecord {
+                        activation: saved.activation.clone(),
+                        work: RecoveryWork::Answered {
+                            claimed: saved.claimed.clone(),
+                            evaluated: saved.evaluated.clone(),
+                        },
+                    }),
+            );
+            recovery.sort_by_key(|record| match &record.work {
+                RecoveryWork::Pending { candidate, .. } => CandidateId::from(candidate),
+                RecoveryWork::Answered { claimed, .. } => claimed.id.clone(),
+            });
+            recovery.truncate(limit);
+            Ok(recovery)
+        }
+
+        fn load_terminal_candidate_ids(
+            &self,
+            candidate_ids: &[CandidateId],
+        ) -> Result<Vec<CandidateId>, StoreError> {
+            assert!(candidate_ids.len() <= MAX_PENDING_CANDIDATES);
+            let call = {
+                let mut calls = self.terminal_lookup_calls.lock().unwrap();
+                calls.push(candidate_ids.to_vec());
+                calls.len()
+            };
+            if *self.fail_terminal_lookup.lock().unwrap()
+                || *self.fail_terminal_lookup_on_call.lock().unwrap() == Some(call)
+            {
+                return Err(StoreError {
+                    message: "injected terminal candidate lookup failure".into(),
+                });
+            }
+            let terminal = self.terminal.lock().unwrap();
+            let mut found = candidate_ids
+                .iter()
+                .filter(|id| terminal.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Some(id) = self.terminal_lookup_extra_id.lock().unwrap().take() {
+                found.push(id);
+            }
+            Ok(found)
         }
 
         fn record_attempt_failure(
             &self,
-            _: &ClaimedCandidate,
-            _: u8,
-            _: AttemptFailure,
+            claimed: &ClaimedCandidate,
+            attempt: &DecisionAttempt,
+            outcome: AttemptFailure,
             _: &EvaluationDiagnostic,
         ) -> Result<ClaimOutcome, StoreError> {
+            self.decision_progress
+                .lock()
+                .unwrap()
+                .get_mut(&claimed.id)
+                .unwrap()
+                .attempts
+                .iter_mut()
+                .find(|row| row.attempt == *attempt)
+                .unwrap()
+                .outcome = match outcome {
+                AttemptFailure::SafeTransient => {
+                    crate::check_store::DecisionAttemptOutcome::SafeTransient
+                }
+                AttemptFailure::Unknown => crate::check_store::DecisionAttemptOutcome::Unknown,
+                AttemptFailure::Permanent => crate::check_store::DecisionAttemptOutcome::Permanent,
+            };
             Ok(ClaimOutcome::Current)
         }
 
         fn record_failure(
             &self,
-            _: &ClaimedCandidate,
-            _: &str,
+            claimed: &ClaimedCandidate,
+            detail: &str,
         ) -> Result<ClaimOutcome, StoreError> {
+            if *self.fail_local_failure_write.lock().unwrap() {
+                return Err(StoreError {
+                    message: "injected local failure write failure".into(),
+                });
+            }
+            if self.local_answers.lock().unwrap().contains_key(&claimed.id) {
+                self.terminal.lock().unwrap().insert(claimed.id.clone());
+                self.local_failures.lock().unwrap().push(detail.into());
+            }
             Ok(ClaimOutcome::Current)
+        }
+
+        fn record_evaluation_failure(
+            &self,
+            claimed: &ClaimedCandidate,
+            diagnostic: &EvaluationDiagnostic,
+        ) -> Result<ClaimOutcome, StoreError> {
+            self.evaluation_failures
+                .lock()
+                .unwrap()
+                .push(diagnostic.clone());
+            self.record_failure(claimed, &diagnostic.detail)
         }
 
         fn record_not_assessed(
             &self,
-            _: &ClaimedCandidate,
+            claimed: &ClaimedCandidate,
             _: &str,
         ) -> Result<ClaimOutcome, StoreError> {
+            self.terminal.lock().unwrap().insert(claimed.id.clone());
+            self.pending
+                .lock()
+                .unwrap()
+                .retain(|pending| pending.candidate.fingerprint != claimed.candidate.fingerprint);
             Ok(ClaimOutcome::Current)
+        }
+
+        fn record_preparation_rejection(
+            &self,
+            claimed: &ClaimedCandidate,
+            failure: &PreparationFailure,
+        ) -> Result<ClaimOutcome, StoreError> {
+            if *self.fail_preparation_rejection.lock().unwrap() {
+                return Err(StoreError {
+                    message: "injected rejection failure".into(),
+                });
+            }
+            self.record_not_assessed(claimed, &failure.detail)
         }
     }
 
     struct FakeEvaluator;
 
     impl DecisionEvaluator for FakeEvaluator {
-        fn evaluate<'a>(
+        fn prepare(
+            &self,
+            activation: &EffectiveActivation,
+            inputs: Vec<DecisionInput>,
+            budget: EvaluationBudget,
+        ) -> Result<PreparedAssessment, PreparationFailure> {
+            test_prepare(activation, inputs, budget)
+        }
+        fn validate_prepared(
+            &self,
+            activation: &EffectiveActivation,
+            prepared: &PreparedAssessment,
+            purpose: PreparationValidationPurpose,
+        ) -> Result<(), PreparationFailure> {
+            test_validate(activation, prepared, purpose)
+        }
+        fn evaluate_prepared<'a>(
             &'a self,
-            _: &'a EffectiveActivation,
+            activation: &'a EffectiveActivation,
             _: &'a FrozenCandidate,
-            _: &'a Value,
-            _: u8,
+            _: &'a PreparedAssessment,
+            attempt: &'a DecisionAttempt,
         ) -> DecisionFuture<'a> {
-            Box::pin(async {
-                let probabilities =
-                    BTreeMap::from([("yes".to_owned(), 0.9), ("no".to_owned(), 0.1)]);
-                let choice = ChoiceResult::validate(
-                    "review",
-                    "verdict",
-                    &["yes".to_owned(), "no".to_owned()],
-                    "yes",
-                    probabilities,
-                )
-                .map_err(|error| EvaluationFailure {
-                    code: EvaluationFailureCode::InvalidDecision,
-                    kind: AttemptFailure::Permanent,
-                    detail: error.message,
-                    attempts: 0,
-                })?;
-                Ok(EvaluatedCandidate {
-                    choices: vec![choice],
-                    attempts: 1,
-                })
-            })
+            Box::pin(async move { Ok(test_answer(activation, attempt, None)) })
         }
     }
 
@@ -1487,12 +2080,28 @@ mod tests {
     }
 
     impl DecisionEvaluator for PendingEvaluator {
-        fn evaluate<'a>(
+        fn prepare(
+            &self,
+            activation: &EffectiveActivation,
+            inputs: Vec<DecisionInput>,
+            budget: EvaluationBudget,
+        ) -> Result<PreparedAssessment, PreparationFailure> {
+            test_prepare(activation, inputs, budget)
+        }
+        fn validate_prepared(
+            &self,
+            activation: &EffectiveActivation,
+            prepared: &PreparedAssessment,
+            purpose: PreparationValidationPurpose,
+        ) -> Result<(), PreparationFailure> {
+            test_validate(activation, prepared, purpose)
+        }
+        fn evaluate_prepared<'a>(
             &'a self,
             _: &'a EffectiveActivation,
             _: &'a FrozenCandidate,
-            _: &'a Value,
-            _: u8,
+            _: &'a PreparedAssessment,
+            _: &'a DecisionAttempt,
         ) -> DecisionFuture<'a> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(std::future::pending())
@@ -1511,7 +2120,7 @@ mod tests {
             source_paths: vec![],
             project_root: None,
             compiled: Arc::new(
-                compile("name: Retry\non:\n  tool_result:\n  cooldown: 10s\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap(),
+                compile("name: Retry\non:\n  tool_result:\n  cooldown: 10s\ndecisions:\n  review:\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap(),
             ),
             bootstrap_observation_position: ObservationPosition(0),
             bootstrap_publication: Default::default(),
@@ -1555,7 +2164,7 @@ mod tests {
     fn window_activation() -> EffectiveActivation {
         EffectiveActivation {
             compiled: Arc::new(
-                compile("name: Retry\non:\n  tool_result:\n  window: {size: 2, min: 2}\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: \"${{ window.messages }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap(),
+                compile("name: Retry\non:\n  tool_result:\n  window: {size: 2, min: 2}\ndecisions:\n  review:\n    input: {activity: \"${{ window.messages }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap(),
             ),
             ..activation()
         }
@@ -1567,10 +2176,12 @@ mod tests {
 
     fn source_event_revision(cursor: u64, identity: &str, revision: u64) -> SourceEvent {
         SourceEvent::Observation {
+            source_evidence_version: None,
             cursor: PublicationCursor(cursor),
             identity: identity.to_owned(),
             revision,
             observation: Box::new(ObservationDraft {
+                first_eligible_publication: None,
                 branch: BranchId("branch-a".to_owned()),
                 native_order: NativeOrderKey(format!("native-{identity}")),
                 first_terminal_publication: None,
@@ -1610,11 +2221,14 @@ mod tests {
 
     fn run_task(mut task: EvaluationTask<'_>) -> RunSettlement {
         let mut context = Context::from_waker(Waker::noop());
-        match task.as_mut().poll(&mut context) {
-            Poll::Ready(Ok(outcome)) => outcome,
-            Poll::Ready(Err(error)) => panic!("evaluation task failed: {}", error.message),
-            Poll::Pending => panic!("immediate evaluator must finish in one poll"),
+        for _ in 0..32 {
+            match task.as_mut().poll(&mut context) {
+                Poll::Ready(Ok(outcome)) => return outcome,
+                Poll::Ready(Err(error)) => panic!("evaluation task failed: {error}"),
+                Poll::Pending => {}
+            }
         }
+        panic!("immediate evaluator did not settle within its bounded attempts");
     }
 
     #[test]
@@ -1628,7 +2242,9 @@ mod tests {
                 minimum: 1,
             });
         assert_eq!(
-            engine.enqueue(&activation, candidate(&activation, 1)),
+            engine
+                .enqueue(&activation, candidate(&activation, 1))
+                .unwrap(),
             EnqueueOutcome::Queued
         );
         let ticket = engine
@@ -1642,7 +2258,9 @@ mod tests {
             })
             .copied();
         assert_eq!(
-            engine.enqueue(&activation, candidate(&activation, 2)),
+            engine
+                .enqueue(&activation, candidate(&activation, 2))
+                .unwrap(),
             EnqueueOutcome::Coalesced
         );
         assert_eq!(
@@ -1665,7 +2283,9 @@ mod tests {
         assert_eq!(*store.dispatches.lock().unwrap(), 1);
 
         assert_eq!(
-            engine.enqueue(&activation, candidate(&activation, 3)),
+            engine
+                .enqueue(&activation, candidate(&activation, 3))
+                .unwrap(),
             EnqueueOutcome::Queued
         );
         assert!(matches!(
@@ -1694,10 +2314,12 @@ mod tests {
         Arc::make_mut(&mut activation.compiled).trigger.cooldown = Duration::ZERO;
         for (trigger, branch) in [(1, "old-a"), (2, "old-b"), (3, "old-c"), (4, "recent-d")] {
             assert_eq!(
-                engine.enqueue(
-                    &activation,
-                    candidate_on_branch(&activation, trigger, branch)
-                ),
+                engine
+                    .enqueue(
+                        &activation,
+                        candidate_on_branch(&activation, trigger, branch)
+                    )
+                    .unwrap(),
                 EnqueueOutcome::Queued
             );
         }
@@ -1709,10 +2331,12 @@ mod tests {
         ] {
             if trigger > 4 {
                 assert_eq!(
-                    engine.enqueue(
-                        &activation,
-                        candidate_on_branch(&activation, trigger, branch)
-                    ),
+                    engine
+                        .enqueue(
+                            &activation,
+                            candidate_on_branch(&activation, trigger, branch)
+                        )
+                        .unwrap(),
                     EnqueueOutcome::Queued
                 );
             }
@@ -1761,7 +2385,9 @@ mod tests {
         });
         let engine = CheckEngine::new(Arc::clone(&store), evaluator.clone());
         let activation = activation();
-        engine.enqueue(&activation, candidate(&activation, 1));
+        engine
+            .enqueue(&activation, candidate(&activation, 1))
+            .unwrap();
         let StartOutcome::Started(mut task) = engine.start_one_due(&activation, 10_000).unwrap()
         else {
             panic!("candidate must start");
@@ -1770,7 +2396,9 @@ mod tests {
         let mut context = Context::from_waker(Waker::noop());
         assert!(task.as_mut().poll(&mut context).is_pending());
         assert_eq!(evaluator.calls.load(Ordering::SeqCst), 1);
-        engine.enqueue(&activation, candidate(&activation, 2));
+        engine
+            .enqueue(&activation, candidate(&activation, 2))
+            .unwrap();
         assert!(matches!(
             engine.start_one_due(&activation, 10_000).unwrap(),
             StartOutcome::NotDue
@@ -2409,7 +3037,9 @@ mod tests {
         let store = Arc::new(FakeStore::default());
         let activation = activation();
         let first_engine = CheckEngine::new(Arc::clone(&store), Arc::new(FakeEvaluator));
-        first_engine.enqueue(&activation, candidate(&activation, 1));
+        first_engine
+            .enqueue(&activation, candidate(&activation, 1))
+            .unwrap();
         let StartOutcome::Started(task) = first_engine.start_one_due(&activation, 50_000).unwrap()
         else {
             panic!("first candidate must start");

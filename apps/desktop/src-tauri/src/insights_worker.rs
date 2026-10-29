@@ -488,7 +488,6 @@ async fn run_worker(app: tauri::AppHandle) {
     // rebuilds the rich row and emits the frontend events.
     let announce = move |key: &SessionKey| {
         crate::installed_checks::wake(&announce_app);
-        crate::jev::worker::wake(&announce_app);
         crate::session_lifecycle::report(
             &announce_app,
             crate::session_lifecycle::SyncObservation::RowChanged {
@@ -668,10 +667,7 @@ pub(crate) fn backoff_secs(retry_count: i64) -> i64 {
 fn published_status(evidence: &SessionEvidence) -> PublishedEvidence {
     let supported = DetectorId::ALL
         .into_iter()
-        .any(|detector| eligible(detector, evidence))
-        || antiburn_local::analysis::ignored_instructions::source_supported(
-            evidence.capabilities.source_format,
-        );
+        .any(|detector| eligible(detector, evidence));
     if supported {
         PublishedEvidence::Ready
     } else {

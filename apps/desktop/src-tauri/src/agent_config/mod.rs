@@ -1,6 +1,7 @@
 //! Safe edits to existing coding-agent settings.
 
 mod config;
+pub mod current_context;
 mod editor;
 pub(crate) mod filesystem;
 mod inventory;
@@ -17,8 +18,8 @@ pub use config::{
 pub use editor::AgentConfigEditor;
 pub use inventory::{
     AdvisoryResource, EnabledState, IndexedResourceEvidence, InventoryIssue, InventoryIssueReason,
-    ResourceInventory, ResourceKind, ResourceProvenance, ResourceScope, SkillSnapshotError,
-    advisory_resource_inventory, skill_opportunity_snapshot,
+    ResourceInventory, ResourceKind, ResourceProvenance, ResourceScope,
+    advisory_resource_inventory, skill_definitions,
 };
 
 #[cfg(test)]

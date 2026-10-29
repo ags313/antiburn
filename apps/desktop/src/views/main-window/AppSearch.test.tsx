@@ -18,7 +18,7 @@ vi.mock("../../lib/checkAvailability", async (importOriginal) => ({
 }))
 
 let availabilityEvent: (event: CheckAvailabilityEvent) => void
-const availableChecks: CheckAvailability = {
+const availableChecks = {
   ...emptyCheckAvailability,
   revision: 1,
   configured: true,
@@ -30,7 +30,7 @@ const availableChecks: CheckAvailability = {
       availability: { status: "available" },
     },
   ],
-}
+} satisfies CheckAvailability
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -212,6 +212,51 @@ describe("app search palette", () => {
       expect(screen.queryByRole("alert")).not.toBeInTheDocument()
     },
   )
+
+  it("removes a discovered destination on its event and rejects a late old read", async () => {
+    const request = deferred<CheckAvailability>()
+    vi.mocked(getCheckAvailability).mockReturnValueOnce(request.promise)
+    const input = open()
+    await act(async () => {})
+    act(() => availabilityEvent({ status: "updated", snapshot: availableChecks }))
+    fireEvent.change(input, { target: { value: "Retry loop" } })
+    expect(screen.getByRole("option", { name: /Retry loop/ })).toBeVisible()
+
+    act(() =>
+      availabilityEvent({
+        status: "updated",
+        snapshot: { ...availableChecks, revision: 2, installedChecks: [] },
+      }),
+    )
+    expect(screen.queryByRole("option", { name: /Retry loop/ })).not.toBeInTheDocument()
+    expect(screen.getByRole("status")).toHaveTextContent("No matching destinations")
+    await act(async () => request.resolve(availableChecks))
+    expect(screen.queryByRole("option", { name: /Retry loop/ })).not.toBeInTheDocument()
+    expect(input).toHaveFocus()
+    fireEvent.change(input, { target: { value: "Burn checks" } })
+    expect(screen.getByRole("option", { name: /ChecksFeatures/ })).toBeVisible()
+  })
+
+  it("replaces a project destination with its same-ID global definition", async () => {
+    vi.mocked(getCheckAvailability).mockResolvedValueOnce(availableChecks)
+    const input = open()
+    fireEvent.change(input, { target: { value: "Retry loop" } })
+    expect(await screen.findByRole("option", { name: /Retry loop/ })).toBeVisible()
+    act(() =>
+      availabilityEvent({
+        status: "updated",
+        snapshot: {
+          ...availableChecks,
+          revision: 2,
+          installedChecks: [{ ...availableChecks.installedChecks[0]!, name: "Global retries" }],
+        },
+      }),
+    )
+    expect(screen.queryByRole("option", { name: /Retry loop/ })).not.toBeInTheDocument()
+    fireEvent.change(input, { target: { value: "Global retries" } })
+    expect(screen.getAllByRole("option")).toHaveLength(1)
+    expect(screen.getByRole("option", { name: /Global retries/ })).toBeVisible()
+  })
 
   it("retries a failed subscription while keeping a successful snapshot", async () => {
     vi.mocked(onCheckAvailabilityChanged).mockRejectedValueOnce(new Error("listen failed"))

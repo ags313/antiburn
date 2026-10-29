@@ -703,18 +703,26 @@ Notes for what isn't expressible as a token:
   these rows hidden by default; the disclosure makes them reachable when needed.
   Start it collapsed; search opens and focuses its target. Collapsing a focused row
   returns focus to the disclosure. Never describe an unassessed row as failed.
-  Put running checks without a saved result in a visible neutral Checking group.
+  Keep checks without a saved result in Not assessed, including during checking.
+  Do not create a separate Checking group or show a provisional pass.
   Keep saved findings and passes in their result groups during new work, errors,
   and reviews without a status change. Keep selection and keyboard focus on the
   same check during group transitions. Use one shared concise status presentation
   in the collection, detail, Overview, reachable popover, and accessible labels.
   Show Snoozed beside retained results in both visible and accessible status text.
-  Installed checks show one progress label: `Catching up` while source activity
-  or check progress is not current, `Waiting for activity` when ready for new
-  events, or `Checking` while work is queued or running. Show a valid remaining
+  Installed checks retain `Not assessed`, `Passed`, or their saved failure label.
+  Append `Checking` while work is queued or running. Show catch-up and activity
+  waits in detail rather than replacing the saved result. Keep this progress visible
+  beside saved results and after reviews that do not write a status. Show a valid remaining
   event count only in detail, such as `Needs 3 more tool results.`, after catch-up.
-  Snooze takes priority, then unavailable definitions, running work, actionable
-  errors, catch-up, and event waits. Keep saved outcomes in their result groups and detail
+  In the detail body, combine progress and the saved outcome in one neutral panel.
+  Label the retained outcome `Saved check result` or `Saved check results`; it is
+  not necessarily the latest completed work. Show its explanation once. Do not
+  stack a separate passing panel beneath Checking. Keep actionable errors first
+  and separate, and retain finding evidence below the combined status. Use
+  `check`, not `assessment`, in app-owned display prose.
+  Snooze takes priority. Definition, source, and provider errors do not replace
+  `Not assessed` or a saved outcome; show their reasons in detail. Keep saved outcomes in their result groups and detail
   content. Do not append source waits, review counts, or no-write outcomes to the
   progress label. Use monospace without a spinner or an extra status row. Waiting
   text stays still. Only checking text animates, with `activity-row-title-shimmer`.
@@ -722,7 +730,7 @@ Notes for what isn't expressible as a token:
   use `Verifying` for verification waits. Announce
   selected-check status changes with a polite live region. The Passed disclosure
   counts its rows; assessed-result summaries count only confirmed passes.
-  Installed definition and execution errors use short card statuses such as
+  Installed definition and execution errors use short detail titles such as
   `Input too large` or `Check needs fixing`; keep explanations out of card labels.
   Their detail panels reuse the passing-panel geometry: `rounded-control`,
   `bg-surface-card/75`, `p-4`, a `gap-3` leading icon, and `type-callout` content.
@@ -733,14 +741,26 @@ Notes for what isn't expressible as a token:
   Put the keyboard-accessible `Open check file` action with an external-open icon
   with the location. Open the file in its default application; do not imply an
   editor line jump. Keep open failures inline beside the action and preserve the
-  diagnostic. Put the safe diagnostic code and available typed decision, field,
-  input path, fitting reason, and local budget details in an accessible disclosure.
+  diagnostic. Put useful decision, YAML field, input path, fitting cause, and local
+  limit details in a collapsed, keyboard-accessible `Technical details` disclosure.
+  Use compact label/value rows. Keep prose and numeric limits in system sans;
+  use monospace only for code and technical identifiers. Show the safe diagnostic
+  code once as a muted line without a repeated label. Omit affected-session counts,
+  repeated primary explanations, and unrelated stored-analysis boilerplate. Keep
+  source causes short rather than repeating saved-history limits. Retain the full
+  diagnostic payload for debugging.
   Do not display raw failure strings or provider bodies. Label estimated tokens
   as estimates. Distinguish a preparation resource stop from exhausted fitting;
   it does not prove that further permitted reductions could not fit. Keep its
-  card status short, such as `Could not check`.
+  detail title short, such as `Could not check`.
   Show errors before empty or passing content, retain earlier valid findings, and
   group repeated errors without hiding distinct file/decision locations. Do not
+  repeat one source issue as both an error and an information card. Show capture
+  alerts only for current capture failures, not old gaps during healthy capture.
+  Keep primary alert copy short and free of source-version labels. Keep diagnostic
+  codes in the collapsed technical details. Put distinct extra issues
+  in a separate collapsed disclosure with a visible count. Announce a selected
+  check's new primary error even when its saved result does not change. Do not
   add a session-open link for definition or fitting errors. Successful shortened
   inputs use the same panel with a tertiary information icon and the title
   `Input shortened`; they are not failures. Clear stale errors after repair. Keep
@@ -875,6 +895,69 @@ Notes for what isn't expressible as a token:
   (`SectionGroup`) → row label `type-body` (`Row`) → row description
   `type-footnote text-label-secondary`. Only the pane title is semibold; below it size and contrast
   carry the hierarchy. Hand-rolled rows must match `Row`'s label type.
+- **Checks settings**: Use sentence case. Keep one `Model-based checks` group
+  with one compact configuration `Card` owned by `ChecksStepSettings`. Normal use
+  shows the master toggle and a visible saved-connection list. Keep `Add connection`
+  in the list header. Each row has one quiet actions menu with `Edit` and `Remove`.
+  An inactive row has an explicit `Use` action; the selected row has a quiet
+  selected mark. Selection does not claim connection health or a passed test.
+  Keep menu actions keyboard-accessible and restore focus to the row's menu
+  trigger after dialog dismissal. Use readable provider/model labels and stable duplicate
+  numbers instead of internal IDs. Do not add a connection-name field.
+  Keep setup available while checks are off. Do not add a `Decision model`
+  heading, nested provider card, or manual Model limits controls.
+  Add and edit use one named modal dialog with stacked full-width fields and
+  labels above controls. Show the Provider picker only when adding. Omit redundant
+  provider subtitles, internal model-code subtitles, field-by-field dividers, and
+  nested cards. A saved credential shows a compact Saved state and Change action;
+  never insert a fake password. Keep rare credential removal separate from
+  connection removal and retain its shared-key warning. Keep secrets out of the
+  normal view. The footer has secondary Test connection, Cancel, and one primary
+  Add connection or Save action. Keep one short sample-data/charge notice and test
+  status by Test. Save does not select another connection. The first saved
+  connection becomes selected without enabling checks. Use explicitly selects a
+  saved connection; focus alone never changes routing. Use the shared type scale
+  and field spacing rather than shrinking text. Keep actions reachable at 200%
+  interface size. Contain dialog focus, restore it to the opener, and handle Escape
+  like Cancel. Confirm connection removal. Removing the selected connection turns
+  checks off and clears selection, including when it is the last connection.
+  The empty state keeps Add connection available and preserves saved results.
+  Keep Check files and Model usage as full-width accordion rows inside this same
+  card, with matching row padding and separators. Both start collapsed. Put the
+  short usage summary with its accordion header, not below a closed disclosure.
+  Allow that summary to wrap at larger interface sizes. Omit unknown values and
+  absent cost estimates. Do not replace them with zero. Hide the usage section
+  when it has no current recorded information to show.
+  Check files starts collapsed and shows only enabled folders with a confirmed
+  positive physical check-file count. Show actual container paths, per-folder
+  counts, and a platform-specific open action. Do not show
+  an aggregate logical count without reliable discovery readiness. Keep paths
+  wrapping and counts distinct from readiness. Omit missing, paused, empty, and
+  uncounted folders. Load a fresh list on each visit to Checks settings; do not
+  add a Refresh folders control or show old rows during that load. Never present
+  an installation template as an openable discovered folder. Usage leads with recorded requests and estimated cost for
+  this device. Use one empty sentence instead of zero-filled diagnostic rows.
+  Keep supported usage fields when another field has no value. Omit unknown
+  request counts and diagnostic explanations from this settings view. Stored
+  accounting and delivery safety do not depend on which fields the view shows.
+  Put toggle errors beside the toggle, connection read errors and Retry by the
+  list, dialog action errors by the actions, and folder-open failures by their
+  row. Preserve draft values through recoverable errors. Mark active state
+  unconfirmed when recovery readback fails. A confirmed null selection is not a
+  read failure. A pending connection operation has an explicit Retry action that
+  remains reachable after its row is removed or Settings reopens. Show it beside
+  the connection list or in the open editor, not in both places at once. Keep
+  typed fields until a result bound to that Save submission proves completion.
+  Do not finish an operation from a settings read, search, or render. Keep Run
+  checks available to turn off during recovery; block new enablement until the
+  operation settles. Native Jev labels omit release
+  versions and distinguish connections when several exist. The master-row
+  subtitle says that check files define which session data goes to the provider.
+  Search reveals and focuses the actual dialog field or secondary disclosure
+  once. It does not save, test, open a folder, or change routing. A busy form waits
+  before completing search focus. When Model usage has no visible content, its
+  search result focuses the Model-based checks group without selecting a control.
+  Keep the standard separation between groups.
 - **Remote hosts in Settings** — keep the folder-access warning above all settings
   sections when access is needed. Place Remote hosts first among the Sources sections,
   before Scanning and Coding agents. Keep the introductory description inside the card, above
@@ -1254,15 +1337,13 @@ The actions align with that first line and wrap without negative vertical offset
 Every finding explanation appears below the header metrics.
 All check actions sit at the header’s right edge. Named resource cards contain evidence only.
 Do not repeat explanations or check-level actions in the body.
-An Ignored Instructions finding shows the same two sections in every detail state: “Instruction”
-and “What happened”. Load bounded saved excerpts when the detail opens, without another
-disclosure. Include the instruction source and line range, plus the cited action and its available
-time. Show each complete bounded excerpt with its source. Show selected supporting
-events in chronological order. Keep the finding summary visible while excerpts load
-or fail; offer Retry after a failed read. New assessments save the compared excerpts with the finding so later session changes
-do not hide the example. For older findings without saved excerpts, show the instruction location
-and action summary, then state that exact text was not saved. Closing or changing the selected
-detail discards late responses. All four Smart Checks load bounded evidence automatically.
+YAML check details show bounded saved evidence from the exact status-writing assessment.
+Model evidence separates each named decision's original input, fitted input, and omissions.
+Show the saved provider and model, not the current Settings selection. Local evidence uses
+the label "Frozen local context" and does not claim that a provider request occurred.
+Keep the finding summary visible while evidence loads or fails, and offer Retry after a failed
+read. Closing or changing the selected detail discards late responses. YAML status and
+explanations do not grant native fix prompts, Auto Fix, verification, burn estimates, or savings.
 The collection and detail panes start at the top of the workspace. The collection docks directly to
 the sidebar and uses the same `--main-window-collection-width` geometry as Sessions. Its 340px width
 does not change by breakpoint. The detail pane remains flexible, and both panes own independent scroll

@@ -2,10 +2,18 @@
 
 mod assessments;
 mod candidates;
+mod connection_changes;
 mod observations;
 mod records;
 mod retention;
 mod runtime;
+#[cfg(test)]
+pub(crate) mod test_hooks;
+#[cfg(test)]
+pub(crate) use crate::trace_capture;
+pub(crate) mod trace_failure;
+pub(crate) mod trace_refs;
+mod usage;
 pub use runtime::StoreCheckStore;
 
 use sha2::{Digest, Sha256};

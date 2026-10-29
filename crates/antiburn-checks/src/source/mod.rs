@@ -4,9 +4,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::compiler::ToolCategory;
+use crate::context::{CurrentInventories, ObservedAttribution};
 use crate::domain::{
     BranchId, EvidenceDependency, EvidenceVersion, FrozenContext, Message, NativeOrderKey,
     Observation, ObservationDraft, ObservationKind,
+};
+
+mod message_validation;
+mod messages;
+mod observations;
+pub use crate::domain::{ResponseCycleStatus, SessionStartReason};
+pub use message_validation::validate_public_message;
+pub use messages::{
+    normalize_assistant_message, normalize_tool_call, normalize_tool_result_message,
+    normalize_user_message,
+};
+pub use observations::{
+    PublishedObservation, PublishedObservationPayload, PublishedResponseCycle,
+    PublishedSourceEvidence,
 };
 
 /// Durable outbox sequence used to deliver one committed source publication.
@@ -40,6 +56,9 @@ pub struct PublishedToolResult {
     pub tool_name: Option<String>,
     /// Normalized category name when the source proves it.
     pub category: Option<String>,
+    /// Optional recorded facts. No fact is recovered from output or current settings.
+    #[serde(skip_serializing_if = "PublishedToolMetadata::is_empty")]
+    pub metadata: Box<PublishedToolMetadata>,
     /// Linked arguments. Missing data stays missing.
     pub arguments: Option<Value>,
     /// Captured result content. Missing data stays missing.
@@ -65,8 +84,46 @@ pub struct PublishedToolResult {
     pub validity: EvidenceValidity,
 }
 
+/// Optional check-facing facts from exact native request/result bindings.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedToolMetadata {
+    /// Recorded requester model and mode evidence, independent of session settings.
+    #[serde(flatten)]
+    pub attribution: ObservedAttribution,
+    /// Source qualifier for recorded mode evidence, not an accuracy score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_mode_evidence: Option<String>,
+    /// A category from a reviewed native identity. Never infer it from collapsed `other`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_category: Option<ToolCategory>,
+    /// Known normalized operation paths. None is unavailable; an empty list is known empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    /// Whether the recorded operation path set is complete.
+    #[serde(default)]
+    pub paths_complete: bool,
+    /// Path evidence and normalization limits, retained beside known paths.
+    #[serde(default)]
+    pub paths_limits: Vec<String>,
+    /// Source-specific reason that a singular requester model is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_limit: Option<String>,
+    /// Source-specific reason that requester mode evidence is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_mode_limit: Option<String>,
+    /// Source-specific category evidence limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_limit: Option<String>,
+}
+
+impl PublishedToolMetadata {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Whether source identity, order, and ownership support selection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvidenceValidity {
     /// The source proves a stable identity, usable order, and admitted ownership.
     Valid,
@@ -116,6 +173,12 @@ pub struct PublishedContext {
     pub main_session: bool,
     /// The source proved complete request history through the result position.
     pub complete_through_event: bool,
+    /// Current inventories captured with this immutable publication, never reread on retry.
+    #[serde(skip_serializing_if = "CurrentInventories::is_empty")]
+    pub inventories: CurrentInventories,
+    /// Explicit current selection, never the latest requester.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_selection: Option<ObservedAttribution>,
 }
 
 /// One committed publication event.
@@ -123,6 +186,8 @@ pub struct PublishedContext {
 pub struct PublishedEvidenceEvent {
     /// Database-wide committed publication sequence.
     pub cursor: PublicationCursor,
+    /// Exact native-current token for this immutable publication, when supplied.
+    pub source_evidence_version: Option<EvidenceVersion>,
     /// Stable branch identity provided by publication admission.
     pub branch: String,
     /// Immutable request context admitted for the event's source position.
@@ -131,19 +196,23 @@ pub struct PublishedEvidenceEvent {
     pub change: PublishedEvidenceChange,
 }
 
-/// Mutation kind for one published result stream.
+/// Mutation kind for one published evidence stream.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PublishedEvidenceChange {
     /// A live source baseline or inactive-session event advances delivery only.
     Ignored,
     /// A finalized result or correction.
     Upsert(PublishedToolResult),
+    /// An admitted public message, complete cycle, or host boundary.
+    ObservationUpsert(PublishedObservation),
     /// A logical result was removed.
     Removal { identity: String, revision: u64 },
     /// A complete snapshot restored membership after a previously reported gap.
     CoverageRestored,
-    /// The publisher cannot prove complete membership or ordering.
+    /// The source no longer proves safe membership or ordering.
     Gap { reason: String },
+    /// The source no longer proves safe identity, ownership, or order.
+    UnsafeUpdate { reason: String },
     /// Content or history is partial; source identity, scope, and order stay safe.
     PartialGap { reason: String },
     /// Continuity loss starts a new selection window while history stays partial.
@@ -155,7 +224,7 @@ pub enum PublishedEvidenceChange {
 pub struct PublishedEvidenceBatch {
     /// Events in strictly increasing durable publication order.
     pub events: Vec<PublishedEvidenceEvent>,
-    /// Cursor after the last returned event, or the request cursor when empty.
+    /// Cursor of the last event. Empty pages can advance past filtered publications.
     pub next: PublicationCursor,
     /// Whether more committed events remain after this page.
     pub has_more: bool,
@@ -175,6 +244,8 @@ pub enum SourceEvent {
     /// A final observation or correction. The logical identity is stable.
     Observation {
         cursor: PublicationCursor,
+        /// Transient native binding, excluded from observation and checkpoint hashes.
+        source_evidence_version: Option<EvidenceVersion>,
         identity: String,
         revision: u64,
         observation: Box<ObservationDraft>,
@@ -273,7 +344,7 @@ impl<R: PublishedEvidenceReader> PublishedEvidenceSource<R> {
             previous = event.cursor;
             events.push(normalize(event)?);
         }
-        if batch.next != previous || batch.next < after {
+        if batch.next < previous || (!events.is_empty() && batch.next != previous) {
             return Err(SourceError::InvalidNextCursor {
                 expected: previous,
                 received: batch.next,
@@ -303,6 +374,11 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
             branch,
             reason,
         }),
+        PublishedEvidenceChange::UnsafeUpdate { reason } => Ok(SourceEvent::UnsafeUpdate {
+            cursor: event.cursor,
+            branch,
+            reason,
+        }),
         PublishedEvidenceChange::SegmentReset { reason } => Ok(SourceEvent::SegmentReset {
             cursor: event.cursor,
             branch,
@@ -318,6 +394,15 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
             cursor: event.cursor,
             branch,
         }),
+        PublishedEvidenceChange::ObservationUpsert(observation) => {
+            observations::normalize_observation(
+                event.cursor,
+                branch,
+                event.context,
+                event.source_evidence_version,
+                observation,
+            )
+        }
         PublishedEvidenceChange::Upsert(result) => {
             let safe_context = event.context.as_ref().is_some_and(|context| {
                 context.main_session
@@ -364,9 +449,26 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                 });
                 if let Some(context) = context.as_ref() {
                     session["id"] = Value::String(context.session_id.clone());
+                    if let Some(selection) = &context.session_selection {
+                        messages::add_attribution(&mut session, selection);
+                    }
                 }
-                let mut value = serde_json::json!({"session": session, "agent": {}, "repo": {}});
+                let mut value =
+                    serde_json::json!({"session": session, "agent": {}, "global": {}, "repo": {}});
                 if let Some(context) = context.as_ref() {
+                    let inventories = serde_json::to_value(&context.inventories)
+                        .map_err(|error| SourceError::Reader(error.to_string()))?;
+                    value["global"] = inventories["global"].clone();
+                    if context.project_root.is_some() {
+                        value["repo"] = inventories["repo"].clone();
+                    } else {
+                        value["repo"] = serde_json::json!({
+                            "instructions_complete": false,
+                            "instructions_limits": ["repository-root-unavailable"],
+                            "skills_complete": false,
+                            "skills_limits": ["repository-root-unavailable"],
+                        });
+                    }
                     value["agent"]["name"] = Value::String(context.agent_name.clone());
                     if let Some(project_root) = &context.project_root {
                         value["repo"]["root"] = Value::String(project_root.clone());
@@ -386,6 +488,11 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
             }
             .to_owned();
             let payload_complete = result.finality && result.payload_complete;
+            let category = result
+                .metadata
+                .check_category
+                .map(|category| category.as_str().to_owned())
+                .or_else(|| result.category.clone());
             let mut message_value = serde_json::json!({
                 "id": result.identity,
                 "source": context.as_ref().expect("selection context was validated").agent_name,
@@ -393,7 +500,7 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                 "role": "tool",
                 "tool": {
                     "name": result.tool_name,
-                    "category": result.category,
+                    "category": category,
                     "arguments": result.arguments,
                     "result": {
                         "content": result.content,
@@ -404,20 +511,44 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
                 "quality": {
                     "source_complete": result.payload_complete,
                     "tool_name_available": result.tool_name.is_some(),
-                    "category_available": result.category.is_some(),
+                    "category_available": category.is_some(),
                     "arguments_available": result.arguments.is_some(),
                     "result_content_available": result.content.is_some(),
                     "request_history_complete": context.as_ref().is_some_and(|context| context.complete_through_event),
                     "main_session": context.as_ref().is_some_and(|context| context.main_session),
+                    "paths_available": result.metadata.paths.is_some(),
+                    "paths_complete": result.metadata.paths.is_some() && result.metadata.paths_complete,
+                    "paths_limits": result.metadata.paths_limits,
                 },
             });
+            if let Some(model) = result.metadata.attribution.model {
+                message_value["model"] = Value::String(model);
+            }
+            if let Some(mode) = result.metadata.attribution.fast_mode {
+                message_value["fast_mode"] = Value::Bool(mode);
+                if let Some(evidence) = result.metadata.fast_mode_evidence {
+                    message_value["quality"]["fast_mode_evidence"] = Value::String(evidence);
+                }
+            }
+            if let Some(paths) = result.metadata.paths {
+                message_value["tool"]["paths"] = serde_json::json!(paths);
+            }
+            for (field, limit) in [
+                ("model_limit", result.metadata.model_limit),
+                ("fast_mode_limit", result.metadata.fast_mode_limit),
+                ("category_limit", result.metadata.category_limit),
+            ] {
+                if let Some(limit) = limit {
+                    message_value["quality"][field] = Value::String(limit);
+                }
+            }
             if result.tool_name.is_none() {
                 message_value["tool"]
                     .as_object_mut()
                     .expect("tool is an object")
                     .remove("name");
             }
-            if result.category.is_none() {
+            if category.is_none() {
                 message_value["tool"]
                     .as_object_mut()
                     .expect("tool is an object")
@@ -447,17 +578,19 @@ fn normalize(event: PublishedEvidenceEvent) -> Result<SourceEvent, SourceError> 
             };
             Ok(SourceEvent::Observation {
                 cursor: event.cursor,
+                source_evidence_version: event.source_evidence_version,
                 identity: result.identity,
                 revision: result.revision,
                 observation: Box::new(ObservationDraft {
                     branch,
                     native_order: result.native_order,
                     first_terminal_publication: result.first_terminal_publication,
+                    first_eligible_publication: None,
                     version,
                     kind: if result.finality {
                         ObservationKind::ToolResult {
                             message,
-                            category: result.category.unwrap_or_default(),
+                            category: category.unwrap_or_default(),
                             status,
                         }
                     } else {
@@ -483,6 +616,8 @@ pub type FileEventSource<R> = PublishedEvidenceSource<R>;
 /// A source read or contract failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceError {
+    /// A typed public payload violates the normalized event contract.
+    InvalidObservation(String),
     /// A page size is outside the supported bound.
     InvalidPageSize(u16),
     /// The reader returned more events than requested.

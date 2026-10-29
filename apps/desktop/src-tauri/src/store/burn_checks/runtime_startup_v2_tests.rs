@@ -1,7 +1,8 @@
 use antiburn_checks::check_store::CheckStore;
 use antiburn_checks::compiler::compile;
+use antiburn_checks::domain::ObservationKind;
 use antiburn_checks::engine::{CheckEngine, DecisionEvaluator, DecisionFuture};
-use antiburn_checks::source::PublishedEvidenceSource;
+use antiburn_checks::source::{PublishedEvidenceSource, SourceBatch};
 use antiburn_local::analysis::{
     SourceFormat, ToolCategory, ToolResultChange, ToolResultCompleteness, ToolResultContext,
     ToolResultObservation, ToolResultPosition, ToolResultStatus,
@@ -35,17 +36,33 @@ fn admission_cursor(session_id: &str) -> String {
     )
 }
 
-const CHECK: &str = "name: Retry\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: '${{ message }}'}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n";
+const CHECK: &str = "name: Retry\non:\n  tool_result:\ndecisions:\n  review:\n    input: {activity: '${{ message }}'}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    input: {result: failure}\n";
 
 struct NoEvaluator;
 
 impl DecisionEvaluator for NoEvaluator {
-    fn evaluate<'a>(
+    fn prepare(
+        &self,
+        _: &EffectiveActivation,
+        _: Vec<antiburn_checks::decision::DecisionInput>,
+        _: antiburn_checks::expression_eval::EvaluationBudget,
+    ) -> Result<antiburn_checks::prepared_assessment::PreparedAssessment, PreparationFailure> {
+        panic!("startup tests do not prepare provider requests")
+    }
+    fn validate_prepared(
+        &self,
+        _: &EffectiveActivation,
+        _: &antiburn_checks::prepared_assessment::PreparedAssessment,
+        _: antiburn_checks::engine::PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        panic!("startup tests do not validate provider requests")
+    }
+    fn evaluate_prepared<'a>(
         &'a self,
         _: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        _: &'a serde_json::Value,
-        _: u8,
+        _: &'a antiburn_checks::prepared_assessment::PreparedAssessment,
+        _: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         panic!("startup tests do not send provider requests")
     }
@@ -156,6 +173,7 @@ fn result(sequence: u64) -> ToolResultObservation {
         item_index: 0,
     };
     ToolResultObservation {
+        facts: None,
         outcome: None,
         provider_executed: None,
         source_format: SourceFormat::OpenCodeSqliteV2,
@@ -192,6 +210,137 @@ fn publish(store: &Store, claim: &OpenCodeV2CaptureClaim, sequence: u64) {
     );
 }
 
+fn assert_event_order(page: &SourceBatch, expected: &[(u64, &str)]) {
+    let actual = page
+        .events
+        .iter()
+        .map(|event| match event {
+            SourceEvent::Observation {
+                cursor,
+                observation,
+                ..
+            } => {
+                let kind = match observation.kind {
+                    ObservationKind::ToolResult { .. } => "tool_result",
+                    ObservationKind::SessionStart { .. } => "session_start",
+                    ref kind => panic!("unexpected startup observation: {kind:?}"),
+                };
+                (cursor.0, kind)
+            }
+            SourceEvent::Gap { cursor, .. } => (cursor.0, "partial_gap"),
+            SourceEvent::SegmentReset { cursor, .. } => (cursor.0, "segment_reset"),
+            SourceEvent::Ignored { cursor } => (cursor.0, "ignored"),
+            event => panic!("unexpected startup event: {event:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    assert_eq!(page.next, PublicationCursor(expected.last().unwrap().0));
+    assert!(!page.has_more);
+}
+
+fn tool_identity(claim: &OpenCodeV2CaptureClaim, sequence: u64) -> String {
+    let mut observation = result(sequence);
+    observation.session_id.clone_from(&claim.key.session_id);
+    crate::store::native_tool_results::evidence::NativeEvidencePayload::ToolResult(observation)
+        .identity()
+        .unwrap()
+}
+
+fn assert_tool_events(page: &SourceBatch, expected: &[(u64, &OpenCodeV2CaptureClaim, u64)]) {
+    let tools = page
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            SourceEvent::Observation {
+                cursor,
+                identity,
+                observation,
+                ..
+            } if matches!(observation.kind, ObservationKind::ToolResult { .. }) => {
+                Some((cursor, identity, observation))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tools.len(), expected.len());
+    for ((cursor, identity, observation), (publication, claim, sequence)) in
+        tools.into_iter().zip(expected)
+    {
+        assert_eq!(*cursor, PublicationCursor(*publication));
+        assert_eq!(*identity, tool_identity(claim, *sequence));
+        assert_eq!(observation.branch, BranchId(claim.key.to_identity_json()));
+        assert_eq!(
+            observation.native_order.0,
+            serde_json::to_string(&ToolResultPosition::OpenCodeV2Event {
+                sequence: *sequence,
+                item_index: 0,
+            })
+            .unwrap()
+        );
+        let ObservationKind::ToolResult { message, .. } = &observation.kind else {
+            unreachable!()
+        };
+        assert_eq!(&message.id, identity);
+        assert_eq!(message.value["tool"]["result"]["content"], "ok");
+    }
+}
+
+fn assert_capture_attachments(store: &Store, active: &EffectiveActivation, keys: &[&SessionKey]) {
+    let scope = StoreCheckStore::activation_scope_key(&active.id.scope);
+    let actual = store
+        .lock()
+        .prepare(
+            "SELECT branch_key, observer_epoch FROM burn_check_session_attachment
+         WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3 ORDER BY branch_key",
+        )
+        .unwrap()
+        .query_map(
+            params![active.id.definition_id, scope, active.id.generation.0],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let mut expected = keys
+        .iter()
+        .map(|key| (key.to_identity_json(), None))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(actual, expected);
+    assert_eq!(store.lock().query_row(
+        "SELECT COUNT(*) FROM native_tool_result_publication WHERE event_kind IN ('session_start', 'session_idle')",
+        [], |row| row.get::<_, i64>(0),
+    ).unwrap(), 0);
+}
+
+fn assert_committed_tools(store: &Store, active: &EffectiveActivation, expected: &[(u64, String)]) {
+    let scope = StoreCheckStore::activation_scope_key(&active.id.scope);
+    let actual = store
+        .lock()
+        .prepare(
+            "SELECT publication_sequence, native_identity, event_kind FROM burn_check_observation
+         WHERE check_id = ?1 AND activation_scope_key = ?2 ORDER BY publication_sequence",
+        )
+        .unwrap()
+        .query_map(params![active.id.definition_id, scope], |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        actual,
+        expected
+            .iter()
+            .map(|(cursor, identity)| (*cursor, identity.clone(), "tool_result".into()))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn v2_startup_writes_empty_attachment_and_never_seeds_current_terminals() {
     let (_directory, store, adapter, active, claim) = unattached_fixture();
@@ -202,7 +351,7 @@ fn v2_startup_writes_empty_attachment_and_never_seeds_current_terminals() {
         .remove(0);
     assert!(session.v2);
     let events = StorePublishedEvidenceReader::for_project(&store, "native", "/repo")
-        .recent_results(&claim.key)
+        .recent_results_before(&claim.key, session.before_publication)
         .unwrap();
     assert!(events.is_empty());
     let before = adapter.load_source_progress(&active).unwrap();
@@ -247,6 +396,7 @@ fn v2_startup_writes_empty_attachment_and_never_seeds_current_terminals() {
 #[test]
 fn capture_attaches_live_checks_before_the_first_publication() {
     let (_directory, store, adapter, active, claim) = fixture();
+    assert_capture_attachments(&store, &active, &[&claim.key]);
     publish(&store, &claim, 5);
     let first_update = store
         .native_tool_result_publications_after(0, 20)
@@ -270,16 +420,15 @@ fn capture_attaches_live_checks_before_the_first_publication() {
     );
     let progress = adapter.load_source_progress(&active).unwrap();
     let ready = source.read_batch(progress.publication_cursor).unwrap();
-    assert!(ready.events.iter().any(
-        |event| matches!(event, SourceEvent::Observation { cursor, .. } if cursor.0 == first_update)
-    ));
-    assert_eq!(
-        engine
-            .apply_source_page(&active, &ready)
-            .unwrap()
-            .candidates,
-        1
+    assert_eq!(first_update, 3);
+    assert_event_order(
+        &ready,
+        &[(1, "segment_reset"), (2, "partial_gap"), (3, "tool_result")],
     );
+    assert_tool_events(&ready, &[(first_update, &claim, 5)]);
+    let outcome = engine.apply_source_page(&active, &ready).unwrap();
+    assert_eq!((outcome.observations, outcome.candidates), (1, 1));
+    assert_committed_tools(&store, &active, &[(first_update, tool_identity(&claim, 5))]);
     assert!(
         adapter
             .initialized_branches(&active)
@@ -296,25 +445,123 @@ fn capture_attaches_live_checks_before_the_first_publication() {
             .unwrap()
             .is_empty()
     );
+    let restarted = restart.load_source_progress(&active).unwrap();
+    assert_eq!(restarted.observation_position, ObservationPosition(1));
+    assert_eq!(restarted.publication_cursor, ready.next);
+    assert!(source.read_batch(ready.next).unwrap().events.is_empty());
+    publish(&store, &claim, 6);
+    let engine = CheckEngine::new(restart.clone(), Arc::new(NoEvaluator));
+    let future = source.read_batch(ready.next).unwrap();
+    assert_event_order(&future, &[(4, "tool_result")]);
+    assert_tool_events(&future, &[(4, &claim, 6)]);
+    let outcome = engine.apply_source_page(&active, &future).unwrap();
+    assert_eq!((outcome.observations, outcome.candidates), (1, 1));
+    assert_committed_tools(
+        &store,
+        &active,
+        &[
+            (first_update, tool_identity(&claim, 5)),
+            (4, tool_identity(&claim, 6)),
+        ],
+    );
+    assert_capture_attachments(&store, &active, &[&claim.key]);
     assert_eq!(
         restart
             .load_source_progress(&active)
             .unwrap()
             .observation_position,
-        ObservationPosition(1)
+        ObservationPosition(2)
     );
-    assert!(source.read_batch(ready.next).unwrap().events.is_empty());
-    publish(&store, &claim, 6);
-    let engine = CheckEngine::new(restart.clone(), Arc::new(NoEvaluator));
-    let future = source.read_batch(ready.next).unwrap();
-    assert_eq!(
-        engine
-            .apply_source_page(&active, &future)
-            .unwrap()
-            .candidates,
-        1
-    );
+    assert!(source.read_batch(future.next).unwrap().events.is_empty());
     assert_eq!(restart.load_recovery(None, 10).unwrap().len(), 2);
+}
+
+#[test]
+fn capture_attachment_publishes_one_host_start_when_observers_initialize() {
+    use crate::store::native_tool_results::evidence::{
+        EvidenceEventKind, EvidencePublicationPayload,
+    };
+
+    let (_directory, store, adapter, active, claim) = fixture();
+    assert_capture_attachments(&store, &active, &[&claim.key]);
+    for expected in [1, 0] {
+        assert_eq!(
+            store
+                .initialize_session_observers(&active.id, now_epoch() * 1000)
+                .unwrap(),
+            expected
+        );
+    }
+    publish(&store, &claim, 5);
+    let source = PublishedEvidenceSource::new(
+        StorePublishedEvidenceReader::for_live_project(&store, "native", "/repo")
+            .with_activation(&active.id),
+        20,
+    )
+    .unwrap();
+    let page = source.read_batch(PublicationCursor(0)).unwrap();
+    assert_event_order(
+        &page,
+        &[
+            (1, "segment_reset"),
+            (2, "session_start"),
+            (3, "partial_gap"),
+            (4, "tool_result"),
+        ],
+    );
+    assert_tool_events(&page, &[(4, &claim, 5)]);
+    let raw = store
+        .native_evidence_publications_for_project_after("native", "/repo", Some(&active.id), 0, 20)
+        .unwrap();
+    let starts = raw
+        .iter()
+        .filter(|event| event.event_kind == EvidenceEventKind::SessionStart)
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 1);
+    let Some(EvidencePublicationPayload::Host(host)) = &starts[0].payload else {
+        panic!("host start expected")
+    };
+    assert_eq!(host.observer.activation, active.id);
+    assert_eq!(host.observer.branch, BranchId(claim.key.to_identity_json()));
+    let SourceEvent::Observation {
+        cursor,
+        identity,
+        observation,
+        ..
+    } = &page.events[1]
+    else {
+        panic!("normalized host start expected")
+    };
+    assert_eq!(*cursor, PublicationCursor(2));
+    assert_eq!(
+        *identity,
+        serde_json::to_string(&("session_start", &host.observer, &host.payload)).unwrap()
+    );
+    assert!(matches!(
+        observation.kind,
+        ObservationKind::SessionStart {
+            reason: antiburn_checks::domain::SessionStartReason::Attached
+        }
+    ));
+    let engine = CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator));
+    let outcome = engine.apply_source_page(&active, &page).unwrap();
+    assert_eq!((outcome.observations, outcome.candidates), (2, 1));
+    let progress = adapter.load_source_progress(&active).unwrap();
+    assert_eq!(progress.observation_position, ObservationPosition(2));
+    assert_eq!(progress.publication_cursor, page.next);
+    assert_eq!(
+        store
+            .initialize_session_observers(&active.id, now_epoch() * 1000)
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.lock().query_row(
+        "SELECT COUNT(*) FROM burn_check_session_attachment WHERE check_id = ?1 AND observer_epoch IS NOT NULL",
+        [&active.id.definition_id], |row| row.get::<_, i64>(0),
+    ).unwrap(), 1);
+    let empty = source.read_batch(page.next).unwrap();
+    assert!(empty.events.is_empty());
+    assert_eq!(empty.next, page.next);
 }
 
 #[test]
@@ -626,21 +873,31 @@ fn ineligible_v2_branch_does_not_block_a_healthy_project_branch() {
         )
         .unwrap();
         let page = source.read_batch(PublicationCursor(0)).unwrap();
-        assert!(!page.has_more);
-        assert!(
-            page.events
-                .iter()
-                .any(|event| matches!(event, SourceEvent::Ignored { .. }))
+        assert_event_order(
+            &page,
+            &[
+                (1, "segment_reset"),
+                (2, "partial_gap"),
+                (3, "ignored"),
+                (4, "segment_reset"),
+                (5, "partial_gap"),
+                (6, "tool_result"),
+            ],
         );
-        let branches: Vec<_> = page
-            .events
-            .iter()
-            .filter_map(|event| match event {
-                SourceEvent::Observation { observation, .. } => Some(&observation.branch),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(branches, [&BranchId(healthy.key.to_identity_json())]);
+        assert_tool_events(&page, &[(6, &healthy, 5)]);
+        assert_capture_attachments(&store, &active, &[&claim.key, &healthy.key]);
+        let engine = CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator));
+        let outcome = engine.apply_source_page(&active, &page).unwrap();
+        assert_eq!((outcome.observations, outcome.candidates), (1, 1));
+        assert_committed_tools(&store, &active, &[(6, tool_identity(&healthy, 5))]);
+        let progress = adapter.load_source_progress(&active).unwrap();
+        assert_eq!(progress.observation_position, ObservationPosition(1));
+        assert_eq!(progress.publication_cursor, page.next);
+        assert_eq!(
+            adapter.initialized_branches(&active).unwrap(),
+            std::collections::BTreeSet::from([BranchId(healthy.key.to_identity_json())])
+        );
+        assert!(source.read_batch(page.next).unwrap().events.is_empty());
     }
 }
 
@@ -825,13 +1082,49 @@ fn v2_disconnect_before_attachment_drains_publications_and_unblocks_healthy_sess
     let sessions = adapter.startup_sessions(&active, now_epoch()).unwrap();
     assert!(sessions.is_empty());
     let ready = source.read_batch(PublicationCursor(0)).unwrap();
+    assert_event_order(
+        &ready,
+        &[
+            (1, "segment_reset"),
+            (2, "partial_gap"),
+            (3, "tool_result"),
+            (4, "segment_reset"),
+            (5, "segment_reset"),
+            (6, "partial_gap"),
+            (7, "tool_result"),
+        ],
+    );
+    assert_tool_events(&ready, &[(3, &claim, 5), (7, &healthy, 5)]);
+    assert_capture_attachments(&store, &active, &[&claim.key, &healthy.key]);
     let outcome = engine.apply_source_page(&active, &ready).unwrap();
     assert_eq!(outcome.observations, 2);
     assert_eq!(outcome.candidates, 1);
+    assert_committed_tools(
+        &store,
+        &active,
+        &[
+            (3, tool_identity(&claim, 5)),
+            (7, tool_identity(&healthy, 5)),
+        ],
+    );
+    let progress = adapter.load_source_progress(&active).unwrap();
+    assert_eq!(progress.observation_position, ObservationPosition(2));
+    assert_eq!(progress.publication_cursor, ready.next);
+    assert!(
+        progress.selection.branches[&BranchId(claim.key.to_identity_json())]
+            .results
+            .is_empty()
+    );
+    assert_eq!(
+        progress.selection.branches[&BranchId(healthy.key.to_identity_json())]
+            .results
+            .len(),
+        1
+    );
     assert!(source.read_batch(ready.next).unwrap().events.is_empty());
     let pending = adapter.load_recovery(None, 10).unwrap();
     assert_eq!(pending.len(), 1);
-    let RecoveryWork::Pending(candidate) = &pending[0].work else {
+    let RecoveryWork::Pending { candidate, .. } = &pending[0].work else {
         panic!("healthy evidence must retain one pending candidate")
     };
     assert_eq!(candidate.branch, BranchId(healthy.key.to_identity_json()));

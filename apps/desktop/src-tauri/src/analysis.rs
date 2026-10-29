@@ -1262,6 +1262,9 @@ fn bootstrap_snapshot(
         user_messages_json: Vec::new(),
         user_message_conflicts: Vec::new(),
         user_messages_complete: true,
+        native_evidence_json: Vec::new(),
+        native_evidence_complete: true,
+        native_admission_failure_json: None,
     })
 }
 

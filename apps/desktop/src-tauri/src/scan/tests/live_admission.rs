@@ -2,16 +2,21 @@ use super::*;
 use crate::check_store::StoreCheckStore;
 use crate::insights_worker::journal::tests::{SyntheticJournal, run_page};
 use crate::published_evidence_reader::StorePublishedEvidenceReader;
-use antiburn_checks::actions::ChoiceResult;
-use antiburn_checks::check_store::{CheckStore, EvaluatedCandidate};
+use antiburn_checks::check_store::CheckStore;
+use antiburn_checks::decision::{DecisionAttempt, DecisionInput, Question};
 use antiburn_checks::definition_lifecycle::{EffectiveActivation, LifecycleTransition};
 use antiburn_checks::discovery::DefinitionScope;
 use antiburn_checks::domain::{
     ActivationId, ActivationScope, FrozenCandidate, Generation, ObservationPosition, RunScope,
 };
 use antiburn_checks::engine::{
-    CheckEngine, DecisionEvaluator, DecisionFuture, RunOutcome, StartOutcome,
+    CheckEngine, DecisionEvaluator, DecisionFuture, PreparationValidationPurpose, RunOutcome,
+    StartOutcome,
 };
+use antiburn_checks::expression_eval::EvaluationBudget;
+use antiburn_checks::fit::{FitReport, PreparationFailure};
+use antiburn_checks::prepared_assessment::{PreparedAssessment, PreparedBlock};
+use antiburn_checks::results::{ChoiceResult, DecisionResult, NamedAnswer, QuestionResult};
 use antiburn_checks::source::{PublicationCursor, PublishedEvidenceSource};
 
 fn native_source(home: &std::path::Path, id: &str) -> (SyntheticJournal, SessionLog) {
@@ -229,39 +234,109 @@ struct MockDecision {
 }
 
 impl DecisionEvaluator for MockDecision {
-    fn evaluate<'a>(
+    fn prepare(
+        &self,
+        activation: &EffectiveActivation,
+        inputs: Vec<DecisionInput>,
+        evaluation_budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
+        let prepared = PreparedAssessment::new(
+            "live-admission-test-v1".into(),
+            evaluation_budget,
+            0,
+            inputs
+                .into_iter()
+                .map(|input| PreparedBlock {
+                    decision: input.decision,
+                    original_input: input.input.clone(),
+                    input: input.input,
+                    request: serde_json::json!({"test": true}),
+                    report: FitReport::default(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        prepared
+            .validate_for_declarations(&activation.compiled.decisions)
+            .unwrap();
+        Ok(prepared)
+    }
+
+    fn validate_prepared(
+        &self,
+        activation: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        _: PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        assert_eq!(prepared.profile, "live-admission-test-v1");
+        prepared
+            .validate_for_declarations(&activation.compiled.decisions)
+            .unwrap();
+        Ok(())
+    }
+
+    fn evaluate_prepared<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        input: &'a serde_json::Value,
-        attempt: u8,
+        prepared: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
+            let input = &prepared
+                .decisions
+                .iter()
+                .find(|block| block.decision == attempt.decision)
+                .unwrap()
+                .input;
             self.inputs.lock().unwrap().push(input.clone());
-            let decision = &activation.compiled.decision;
-            let labels = decision
-                .criteria
+            let decision = activation
+                .compiled
+                .decisions
+                .iter()
+                .find(|decision| decision.name == attempt.decision)
+                .unwrap();
+            let [question] = decision.outputs.as_slice() else {
+                panic!("the live admission fixture requires one question");
+            };
+            let Question::Choice { criteria, .. } = &question.question else {
+                panic!("the live admission fixture requires a Choice question");
+            };
+            let labels = criteria
                 .iter()
                 .map(|(label, _)| label.clone())
                 .collect::<Vec<_>>();
-            Ok(EvaluatedCandidate {
-                choices: vec![
-                    ChoiceResult::validate(
-                        &decision.name,
-                        &decision.question_id,
-                        &labels,
-                        "stuck",
-                        labels
-                            .iter()
-                            .map(|label| {
-                                (label.clone(), if label == "stuck" { 0.99 } else { 0.005 })
-                            })
-                            .collect(),
+            Ok(DecisionResult::new(
+                decision,
+                &activation.compiled.question_requirements(),
+                vec![
+                    NamedAnswer::new(
+                        &question.name,
+                        QuestionResult::Choice(
+                            ChoiceResult::new(
+                                &question.question,
+                                "stuck",
+                                Some(
+                                    labels
+                                        .iter()
+                                        .map(|label| {
+                                            (
+                                                label.clone(),
+                                                if label == "stuck" { 0.99 } else { 0.005 },
+                                            )
+                                        })
+                                        .collect(),
+                                ),
+                                Some(0.99),
+                            )
+                            .unwrap(),
+                        ),
                     )
                     .unwrap(),
                 ],
-                attempts: attempt,
-            })
+                attempt.number,
+            )
+            .unwrap())
         })
     }
 }
@@ -296,7 +371,7 @@ fn catch_up(
     for session in adapter.startup_sessions(active, unix_now() - 180).unwrap() {
         let events = StorePublishedEvidenceReader::for_project(store, "native", cwd)
             .with_repository_root(Some(cwd))
-            .recent_results(&session.key)
+            .recent_results_before(&session.key, session.before_publication)
             .unwrap();
         adapter
             .initialize_recent(active, &session, &events)
@@ -311,6 +386,9 @@ async fn three_post_baseline_results_write_a_mocked_status_while_fingerprint_is_
     let home = tempfile::tempdir().unwrap();
     let root = home.path().canonicalize().unwrap();
     let store = Arc::new(Store::open_in_memory(&root).unwrap());
+    store
+        .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+        .unwrap();
     let (mut source, log) = native_source(&root, "native-session");
     let scope = ActivationScope {
         environment: "native".into(),
@@ -335,7 +413,7 @@ async fn three_post_baseline_results_write_a_mocked_status_while_fingerprint_is_
         compiled: Arc::new(
             antiburn_checks::compiler::compile(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../../docs/burn-check/examples/failed-retry-loop.yml"
+                "/../../../crates/antiburn-checks/tests/fixtures/retry-review.yml"
             )))
             .unwrap(),
         ),

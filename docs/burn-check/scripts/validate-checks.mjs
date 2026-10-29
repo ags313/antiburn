@@ -5,7 +5,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import { isAlias, isMap, isScalar, parseAllDocuments, visit } from "yaml";
 
 export const validationBoundary =
-  "Burn Checks v1-prealpha is experimental and not yet standardized. Syntax, semantics, and capabilities may change with breaking changes and no backward compatibility promise. Validation covers YAML restrictions and schema structure only, not runtime support. Runtime validation must check expression syntax (including blank expressions), reference types, frozen contexts and validated result values for dynamic messages, nesting limits, iteration budgets, glob syntax, map aliases that must not shadow public input roots (session, turn, message, window, global, repo, agent), and window min <= size (min defaults to 1). The window root exposes window.messages only with on.window in decision inputs and actions, not top-level if. Status result expressions must evaluate to exactly success or failure, case-sensitive, without boolean coercion.";
+  "Burn Checks v1-alpha is experimental and not yet standardized. Syntax, semantics, and capabilities can change, including breaking changes, with no backward compatibility promise. Beta and stable scope are not set. Missing features are unassigned future work, not usable today. Validation covers YAML restrictions and schema structure only, not runtime support, native source proof, or provider capability. The compiler and runtime check expression syntax (including blank expressions), event-scoped roots and filters, closed-record access, frozen evidence, source and evaluation bounds, glob syntax, aliases, window min <= size, and fit rules. Message alternatives share one rolling window; turn and session events have no window. Current session selection cannot fill past attribution. The desktop emits session_start reason attached only. The 120-second idle policy is an observation, not measured activity. Message actions remain unsupported even behind false conditions. Status result expressions must return exactly success or failure, case-sensitive, without Boolean coercion.";
 
 export function parseCheck(source) {
   const documents = parseAllDocuments(source, {
@@ -117,14 +117,14 @@ async function main() {
   console.log(validationBoundary);
   const validate = await createValidator();
   console.log("Schema is valid (JSON Schema Draft 2020-12).");
-  const examples = new URL("../examples/", import.meta.url);
+  const definitions = new URL("../../../.antiburn/checks/", import.meta.url);
   const supplied = process.argv.slice(2);
   const files = supplied.length
     ? supplied.map((file) => resolve(file))
-    : (await readdir(examples))
+    : (await readdir(definitions))
         .filter((file) => /\.ya?ml$/i.test(file))
         .sort()
-        .map((file) => fileURLToPath(new URL(file, examples)));
+        .map((file) => fileURLToPath(new URL(file, definitions)));
   if (!files.length) {
     throw new Error("No Burn Check definitions found.");
   }

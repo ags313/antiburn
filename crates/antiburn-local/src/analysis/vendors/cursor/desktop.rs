@@ -205,6 +205,7 @@ impl<'a> DesktopEvidence<'a> {
                 status,
                 outcome: None,
                 provider_executed: None,
+                facts: None,
                 finality: terminal,
                 completeness: if !self.root {
                     ToolResultCompleteness::UnsafeOwnership

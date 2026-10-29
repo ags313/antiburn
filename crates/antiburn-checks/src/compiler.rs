@@ -7,17 +7,33 @@ use serde::{Deserialize, Serialize};
 use serde_json::Number;
 
 use crate::config::{ConfigEntry, ConfigValue, ConfigValueKind, YamlDocument, parse_yaml};
+use crate::decision::{DecisionBlock, NamedQuestion, Question, QuestionKind, QuestionRequirements};
 use crate::diagnostics::{Diagnostic, DiagnosticCode};
-use crate::expression::{Expression, PathSegment, parse_expression};
+use crate::expression::{Expression, parse_expression};
+use crate::filters::{RepositoryGlob, is_model_identifier};
 use crate::fit::{
     FitPathSegment, FitRule, FitStrategy, MAX_FIT_PATH_BYTES, MAX_FIT_PATH_SEGMENTS, MAX_FIT_RULES,
     parse_fit_path, paths_overlap,
 };
 
 const MAX_WINDOW_SIZE: u64 = 40;
-const SUPPORTED_MODEL: &str = "typesafe/jev-1.13.0";
-/// The pinned Jev route accepts at most this number of Choice criteria.
-pub const MAX_CHOICE_CRITERIA: usize = 26;
+const PUBLIC_ROOTS: &[&str] = &[
+    "session",
+    "turn",
+    "message",
+    "window",
+    "global",
+    "repo",
+    "agent",
+    "decisions",
+];
+
+mod access;
+mod inventories;
+mod requirements;
+mod triggers;
+use access::ValueShape;
+pub use inventories::CurrentInventoryDemand;
 
 /// One fully validated check that uses only supported capabilities.
 #[derive(Clone, Debug, PartialEq)]
@@ -28,16 +44,16 @@ pub struct CompiledCheck {
     pub description: Option<String>,
     /// A pre-scheduling condition, when configured.
     pub condition: Option<Condition>,
-    /// The supported finalized-tool-result trigger.
+    /// The selected event family, its filters, and scheduling settings.
     pub trigger: ToolResultTrigger,
-    /// The one supported TypeSafe Choice question.
-    pub decision: ChoiceDecision,
+    /// Independent model decisions in authored order. Empty for local checks.
+    pub decisions: Vec<DecisionBlock>,
     /// Ordered status actions. The runtime evaluates each condition separately.
     pub actions: Vec<StatusAction>,
 }
 
 /// A Boolean condition or parsed expression.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum Condition {
     /// A literal YAML Boolean.
     Boolean(bool),
@@ -45,21 +61,60 @@ pub enum Condition {
     Expression(Expression),
 }
 
-/// Filters and rolling selection settings for `tool_result` events.
+/// Event alternatives and scheduling settings. Legacy fields filter result events.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolResultTrigger {
+    /// Exactly one event family, with alternatives inside that family.
+    pub family: TriggerFamily,
     /// Optional normalized tool categories. An absent list means all categories.
     pub tools: Option<Vec<ToolCategory>>,
     /// Optional final result statuses. An absent list means all statuses.
     pub statuses: Option<Vec<ToolResultStatus>>,
+    /// Exact requester model identities at message scope.
+    pub models: Option<Vec<String>>,
+    /// Proven effective requester mode at message scope.
+    pub fast_mode: Option<bool>,
+    /// At least one recorded repository-relative path must match.
+    pub paths: Option<Vec<RepositoryGlob>>,
+    /// Any matching recorded path vetoes the event.
+    pub paths_ignore: Option<Vec<RepositoryGlob>>,
     /// Optional rolling message window.
     pub window: Option<RollingWindow>,
-    /// The model-run cooldown. The default is 60 seconds.
+    /// The run cooldown. Defaults to zero locally and 60 seconds for models.
     pub cooldown: Duration,
 }
 
+/// Event alternatives from one authored family.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TriggerFamily {
+    Messages {
+        tool_result: bool,
+        user_message: Option<EventFilters>,
+        assistant_message: Option<EventFilters>,
+        tool_call: Option<EventFilters>,
+    },
+    ResponseCycle(EventFilters),
+    Session {
+        session_start: Option<EventFilters>,
+        session_idle: Option<EventFilters>,
+    },
+}
+
+/// Filters for one non-result event alternative.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EventFilters {
+    pub tools: Option<Vec<ToolCategory>>,
+    pub statuses: Option<Vec<ToolResultStatus>>,
+    pub models: Option<Vec<String>>,
+    pub fast_mode: Option<bool>,
+    pub paths: Option<Vec<RepositoryGlob>>,
+    pub paths_ignore: Option<Vec<RepositoryGlob>>,
+    pub reasons: Option<Vec<crate::domain::SessionStartReason>>,
+}
+
 /// A normalized tool category accepted by the current filter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolCategory {
     /// Shell or command execution.
     Shell,
@@ -79,6 +134,24 @@ pub enum ToolCategory {
     Mcp,
     /// Other normalized tools.
     Other,
+}
+
+impl ToolCategory {
+    /// Returns the check-facing category without changing native metric categories.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Read => "read",
+            Self::Search => "search",
+            Self::Edit => "edit",
+            Self::Write => "write",
+            Self::Delegate => "delegate",
+            Self::Skill => "skill",
+            Self::Mcp => "mcp",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// A final tool-result status accepted by the current filter.
@@ -103,32 +176,6 @@ pub struct RollingWindow {
     pub minimum: u8,
 }
 
-/// The model route supported by this release.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub enum DecisionModel {
-    /// TypeSafe's pinned `jev-1.13.0` route.
-    TypeSafeJev1130,
-}
-
-/// One compiled model-backed Choice decision.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct ChoiceDecision {
-    /// The authored decision identifier.
-    pub name: String,
-    /// The supported provider route.
-    pub model: DecisionModel,
-    /// Fixed-key input templates prepared against the frozen candidate.
-    pub input: Vec<(String, InputTemplate)>,
-    /// Authorized reductions in YAML declaration order.
-    pub fit: Vec<FitRule>,
-    /// The one output question identifier.
-    pub question_id: String,
-    /// The fixed Choice question text.
-    pub question: String,
-    /// Declared labels and their fixed descriptions, in authored order.
-    pub criteria: Vec<(String, String)>,
-}
-
 /// A recursively prepared decision input value.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum InputTemplate {
@@ -136,10 +183,32 @@ pub enum InputTemplate {
     Literal(InputLiteral),
     /// A typed whole-value expression.
     Expression(Expression),
+    /// Text with literal parts and expressions evaluated once.
+    Text(Vec<TemplatePart>),
     /// An ordered array template.
     Sequence(Vec<Self>),
     /// A fixed-key object template.
     Object(Vec<(String, Self)>),
+    /// An ordered, optionally filtered array mapping.
+    Map {
+        /// The expression that selects the source array.
+        collection: Expression,
+        /// The item name visible only to the condition and value.
+        alias: String,
+        /// The optional item filter.
+        condition: Option<Condition>,
+        /// The template evaluated for each included item.
+        value: Box<Self>,
+    },
+}
+
+/// One literal or expression part of an embedded text template.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum TemplatePart {
+    /// Fixed authored text.
+    Literal(String),
+    /// An expression converted with scalar text rules.
+    Expression(Expression),
 }
 
 /// A JSON-compatible literal accepted by an input template.
@@ -164,21 +233,124 @@ pub enum StatusResult {
     Success,
 }
 
+/// An authored fixed status or a whole-value expression.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StatusResultTemplate {
+    /// A validated fixed result.
+    Literal(StatusResult),
+    /// An expression that must produce exactly `success` or `failure`.
+    Expression(Expression),
+}
+
+impl From<StatusResult> for StatusResultTemplate {
+    fn from(value: StatusResult) -> Self {
+        Self::Literal(value)
+    }
+}
+
 /// One independently gated, ordered status action.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatusAction {
     /// The action condition, when configured.
     pub condition: Option<Condition>,
-    /// The literal status result to write when the condition passes.
-    pub result: StatusResult,
-    /// Optional fixed user-facing explanation.
-    pub message: Option<String>,
+    /// The status value evaluated when the condition passes.
+    pub result: StatusResultTemplate,
+    /// Optional user-facing explanation template.
+    pub message: Option<InputTemplate>,
+}
+
+impl CompiledCheck {
+    /// Returns where current file inventories can affect this check.
+    #[must_use]
+    pub fn current_inventory_demand(&self) -> CurrentInventoryDemand {
+        inventories::inspect(self)
+    }
+
+    /// Returns whether actions run without model decisions.
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        self.decisions.is_empty()
+    }
+
+    /// Returns provider requirements without evaluating action conditions.
+    ///
+    /// The host must check every reference, including references in branches
+    /// that can be false. This does not admit unsupported language features.
+    pub fn question_requirements(&self) -> Vec<QuestionRequirements> {
+        let mut required = Vec::new();
+        for decision in &self.decisions {
+            for question in &decision.outputs {
+                let mut requirements = QuestionRequirements {
+                    decision: decision.name.clone(),
+                    question: question.name.clone(),
+                    kind: question.question.kind(),
+                    criteria_count: question.question.criteria_count(),
+                    probabilities: false,
+                    confidence: false,
+                };
+                for action in &self.actions {
+                    let mut inspect = |expression: &Expression| {
+                        requirements::inspect(expression, decision, question, &mut requirements);
+                    };
+                    if let Some(Condition::Expression(expression)) = &action.condition {
+                        inspect(expression);
+                    }
+                    if let StatusResultTemplate::Expression(expression) = &action.result {
+                        inspect(expression);
+                    }
+                    if let Some(template) = &action.message {
+                        template.visit_expressions(&mut inspect);
+                    }
+                }
+                required.push(requirements);
+            }
+        }
+        required
+    }
+}
+
+impl InputTemplate {
+    fn visit_expressions(&self, visitor: &mut impl FnMut(&Expression)) {
+        match self {
+            Self::Literal(_) => {}
+            Self::Expression(expression) => visitor(expression),
+            Self::Text(parts) => {
+                for part in parts {
+                    if let TemplatePart::Expression(expression) = part {
+                        visitor(expression);
+                    }
+                }
+            }
+            Self::Sequence(items) => {
+                for item in items {
+                    item.visit_expressions(visitor);
+                }
+            }
+            Self::Object(items) => {
+                for (_, item) in items {
+                    item.visit_expressions(visitor);
+                }
+            }
+            Self::Map {
+                collection,
+                condition,
+                value,
+                ..
+            } => {
+                visitor(collection);
+                if let Some(Condition::Expression(expression)) = condition {
+                    visitor(expression);
+                }
+                value.visit_expressions(visitor);
+            }
+        }
+    }
 }
 
 /// Parses YAML and compiles it against the application's supported feature set.
 ///
 /// This validates authored configuration. It does not evaluate expressions,
-/// read evidence, call TypeSafe, or execute actions.
+/// read evidence, call a provider, or execute actions.
 ///
 /// # Errors
 /// Returns YAML, structural, expression, or unsupported-feature diagnostics.
@@ -195,7 +367,9 @@ pub fn compile_document(document: &YamlDocument) -> Result<CompiledCheck, Vec<Di
     let mut validator = Validator {
         diagnostics: Vec::new(),
         has_window: false,
-        decisions: None,
+        decisions: Vec::new(),
+        aliases: Vec::new(),
+        trigger_family: None,
     };
     let compiled = validator.compile_root(document.root());
     if validator.diagnostics.is_empty() {
@@ -208,20 +382,23 @@ pub fn compile_document(document: &YamlDocument) -> Result<CompiledCheck, Vec<Di
 struct Validator {
     diagnostics: Vec<Diagnostic>,
     has_window: bool,
-    decisions: Option<DecisionSymbols>,
+    decisions: Vec<DecisionSymbols>,
+    aliases: Vec<(String, ValueShape)>,
+    trigger_family: Option<TriggerFamily>,
 }
 
 #[derive(Clone)]
 struct DecisionSymbols {
     name: String,
-    question: String,
-    labels: HashSet<String>,
+    outputs: Vec<QuestionSymbols>,
 }
 
-struct CompiledChoiceOutput {
-    question_id: String,
-    question: String,
-    criteria: Vec<(String, String)>,
+#[derive(Clone)]
+struct QuestionSymbols {
+    name: String,
+    kind: QuestionKind,
+    labels: HashSet<String>,
+    criteria_count: usize,
 }
 
 impl Validator {
@@ -233,7 +410,7 @@ impl Validator {
             "",
         );
 
-        for required_name in ["name", "on", "decisions", "actions"] {
+        for required_name in ["name", "on", "actions"] {
             if !fields.iter().any(|entry| entry.key == required_name) {
                 self.missing_field(root, required_name);
             }
@@ -246,27 +423,32 @@ impl Validator {
             .iter()
             .find(|entry| entry.key == "description")
             .and_then(|entry| self.fixed_text(Some(&entry.value), "description"));
+        let decision_entry = fields.iter().find(|entry| entry.key == "decisions");
+        let default_cooldown = if decision_entry.is_some() {
+            Duration::from_secs(60)
+        } else {
+            Duration::ZERO
+        };
         let trigger = fields
             .iter()
             .find(|entry| entry.key == "on")
-            .and_then(|entry| self.compile_trigger(&entry.value));
+            .and_then(|entry| self.compile_trigger(&entry.value, default_cooldown));
         self.has_window = trigger.as_ref().is_some_and(|value| value.window.is_some());
+        self.trigger_family = trigger.as_ref().map(|value| value.family.clone());
         let condition = fields
             .iter()
             .find(|entry| entry.key == "if")
             .and_then(|entry| self.condition(&entry.value, "if", ExpressionContext::TopLevel));
-        let decision = fields
-            .iter()
-            .find(|entry| entry.key == "decisions")
-            .and_then(|entry| self.compile_decision(&entry.value));
+        let decisions = match decision_entry {
+            Some(entry) => self.compile_decisions(&entry.value)?,
+            None => Vec::new(),
+        };
         let actions = fields
             .iter()
             .find(|entry| entry.key == "actions")
             .and_then(|entry| self.compile_actions(&entry.value));
 
-        let (Some(name), Some(trigger), Some(decision), Some(actions)) =
-            (name, trigger, decision, actions)
-        else {
+        let (Some(name), Some(trigger), Some(actions)) = (name, trigger, actions) else {
             return None;
         };
         Some(CompiledCheck {
@@ -274,107 +456,8 @@ impl Validator {
             description,
             condition,
             trigger,
-            decision,
+            decisions,
             actions,
-        })
-    }
-
-    fn compile_trigger(&mut self, value: &ConfigValue) -> Option<ToolResultTrigger> {
-        let fields = self.mapping(value, "on")?;
-        let event_names = [
-            "tool_result",
-            "user_message",
-            "assistant_message",
-            "tool_call",
-            "turn_end",
-            "session_start",
-            "session_idle",
-        ];
-        let mut allowed_events = vec!["window", "cooldown"];
-        allowed_events.extend(event_names);
-        self.allowed_fields(fields, &allowed_events, "on");
-        for entry in fields {
-            if entry.key != "tool_result" && event_names.contains(&entry.key.as_str()) {
-                self.unsupported(
-                    &entry.value,
-                    format!("Trigger `{}` is not supported yet.", entry.key),
-                    format!("on.{}", entry.key),
-                );
-            }
-        }
-        let event = fields.iter().find(|entry| entry.key == "tool_result");
-        if event.is_none() {
-            self.push(
-                DiagnosticCode::ConfigMissingField,
-                "The supported trigger requires `on.tool_result`.",
-                value,
-                "on.tool_result",
-            );
-        }
-        let mut tools = None;
-        let mut statuses = None;
-        if let Some(entry) = event {
-            match &entry.value.kind {
-                ConfigValueKind::Null => {}
-                ConfigValueKind::Mapping(filters) => {
-                    self.allowed_fields(
-                        filters,
-                        &[
-                            "tools",
-                            "status",
-                            "models",
-                            "fast_mode",
-                            "paths",
-                            "paths-ignore",
-                        ],
-                        "on.tool_result",
-                    );
-                    for filter in filters {
-                        if matches!(
-                            filter.key.as_str(),
-                            "models" | "fast_mode" | "paths" | "paths-ignore"
-                        ) {
-                            self.unsupported(
-                                &filter.value,
-                                format!(
-                                    "The `tool_result.{}` filter is not supported yet.",
-                                    filter.key
-                                ),
-                                format!("on.tool_result.{}", filter.key),
-                            );
-                        }
-                    }
-                    tools = filters
-                        .iter()
-                        .find(|filter| filter.key == "tools")
-                        .and_then(|filter| self.parse_tools(&filter.value, "on.tool_result.tools"));
-                    statuses = filters
-                        .iter()
-                        .find(|filter| filter.key == "status")
-                        .and_then(|filter| {
-                            self.parse_statuses(&filter.value, "on.tool_result.status")
-                        });
-                }
-                _ => self.invalid_type(&entry.value, "on.tool_result", "null or an object"),
-            }
-        }
-        let window = fields
-            .iter()
-            .find(|entry| entry.key == "window")
-            .and_then(|entry| self.parse_window(&entry.value));
-        let cooldown = fields
-            .iter()
-            .find(|entry| entry.key == "cooldown")
-            .and_then(|entry| self.parse_cooldown(&entry.value, "on.cooldown"))
-            .or_else(|| {
-                (!fields.iter().any(|entry| entry.key == "cooldown"))
-                    .then(|| Duration::from_secs(60))
-            });
-        Some(ToolResultTrigger {
-            tools,
-            statuses,
-            window,
-            cooldown: cooldown?,
         })
     }
 
@@ -399,14 +482,10 @@ impl Validator {
                 "read" => ToolCategory::Read,
                 "search" => ToolCategory::Search,
                 "edit" => ToolCategory::Edit,
-                "write" | "delegate" | "skill" | "mcp" => {
-                    self.unsupported(
-                        item,
-                        format!("The `{text}` tool category is not supported by source adapters."),
-                        path,
-                    );
-                    continue;
-                }
+                "write" => ToolCategory::Write,
+                "delegate" => ToolCategory::Delegate,
+                "skill" => ToolCategory::Skill,
+                "mcp" => ToolCategory::Mcp,
                 "other" => ToolCategory::Other,
                 _ => {
                     self.invalid_value(item, path, "Unknown normalized tool category.");
@@ -414,6 +493,62 @@ impl Validator {
                 }
             };
             output.push(category);
+        }
+        Some(output)
+    }
+
+    fn parse_models(&mut self, value: &ConfigValue, path: &str) -> Option<Vec<String>> {
+        let items = self.unique_strings(value, path)?;
+        for (item, text) in &items {
+            if text.contains("${{") {
+                self.invalid_value(
+                    item,
+                    path,
+                    "Model filters must be fixed text without `${{`.",
+                );
+            } else if !is_model_identifier(text) {
+                self.invalid_value(item, path, "Use an exact provider/model identifier with nonempty segments and no whitespace.");
+            }
+        }
+        Some(items.into_iter().map(|(_, text)| text).collect())
+    }
+
+    fn parse_path_globs(&mut self, value: &ConfigValue, path: &str) -> Option<Vec<RepositoryGlob>> {
+        let items = self.unique_strings(value, path)?;
+        Some(
+            items
+                .into_iter()
+                .filter_map(|(item, text)| match RepositoryGlob::parse(&text) {
+                    Ok(glob) => Some(glob),
+                    Err(message) => {
+                        self.invalid_value(item, path, message);
+                        None
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn unique_strings<'a>(
+        &mut self,
+        value: &'a ConfigValue,
+        path: &str,
+    ) -> Option<Vec<(&'a ConfigValue, String)>> {
+        let items = self.sequence(value, path)?;
+        if items.is_empty() {
+            self.invalid_value(value, path, "The filter list must not be empty.");
+        }
+        let mut seen = HashSet::new();
+        let mut output = Vec::new();
+        for item in items {
+            let Some(text) = self.string(item, path) else {
+                continue;
+            };
+            if !seen.insert(text.to_owned()) {
+                self.invalid_value(item, path, "Filter values must be unique.");
+                continue;
+            }
+            output.push((item, text.to_owned()));
         }
         Some(output)
     }
@@ -553,42 +688,53 @@ impl Validator {
         Some(Duration::from_secs(seconds.expect("checked above")))
     }
 
-    fn compile_decision(&mut self, value: &ConfigValue) -> Option<ChoiceDecision> {
+    fn compile_decisions(&mut self, value: &ConfigValue) -> Option<Vec<DecisionBlock>> {
         let path = "decisions";
         let entries = self.mapping(value, path)?;
-        if entries.len() != 1 {
-            self.unsupported(
-                value,
-                "Exactly one decision block is supported.".to_owned(),
-                path,
-            );
+        if entries.is_empty() {
+            self.invalid_value(value, path, "Decisions must contain at least one block.");
+            return None;
         }
-        let entry = entries.first()?;
+        let decisions = entries
+            .iter()
+            .filter_map(|entry| self.compile_decision(entry))
+            .collect::<Vec<_>>();
+        self.decisions = decisions
+            .iter()
+            .map(|decision| DecisionSymbols {
+                name: decision.name.clone(),
+                outputs: decision
+                    .outputs
+                    .iter()
+                    .map(|output| QuestionSymbols {
+                        name: output.name.clone(),
+                        kind: output.question.kind(),
+                        labels: match &output.question {
+                            Question::Choice { criteria, .. } => {
+                                criteria.iter().map(|(label, _)| label.clone()).collect()
+                            }
+                            _ => HashSet::new(),
+                        },
+                        criteria_count: output.question.criteria_count(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        Some(decisions)
+    }
+
+    fn compile_decision(&mut self, entry: &ConfigEntry) -> Option<DecisionBlock> {
         if !is_identifier(&entry.key) {
-            self.invalid_value(value, path, "Decision names must match [a-z][a-z0-9_]*.");
+            self.invalid_value(
+                &entry.value,
+                "decisions",
+                "Decision names must match [a-z][a-z0-9_]*.",
+            );
         }
         let fields = self.mapping(&entry.value, &format!("decisions.{}", entry.key))?;
         let block_path = format!("decisions.{}", entry.key);
-        self.allowed_fields(fields, &["model", "input", "fit", "output"], &block_path);
-        self.require_fields(
-            fields,
-            &["model", "input", "output"],
-            &entry.value,
-            &block_path,
-        );
-        let model_entry = fields.iter().find(|field| field.key == "model");
-        let model = model_entry
-            .and_then(|field| self.string(&field.value, &format!("{block_path}.model")))
-            .map(|model| {
-                if model != SUPPORTED_MODEL {
-                    self.unsupported(
-                        &model_entry.expect("model entry exists").value,
-                        format!("Model route must be exactly `{SUPPORTED_MODEL}`."),
-                        format!("{block_path}.model"),
-                    );
-                }
-                DecisionModel::TypeSafeJev1130
-            });
+        self.allowed_fields(fields, &["input", "fit", "output"], &block_path);
+        self.require_fields(fields, &["input", "output"], &entry.value, &block_path);
         let input_value = fields.iter().find(|field| field.key == "input");
         let input = input_value.and_then(|field| {
             let input_path = format!("{block_path}.input");
@@ -627,30 +773,13 @@ impl Validator {
                 )
             });
         let output_value = fields.iter().find(|field| field.key == "output");
-        let output =
-            output_value.and_then(|field| self.compile_choice_output(&field.value, &block_path));
-        if let Some(output) = output.as_ref() {
-            self.decisions = Some(DecisionSymbols {
-                name: entry.key.clone(),
-                question: output.question_id.clone(),
-                labels: output
-                    .criteria
-                    .iter()
-                    .map(|(label, _)| label.clone())
-                    .collect(),
-            });
-        }
-        let question_id = output.as_ref().map(|output| output.question_id.clone());
-        let question = output.as_ref().map(|output| output.question.clone());
-        let criteria = output.map_or_else(Vec::new, |output| output.criteria);
-        Some(ChoiceDecision {
+        let outputs =
+            output_value.and_then(|field| self.compile_outputs(&field.value, &block_path));
+        Some(DecisionBlock {
             name: entry.key.clone(),
-            model: model?,
-            input: input?,
+            input: InputTemplate::Object(input?),
             fit,
-            question_id: question_id?,
-            question: question?,
-            criteria,
+            outputs: outputs?,
         })
     }
 
@@ -736,49 +865,57 @@ impl Validator {
         rules
     }
 
-    fn compile_choice_output(
+    fn compile_outputs(
         &mut self,
         value: &ConfigValue,
         decision_path: &str,
-    ) -> Option<CompiledChoiceOutput> {
+    ) -> Option<Vec<NamedQuestion>> {
         let path = format!("{decision_path}.output");
         let fields = self.mapping(value, &path)?;
-        if fields.len() != 1 {
-            self.unsupported(
+        if fields.is_empty() || fields.len() > crate::decision::MAX_QUESTIONS_PER_DECISION {
+            self.invalid_value(
                 value,
-                "Exactly one Choice question is supported.".to_owned(),
                 &path,
+                "Each decision requires one to eight questions.",
             );
         }
-        let output = fields.first()?;
+        Some(
+            fields
+                .iter()
+                .filter_map(|output| self.compile_question(output, &path))
+                .collect(),
+        )
+    }
+
+    fn compile_question(&mut self, output: &ConfigEntry, path: &str) -> Option<NamedQuestion> {
         if !is_identifier(&output.key) {
-            self.invalid_value(value, &path, "Question names must match [a-z][a-z0-9_]*.");
+            self.invalid_value(
+                &output.value,
+                path,
+                "Question names must match [a-z][a-z0-9_]*.",
+            );
         }
         let question_path = format!("{path}.{}", output.key);
         let question_fields = self.mapping(&output.value, &question_path)?;
         self.require_fields(
             question_fields,
-            &["type", "question", "criteria"],
+            &["type", "question"],
             &output.value,
-            &question_path,
-        );
-        self.allowed_fields(
-            question_fields,
-            &["type", "question", "criteria"],
             &question_path,
         );
         let kind_field = question_fields.iter().find(|field| field.key == "type");
         let kind = kind_field
             .and_then(|field| self.string(&field.value, &format!("{question_path}.type")));
-        if let Some(kind) = kind
-            && kind != "choice"
-        {
-            self.unsupported(
-                &kind_field.expect("type entry exists").value,
-                "Only Choice questions are supported.".to_owned(),
-                format!("{question_path}.type"),
-            );
-        }
+        let kind = kind?;
+        self.allowed_fields(
+            question_fields,
+            if kind == "noul" {
+                &["type", "question"]
+            } else {
+                &["type", "question", "criteria"]
+            },
+            &question_path,
+        );
         let question = question_fields
             .iter()
             .find(|field| field.key == "question")
@@ -789,43 +926,80 @@ impl Validator {
             .iter()
             .find(|field| field.key == "criteria")
             .map(|field| &field.value);
-        let criteria_fields = criteria_value
-            .and_then(|value| self.mapping(value, &format!("{question_path}.criteria")));
-        let mut criteria = Vec::new();
-        if let Some(criteria_fields) = criteria_fields {
-            if criteria_fields.len() > MAX_CHOICE_CRITERIA {
-                self.invalid_value(criteria_value.expect("criteria mapping has a source value"),
-                    &format!("{question_path}.criteria"),
-                    &format!("The pinned Jev model supports at most {MAX_CHOICE_CRITERIA} Choice criteria."));
-            }
-            if criteria_fields.len() < 2 {
-                self.invalid_value(
-                    &output.value,
-                    &format!("{question_path}.criteria"),
-                    "Choice criteria must contain at least two labels.",
-                );
-            }
-            for criterion in criteria_fields {
-                if !is_identifier(&criterion.key) {
+        if matches!(kind, "choice" | "score") && criteria_value.is_none() {
+            self.missing_field(&output.value, &format!("{question_path}.criteria"));
+        }
+        let question = question?;
+        let criteria_path = format!("{question_path}.criteria");
+        let question = match kind {
+            "choice" => Question::Choice {
+                question,
+                criteria: self.compile_choice_criteria(criteria_value?, &criteria_path)?,
+            },
+            "score" => {
+                let criteria_value = criteria_value?;
+                let items = self.sequence(criteria_value, &criteria_path)?;
+                if items.len() < 2 {
                     self.invalid_value(
-                        &criterion.value,
-                        &format!("{question_path}.criteria.{}", criterion.key),
-                        "Choice labels must match [a-z][a-z0-9_]*.",
+                        criteria_value,
+                        &criteria_path,
+                        "Score criteria must contain at least two descriptions.",
                     );
                 }
-                if let Some(description) = self.fixed_text(
-                    Some(&criterion.value),
-                    &format!("{question_path}.criteria.{}", criterion.key),
-                ) {
-                    criteria.push((criterion.key.clone(), description));
-                }
+                let criteria = items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, item)| {
+                        self.fixed_text(Some(item), &format!("{criteria_path}[{index}]"))
+                    })
+                    .collect();
+                Question::Score { question, criteria }
+            }
+            "noul" => Question::Noul { question },
+            _ => {
+                self.unsupported(
+                    &kind_field.expect("type entry exists").value,
+                    "Question type must be choice, score, or noul.".to_owned(),
+                    format!("{question_path}.type"),
+                );
+                return None;
+            }
+        };
+        Some(NamedQuestion {
+            name: output.key.clone(),
+            question,
+        })
+    }
+
+    fn compile_choice_criteria(
+        &mut self,
+        value: &ConfigValue,
+        path: &str,
+    ) -> Option<Vec<(String, String)>> {
+        let criteria_fields = self.mapping(value, path)?;
+        let mut criteria = Vec::new();
+        if criteria_fields.len() < 2 {
+            self.invalid_value(
+                value,
+                path,
+                "Choice criteria must contain at least two labels.",
+            );
+        }
+        for criterion in criteria_fields {
+            if !is_identifier(&criterion.key) {
+                self.invalid_value(
+                    &criterion.value,
+                    &format!("{path}.{}", criterion.key),
+                    "Choice labels must match [a-z][a-z0-9_]*.",
+                );
+            }
+            if let Some(description) =
+                self.fixed_text(Some(&criterion.value), &format!("{path}.{}", criterion.key))
+            {
+                criteria.push((criterion.key.clone(), description));
             }
         }
-        Some(CompiledChoiceOutput {
-            question_id: output.key.clone(),
-            question: question?,
-            criteria,
-        })
+        Some(criteria)
     }
 
     fn input_template(&mut self, value: &ConfigValue, path: &str) -> Option<InputTemplate> {
@@ -837,7 +1011,9 @@ impl Validator {
             ConfigValueKind::Number(value) => {
                 Some(InputTemplate::Literal(InputLiteral::Number(value.clone())))
             }
-            ConfigValueKind::String(text) => self.string_template(text, value, path),
+            ConfigValueKind::String(text) => {
+                self.string_template(text, value, path, ExpressionContext::DecisionInput)
+            }
             ConfigValueKind::Sequence(items) => self.sequence_template(items, path),
             ConfigValueKind::Mapping(entries) => self.object_template(entries, value, path),
         }
@@ -848,27 +1024,41 @@ impl Validator {
         text: &str,
         value: &ConfigValue,
         path: &str,
+        context: ExpressionContext,
     ) -> Option<InputTemplate> {
         if !text.contains("${{") {
             return Some(InputTemplate::Literal(InputLiteral::String(
                 text.to_owned(),
             )));
         }
-        let Some(expression_text) = whole_expression(text) else {
-            self.unsupported(
+        if let Some(expression_text) = whole_expression(text) {
+            return self
+                .expression(expression_text, value, path, context)
+                .map(InputTemplate::Expression);
+        }
+        let mut parts = Vec::new();
+        let mut remaining = text;
+        while let Some(start) = remaining.find("${{") {
+            if start > 0 {
+                parts.push(TemplatePart::Literal(remaining[..start].to_owned()));
+            }
+            let body = &remaining[start + 3..];
+            let Some(end) = expression_end(body) else {
+                self.invalid_expression(value, path, "Expression wrapper must end with `}}`.");
+                return None;
+            };
+            parts.push(TemplatePart::Expression(self.expression(
+                &body[..end],
                 value,
-                "Embedded text templates are not supported yet.".to_owned(),
                 path,
-            );
-            return None;
-        };
-        self.expression(
-            expression_text,
-            value,
-            path,
-            ExpressionContext::DecisionInput,
-        )
-        .map(InputTemplate::Expression)
+                context,
+            )?));
+            remaining = &body[end + 2..];
+        }
+        if !remaining.is_empty() {
+            parts.push(TemplatePart::Literal(remaining.to_owned()));
+        }
+        Some(InputTemplate::Text(parts))
     }
 
     fn sequence_template(&mut self, items: &[ConfigValue], path: &str) -> Option<InputTemplate> {
@@ -887,8 +1077,7 @@ impl Validator {
         path: &str,
     ) -> Option<InputTemplate> {
         if entries.iter().any(|entry| entry.key == "map") {
-            self.unsupported(value, "Map directives are not supported yet.", path);
-            return None;
+            return self.map_template(entries, value, path);
         }
         let mut fields = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -906,6 +1095,84 @@ impl Validator {
             ));
         }
         Some(InputTemplate::Object(fields))
+    }
+
+    fn map_template(
+        &mut self,
+        entries: &[ConfigEntry],
+        value: &ConfigValue,
+        path: &str,
+    ) -> Option<InputTemplate> {
+        self.allowed_fields(entries, &["map", "as", "if", "value"], path);
+        self.require_fields(entries, &["map", "as", "value"], value, path);
+        let collection_field = entries.iter().find(|entry| entry.key == "map")?;
+        let collection_path = format!("{path}.map");
+        let text = self.string(&collection_field.value, &collection_path)?;
+        let Some(body) = whole_expression(text) else {
+            self.invalid_expression(
+                &collection_field.value,
+                &collection_path,
+                "Map collection must be a whole `${{ expression }}`.",
+            );
+            return None;
+        };
+        let collection = self.expression(
+            body,
+            &collection_field.value,
+            &collection_path,
+            ExpressionContext::DecisionInput,
+        )?;
+        let alias_field = entries.iter().find(|entry| entry.key == "as")?;
+        let alias = self
+            .string(&alias_field.value, &format!("{path}.as"))?
+            .to_owned();
+        if !is_identifier(&alias)
+            || PUBLIC_ROOTS.contains(&alias.as_str())
+            || self.aliases.iter().any(|(name, _)| name == &alias)
+        {
+            self.invalid_value(
+                &alias_field.value,
+                &format!("{path}.as"),
+                "Map aliases must be identifiers and must not shadow roots or enclosing aliases.",
+            );
+            return None;
+        }
+        let collection_shape = self
+            .resolve_expression(&collection, ExpressionContext::DecisionInput)
+            .ok()?;
+        let item_shape = match collection_shape.map_item() {
+            Some(item) => item,
+            None => {
+                self.invalid_value(
+                    &collection_field.value,
+                    &collection_path,
+                    "Map collection must resolve to an array.",
+                );
+                return None;
+            }
+        };
+        self.aliases.push((alias.clone(), item_shape));
+        let condition = entries
+            .iter()
+            .find(|entry| entry.key == "if")
+            .and_then(|entry| {
+                self.condition(
+                    &entry.value,
+                    &format!("{path}.if"),
+                    ExpressionContext::DecisionInput,
+                )
+            });
+        let item = entries
+            .iter()
+            .find(|entry| entry.key == "value")
+            .and_then(|entry| self.input_template(&entry.value, &format!("{path}.value")));
+        self.aliases.pop();
+        Some(InputTemplate::Map {
+            collection,
+            alias,
+            condition,
+            value: Box::new(item?),
+        })
     }
 
     fn compile_actions(&mut self, value: &ConfigValue) -> Option<Vec<StatusAction>> {
@@ -976,15 +1243,25 @@ impl Validator {
                 continue;
             };
             let result = match self.string(&result_field.value, &format!("{path}.input.result")) {
-                Some("failure") => Some(StatusResult::Failure),
-                Some("success") => Some(StatusResult::Success),
+                Some("failure") => Some(StatusResultTemplate::Literal(StatusResult::Failure)),
+                Some("success") => Some(StatusResultTemplate::Literal(StatusResult::Success)),
                 Some(result) if result.contains("${{") => {
-                    self.unsupported(
-                        &result_field.value,
-                        "Dynamic status results are not supported yet.".to_owned(),
-                        format!("{path}.input.result"),
-                    );
-                    None
+                    if let Some(body) = whole_expression(result) {
+                        self.expression(
+                            body,
+                            &result_field.value,
+                            &format!("{path}.input.result"),
+                            ExpressionContext::ActionCondition,
+                        )
+                        .map(StatusResultTemplate::Expression)
+                    } else {
+                        self.invalid_action(
+                            &result_field.value,
+                            &format!("{path}.input.result"),
+                            "Status result must be a fixed result or a whole expression.",
+                        );
+                        None
+                    }
                 }
                 Some(_) => {
                     self.invalid_action(
@@ -1001,16 +1278,21 @@ impl Validator {
                 .find(|field| field.key == "message")
                 .and_then(|field| {
                     let message_path = format!("{path}.input.message");
-                    if matches!(&field.value.kind, ConfigValueKind::String(text) if text.contains("${{")) {
-                        self.unsupported(
+                    let text = self.string(&field.value, &message_path)?;
+                    if text.trim().is_empty() {
+                        self.invalid_action(
                             &field.value,
-                            "Dynamic status messages are not supported yet.",
-                            message_path,
+                            &message_path,
+                            "Status message must be a nonblank string.",
                         );
-                        None
-                    } else {
-                        self.fixed_text(Some(&field.value), &message_path)
+                        return None;
                     }
+                    self.string_template(
+                        text,
+                        &field.value,
+                        &message_path,
+                        ExpressionContext::ActionCondition,
+                    )
                 });
             if let Some(result) = result {
                 actions.push(StatusAction {
@@ -1074,114 +1356,11 @@ impl Validator {
                 return None;
             }
         };
-        let mut paths = Vec::new();
-        expression.visit_paths(&mut |segments| paths.push(segments.to_vec()));
-        for segments in paths {
-            if let Err((code, message)) = self.validate_path(&segments, context) {
-                self.diagnostics.push(
-                    Diagnostic::at(code, message, value.span).with_config_path(path.to_owned()),
-                );
-            }
+        if let Err((code, message)) = self.resolve_expression(&expression, context) {
+            self.diagnostics
+                .push(Diagnostic::at(code, message, value.span).with_config_path(path.to_owned()));
         }
         Some(expression)
-    }
-
-    fn validate_path(
-        &self,
-        path: &[PathSegment],
-        context: ExpressionContext,
-    ) -> Result<(), (DiagnosticCode, String)> {
-        let properties = path
-            .iter()
-            .map(|segment| match segment {
-                PathSegment::Property(value) => Some(value.as_str()),
-                PathSegment::Index(_) => None,
-            })
-            .collect::<Vec<_>>();
-        let Some(Some(root)) = properties.first() else {
-            return Err(reference_error(
-                "Expression paths must start with a context root.",
-            ));
-        };
-        let root_name = *root;
-        if root_name == "window" {
-            if context == ExpressionContext::TopLevel {
-                return Err(unsupported_reference(
-                    "The `window` root is unavailable to top-level conditions.",
-                ));
-            }
-            if !self.has_window {
-                return Err(reference_error("The `window` root requires `on.window`."));
-            }
-            return validate_window_path(path);
-        }
-        if root_name == "decisions" {
-            if context != ExpressionContext::ActionCondition {
-                return Err(unsupported_reference(
-                    "The `decisions` root is available only to action conditions.",
-                ));
-            }
-            return self.validate_decision_path(&properties);
-        }
-        match root_name {
-            "session" => validate_session_path(path),
-            "message" => validate_message_path(path),
-            "agent" => validate_agent_path(path),
-            "repo" => validate_repo_path(path),
-            "global" | "turn" => Err(unsupported_reference(&format!(
-                "The `{root_name}` root is not supported yet."
-            ))),
-            _ => Err(reference_error(&format!(
-                "Unknown context root `{root_name}`."
-            ))),
-        }
-    }
-
-    fn validate_decision_path(
-        &self,
-        properties: &[Option<&str>],
-    ) -> Result<(), (DiagnosticCode, String)> {
-        let Some(symbols) = &self.decisions else {
-            return Err(reference_error(
-                "Decision results are unavailable without a compiled decision.",
-            ));
-        };
-        if properties.get(1).copied().flatten() != Some(symbols.name.as_str()) {
-            return Err(reference_error("The expression names an unknown decision."));
-        }
-        match properties.get(2).copied().flatten() {
-            Some("outputs") => {
-                if properties.get(3).copied().flatten() == Some(symbols.question.as_str())
-                    && properties.len() == 4
-                {
-                    Ok(())
-                } else {
-                    Err(reference_error(
-                        "The expression names an unknown Choice output.",
-                    ))
-                }
-            }
-            Some("details") => {
-                if properties.get(3).copied().flatten() == Some(symbols.question.as_str())
-                    && properties.get(4).copied().flatten() == Some("probabilities")
-                    && properties
-                        .get(5)
-                        .copied()
-                        .flatten()
-                        .is_some_and(|label| symbols.labels.contains(label))
-                    && properties.len() == 6
-                {
-                    Ok(())
-                } else {
-                    Err(unsupported_reference(
-                        "Only declared Choice probabilities are available in action conditions.",
-                    ))
-                }
-            }
-            _ => Err(reference_error(
-                "Decision paths must read the declared output or Choice probabilities.",
-            )),
-        }
     }
 
     fn mapping<'a>(&mut self, value: &'a ConfigValue, path: &str) -> Option<&'a [ConfigEntry]> {
@@ -1342,11 +1521,29 @@ enum ExpressionContext {
 }
 
 fn whole_expression(value: &str) -> Option<&str> {
-    let body = value.strip_prefix("${{")?.strip_suffix("}}")?;
-    if body.contains("${{") || body.contains("}}") {
-        return None;
+    let body = value.strip_prefix("${{")?;
+    let end = expression_end(body)?;
+    (end + 2 == body.len()).then_some(&body[..end])
+}
+
+fn expression_end(body: &str) -> Option<usize> {
+    let mut quoted = false;
+    let mut characters = body.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        if character == '\'' {
+            if quoted && characters.peek().is_some_and(|(_, next)| *next == '\'') {
+                characters.next();
+            } else {
+                quoted = !quoted;
+            }
+        } else if !quoted
+            && character == '}'
+            && characters.peek().is_some_and(|(_, next)| *next == '}')
+        {
+            return Some(index);
+        }
     }
-    Some(body)
+    None
 }
 
 fn is_identifier(value: &str) -> bool {
@@ -1372,236 +1569,4 @@ fn unsupported_reference(message: &str) -> (DiagnosticCode, String) {
         DiagnosticCode::CompileUnsupportedFeature,
         message.to_owned(),
     )
-}
-
-fn validate_agent_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    match path {
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "agent" && field == "name" =>
-        {
-            Ok(())
-        }
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "agent" && field == "skills" =>
-        {
-            Err(unsupported_reference(
-                "`agent.skills` is not supported yet.",
-            ))
-        }
-        _ => Err(reference_error("Only `agent.name` is supported.")),
-    }
-}
-
-fn validate_repo_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    match path {
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "repo" && field == "root" =>
-        {
-            Ok(())
-        }
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "repo" && matches!(field.as_str(), "branch" | "instructions" | "skills") =>
-        {
-            Err(unsupported_reference(&format!(
-                "`repo.{field}` is not supported yet."
-            )))
-        }
-        _ => Err(reference_error("Only `repo.root` is supported.")),
-    }
-}
-
-fn validate_session_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    match path {
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "session"
-                && matches!(
-                    field.as_str(),
-                    "id" | "requests_complete" | "source_coverage"
-                ) =>
-        {
-            Ok(())
-        }
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "session" && field == "requests" =>
-        {
-            Ok(())
-        }
-        [
-            PathSegment::Property(root),
-            PathSegment::Property(field),
-            PathSegment::Property(length),
-        ] if root == "session" && field == "requests" && length == "length" => Ok(()),
-        [
-            PathSegment::Property(root),
-            PathSegment::Property(field),
-            PathSegment::Index(_),
-        ] if root == "session" && field == "requests" => Ok(()),
-        [
-            PathSegment::Property(root),
-            PathSegment::Property(field),
-            PathSegment::Index(_),
-            PathSegment::Property(request_field),
-        ] if root == "session"
-            && field == "requests"
-            && matches!(
-                request_field.as_str(),
-                "id" | "source" | "kind" | "text" | "in_reply_to"
-            ) =>
-        {
-            Ok(())
-        }
-        [PathSegment::Property(root), PathSegment::Property(field)]
-            if root == "session"
-                && matches!(
-                    field.as_str(),
-                    "model" | "fast_mode" | "start_reason" | "idle_seconds" | "last_activity_at"
-                ) =>
-        {
-            Err(unsupported_reference(&format!(
-                "`session.{field}` is not supported yet."
-            )))
-        }
-        _ => Err(reference_error(
-            "The expression reads a field outside the supported session data.",
-        )),
-    }
-}
-
-fn validate_window_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    match path {
-        [PathSegment::Property(root), PathSegment::Property(messages)]
-            if root == "window" && messages == "messages" =>
-        {
-            Ok(())
-        }
-        [
-            PathSegment::Property(root),
-            PathSegment::Property(messages),
-            PathSegment::Property(length),
-        ] if root == "window" && messages == "messages" && length == "length" => Ok(()),
-        [
-            PathSegment::Property(root),
-            PathSegment::Property(messages),
-            PathSegment::Index(_),
-        ] if root == "window" && messages == "messages" => Ok(()),
-        [
-            PathSegment::Property(root),
-            PathSegment::Property(messages),
-            PathSegment::Index(_),
-            ..,
-        ] if root == "window" && messages == "messages" => validate_message_path_from(path, 3),
-        _ => Err(reference_error(
-            "`window.messages` is available only when a rolling window is configured.",
-        )),
-    }
-}
-
-fn validate_message_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    validate_message_path_from(path, 1)
-}
-
-fn validate_message_path_from(
-    path: &[PathSegment],
-    start: usize,
-) -> Result<(), (DiagnosticCode, String)> {
-    let rest = &path[start..];
-    if rest.is_empty() {
-        return Ok(());
-    }
-    let field = match &rest[0] {
-        PathSegment::Property(field) => field.as_str(),
-        PathSegment::Index(_) => {
-            return Err(reference_error(
-                "A message object cannot use an array index.",
-            ));
-        }
-    };
-    if matches!(
-        field,
-        "id" | "source"
-            | "occurred_at"
-            | "kind"
-            | "role"
-            | "model"
-            | "fast_mode"
-            | "content"
-            | "quality"
-    ) {
-        return if rest.len() == 1 || field == "content" {
-            Ok(())
-        } else {
-            Err(reference_error(&format!(
-                "`message.{field}` has no supported child fields."
-            )))
-        };
-    }
-    if field != "tool" {
-        return Err(reference_error(&format!(
-            "Unknown normalized message field `message.{field}`."
-        )));
-    }
-    validate_tool_path(&rest[1..])
-}
-
-fn validate_tool_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    if path.is_empty() {
-        return Ok(());
-    }
-    let field = match &path[0] {
-        PathSegment::Property(field) => field.as_str(),
-        PathSegment::Index(_) => {
-            return Err(reference_error("A tool object cannot use an array index."));
-        }
-    };
-    match field {
-        "name" | "category" | "call_id" => {
-            if path.len() == 1 {
-                Ok(())
-            } else {
-                Err(reference_error(&format!(
-                    "`message.tool.{field}` has no supported child fields."
-                )))
-            }
-        }
-        "arguments" => Ok(()),
-        "paths" => match path {
-            [_] => Ok(()),
-            [_, PathSegment::Property(length)] if length == "length" => Ok(()),
-            [_, PathSegment::Index(_)] => Ok(()),
-            _ => Err(reference_error(
-                "Only length and fixed indexes are supported on `message.tool.paths`.",
-            )),
-        },
-        "result" => validate_result_path(&path[1..]),
-        _ => Err(reference_error(&format!(
-            "Unknown normalized tool field `message.tool.{field}`."
-        ))),
-    }
-}
-
-fn validate_result_path(path: &[PathSegment]) -> Result<(), (DiagnosticCode, String)> {
-    if path.is_empty() {
-        return Ok(());
-    }
-    let field = match &path[0] {
-        PathSegment::Property(field) => field.as_str(),
-        PathSegment::Index(_) => {
-            return Err(reference_error("A tool result cannot use an array index."));
-        }
-    };
-    match field {
-        "status" | "output_bytes" => {
-            if path.len() == 1 {
-                Ok(())
-            } else {
-                Err(reference_error(&format!(
-                    "`message.tool.result.{field}` has no supported child fields."
-                )))
-            }
-        }
-        "content" => Ok(()),
-        _ => Err(reference_error(&format!(
-            "Unknown normalized tool result field `message.tool.result.{field}`."
-        ))),
-    }
 }

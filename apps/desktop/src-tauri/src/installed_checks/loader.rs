@@ -27,9 +27,12 @@ pub(super) fn load_directory(
         Err(error) => {
             if error.kind() == io::ErrorKind::PermissionDenied
                 && let Some(name) = protected::protected_dir_name(directory)
-                && let Err(error) = store.revoke_dir_grant(&name)
+                && store.revoke_dir_grant(&name).is_err()
             {
-                ::tracing::error!(event = "installed_check_grant_revoke_failed", error = %error);
+                ::tracing::error!(
+                    event = "installed_check_grant_revoke_failed",
+                    reason = "storage_write_failed"
+                );
             }
             unavailable(
                 directory,
@@ -56,6 +59,13 @@ pub(super) fn disabled(directory: &Path) -> DirectoryChecks {
     }
 }
 
+pub(super) fn has_check_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("yml" | "yaml")
+    )
+}
+
 fn read_check_files(directory: &Path) -> io::Result<Vec<CheckFile>> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -66,10 +76,7 @@ fn read_check_files(directory: &Path) -> io::Result<Vec<CheckFile>> {
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if !matches!(
-            path.extension().and_then(|extension| extension.to_str()),
-            Some("yml" | "yaml")
-        ) {
+        if !has_check_extension(&path) {
             continue;
         }
         let content = match entry.file_type() {

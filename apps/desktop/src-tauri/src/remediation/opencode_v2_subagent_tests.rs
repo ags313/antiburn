@@ -176,7 +176,6 @@ fn native_s_binds_only_the_exact_agent_and_provider_and_retains_recovery_identit
             id: "native-s".into(),
             value: target,
             check_preferences_revision: revision,
-            smart_master_generation: None,
             created_at_epoch: 10,
         });
     let review = fixture

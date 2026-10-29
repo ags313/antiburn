@@ -31,22 +31,6 @@ repository = "https://github.com/antiburn/antiburn"
 publish = false
 
 [[test]]
-name = "ignored_instructions"
-path = "eval/ignored_instructions/main.rs"
-
-[[test]]
-name = "scope_creep"
-path = "eval/scope_creep/main.rs"
-
-[[test]]
-name = "over_exploring"
-path = "eval/over_exploring/main.rs"
-
-[[test]]
-name = "skill_opportunities"
-path = "eval/skill_opportunities/main.rs"
-
-[[test]]
 name = "provider_validation"
 path = "eval/provider_validation/main.rs"
 
@@ -226,6 +210,8 @@ tauri-plugin-updater = "2"
 keyring = { version = "3.6.3", default-features = false, features = [
   "apple-native",
 ] }
+# Read numeric Keychain status codes without formatting credential errors.
+security-framework = { version = "3.7.0", default-features = false }
 # macOS 13+ login-item registration for the main application. Unlike the
 # cross-platform plugin, this uses Apple's current System Settings-visible API.
 smappservice-rs = "0.1"

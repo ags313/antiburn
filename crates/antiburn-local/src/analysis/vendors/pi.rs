@@ -485,6 +485,7 @@ struct PiToolCall {
     record_id: String,
     name: String,
     arguments: Option<String>,
+    facts: crate::analysis::NativeToolFacts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,6 +563,17 @@ pub(crate) enum PiAdmission {
     Rejected,
 }
 
+fn recorded_model_suffix_fast_mode(model: Option<&str>) -> Option<bool> {
+    let model =
+        model.filter(|model| model.len() <= 4096 && !model.chars().any(char::is_control))?;
+    let (prefix, token) = model.rsplit_once(['-', '_', ' '])?;
+    let separator = model.as_bytes()[prefix.len()];
+    (!prefix.is_empty()
+        && !(separator == b' ' && prefix.ends_with(' '))
+        && (token.eq_ignore_ascii_case("fast") || token.eq_ignore_ascii_case("ultrafast")))
+    .then_some(true)
+}
+
 impl PiStreamState {
     fn with_native_contract(mut self, input: &SessionInput, dialect: PiDialect) -> Self {
         self.publication_root = input.fork_parent_session_id.is_none();
@@ -633,9 +645,29 @@ impl PiStreamState {
     ) -> anyhow::Result<()> {
         let mut value = value;
         self.migrate_entry(&mut value);
+        let duplicate_id = thread_identity_field(&value, "id")
+            .as_deref()
+            .is_some_and(|id| self.threads.contains(id));
+        if self.native_tool_results_enabled
+            && let Some(session_id) = &self.native_session_id
+            && (duplicate_id || self.native.known_parent_mismatch(&value))
+        {
+            sink.native_admission_failure(crate::analysis::NativeAdmissionFailure {
+                source_format: crate::analysis::SourceFormat::PiV3Jsonl,
+                session_id: session_id.clone(),
+                position: ToolResultPosition::Jsonl {
+                    record_index,
+                    item_index: u32::MAX,
+                },
+                reason: if duplicate_id {
+                    ToolResultCompleteness::UnsafeIdentity
+                } else {
+                    ToolResultCompleteness::UnsafeOrder
+                },
+            });
+        }
         if self.scope_enabled {
-            self.native
-                .observe_entry(&value, is_inert_shape(&value), sink);
+            self.native.observe_entry(&value, sink);
         }
         if let Some(reason) = pi_lineage_reason(&value) {
             sink.record(NormalizedRecord::Unusable(reason));
@@ -668,6 +700,45 @@ impl PiStreamState {
             self.current_thinking_mode = policy.thinking_mode;
         }
         self.observe_row(&value, thread_id, housekeeping, record_index, sink, cancel)?;
+        if self.native_tool_results_enabled
+            && self.publication_root
+            && !self.native.publication_order_incomplete()
+        {
+            if value["type"] == "model_change" {
+                let mut selection = crate::analysis::NativeRequestAttribution::observed(
+                    value["provider"].as_str(),
+                    value["modelId"].as_str(),
+                );
+                selection.fast_mode = recorded_model_suffix_fast_mode(value["modelId"].as_str());
+                if let Some(session_id) = &self.native_session_id {
+                    sink.session_selection(crate::analysis::NativeSessionSelectionObservation {
+                        source_format: crate::analysis::SourceFormat::PiV3Jsonl,
+                        session_id: session_id.clone(),
+                        position: ToolResultPosition::Jsonl {
+                            record_index,
+                            item_index: 0,
+                        },
+                        selection,
+                    });
+                }
+            }
+            if value["type"] == "message"
+                && matches!(
+                    value["message"]["role"].as_str(),
+                    Some("user" | "assistant" | "toolResult")
+                )
+                && let Some(session_id) = &self.native_session_id
+            {
+                crate::analysis::public_events::emit_activity(
+                    sink,
+                    crate::analysis::SourceFormat::PiV3Jsonl,
+                    session_id,
+                    record_index,
+                    value["id"].as_str().unwrap_or("message"),
+                    value.get("timestamp").and_then(parse_ts),
+                );
+            }
+        }
         // Use the thread resolver's bound and keep each identity's first policy.
         if !self.threads.capped()
             && let Some(id) = id
@@ -891,6 +962,7 @@ impl PiStreamState {
 
         if role == "assistant" {
             self.observe_native_tool_calls(value);
+            self.emit_public_messages(value, record_index, sink);
         }
 
         let Some(timestamp) = value.get("timestamp").and_then(parse_ts) else {
@@ -1113,10 +1185,24 @@ impl PiStreamState {
                 continue;
             }
             let arguments = block.get("arguments").map(Value::to_string);
+            let model = value["message"]["model"].as_str();
+            let mut requester = crate::analysis::NativeRequestAttribution::observed(
+                value["message"]["provider"].as_str(),
+                model,
+            );
+            requester.fast_mode = recorded_model_suffix_fast_mode(model);
+            let facts = crate::analysis::NativeToolFacts::for_call(
+                crate::analysis::SourceFormat::PiV3Jsonl,
+                name,
+                block.get("arguments"),
+                None,
+                requester,
+            );
             let bytes = record_id.len()
                 + call_id.len()
                 + name.len()
-                + arguments.as_ref().map_or(0, String::len);
+                + arguments.as_ref().map_or(0, String::len)
+                + facts.retained_bytes();
             if self.native_tool_calls.len() >= MAX_NATIVE_TOOL_CALLS
                 || bytes > MAX_NATIVE_TOOL_BYTES.saturating_sub(self.native_tool_bytes)
             {
@@ -1131,8 +1217,115 @@ impl PiStreamState {
                     record_id: record_id.clone(),
                     name: name.to_owned(),
                     arguments,
+                    facts,
                 },
             );
+        }
+    }
+
+    fn emit_public_messages(&self, value: &Value, record_index: u64, sink: &mut dyn RecordSink) {
+        use crate::analysis::{
+            NativeEventContext, NativeToolInput, PublicMessageObservation, PublicMessagePayload,
+            UserMessagePart,
+        };
+        if !self.native_tool_results_enabled
+            || !self.publication_root
+            || self.native.publication_order_incomplete()
+            || !native_record_complete(value)
+        {
+            return;
+        }
+        let (Some(id), Some(session)) = (value["id"].as_str(), self.native_session_id.as_ref())
+        else {
+            return;
+        };
+        let Some(blocks) = value["message"]["content"].as_array() else {
+            return;
+        };
+        let public = |item_index: u32, call_id: Option<String>, payload| {
+            let position = ToolResultPosition::Jsonl {
+                record_index,
+                item_index,
+            };
+            PublicMessageObservation {
+                source_format: crate::analysis::SourceFormat::PiV3Jsonl,
+                session_id: session.clone(),
+                record_id: id.to_owned(),
+                part_id: call_id.clone(),
+                call_id,
+                position,
+                revision: record_index.saturating_add(1),
+                change: ToolResultChange::Update,
+                eligible: true,
+                completeness: ToolResultCompleteness::Complete,
+                context: Some(NativeEventContext::pending(position, true)),
+                payload,
+            }
+        };
+        for (index, block) in blocks.iter().enumerate() {
+            if block["type"] != "toolCall" || !native_record_complete(block) {
+                continue;
+            }
+            let Some(call_id) = block["id"].as_str() else {
+                continue;
+            };
+            let Some(call) = self
+                .native_tool_calls
+                .get(call_id)
+                .filter(|call| call.record_id == id)
+            else {
+                continue;
+            };
+            if let Some(input) = block.get("arguments").filter(|input| input.is_object()) {
+                sink.record(NormalizedRecord::PublicMessage(Box::new(public(
+                    index as u32,
+                    Some(call_id.to_owned()),
+                    PublicMessagePayload::ToolCall {
+                        tool_name: call.name.clone(),
+                        input: Some(NativeToolInput::Json(input.clone())),
+                        facts: Some(call.facts.clone()),
+                        provider_executed: None,
+                    },
+                ))));
+            }
+        }
+        if !matches!(
+            value["message"]["stopReason"].as_str(),
+            Some("stop" | "toolUse")
+        ) {
+            return;
+        }
+        let parts: Option<Vec<_>> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block["type"] == "text")
+            .map(|(index, block)| {
+                if !native_record_complete(block) {
+                    return None;
+                }
+                Some(UserMessagePart {
+                    item_index: index as u32,
+                    native_part_id: None,
+                    text: block["text"].as_str()?.to_owned(),
+                })
+            })
+            .collect();
+        if let Some(parts) = parts.filter(|parts| {
+            !parts.is_empty()
+                && parts.iter().map(|part| part.text.len()).sum::<usize>()
+                    <= crate::analysis::MAX_CONTENT_PART_BYTES
+        }) {
+            let mut generator = crate::analysis::NativeRequestAttribution::observed(
+                value["message"]["provider"].as_str(),
+                value["message"]["model"].as_str(),
+            );
+            generator.fast_mode =
+                recorded_model_suffix_fast_mode(value["message"]["model"].as_str());
+            sink.record(NormalizedRecord::PublicMessage(Box::new(public(
+                blocks.len() as u32,
+                None,
+                PublicMessagePayload::AssistantText { parts, generator },
+            ))));
         }
     }
 
@@ -1220,6 +1413,7 @@ impl PiStreamState {
         let identity_safe =
             pending.record_id.is_some() && pending.call_id.is_some() && call.is_some();
         ToolResultObservation {
+            facts: call.map(|call| call.facts.clone()),
             outcome: None,
             provider_executed: None,
             context: Some(crate::analysis::ToolResultContext::pending(
@@ -1263,6 +1457,14 @@ impl PiStreamState {
     }
 
     fn emit_native_tool_results(&mut self, sink: &mut dyn RecordSink) {
+        self.emit_native_tool_results_with_admission(sink, true);
+    }
+
+    fn emit_native_tool_results_with_admission(
+        &mut self,
+        sink: &mut dyn RecordSink,
+        report_legacy_admission: bool,
+    ) {
         let pending_results = std::mem::take(&mut self.native_tool_results);
         let stream_complete = self.native_tool_results_enabled
             && !self.native.publication_order_incomplete()
@@ -1270,7 +1472,9 @@ impl PiStreamState {
             && !self.fork_attribution_incomplete
             && !self.legacy_migration_incomplete
             && !self.native_tool_results_incomplete;
-        if self.native.publication_order_incomplete()
+        if !report_legacy_admission && !stream_complete {
+            sink.tool_result_gap();
+        } else if self.native.publication_order_incomplete()
             || self.branched_tree
             || self.legacy_migration_incomplete
         {
@@ -2085,6 +2289,7 @@ mod tests {
                 record_id: "call-record".to_owned(),
                 name: "bash".to_owned(),
                 arguments: Some("{}".to_owned()),
+                facts: Default::default(),
             },
         );
         let result = json!({
@@ -2165,6 +2370,9 @@ mod tests {
             user_messages_json: Vec::new(),
             user_message_conflicts: Vec::new(),
             user_messages_complete: true,
+            native_evidence_json: Vec::new(),
+            native_evidence_complete: true,
+            native_admission_failure_json: None,
         }
     }
 

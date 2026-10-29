@@ -608,7 +608,7 @@ proc-macro-crate@3.5.0 | MIT OR Apache-2.0 | https://github.com/bkchr/proc-macro
 proc-macro-error-attr@1.0.4 | MIT OR Apache-2.0 | https://gitlab.com/CreepySkeleton/proc-macro-error
 proc-macro-error@1.0.4 | MIT OR Apache-2.0 | https://gitlab.com/CreepySkeleton/proc-macro-error
 proc-macro2@1.0.107 | MIT OR Apache-2.0 | https://github.com/dtolnay/proc-macro2
-pulldown-cmark@0.13.4 | MIT | https://github.com/raphlinus/pulldown-cmark
+pulldown-cmark@0.13.5 | MIT | https://github.com/raphlinus/pulldown-cmark
 pxfm@0.1.30 | BSD-3-Clause OR Apache-2.0 | https://github.com/awxkee/pxfm
 quick-error@2.0.1 | MIT OR Apache-2.0 | http://github.com/tailhook/quick-error
 quick-xml@0.41.0 | MIT | https://github.com/tafia/quick-xml
@@ -8229,7 +8229,7 @@ SOFTWARE.
 ========================================
 
 Used by:
-  pulldown-cmark@0.13.4
+  pulldown-cmark@0.13.5
 
 The MIT License
 

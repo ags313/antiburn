@@ -728,10 +728,6 @@ mod tests {
     use super::super::tests::{KEY, base_row, test_connection};
     use super::*;
     use crate::analysis::rows::insert_turn_rows;
-    use crate::analysis::session_scope::{
-        SCOPE_SELECTION, ScopeAuthority, ScopeMissingReason, SessionScopeBoundary,
-        SessionScopeBranch, SessionScopeBuilder,
-    };
     use crate::analysis::{SourceFormat, UserTextOrigin};
 
     #[test]
@@ -753,7 +749,7 @@ mod tests {
                 source_generation: 3,
                 after_ms: None,
                 source_positions: &BTreeMap::new(),
-                selection: SCOPE_SELECTION,
+                selection: JevInputSelection::from_fields(&[JevInputField::UserMessage]),
                 cursor: None,
             },
         )
@@ -769,32 +765,18 @@ mod tests {
         assert!(part.metadata.human_text.is_none());
         assert!(part.metadata.user_answers.is_empty());
 
-        let mut scope = SessionScopeBuilder::new(
+        let content = crate::analysis::jev_evidence::prepare_session_content(
+            "session",
             SourceFormat::OpenCodeSqliteV2,
-            SessionScopeBoundary {
-                source_key: "source".into(),
-                thread_id: "source".into(),
-                turn_index: 0,
-                part_index: 0,
-                branch: SessionScopeBranch::ProvenLinear,
-            },
-            1,
-            3,
-            true,
-        )
-        .unwrap();
-        scope.push_page(page.content, false).unwrap();
-        let snapshot = scope.finish().unwrap();
-        assert_eq!(snapshot.occurrences().len(), 1);
+            page.content,
+        );
+        assert_eq!(content.actions.len(), 1);
+        assert_eq!(content.actions[0].authority, "user");
         assert_eq!(
-            snapshot.occurrences()[0].authority,
-            ScopeAuthority::UnknownInfluence
+            content.actions[0].metadata.user_text_origin,
+            Some(UserTextOrigin::AcceptedUserSlot)
         );
-        assert!(
-            snapshot
-                .limitations()
-                .contains(&ScopeMissingReason::NoUserContext)
-        );
+        assert!(content.actions[0].metadata.human_text.is_none());
     }
 
     #[test]

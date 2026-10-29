@@ -15,6 +15,8 @@ use crate::store::{SessionKey, Store};
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PublicationPolicy<'a> {
+    pub invalidation_effects:
+        Option<&'a std::cell::Cell<super::trace_effects::InvalidationEffects>>,
     pub(crate) baseline: Option<u64>,
     pub(crate) history_complete: Option<bool>,
     pub(crate) gap_reason: Option<&'a str>,
@@ -23,7 +25,8 @@ pub(crate) struct PublicationPolicy<'a> {
     pub(crate) live_eligible: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PublicationGapKind {
     #[default]
     Invalidated,
@@ -90,6 +93,8 @@ pub struct ToolResultPublishOptions<'a> {
 /// gaps have no native result identity or payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResultPublication {
+    /// Explicit session selection at the original publication, if known.
+    pub session_selection: Option<antiburn_checks::context::ObservedAttribution>,
     /// Increasing database-wide sequence assigned at commit time.
     pub publication_sequence: i64,
     /// Whether this event adds or changes a result, removes one, or marks a gap.
@@ -119,7 +124,7 @@ pub struct ToolResultPublication {
 }
 
 /// Result of one durable native tool-result publication event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ToolResultPublicationOutcome {
     /// A new or corrected observation became current.
     Update,
@@ -215,6 +220,7 @@ impl Store {
 }
 
 pub(crate) fn delete_session_data_in(connection: &Connection, session: &SessionKey) -> Result<()> {
+    super::request_origin::delete_session_binding_in(connection, session)?;
     connection.execute(
         "DELETE FROM burn_check_session_attachment WHERE branch_key = ?1",
         [session.to_identity_json()],
@@ -241,6 +247,7 @@ pub(crate) fn delete_session_data_in(connection: &Connection, session: &SessionK
 }
 
 pub(crate) fn clear_local_data_in(connection: &Connection) -> Result<()> {
+    super::request_origin::clear_bindings_in(connection)?;
     connection.execute("DELETE FROM opencode_journal_delivery", [])?;
     connection.execute("DELETE FROM native_file_delivery", [])?;
     connection.execute("DELETE FROM burn_check_session_attachment", [])?;
@@ -310,6 +317,7 @@ pub(crate) fn reconcile_borrowed_with_policy(
         )?;
     }
     let mut present_by_format = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let mut changed = std::collections::BTreeSet::new();
     for result in batch.results {
         ensure!(
             result.session_id == session.session_id,
@@ -339,6 +347,11 @@ pub(crate) fn reconcile_borrowed_with_policy(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
+        if result.change == ToolResultChange::Update
+            && previous.as_ref().is_some_and(|(_, removed)| *removed != 0)
+        {
+            continue;
+        }
         let mut result = std::borrow::Cow::Borrowed(result);
         if let Some((old, _)) = &previous {
             let old: ToolResultObservation = serde_json::from_str(old)?;
@@ -368,6 +381,12 @@ pub(crate) fn reconcile_borrowed_with_policy(
             Some(&source_format),
             Some(&identity),
             Some(&position),
+            Some(
+                result
+                    .context
+                    .as_ref()
+                    .map_or(result.position, |context| context.result_position),
+            ),
             Some(revision),
             Some(&payload),
             result.completeness == antiburn_local::analysis::ToolResultCompleteness::Complete,
@@ -394,22 +413,24 @@ pub(crate) fn reconcile_borrowed_with_policy(
             "INSERT INTO native_tool_result_current (
                  environment_key, agent, session_id, source_format, native_identity,
                  native_position_json, native_revision, payload_json, complete,
-                 is_removed, publication_sequence, source_generation, claim_fence)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                  is_removed, publication_sequence, source_generation, claim_fence, owner_message_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(environment_key, agent, session_id, source_format, native_identity)
              DO UPDATE SET native_position_json = excluded.native_position_json,
                  native_revision = excluded.native_revision, payload_json = excluded.payload_json,
                  complete = excluded.complete, is_removed = excluded.is_removed,
                  publication_sequence = excluded.publication_sequence,
-                 source_generation = excluded.source_generation, claim_fence = excluded.claim_fence",
+                  source_generation = excluded.source_generation, claim_fence = excluded.claim_fence,
+                  owner_message_id = excluded.owner_message_id",
             params![
                 session.environment_key, session.agent, session.session_id, source_format,
                 identity, position, revision, payload,
                 i64::from(result.completeness == antiburn_local::analysis::ToolResultCompleteness::Complete),
                 i64::from(result.change == ToolResultChange::Removal), sequence,
-                source_generation, claim_fence,
+                source_generation, claim_fence, result.record_id,
             ],
         )?;
+        changed.insert((source_format, identity));
     }
 
     if batch.complete {
@@ -417,7 +438,7 @@ pub(crate) fn reconcile_borrowed_with_policy(
             "SELECT native_identity, native_position_json, native_revision, payload_json
                FROM native_tool_result_current
               WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-                AND source_format = ?4 AND is_removed = 0",
+                 AND source_format = ?4 AND is_removed = 0 AND event_kind = 'tool_result'",
         )?;
         let stale = statement
             .query_map(
@@ -452,6 +473,7 @@ pub(crate) fn reconcile_borrowed_with_policy(
                 Some(&parent_format),
                 Some(&identity),
                 Some(&position),
+                None,
                 Some(revision),
                 Some(&payload),
                 true,
@@ -477,9 +499,20 @@ pub(crate) fn reconcile_borrowed_with_policy(
                     claim_fence
                 ],
             )?;
+            changed.insert((parent_format.clone(), identity));
         }
     }
 
+    for (format, identity) in changed {
+        super::evidence::invalidate_native_identity_dependents_in(
+            transaction,
+            session,
+            &format,
+            &identity,
+            super::evidence::EvidenceEventKind::ToolResult,
+        )?
+        .record(policy.invalidation_effects);
+    }
     if !policy.suppress_coverage && policy.history_complete.is_none() {
         publish_coverage_with_kind_in(
             transaction,
@@ -568,6 +601,7 @@ pub(crate) fn publish_coverage_with_kind_in(
             None,
             None,
             None,
+            None,
             complete,
             source_generation,
             claim_fence,
@@ -579,7 +613,7 @@ pub(crate) fn publish_coverage_with_kind_in(
     Ok(())
 }
 
-fn native_identity(result: &ToolResultObservation) -> Result<String> {
+pub(super) fn native_identity(result: &ToolResultObservation) -> Result<String> {
     // The producer IDs identify corrections; position is the stable fallback
     // for formats that do not provide a record or result identifier.
     let identity =
@@ -604,6 +638,7 @@ fn insert_event(
     source_format: Option<&str>,
     identity: Option<&str>,
     position: Option<&str>,
+    selection_position: Option<ToolResultPosition>,
     revision: Option<i64>,
     payload: Option<&str>,
     complete: bool,
@@ -613,14 +648,29 @@ fn insert_event(
     gap_reason: Option<&str>,
     gap_kind: PublicationGapKind,
 ) -> Result<i64> {
+    let session_selection_json = match (source_format, identity, position) {
+        (Some(format), Some(identity), Some(position)) => {
+            super::observers::frozen_selection_json_in(
+                transaction,
+                session,
+                format,
+                identity,
+                match selection_position {
+                    Some(position) => position,
+                    None => serde_json::from_str(position)?,
+                },
+            )?
+        }
+        _ => None,
+    };
     let inserted = transaction.execute(
         "INSERT INTO native_tool_result_publication (
              outcome, environment_key, agent, session_id, source_format,
              native_identity, native_position_json, native_revision, payload_json,
              complete, source_generation, claim_fence, live_eligible, gap_reason,
-              project_cwd, session_incarnation, gap_kind)
+              project_cwd, session_incarnation, gap_kind, session_selection_json)
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                 s.cwd, s.incarnation, ?15 FROM session s
+                 s.cwd, s.incarnation, ?15, ?16 FROM session s
           WHERE s.environment_key = ?2 AND s.agent = ?3 AND s.session_id = ?4",
         params![
             match outcome {
@@ -643,6 +693,7 @@ fn insert_event(
             live_eligible,
             gap_reason,
             gap_kind.code(),
+            session_selection_json,
         ],
     )?;
     ensure!(inserted == 1, "native publication has no owning session");
@@ -658,9 +709,10 @@ fn read_publications_after(
     let mut statement = connection.prepare(
         "SELECT p.publication_sequence, p.outcome, p.environment_key, p.agent, p.session_id,
                 source_format, native_identity, native_position_json, native_revision,
-                payload_json, complete, source_generation, claim_fence, live_eligible, gap_reason, gap_kind
+                payload_json, complete, source_generation, claim_fence, live_eligible, gap_reason,
+                gap_kind, session_selection_json
            FROM native_tool_result_publication p
-          WHERE p.publication_sequence > ?1
+          WHERE p.publication_sequence > ?1 AND p.event_kind = 'tool_result'
             AND (?3 IS NULL OR (p.environment_key = ?3 AND EXISTS (
                 SELECT 1 FROM session s WHERE s.environment_key = p.environment_key
                    AND s.agent = p.agent AND s.session_id = p.session_id AND s.cwd = ?4
@@ -678,7 +730,9 @@ fn read_publications_after(
     let mut bytes = 0;
     while let Some(row) = rows.next()? {
         let payload: Option<String> = row.get(9)?;
-        let size = payload.as_ref().map_or(0, String::len);
+        let selection: Option<String> = row.get(16)?;
+        let size =
+            payload.as_ref().map_or(0, String::len) + selection.as_ref().map_or(0, String::len);
         if !events.is_empty() && bytes + size > antiburn_local::analysis::MAX_TOOL_RESULT_BYTES {
             break;
         }
@@ -695,6 +749,10 @@ fn decode_publication(
     let position: Option<String> = row.get(7)?;
     let event = (|| -> Result<ToolResultPublication> {
         Ok(ToolResultPublication {
+            session_selection: row
+                .get::<_, Option<String>>(16)?
+                .map(|json| serde_json::from_str(&json))
+                .transpose()?,
             publication_sequence: row.get(0)?,
             outcome: match row.get::<_, String>(1)?.as_str() {
                 "update" => ToolResultPublicationOutcome::Update,
@@ -742,7 +800,7 @@ fn read_current(
                 payload_json, complete, is_removed, publication_sequence
            FROM native_tool_result_current
           WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-          ORDER BY source_format, native_identity",
+             AND event_kind = 'tool_result' ORDER BY source_format, native_identity",
     )?;
     let rows = statement
         .query_map(

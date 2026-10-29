@@ -4,7 +4,6 @@ struct CurrentPromptTargets {
     targets: Vec<CachedTarget>,
     truncated: bool,
     check_preferences_revision: u64,
-    smart_master_generation: Option<String>,
 }
 
 impl RemediationController {
@@ -90,10 +89,7 @@ impl RemediationController {
                     .collect::<Vec<_>>();
                 overflow = eligible.len() > MAX_CHECK_PROMPT_TARGETS;
                 selected.extend(eligible.into_iter().take(MAX_CHECK_PROMPT_TARGETS).cloned());
-                if selected.is_empty()
-                    && (!snapshot.targets.is_empty()
-                        || (!snapshot.truncated && detector != DetectorId::IgnoredInstructions))
-                {
+                if selected.is_empty() && (!snapshot.targets.is_empty() || !snapshot.truncated) {
                     return Err(ControllerError::CheckPromptUnavailable);
                 }
             }
@@ -118,10 +114,9 @@ impl RemediationController {
         let (enabled, check_preferences_revision) = store
             .check_preferences_snapshot()
             .map_err(|_| ControllerError::PersistenceFailed)?;
-        if !enabled.contains(&detector) || !smart_check_master_available(store, detector) {
+        if !enabled.contains(&detector) {
             return Err(ControllerError::CheckPromptUnavailable);
         }
-        let smart_master_generation = smart_check_master_generation(store, detector);
         let home = antiburn_local::paths::home_dir();
         let mut authorities = opencode_current::AuthorityCache::for_listing();
         let (targets, truncated) = if matches!(
@@ -223,7 +218,6 @@ impl RemediationController {
             targets,
             truncated,
             check_preferences_revision,
-            smart_master_generation,
         })
     }
 
@@ -241,36 +235,27 @@ impl RemediationController {
             base.push_str("\n\nSelection limit\nThe current accepted evidence does not establish the selected target. Inspect only. Do not infer a current finding, reuse earlier target facts, or apply changes from this request.");
         }
         let now = now_epoch();
-        let inputs = if prompt_watch_supported([detector]) {
-            targets
-                .iter()
-                .map(|target| {
-                    let (remediation, guards) = self.watch_input(
-                        target,
-                        RemediationState::WaitingForPromptUse,
-                        None,
-                        now,
-                        None,
-                    )?;
-                    let display = serde_json::to_string(&StoredDisplaySnapshot {
-                        version: 1,
-                        finding_id: stable_finding_id(target),
-                        display: burn_check_display_facts(target, None),
-                    })
-                    .map_err(|_| ControllerError::Internal)?;
-                    Ok((remediation, guards, display))
+        let inputs = targets
+            .iter()
+            .map(|target| {
+                let (remediation, guards) = self.watch_input(
+                    target,
+                    RemediationState::WaitingForPromptUse,
+                    None,
+                    now,
+                    None,
+                )?;
+                let display = serde_json::to_string(&StoredDisplaySnapshot {
+                    version: 1,
+                    finding_id: stable_finding_id(target),
+                    display: burn_check_display_facts(target, None),
                 })
-                .collect::<Result<Vec<_>, ControllerError>>()?
-        } else {
-            Vec::new()
-        };
+                .map_err(|_| ControllerError::Internal)?;
+                Ok((remediation, guards, display))
+            })
+            .collect::<Result<Vec<_>, ControllerError>>()?;
         if inputs.is_empty() {
-            if !self.check_policy_matches(
-                store,
-                detector,
-                snapshot.check_preferences_revision,
-                snapshot.smart_master_generation.as_deref(),
-            )? {
+            if !self.check_policy_matches(store, detector, snapshot.check_preferences_revision)? {
                 return Err(ControllerError::TargetChanged);
             }
             return Ok((Vec::new(), base));
@@ -280,7 +265,6 @@ impl RemediationController {
                 &inputs,
                 detector,
                 snapshot.check_preferences_revision,
-                snapshot.smart_master_generation.as_deref(),
                 |records| {
                     let records = records.iter().filter_map(Clone::clone).collect::<Vec<_>>();
                     let references = records

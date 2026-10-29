@@ -15,12 +15,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "antiburn-checks"
+version = "0.1.0"
+dependencies = [
+ "saphyr-parser",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "antiburn-checks-store"
 version = "0.1.0"
 dependencies = [
+ "antiburn-checks",
  "antiburn-local",
  "anyhow",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
 ]
@@ -53,6 +65,12 @@ name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
 
 [[package]]
 name = "async-trait"
@@ -580,6 +598,16 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "saphyr-parser"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b76a6d2c15f6fe77217c21796e39cd406ddc5f192d5c8a2a1ddecb672abedcd"
+dependencies = [
+ "arraydeque",
+ "thiserror",
+]
 
 [[package]]
 name = "serde"

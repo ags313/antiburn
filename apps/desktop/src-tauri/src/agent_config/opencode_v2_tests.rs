@@ -87,21 +87,29 @@ fn v2_config_controls_do_not_enter_the_v1_editor() {
 }
 
 #[test]
-fn v2_inventory_needs_current_consumer_authority_for_stored_and_exported_evidence() {
+fn opencode_inventory_requires_current_authority_instead_of_legacy_files() {
     let temporary = tempfile::tempdir().unwrap();
+    let skill = temporary
+        .path()
+        .join(".config/opencode/skills/review/SKILL.md");
+    fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    fs::write(
+        &skill,
+        "---\nname: review\ndescription: Review code.\n---\n",
+    )
+    .unwrap();
     let mut context = ConfigContext::native(AgentKind::OpenCode, temporary.path(), None);
-    for source in V2_SOURCES {
+    for source in [
+        SourceFormat::OpenCodeJsonl,
+        SourceFormat::OpenCodeSqliteV1,
+        SourceFormat::OpenCodeSqliteV2,
+        SourceFormat::OpenCodeV2SessionExport,
+    ] {
         context.source_format = Some(source);
         assert_eq!(
             advisory_resource_inventory(&context, []),
             Err(ConfigUnavailableReason::RuntimeOverride)
         );
-        assert!(matches!(
-            skill_opportunity_snapshot(&context),
-            Err(SkillSnapshotError::Config(
-                ConfigUnavailableReason::UnsupportedSetting
-            ))
-        ));
     }
 }
 

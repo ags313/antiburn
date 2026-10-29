@@ -26,7 +26,10 @@ fn prerelease_upgrade_preserves_incarnations_and_applies_main_migrations() {
         )
         .unwrap();
     let store = Store::from_connection(connection, Path::new("/tmp/legacy-v49").into()).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 86);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        super::super::schema::MIGRATIONS.len() as i64
+    );
     assert_eq!(counter(&store), 57);
     let key = SessionKey {
         environment_key: "native".into(),
@@ -85,7 +88,10 @@ fn prerelease_repair_rolls_back_if_a_main_migration_fails() {
         .execute_batch("DROP TRIGGER fail_history_delete")
         .unwrap();
     store.migrate().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 86);
+    assert_eq!(
+        store.schema_version().unwrap(),
+        super::super::schema::MIGRATIONS.len() as i64
+    );
 }
 
 #[test]
@@ -117,7 +123,10 @@ fn branch_allowance_versions_receive_main_quota_schema() {
         let store =
             Store::from_connection(connection, Path::new("/tmp/branch-allowance-schema").into())
                 .unwrap();
-        assert_eq!(store.schema_version().unwrap(), 86);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            super::super::schema::MIGRATIONS.len() as i64
+        );
         let connection = store.lock();
         let table_exists = |name: &str| -> bool {
             connection
@@ -140,7 +149,10 @@ fn branch_allowance_versions_receive_main_quota_schema() {
         assert!(factor_sql.contains("lane LIKE 'model:%'"));
         drop(connection);
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 86);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            super::super::schema::MIGRATIONS.len() as i64
+        );
     }
 }
 
@@ -163,7 +175,7 @@ CREATE TABLE burn_check_runtime_definition_state (
 ) STRICT;
 INSERT INTO burn_check_runtime_definition_state VALUES (1, 1, 0);
 "#;
-    for (feature_schema, version) in [(false, 81), (true, 81), (true, 82)] {
+    for (feature_schema, version) in [(false, 81), (true, 81), (true, 82), (true, 83)] {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         for sql in &super::super::schema::MIGRATIONS[..80] {
             connection.execute_batch(sql).unwrap();
@@ -188,7 +200,7 @@ INSERT INTO burn_check_runtime_definition_state VALUES (1, 1, 0);
         let store =
             Store::from_connection(connection, Path::new("/tmp/version-81-collision").into())
                 .unwrap();
-        assert_eq!(store.schema_version().unwrap(), 86);
+        assert_eq!(store.schema_version().unwrap(), 92);
         store.migrate().unwrap();
         let connection = store.lock();
         let initialized: i64 = connection
@@ -211,14 +223,46 @@ INSERT INTO burn_check_runtime_definition_state VALUES (1, 1, 0);
         assert_eq!(indexes, 1);
     }
 }
+
+#[test]
+fn opencode_branch_fixture_frames_lf_and_crlf_without_changing_sql() {
+    let expected = opencode_branch_migrations(include_str!(
+        "../../schema/compatibility/branch_history.sql"
+    ));
+    assert_eq!(expected.len(), 7);
+    for newline in ["\n", "\r\n"] {
+        let fixture = expected.join(&format!("-- next migration{newline}"));
+        assert_eq!(opencode_branch_migrations(&fixture), expected);
+    }
+}
+
+fn opencode_branch_migrations(sql: &str) -> Vec<&str> {
+    let mut steps = Vec::new();
+    let mut start = 0;
+    let mut offset = 0;
+    for line in sql.split_inclusive('\n') {
+        if matches!(line, "-- next migration\n" | "-- next migration\r\n") {
+            steps.push(&sql[start..offset]);
+            start = offset + line.len();
+        }
+        offset += line.len();
+    }
+    steps.push(&sql[start..]);
+    steps
+}
+
 #[test]
 fn opencode_branch_versions_receive_the_main_quota_index() {
+    let branch_migrations = opencode_branch_migrations(include_str!(
+        "../../schema/compatibility/branch_history.sql"
+    ));
+    assert_eq!(branch_migrations.len(), 7);
     for version in 81..=83 {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         for sql in &super::super::schema::MIGRATIONS[..80] {
             connection.execute_batch(sql).unwrap();
         }
-        for sql in &super::super::schema::MIGRATIONS[81..=version] {
+        for sql in &branch_migrations[..version - 80] {
             connection.execute_batch(sql).unwrap();
         }
         connection
@@ -226,7 +270,10 @@ fn opencode_branch_versions_receive_the_main_quota_index() {
             .unwrap();
         let store =
             Store::from_connection(connection, Path::new("/tmp/opencode-branch").into()).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 86);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            super::super::schema::MIGRATIONS.len() as i64
+        );
         let index_exists: bool = store
             .lock()
             .query_row(
@@ -253,7 +300,10 @@ fn opencode_branch_versions_receive_the_main_quota_index() {
             assert!(exists, "{table}.{column} must survive migration");
         }
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 86);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            super::super::schema::MIGRATIONS.len() as i64
+        );
     }
 }
 

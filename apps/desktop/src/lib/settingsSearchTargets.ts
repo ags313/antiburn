@@ -127,17 +127,82 @@ export const SETTINGS_SEARCH_TARGETS = {
   },
   typeSafeApiKey: {
     pane: "checks",
-    label: "Jev connection",
+    label: "Jev API key",
     aliases: ["TypeSafe API key", "Jev", "enable checks", "usage charges"],
+  },
+  decisionProvider: {
+    pane: "checks",
+    label: "Provider",
+    aliases: ["decision model", "Jev", "Ollama", "Cloudflare", "Custom"],
+  },
+  decisionConnection: {
+    pane: "checks",
+    label: "Connections",
+    aliases: [
+      "saved connections",
+      "profiles",
+      "active connection",
+      "switch provider",
+      "add connection",
+      "remove connection",
+    ],
+  },
+  ollamaUrl: { pane: "checks", label: "Ollama URL", aliases: ["Ollama base URL", "server"] },
+  ollamaModel: { pane: "checks", label: "Ollama model", aliases: ["local decision model"] },
+  ollamaApiKey: {
+    pane: "checks",
+    label: "Ollama API key (optional)",
+    aliases: ["Ollama authentication"],
+  },
+  cloudflareAccountId: {
+    pane: "checks",
+    label: "Cloudflare account ID",
+    aliases: ["Workers AI account"],
+  },
+  cloudflareApiToken: {
+    pane: "checks",
+    label: "Cloudflare API token",
+    aliases: ["Cloudflare credential"],
+  },
+  cloudflareModel: {
+    pane: "checks",
+    label: "Cloudflare model",
+    aliases: ["clef", "clef-flash"],
+  },
+  customUrl: {
+    pane: "checks",
+    label: "Exact inference URL",
+    aliases: ["Custom endpoint", "Custom URL"],
+  },
+  customModel: { pane: "checks", label: "Custom model", aliases: ["Custom decision model"] },
+  customApiKey: {
+    pane: "checks",
+    label: "Custom API key (optional)",
+    aliases: ["Custom authentication"],
+  },
+  customResponseMode: {
+    pane: "checks",
+    label: "Response mode",
+    aliases: ["Custom response", "direct", "Cloudflare envelope"],
+  },
+  checkDirectories: {
+    pane: "checks",
+    label: "Check files",
+    aliases: ["check folders", "check directories", "discovery", "YAML files"],
+  },
+  checkModelUsage: {
+    pane: "checks",
+    label: "Model usage",
+    aliases: ["check requests", "check cost", "usage details"],
   },
   smartChecksEnabled: {
     pane: "checks",
-    label: "Model-based Checks",
+    label: "Run checks",
     aliases: [
+      "model-based checks",
       "enable model-based checks",
       "pause model-based checks",
       "Jev checks",
-      "discovery",
     ],
   },
   theme: {

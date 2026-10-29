@@ -40,8 +40,7 @@ The flow is check to finding to target to action:
 9. The evidence worker verifies each dirty attempt and stores one contribution when proof exists.
 
 The check-level Copy action re-runs the target query in the backend for each
-click. It returns no prompt when a complete query has no selectable target,
-except for the existing Ignored Instructions inspection fallback. Target and
+click. It returns no prompt when a complete query has no selectable target. Target and
 batch Copy use stable finding IDs, not expiring action IDs, to resolve current
 targets. If current evidence cannot establish a selected identity, Copy returns
 inspection-only text without old target facts or a new attempt. Existing
@@ -177,8 +176,7 @@ gets a new durable ID and prompt reference.
 Prompt support is independent from Auto Fix support. The UI offers `Copy fix
 prompt` when the engine recommendation gate accepts at least one selectable
 current target. The check-level action can use bounded generic text for those
-targets. A complete query with no selectable target returns no prompt, except
-for the existing Ignored Instructions inspection fallback. An empty truncated
+targets. A complete query with no selectable target returns no prompt. An empty truncated
 query or a missing selected identity can also return inspection-only text. None
 of these fallbacks establishes a current finding. A matched target that fails
 the source, agent, check, protected-tool, or essential-identity gate remains
@@ -221,7 +219,8 @@ has write-text permission only. Each explicit click prepares fresh text,
 including a retry after a failed native write or a successful copy. The UI shows
 `Copied` only after native write success and reports prompt preparation and
 clipboard write failures separately. It does not show prompt-ready or
-unconfirmed-watch status lines.
+unconfirmed-watch status lines. An activated or applied watch with unavailable
+verification keeps that limit visible after refresh.
 
 The prompt contains one opaque `Remediation reference: ABR-<id>` marker for each
 selected `waitingForPromptUse` attempt returned by enrollment, up to 100. It needs
@@ -348,7 +347,7 @@ winning persisted field. Cursor never edits its private store or invokes its CLI
 For `OpenCodeSqliteV2`, Auto Fix supports O model edits and S worker edits only
 when an exact current-consumer target resolves. V2 has no M, B, or K finding
 support. O verification stays unavailable because saved evidence does not prove
-the provider API route. Native smart checks remain suspended.
+the provider API route.
 B can disable one exact optional specialized Claude Code built-in tool from a standard
 settings file. A project target requires the exact bare tool name in
 `permissions.allow`; inherited tools use the global target. It can add a missing

@@ -105,7 +105,7 @@ export const WORKSPACES = [
     id: "checks-store",
     directory: "crates/antiburn-checks-store",
     group: "engine",
-    dependsOn: ["engine"],
+    dependsOn: ["checks", "engine"],
   },
   {
     id: "cli",

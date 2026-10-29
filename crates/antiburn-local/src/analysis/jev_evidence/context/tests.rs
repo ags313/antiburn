@@ -128,7 +128,6 @@ fn request_digest_binds_selected_command_text_not_raw_native_arguments() {
             publication_fence: 17,
             selected_input_digest: String::new(),
             actions,
-            instructions: Vec::new(),
             complete: true,
             limitations: Vec::new(),
             excluded_thinking_parts: 0,

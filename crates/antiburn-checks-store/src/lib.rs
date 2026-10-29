@@ -1,10 +1,11 @@
 use antiburn_local::analysis::{ANALYZER_REVISION, EVIDENCE_SCHEMA_REVISION, PARSER_REVISION};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum CheckStatus {
     Failure,
     Success,
@@ -237,7 +238,7 @@ pub fn read_session_checks(
                     AND a.enabled = 1
                     AND c.session_key_json = json_array(?1, ?2, ?3)
                     AND c.state IN ('pending', 'claimed', 'dispatching', 'answered')),
-                st.status, h.actions_json, h.accepted_at_epoch
+                st.status, h.actions_json, h.accepted_at_epoch, h.evidence_valid
          FROM burn_check_runtime_definition d
          LEFT JOIN burn_check_activation a
            ON a.check_id = d.check_id AND a.activation_scope_key = d.activation_scope_key
@@ -246,13 +247,15 @@ pub fn read_session_checks(
            ON st.check_id = d.check_id AND st.activation_scope_key = d.activation_scope_key
           AND st.generation = d.generation AND st.branch_key = json_array(?1, ?2, ?3)
           AND st.evidence_valid = 1 AND a.enabled = 1
-         LEFT JOIN burn_check_assessment_history h
-           ON h.assessment_id = st.assessment_id AND h.generation = d.generation
-          AND h.outcome = 'assessed' AND h.evidence_valid = 1
+          LEFT JOIN burn_check_assessment_history h
+            ON h.assessment_id = st.assessment_id AND h.generation = d.generation
+           AND h.check_id = st.check_id AND h.activation_scope_key = st.activation_scope_key
+           AND h.branch_key = st.branch_key AND h.trigger_position = st.position
+           AND h.outcome = 'assessed'
          WHERE json_extract(d.activation_scope_key, '$.environment') = ?1
            AND json_extract(d.activation_scope_key, '$.session_cwd') IS ?4
            AND json_extract(d.activation_scope_key, '$.run') = 'Live'
-         ORDER BY d.check_id, d.activation_scope_key",
+          ORDER BY d.check_id, d.activation_scope_key LIMIT 129",
     )?;
     let rows = statement.query_map(params![environment, agent, session_id, cwd], |row| {
         Ok((
@@ -268,6 +271,7 @@ pub fn read_session_checks(
             row.get::<_, Option<String>>(9)?,
             row.get::<_, Option<String>>(10)?,
             row.get::<_, Option<i64>>(11)?,
+            row.get::<_, Option<bool>>(12)?,
         ))
     })?;
 
@@ -276,6 +280,9 @@ pub fn read_session_checks(
         rows.len() <= MAX_RUNTIME_DEFINITIONS,
         "session check projection limit exceeded"
     );
+    if legacy_registry_source_schema(connection)? {
+        return Ok(Vec::new());
+    }
     let source_state = if rows
         .iter()
         .any(|row| row.7 == "available" && row.3 == Some(true))
@@ -302,6 +309,7 @@ pub fn read_session_checks(
             status,
             actions,
             assessed_at,
+            history_valid,
         ) = row;
         let generation_key = generation.unwrap_or_default();
         if availability != "available" {
@@ -353,24 +361,35 @@ pub fn read_session_checks(
         }
 
         let (ready, can_arrive) = source_state.expect("active definitions have source state");
-        let status = if ready {
+        if status.is_some() {
+            ensure!(
+                history_valid.is_some(),
+                "current status has no matching assessment"
+            );
+        }
+        let status = if ready && history_valid == Some(true) {
             match status.as_deref() {
                 Some("failure") => Some(CheckStatus::Failure),
                 Some("success") => Some(CheckStatus::Success),
-                _ => None,
+                None => None,
+                _ => anyhow::bail!("unknown current check status"),
             }
         } else {
             None
         };
-        let message = match (&actions, &status) {
-            (Some(actions), Some(status)) => status_message(
-                Some(actions),
+        let message = match status {
+            Some(status) => status_message(
+                Some(
+                    actions
+                        .as_deref()
+                        .context("current status has no saved actions")?,
+                ),
                 match status {
                     CheckStatus::Failure => "failure",
                     CheckStatus::Success => "success",
                 },
             )?,
-            _ => None,
+            None => None,
         };
         ensure!(
             message
@@ -396,6 +415,51 @@ pub fn read_session_checks(
         });
     }
     Ok(checks)
+}
+
+fn legacy_registry_source_schema(connection: &Connection) -> Result<bool> {
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !(81..=83).contains(&version) {
+        return Ok(false);
+    }
+    // Registry-only branch builds precede capture and typed source metadata.
+    // Withhold their projection rather than infer current source readiness.
+    let legacy: bool = connection.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE name IN
+            ('opencode_v2_selection', 'opencode_v2_capture', 'opencode_v2_source_status',
+             'session_relation_related'))
+          AND (SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name IN
+            ('native_file_delivery', 'opencode_journal_delivery',
+             'native_tool_result_publication')) = 3
+          AND NOT EXISTS(SELECT 1 FROM pragma_table_info('session') WHERE name = 'source_format')
+          AND NOT EXISTS(SELECT 1 FROM pragma_table_info('native_tool_result_publication')
+            WHERE name = 'gap_kind')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !legacy {
+        return Ok(false);
+    }
+    for sql in [
+        "SELECT environment_key, agent, session_id, cwd, source_kind, source_generation,
+            incarnation, source_label, wsl_distro FROM session LIMIT 0",
+        "SELECT environment_key, agent, session_id, related_id, kind
+         FROM session_relation LIMIT 0",
+        "SELECT environment_key, agent, session_id, status, analyzed_generation,
+            parser_revision, analyzer_revision, evidence_schema_revision
+         FROM session_evidence LIMIT 0",
+        "SELECT environment_key, agent, session_id, incarnation, source_label, cwd,
+            parser_revision, cursor_json, blocked, last_error FROM native_file_delivery LIMIT 0",
+        "SELECT environment_key, agent, session_id, incarnation, source_label, cwd,
+            parser_revision, cursor_json, blocked, main_session, last_error
+         FROM opencode_journal_delivery LIMIT 0",
+        "SELECT publication_sequence, environment_key, agent, session_id, source_format,
+            session_incarnation, project_cwd, outcome, gap_reason
+         FROM native_tool_result_publication LIMIT 0",
+    ] {
+        let _statement = connection.prepare(sql)?;
+    }
+    Ok(true)
 }
 
 pub fn is_current_activation(
@@ -435,6 +499,36 @@ pub fn is_current_activation(
     )
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPlan {
+    current_status: CheckStatus,
+    outcomes: Vec<StoredAction>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAction {
+    index: usize,
+    outcome: StoredActionOutcome,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+enum StoredActionOutcome {
+    Applied {
+        result: CheckStatus,
+        message: Option<String>,
+    },
+    SkippedConditionFalse,
+    SkippedConditionUnavailable,
+    SkippedInputUnavailable,
+    Failed {
+        code: String,
+        message: String,
+    },
+}
+
 pub fn status_message(actions: Option<&str>, status: &str) -> Result<Option<String>> {
     let Some(actions) = actions else {
         return Ok(None);
@@ -444,40 +538,50 @@ pub fn status_message(actions: Option<&str>, status: &str) -> Result<Option<Stri
         "success" => CheckStatus::Success,
         _ => anyhow::bail!("unknown current check status"),
     };
-    let actions: serde_json::Value =
-        serde_json::from_str(actions).context("decode status actions")?;
-    let Some(outcomes) = actions
-        .get("outcomes")
-        .and_then(serde_json::Value::as_array)
-    else {
-        anyhow::bail!("current status has no applied action");
-    };
-    for item in outcomes.iter().rev() {
-        let Some(outcome) = item.get("outcome") else {
-            continue;
-        };
-        if let Some(applied) = outcome.get("Applied") {
-            let expected_name = match expected {
-                CheckStatus::Failure => "Failure",
-                CheckStatus::Success => "Success",
-            };
-            if applied.get("result").and_then(serde_json::Value::as_str) != Some(expected_name) {
-                anyhow::bail!("stored status action does not match current status");
+    let actions: StoredPlan = serde_json::from_str(actions).context("decode status actions")?;
+    ensure!(
+        actions.current_status == expected,
+        "stored plan does not match current status"
+    );
+    let mut last_write = None;
+    for (index, action) in actions.outcomes.into_iter().enumerate() {
+        ensure!(
+            action.index == index,
+            "stored status action order is invalid"
+        );
+        match action.outcome {
+            StoredActionOutcome::Applied { result, message } => {
+                ensure!(
+                    message
+                        .as_ref()
+                        .is_none_or(|message| !message.trim().is_empty()),
+                    "stored status message is blank"
+                );
+                last_write = Some((result, message));
             }
-            let message = applied
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
-            ensure!(
-                message
-                    .as_ref()
-                    .is_none_or(|message| message.len() <= MAX_STATUS_MESSAGE_BYTES),
-                "check status message exceeds the projection limit"
-            );
-            return Ok(message);
+            StoredActionOutcome::Failed { code, message } => {
+                ensure!(
+                    !code.is_empty() && !message.is_empty(),
+                    "stored action error is invalid"
+                );
+            }
+            StoredActionOutcome::SkippedConditionFalse
+            | StoredActionOutcome::SkippedConditionUnavailable
+            | StoredActionOutcome::SkippedInputUnavailable => {}
         }
     }
-    anyhow::bail!("current status has no applied action")
+    let (result, message) = last_write.context("current status has no applied action")?;
+    ensure!(
+        result == expected,
+        "stored status action does not match current status"
+    );
+    ensure!(
+        message
+            .as_ref()
+            .is_none_or(|message| message.len() <= MAX_STATUS_MESSAGE_BYTES),
+        "check status message exceeds the projection limit"
+    );
+    Ok(message)
 }
 
 fn session_source_ready(
@@ -486,16 +590,7 @@ fn session_source_ready(
     agent: &str,
     session_id: &str,
 ) -> Result<bool> {
-    let has_source_format: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('session') WHERE name = 'source_format')",
-        [],
-        |row| row.get(0),
-    )?;
-    let ready = if has_source_format {
-        source_ready_at_sql(1, 2, 3, "unixepoch()")
-    } else {
-        source_ready_sql(1, 2, 3)
-    };
+    let ready = source_ready_sql(1, 2, 3);
     Ok(connection.query_row(
         &format!(
             "SELECT COALESCE(({ready}), 0) FROM session s
@@ -540,9 +635,74 @@ fn source_can_arrive(
         .unwrap_or(false))
 }
 
+/// Check a native file receipt's supported layout and public identity fields.
+///
+/// Use delivery alias `d` and session alias `s`, joined by environment, agent,
+/// and session ID. `parser` is a SQL parameter position. A NULL cursor permits
+/// initialization only when its parser is NULL or known. A saved cursor needs a
+/// known pair: 62/layout 4, main 64/layout 1, or current/63/64/65/66/layout 5.
+///
+/// This predicate does not grant readiness or pending work. It does not check
+/// source incarnation, health, activity, or origin. Apply the native reset policy
+/// first when that policy discards the old cursor. The reader still validates
+/// the full cursor and file identity when it resumes a retained receipt.
+/// Main at `143d4b05` needs its named converter before a layout-5 page can commit.
+pub fn native_file_receipt_compatible_sql(parser: usize) -> String {
+    format!(
+        "CASE WHEN d.cursor_json IS NULL THEN
+           d.parser_revision IS NULL OR d.parser_revision IN (?{parser}, 62, 63, 64, 65, 66)
+         ELSE COALESCE(
+            ((d.parser_revision = 62 AND json_extract(d.cursor_json, '$.revision') = 4)
+             OR (d.parser_revision = 64 AND json_extract(d.cursor_json, '$.revision') = 1)
+             OR (d.parser_revision IN (?{parser}, 63, 64, 65, 66)
+               AND json_extract(d.cursor_json, '$.revision') = 5))
+           AND json_extract(d.cursor_json, '$.session_id') = s.session_id
+           AND json_extract(d.cursor_json, '$.agent') = CASE s.agent
+             WHEN 'claude-code' THEN 'claude' ELSE s.agent END
+           AND json_extract(d.cursor_json, '$.source_format') = CASE s.agent
+             WHEN 'claude-code' THEN 'claude_jsonl'
+             WHEN 'codex' THEN 'codex_rollout_jsonl' WHEN 'pi' THEN 'pi_v3_jsonl' END
+           AND (s.source_format IS NULL OR s.source_format =
+             json_quote(json_extract(d.cursor_json, '$.source_format'))), 0) END"
+    )
+}
+
+/// Check a V1 journal receipt's supported live layout and public identity fields.
+///
+/// Use delivery alias `d` and session alias `s`, joined by environment, agent,
+/// and session ID. `parser` is a SQL parameter position. NULL cursor/parser rules
+/// match `native_file_receipt_compatible_sql`. Saved receipts need matching row
+/// and cursor parsers: 62/live 4, main 64/live 2, or current/63/64/65/66/live 5.
+/// Live 2 needs a non-negative integer baseline. Live 5 needs a non-negative
+/// integer public baseline. These checks do not prove historical public fields.
+///
+/// This predicate does not check readiness, source binding, health, or activity.
+/// Apply an approved cursor-discarding reset before this retained-receipt gate.
+/// The reader still validates the full cursor, owner, sequences, and samples.
+/// Main at `143d4b05` needs its named converter before a live-5 page can commit.
+pub fn opencode_journal_receipt_compatible_sql(parser: usize) -> String {
+    format!(
+        "CASE WHEN d.cursor_json IS NULL THEN
+           d.parser_revision IS NULL OR d.parser_revision IN (?{parser}, 62, 63, 64, 65, 66)
+         ELSE COALESCE(
+           json_extract(d.cursor_json, '$.session_id') = s.session_id
+           AND json_extract(d.cursor_json, '$.parser_revision') = d.parser_revision
+           AND ((d.parser_revision = 62 AND json_extract(d.cursor_json, '$.live.revision') = 4)
+             OR (d.parser_revision = 64 AND json_extract(d.cursor_json, '$.live.revision') = 2
+               AND json_type(d.cursor_json, '$.live.baseline') = 'integer'
+               AND json_extract(d.cursor_json, '$.live.baseline') >= 0)
+             OR (d.parser_revision IN (?{parser}, 63, 64, 65, 66)
+               AND json_extract(d.cursor_json, '$.live.revision') = 5
+               AND json_type(d.cursor_json, '$.live.public_baseline') = 'integer'
+               AND json_extract(d.cursor_json, '$.live.public_baseline') >= 0)), 0) END"
+    )
+}
+
 /// Builds source validity for databases with native OpenCode V2 capture.
 pub fn source_ready_at_sql(parser: usize, analyzer: usize, evidence: usize, now: &str) -> String {
-    let legacy = source_ready_sql(parser, analyzer, evidence);
+    // Named converters permit decoding, not readiness before a layout-5 page commits.
+    let file_receipt = native_file_receipt_compatible_sql(parser);
+    let journal_receipt = opencode_journal_receipt_compatible_sql(parser);
     format!(
         "CASE WHEN s.agent = 'opencode' AND s.source_kind = 'providerDb'
         AND s.source_format = '\"open_code_v2_sqlite\"' THEN
@@ -558,36 +718,53 @@ pub fn source_ready_at_sql(parser: usize, analyzer: usize, evidence: usize, now:
               AND d.source_label = s.source_label AND d.cwd = s.cwd
               AND d.capture_epoch <> '' AND d.claim_fence > 0
               AND d.lease_expires_at_epoch > ({now}))
-        WHEN s.agent = 'opencode' AND s.source_kind = 'providerDb'
-          AND s.source_format IS NOT '\"open_code_sqlite_v2\"' THEN 0
-        ELSE ({legacy}) END"
-    )
-}
-
-/// Build the same source-validity predicate used by the desktop report.
-pub fn source_ready_sql(parser: usize, analyzer: usize, evidence: usize) -> String {
-    format!("CASE WHEN s.environment_key = 'native' AND s.agent = 'opencode'
-          AND s.source_kind = 'providerDb' THEN EXISTS (
+        WHEN s.agent = 'opencode' AND s.source_kind = 'providerDb' THEN
+          s.environment_key = 'native' AND s.wsl_distro IS NULL
+          AND s.source_format = '\"open_code_sqlite_v2\"'
+          AND s.cwd IS NOT NULL AND s.cwd <> ''
+          AND NOT EXISTS(SELECT 1 FROM session_relation r
+            WHERE r.environment_key = s.environment_key AND r.agent = s.agent
+              AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
+                OR (r.related_id = s.session_id AND r.kind = 'subagent')))
+          AND EXISTS (
             SELECT 1 FROM opencode_journal_delivery d
              WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
                AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
-               AND d.parser_revision = ?{parser} AND d.cursor_json IS NOT NULL
-               AND d.blocked = 0 AND d.main_session = 1
-               AND (d.last_error IS NULL OR d.last_error IN ('journal-history-incomplete', 'journal-cancelled'))
-               AND NOT EXISTS(SELECT 1 FROM session_relation r WHERE r.environment_key = s.environment_key
-                   AND r.agent = s.agent AND r.session_id = s.session_id AND r.kind = 'forkParent'))
-           WHEN s.environment_key = 'native' AND s.agent IN ('claude-code', 'codex', 'pi')
-             AND s.source_kind = 'file' THEN EXISTS (
+                  AND ({journal_receipt})
+                  AND json_extract(d.cursor_json, '$.live.revision') = 5
+                  AND json_type(d.cursor_json, '$.cold_replay') IS NULL
+                 AND d.blocked = 0 AND d.main_session = 1
+                AND (d.last_error IS NULL OR d.last_error IN ('journal-history-incomplete', 'journal-cancelled')))
+            WHEN s.environment_key = 'native' AND s.agent IN ('claude-code', 'codex', 'pi')
+              AND s.source_kind = 'file' THEN s.wsl_distro IS NULL
+              AND s.cwd IS NOT NULL AND s.cwd <> '' AND EXISTS (
              SELECT 1 FROM native_file_delivery d
               WHERE d.environment_key = s.environment_key AND d.agent = s.agent AND d.session_id = s.session_id
                 AND d.incarnation = s.incarnation AND d.source_label = s.source_label AND d.cwd IS s.cwd
-                AND d.parser_revision = ?{parser} AND d.cursor_json IS NOT NULL
-                AND d.blocked = 0 AND d.last_error IS NULL
+                  AND ({file_receipt})
+                  AND json_extract(d.cursor_json, '$.revision') = 5
+                 AND d.blocked = 0 AND d.last_error IS NULL
                 AND NOT EXISTS(SELECT 1 FROM session_relation r
                   WHERE r.environment_key = s.environment_key AND r.agent = s.agent
                     AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
-                      OR (r.related_id = s.session_id AND r.kind = 'subagent'))))
-           WHEN s.agent = 'cursor' THEN s.environment_key = 'native'
+                       OR (r.related_id = s.session_id AND r.kind = 'subagent')))
+                 AND (s.agent <> 'claude-code' OR (d.parser_revision IN (?{parser}, 65, 66)
+                   AND EXISTS(SELECT 1 FROM native_tool_result_publication origin
+                     JOIN setting origin_binding ON origin_binding.key =
+                       'internal:claudeRequestOriginParser65:' ||
+                         json_array(s.environment_key, s.agent, s.session_id)
+                     WHERE origin.environment_key = s.environment_key AND origin.agent = s.agent
+                       AND origin.session_id = s.session_id AND origin.source_format = '\"claude_jsonl\"'
+                       AND origin.session_incarnation = s.incarnation AND origin.project_cwd IS s.cwd
+                       AND origin.outcome = 'coverage_gap' AND origin.gap_kind = 'segment_reset'
+                       AND origin.gap_reason = 'claude-request-origin-parser-65'
+                       AND json_extract(origin_binding.value, '$.publication_sequence') = origin.publication_sequence
+                       AND json_extract(origin_binding.value, '$.source_label') = s.source_label
+                       AND json_extract(origin_binding.value, '$.incarnation') = s.incarnation
+                       AND json_extract(origin_binding.value, '$.cwd') IS s.cwd
+                       AND json_extract(origin_binding.value, '$.source_format') = 'claude_jsonl'))))
+            WHEN s.agent IN ('claude-code', 'codex', 'pi', 'opencode') THEN 0
+            WHEN s.agent = 'cursor' THEN s.environment_key = 'native'
              AND s.source_kind = 'inline' AND s.source_label GLOB 'cursor-desktop:*'
              AND s.wsl_distro IS NULL
              AND NOT EXISTS(SELECT 1 FROM session_relation r
@@ -599,7 +776,13 @@ pub fn source_ready_sql(parser: usize, analyzer: usize, evidence: usize) -> Stri
                AND e.evidence_schema_revision = ?{evidence}, 0)
            ELSE COALESCE(e.status = 'ready' AND e.analyzed_generation = s.source_generation
               AND e.parser_revision = ?{parser} AND e.analyzer_revision = ?{analyzer}
-              AND e.evidence_schema_revision = ?{evidence}, 0) END")
+               AND e.evidence_schema_revision = ?{evidence}, 0) END"
+    )
+}
+
+/// Build the same source-validity predicate used by the desktop report.
+pub fn source_ready_sql(parser: usize, analyzer: usize, evidence: usize) -> String {
+    source_ready_at_sql(parser, analyzer, evidence, "unixepoch()")
 }
 
 #[cfg(test)]
@@ -641,12 +824,12 @@ mod tests {
         seed_activation(&connection, true);
         let scope = r#"{"environment":"native","session_cwd":"/repo","run":"Live"}"#;
         connection.execute(
-            "INSERT INTO burn_check_current_status VALUES ('retry-loop',?1,2,'[\"native\",\"claude-code\",\"s1\"]','failure','a1',1)",
+            "INSERT INTO burn_check_current_status VALUES ('retry-loop',?1,2,'[\"native\",\"claude-code\",\"s1\"]','failure','a1',1,0)",
             [scope],
         ).unwrap();
         connection.execute(
-            "INSERT INTO burn_check_assessment_history VALUES ('a1',2,'assessed',1,?1,123)",
-            [r#"{"outcomes":[{"outcome":{"Applied":{"result":"Failure","message":"Repeated retries detected."}}}]}"#],
+            "INSERT INTO burn_check_assessment_history VALUES ('a1',2,'assessed',1,?1,123,'retry-loop',?2,'[\"native\",\"claude-code\",\"s1\"]',0)",
+            params![r#"{"current_status":"Failure","outcomes":[{"index":0,"outcome":{"Applied":{"result":"Failure","message":"Repeated retries detected."}}}]}"#, scope],
         ).unwrap();
         let before: i64 = connection
             .query_row("SELECT total_changes()", [], |row| row.get(0))
@@ -672,10 +855,15 @@ mod tests {
 
     #[test]
     fn status_message_keeps_applied_without_message_distinct_from_missing_action() {
-        let actions =
-            r#"{"outcomes":[{"outcome":{"Applied":{"result":"Failure","message":null}}}]}"#;
+        let actions = r#"{"current_status":"Failure","outcomes":[{"index":0,"outcome":{"Applied":{"result":"Failure","message":null}}}]}"#;
         assert_eq!(status_message(Some(actions), "failure").unwrap(), None);
-        assert!(status_message(Some(r#"{"outcomes":[]}"#), "failure").is_err());
+        assert!(
+            status_message(
+                Some(r#"{"current_status":"Failure","outcomes":[]}"#),
+                "failure"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -879,12 +1067,12 @@ mod tests {
         seed_activation(&connection, true);
         let scope = r#"{"environment":"native","session_cwd":"/repo","run":"Live"}"#;
         connection.execute(
-            "INSERT INTO burn_check_current_status VALUES ('retry-loop',?1,2,'[\"native\",\"claude-code\",\"s1\"]','failure','a1',1)",
+            "INSERT INTO burn_check_current_status VALUES ('retry-loop',?1,2,'[\"native\",\"claude-code\",\"s1\"]','failure','a1',1,0)",
             [scope],
         ).unwrap();
         connection.execute(
-            "INSERT INTO burn_check_assessment_history VALUES ('a1',2,'assessed',1,?1,123)",
-            [r#"{"outcomes":[{"outcome":{"Applied":{"result":"Failure","message":"Repeated retries detected."}}}]}"#],
+            "INSERT INTO burn_check_assessment_history VALUES ('a1',2,'assessed',1,?1,123,'retry-loop',?2,'[\"native\",\"claude-code\",\"s1\"]',0)",
+            params![r#"{"current_status":"Failure","outcomes":[{"index":0,"outcome":{"Applied":{"result":"Failure","message":"Repeated retries detected."}}}]}"#, scope],
         ).unwrap();
 
         connection
@@ -901,7 +1089,9 @@ mod tests {
 
         connection
             .execute(
-                "UPDATE native_file_delivery SET cursor_json = '{}' WHERE session_id = 's1'",
+                "UPDATE native_file_delivery SET cursor_json =
+                 '{\"revision\":5,\"agent\":\"claude\",\"session_id\":\"s1\",\"source_format\":\"claude_jsonl\"}'
+                 WHERE session_id = 's1'",
                 [],
             )
             .unwrap();
@@ -918,12 +1108,7 @@ mod tests {
         let connection = database();
         connection
             .execute_batch(
-                "ALTER TABLE session ADD COLUMN source_format TEXT;
-             CREATE TABLE opencode_v2_capture (
-                environment_key TEXT, agent TEXT, session_id TEXT, incarnation INTEGER,
-                source_label TEXT, cwd TEXT, capture_epoch TEXT, claim_fence INTEGER,
-                lease_expires_at_epoch INTEGER);
-             UPDATE session SET agent = 'opencode', source_kind = 'providerDb',
+                "UPDATE session SET agent = 'opencode', source_kind = 'providerDb',
                 source_format = '\"open_code_v2_sqlite\"';
              INSERT INTO opencode_v2_capture VALUES
                 ('native','opencode','s1',7,'source','/repo','epoch',1,unixepoch()+60);",

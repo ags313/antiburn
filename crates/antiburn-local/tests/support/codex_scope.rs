@@ -802,7 +802,6 @@ fn stored_environment_action() -> antiburn_local::analysis::jev_evidence::Conten
             &input.session_id,
             SourceFormat::CodexRolloutJsonl,
             published,
-            vec![],
         )
         .actions
         .into_iter()
@@ -1306,6 +1305,9 @@ fn assert_resume_parity(records: Vec<Value>) {
         user_messages_json: Vec::new(),
         user_message_conflicts: Vec::new(),
         user_messages_complete: true,
+        native_evidence_json: Vec::new(),
+        native_evidence_complete: true,
+        native_admission_failure_json: None,
     };
     let mut sink = ContentCapturingSink::default();
     let records = provider_input(records);
@@ -1449,12 +1451,7 @@ fn selected_answers(
         )
         .unwrap();
         let selected = select_session_content(
-            &prepare_session_content(
-                &input.session_id,
-                SourceFormat::CodexRolloutJsonl,
-                content,
-                Vec::new(),
-            ),
+            &prepare_session_content(&input.session_id, SourceFormat::CodexRolloutJsonl, content),
             fields,
         );
         selected

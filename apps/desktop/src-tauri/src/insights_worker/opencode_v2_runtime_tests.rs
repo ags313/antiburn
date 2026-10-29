@@ -9,9 +9,9 @@ use std::{
 };
 
 use antiburn_checks::{
-    actions::ChoiceResult,
-    check_store::{CandidateClaim, CheckStore, EvaluatedCandidate, RecoveryWork},
+    check_store::{CandidateClaim, CheckStore, RecoveryWork},
     compiler::compile,
+    decision::{DecisionAttempt, DecisionInput, Question},
     definition_lifecycle::{EffectiveActivation, LifecycleTransition},
     discovery::DefinitionScope,
     domain::{
@@ -19,8 +19,13 @@ use antiburn_checks::{
         RunScope,
     },
     engine::{
-        CheckEngine, DecisionEvaluator, DecisionFuture, RunOutcome, RunSettlement, StartOutcome,
+        CheckEngine, DecisionEvaluator, DecisionFuture, EvaluationTask,
+        PreparationValidationPurpose, RunOutcome, RunSettlement, StartOutcome,
     },
+    expression_eval::EvaluationBudget,
+    fit::{FitReport, PreparationFailure},
+    prepared_assessment::{PreparedAssessment, PreparedBlock},
+    results::{ChoiceResult, DecisionResult, NamedAnswer, QuestionResult},
     source::{PublicationCursor, PublishedEvidenceSource, SourceEvent},
 };
 use serde_json::json;
@@ -31,19 +36,23 @@ use crate::{
     store::SessionRecord,
 };
 
-const FAILED_RETRY: &str = include_str!(concat!(
+const SYNTHETIC_RETRY: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../docs/burn-check/examples/failed-retry-loop.yml"
+    "/../../../crates/antiburn-checks/tests/fixtures/retry-review.yml"
 ));
 const OVER_EXPLORING: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../docs/burn-check/examples/over-exploring.yml"
+    "/../../../.antiburn/checks/over-exploring.yml"
 ));
 const SCOPE_CREEP: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../docs/burn-check/examples/scope-creep.yml"
+    "/../../../.antiburn/checks/scope-creep.yml"
 ));
-const SINGLE_RESULT: &str = "name: Result\non:\n  tool_result:\n  cooldown: 0s\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input:\n      content: ${{ message.tool.result.content }}\n    output:\n      verdict:\n        type: choice\n        question: Does this result show a failure?\n        criteria: {yes: A failure., no: No failure.}\nactions:\n  - type: status\n    input: {result: failure}\n";
+const FAST_MODE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../.antiburn/checks/fast-mode-value.yml"
+));
+pub(super) const SINGLE_RESULT: &str = "name: Result\non:\n  tool_result:\n  cooldown: 0s\ndecisions:\n  review:\n    input:\n      content: ${{ message.tool.result.content }}\n    output:\n      verdict:\n        type: choice\n        question: Does this result show a failure?\n        criteria: {yes: A failure., no: No failure.}\nactions:\n  - type: status\n    input: {result: failure}\n";
 
 #[derive(Default)]
 struct TestEvaluator {
@@ -53,19 +62,77 @@ struct TestEvaluator {
 }
 
 impl DecisionEvaluator for TestEvaluator {
-    fn evaluate<'a>(
+    fn prepare(
+        &self,
+        activation: &EffectiveActivation,
+        inputs: Vec<DecisionInput>,
+        evaluation_budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
+        let prepared = PreparedAssessment::new(
+            "opencode-v2-test-v1".into(),
+            evaluation_budget,
+            0,
+            inputs
+                .into_iter()
+                .map(|input| PreparedBlock {
+                    decision: input.decision,
+                    original_input: input.input.clone(),
+                    input: input.input,
+                    request: json!({"test": true}),
+                    report: FitReport::default(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        prepared
+            .validate_for_declarations(&activation.compiled.decisions)
+            .unwrap();
+        Ok(prepared)
+    }
+
+    fn validate_prepared(
+        &self,
+        activation: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        _: PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        assert_eq!(prepared.profile, "opencode-v2-test-v1");
+        prepared
+            .validate_for_declarations(&activation.compiled.decisions)
+            .unwrap();
+        Ok(())
+    }
+
+    fn evaluate_prepared<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
         candidate: &'a FrozenCandidate,
-        input: &'a Value,
-        attempt: u8,
+        prepared: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
+        let input = &prepared
+            .decisions
+            .iter()
+            .find(|block| block.decision == attempt.decision)
+            .unwrap()
+            .input;
         self.calls
             .lock()
             .unwrap()
-            .push((candidate.clone(), input.clone(), attempt));
-        let decision = &activation.compiled.decision;
-        let labels: Vec<_> = decision.criteria.iter().map(|(id, _)| id.clone()).collect();
+            .push((candidate.clone(), input.clone(), attempt.number));
+        let decision = activation
+            .compiled
+            .decisions
+            .iter()
+            .find(|decision| decision.name == attempt.decision)
+            .unwrap();
+        let [question] = decision.outputs.as_slice() else {
+            panic!("the V2 fixture requires one question");
+        };
+        let Question::Choice { criteria, .. } = &question.question else {
+            panic!("the V2 fixture requires a Choice question");
+        };
+        let labels: Vec<_> = criteria.iter().map(|(id, _)| id.clone()).collect();
         let selected = self
             .selected
             .lock()
@@ -85,22 +152,32 @@ impl DecisionEvaluator for TestEvaluator {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let choice = ChoiceResult::validate(
-            &decision.name,
-            &decision.question_id,
-            &labels,
-            &selected,
-            probabilities,
+        let evaluated = DecisionResult::new(
+            decision,
+            &activation.compiled.question_requirements(),
+            vec![
+                NamedAnswer::new(
+                    &question.name,
+                    QuestionResult::Choice(
+                        ChoiceResult::new(
+                            &question.question,
+                            &selected,
+                            Some(probabilities),
+                            Some(0.99),
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .unwrap(),
+            ],
+            attempt.number,
         )
         .unwrap();
         Box::pin(std::future::poll_fn(move |_| {
             if self.hold.load(Ordering::SeqCst) {
                 Poll::Pending
             } else {
-                Poll::Ready(Ok(EvaluatedCandidate {
-                    attempts: attempt,
-                    choices: vec![choice.clone()],
-                }))
+                Poll::Ready(Ok(evaluated.clone()))
             }
         }))
     }
@@ -114,14 +191,26 @@ pub(super) struct Runtime {
     engine: CheckEngine<StoreCheckStore, TestEvaluator>,
 }
 
-impl Runtime {
-    #[cfg(unix)]
-    pub(super) fn single_result(path: &Path) -> Self {
-        Self::new(path, SINGLE_RESULT)
+fn settle_ready_task(task: &mut EvaluationTask<'_>) -> RunSettlement {
+    for _ in 0..=2 {
+        if let Poll::Ready(result) = task
+            .as_mut()
+            .poll(&mut TaskContext::from_waker(Waker::noop()))
+        {
+            return result.unwrap();
+        }
     }
+    panic!("the test evaluator must settle without external I/O");
+}
 
+impl Runtime {
     pub(super) fn evaluator_calls(&self) -> usize {
         self.evaluator.calls.lock().unwrap().len()
+    }
+
+    #[cfg(unix)]
+    pub(super) fn refresh_source_progress(&self) {
+        self.engine.refresh_source_progress(&self.active).unwrap();
     }
 
     #[cfg(unix)]
@@ -148,8 +237,11 @@ impl Runtime {
         drop(task);
         self.evaluator.hold.store(false, Ordering::SeqCst);
     }
-    fn new(path: &Path, source: &str) -> Self {
+    pub(super) fn new(path: &Path, source: &str) -> Self {
         let store = Arc::new(Store::open(path).unwrap());
+        store
+            .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+            .unwrap();
         let scope = ActivationScope {
             environment: "native".into(),
             session_cwd: "/repo".into(),
@@ -204,6 +296,9 @@ impl Runtime {
 
     fn reopen(path: &Path, active: EffectiveActivation, evaluator: Arc<TestEvaluator>) -> Self {
         let store = Arc::new(Store::open(path).unwrap());
+        store
+            .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+            .unwrap();
         let adapter = Arc::new(
             StoreCheckStore::new(
                 store.clone(),
@@ -256,7 +351,7 @@ impl Runtime {
         {
             let events = StorePublishedEvidenceReader::for_project(&self.store, "native", "/repo")
                 .with_repository_root(Some("/repo"))
-                .recent_results(&session.key)
+                .recent_results_before(&session.key, session.before_publication)
                 .unwrap();
             candidates += self
                 .adapter
@@ -279,13 +374,7 @@ impl Runtime {
         else {
             panic!("an attached V2 candidate must be due");
         };
-        let Poll::Ready(result) = task
-            .as_mut()
-            .poll(&mut TaskContext::from_waker(Waker::noop()))
-        else {
-            panic!("the test evaluator must settle without external I/O");
-        };
-        result.unwrap()
+        settle_ready_task(&mut task)
     }
 
     pub(super) fn assert_idle(&self, now: u64) {
@@ -304,7 +393,7 @@ impl Runtime {
             .unwrap()
             .into_iter()
             .filter_map(|record| match record.work {
-                RecoveryWork::Pending(candidate) => Some(candidate),
+                RecoveryWork::Pending { candidate, .. } => Some(candidate),
                 _ => None,
             })
             .collect()
@@ -369,6 +458,99 @@ struct Capture {
     claims: HashMap<String, OpenCodeV2CaptureClaim>,
     joiners: HashMap<String, OpenCodeV2EventJoiner>,
     sequences: HashMap<String, u64>,
+}
+
+#[tokio::test]
+async fn retired_feed_sessions_drop_queued_events_on_both_receive_paths() {
+    let (sender, receiver) = mpsc::channel(8);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut pump = FeedPump {
+        receiver,
+        cancelled,
+        task: tauri::async_runtime::spawn(async {}),
+        admitted: Arc::new(RwLock::new(HashSet::from(["ses_a".into(), "ses_b".into()]))),
+        registration: opencode_live::decode_registration(
+            br#"{"url":"http://127.0.0.1:4400","pid":1}"#,
+        )
+        .unwrap(),
+    };
+    let event = |session| json!({"id":format!("{session}-event"), "durable":{"aggregateID":session,"seq":1}});
+    let mut capture = OpenCodeV2CaptureEpoch::new(vec!["ses_a".into(), "ses_b".into()]).unwrap();
+    let epoch = capture.id();
+    capture.confirm_subscription().unwrap();
+    capture
+        .finish_hydration(HashMap::from([
+            ("ses_a".into(), None),
+            ("ses_b".into(), None),
+        ]))
+        .unwrap();
+    assert!(capture.observe(event("ses_a")).unwrap().is_some());
+    assert!(capture.observe(event("ses_b")).unwrap().is_some());
+    for session in ["ses_a", "ses_b", "ses_a"] {
+        sender.try_send(Ok(event(session))).unwrap();
+    }
+    capture.retire_session("ses_a");
+    pump.exclude_session("ses_a").unwrap();
+    assert_eq!(pump.try_next().unwrap().unwrap(), event("ses_b"));
+    assert!(pump.try_next().is_none());
+    assert!(!pump.admits(&event("ses_a")).unwrap());
+    assert!(pump.admits(&event("ses_b")).unwrap());
+    for session in ["ses_a", "ses_b"] {
+        sender.try_send(Ok(event(session))).unwrap();
+    }
+    assert_eq!(pump.next().await.unwrap().unwrap(), event("ses_b"));
+    assert!(pump.try_next().is_none());
+    assert_eq!(capture.observe(event("ses_a")).unwrap(), None);
+    assert_eq!(capture.observe(event("ses_b")).unwrap(), None);
+    let mut replacement = OpenCodeV2CaptureEpoch::new(vec!["ses_c".into()]).unwrap();
+    replacement.confirm_subscription().unwrap();
+    replacement
+        .finish_hydration(HashMap::from([("ses_c".into(), None)]))
+        .unwrap();
+    capture.resume_sessions(replacement).unwrap();
+    pump.include_sessions(&[record("ses_c")]).unwrap();
+    assert!(pump.admits(&event("ses_b")).unwrap());
+    assert!(pump.admits(&event("ses_c")).unwrap());
+    assert!(capture.observe(event("ses_c")).unwrap().is_some());
+    assert_eq!(capture.id(), epoch);
+    assert!(capture.gapped_sessions().next().is_none());
+    pump.replace_sessions(&[record("ses_b")]).unwrap();
+    capture.retain_sessions(&HashSet::from(["ses_b".into()]));
+    assert!(pump.admits(&event("ses_b")).unwrap());
+    assert!(!pump.admits(&event("ses_c")).unwrap());
+    assert_eq!(capture.observe(event("ses_b")).unwrap(), None);
+}
+
+#[tokio::test]
+async fn retirement_filters_a_send_that_was_blocked_before_exclusion() {
+    let (sender, receiver) = mpsc::channel(1);
+    let mut pump = FeedPump {
+        receiver,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        task: tauri::async_runtime::spawn(async {}),
+        admitted: Arc::new(RwLock::new(HashSet::from(["ses_a".into(), "ses_b".into()]))),
+        registration: opencode_live::decode_registration(
+            br#"{"url":"http://127.0.0.1:4400","pid":1}"#,
+        )
+        .unwrap(),
+    };
+    let event = |session| json!({"durable":{"aggregateID":session}});
+    sender.try_send(Ok(event("ses_a"))).unwrap();
+    let mut blocked = Box::pin(sender.send(Ok(event("ses_a"))));
+    assert!(
+        blocked
+            .as_mut()
+            .poll(&mut TaskContext::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    pump.exclude_session("ses_a").unwrap();
+    assert!(pump.try_next().is_none());
+    blocked.await.unwrap();
+    let healthy = event("ses_b");
+    let expected = healthy.clone();
+    let send_healthy = tokio::spawn(async move { sender.send(Ok(healthy)).await.unwrap() });
+    assert_eq!(pump.next().await.unwrap().unwrap(), expected);
+    send_healthy.await.unwrap();
 }
 
 impl Capture {
@@ -464,7 +646,7 @@ impl Capture {
                 "session.inbox.delivered",
                 json!({"inboxID": id}),
             ),
-            ProcessResult::Advanced
+            ProcessResult::ResultPublished(self.claims[session].key.clone())
         );
     }
 
@@ -486,6 +668,15 @@ impl Capture {
     }
 
     fn step(&mut self, store: &Store, session: &str, message: &str) {
+        self.step_with_model(
+            store,
+            session,
+            message,
+            json!({"providerID": "synthetic", "id": "no-network"}),
+        );
+    }
+
+    fn step_with_model(&mut self, store: &Store, session: &str, message: &str, model: Value) {
         assert_eq!(
             self.emit(
                 store,
@@ -493,7 +684,7 @@ impl Capture {
                 "session.step.started",
                 json!({
                     "assistantMessageID": message, "agent": "build", "started": 1_000,
-                    "model": {"providerID": "synthetic", "id": "no-network"},
+                    "model": model,
                 }),
             ),
             ProcessResult::Advanced
@@ -519,7 +710,11 @@ impl Capture {
             fields["assistantMessageID"] = json!("msg_step");
             assert_eq!(
                 self.emit(store, session, kind, fields),
-                ProcessResult::Advanced
+                if kind == "session.tool.called" {
+                    ProcessResult::ResultPublished(self.claims[session].key.clone())
+                } else {
+                    ProcessResult::Advanced
+                }
             );
         }
     }
@@ -555,7 +750,7 @@ impl Capture {
             store,
             session,
             call,
-            "Shell",
+            "shell",
             json!({"command": "cargo check", "workdir": "/repo"}),
         );
         self.finish(store, session, call, failed, Some(call));
@@ -576,9 +771,9 @@ fn activity_contents(input: &Value) -> Vec<&str> {
 }
 
 #[test]
-fn maintained_failed_retry_yaml_runs_in_native_terminal_order_with_partial_requests() {
+fn synthetic_retry_yaml_runs_in_native_terminal_order_with_partial_requests() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = Runtime::new(directory.path(), FAILED_RETRY);
+    let runtime = Runtime::new(directory.path(), SYNTHETIC_RETRY);
     let mut capture = Capture::start(&runtime.store, &["ses_retry"], Some(0));
     assert_eq!(runtime.sync(), 0);
     assert_eq!(runtime.count("burn_check_session_attachment"), 1);
@@ -594,7 +789,7 @@ fn maintained_failed_retry_yaml_runs_in_native_terminal_order_with_partial_reque
             &runtime.store,
             "ses_retry",
             call,
-            "Shell",
+            "shell",
             json!({"command": "cargo check", "workdir": "/repo"}),
         );
     }
@@ -640,9 +835,9 @@ fn maintained_failed_retry_yaml_runs_in_native_terminal_order_with_partial_reque
 }
 
 #[test]
-fn failed_retry_success_survives_v2_quality_gaps_continuity_resets_and_restart() {
+fn synthetic_success_survives_v2_quality_gaps_continuity_resets_and_restart() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = Runtime::new(directory.path(), FAILED_RETRY);
+    let runtime = Runtime::new(directory.path(), SYNTHETIC_RETRY);
     *runtime.evaluator.selected.lock().unwrap() = Some("clear".into());
     let session = "ses_saved_success";
     let mut capture = Capture::start(&runtime.store, &[session], Some(0));
@@ -796,6 +991,78 @@ fn failed_retry_success_survives_v2_quality_gaps_continuity_resets_and_restart()
 }
 
 #[test]
+fn maintained_fast_mode_yaml_uses_recorded_catalog_choices_without_served_tier() {
+    for (model, eligible) in [
+        (
+            json!({"providerID": "openai", "id": "gpt-6.1-sol-fast"}),
+            true,
+        ),
+        (
+            json!({"providerID": "openai", "id": "gpt-6.1-sol-ultrafast"}),
+            true,
+        ),
+        (json!({"providerID": "openai", "id": "gpt-6.1-sol"}), false),
+        (
+            json!({"providerID": "other", "id": "gpt-6.1-sol-fast"}),
+            false,
+        ),
+        (
+            json!({"providerID": "openai", "id": "gpt-6.1-sol", "variant": "fast"}),
+            false,
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = Runtime::new(directory.path(), FAST_MODE);
+        let mut capture = Capture::start(&runtime.store, &["ses_fast"], Some(0));
+        runtime.sync();
+        capture.request(
+            &runtime.store,
+            "ses_fast",
+            "msg_user",
+            "Update the docs. This is not urgent; slower work is fine.",
+        );
+        capture.step_with_model(&runtime.store, "ses_fast", "msg_step", model.clone());
+        for call in ["first", "second", "third"] {
+            capture.begin(
+                &runtime.store,
+                "ses_fast",
+                call,
+                "shell",
+                json!({"command": "cargo check", "workdir": "/repo"}),
+            );
+        }
+        capture.step_with_model(
+            &runtime.store,
+            "ses_fast",
+            "msg_other",
+            json!({
+                "providerID": "openai",
+                "id": if eligible { "gpt-6.1-sol" } else { "gpt-6.1-sol-fast" },
+            }),
+        );
+        for call in ["first", "second", "third"] {
+            capture.finish(&runtime.store, "ses_fast", call, false, Some(call));
+        }
+        assert_eq!(runtime.sync(), usize::from(eligible), "{model}");
+        if eligible {
+            *runtime.evaluator.selected.lock().unwrap() = Some("try_standard_mode".into());
+            assert_eq!(runtime.run(100_000).outcome, RunOutcome::Accepted);
+            let calls = runtime.evaluator.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(activity_contents(&calls[0].1), ["first", "second", "third"]);
+            assert!(calls[0].0.messages.iter().all(|message| {
+                message.value["fast_mode"] == true
+                    && message.value["model"] == format!("openai/{}", model["id"].as_str().unwrap())
+            }));
+        } else {
+            runtime.assert_idle(100_000);
+            assert_eq!(runtime.evaluator_calls(), 0);
+            assert_eq!(runtime.count("burn_check_assessment_history"), 0);
+        }
+    }
+}
+
+#[test]
 fn maintained_over_exploring_yaml_counts_only_completed_direct_reads_and_searches() {
     let directory = tempfile::tempdir().unwrap();
     let runtime = Runtime::new(directory.path(), OVER_EXPLORING);
@@ -813,7 +1080,7 @@ fn maintained_over_exploring_yaml_counts_only_completed_direct_reads_and_searche
         &runtime.store,
         "ses_explore",
         "read_error_not_selected",
-        "Read",
+        "read",
         json!({"path": "missing.rs"}),
     );
     capture.finish(
@@ -823,12 +1090,26 @@ fn maintained_over_exploring_yaml_counts_only_completed_direct_reads_and_searche
         true,
         Some("File not found"),
     );
+    capture.begin(
+        &runtime.store,
+        "ses_explore",
+        "unknown_name_not_selected",
+        "Read",
+        json!({"path": "src/main.rs"}),
+    );
+    capture.finish(
+        &runtime.store,
+        "ses_explore",
+        "unknown_name_not_selected",
+        false,
+        Some("An unrecognized tool name does not prove a read."),
+    );
     for index in 0..10 {
         let call = format!("selected_{index}");
         let (name, input) = if index % 2 == 0 {
-            ("Read", json!({"path": "src/main.rs"}))
+            ("read", json!({"path": "src/main.rs"}))
         } else {
-            ("Grep", json!({"pattern": "main", "path": "src"}))
+            ("grep", json!({"pattern": "main", "path": "src"}))
         };
         capture.begin(&runtime.store, "ses_explore", &call, name, input);
         capture.finish(&runtime.store, "ses_explore", &call, false, Some(&call));
@@ -867,7 +1148,7 @@ fn maintained_scope_creep_yaml_receives_direct_edit_arguments_and_frozen_request
             &runtime.store,
             "ses_scope",
             &call,
-            "Patch",
+            "patch",
             json!({"patchText": "*** Begin Patch\n*** Update File: src/extra.rs\n-old\n+new\n*** End Patch"}),
         );
         capture.finish(
@@ -994,7 +1275,7 @@ fn cold_empty_attachment_survives_restart_before_any_result() {
 #[test]
 fn fresh_activation_does_not_replay_prior_captured_results() {
     let directory = tempfile::tempdir().unwrap();
-    let mut runtime = Runtime::new(directory.path(), FAILED_RETRY);
+    let mut runtime = Runtime::new(directory.path(), SYNTHETIC_RETRY);
     let mut capture = Capture::start(&runtime.store, &["ses_seed"], Some(0));
     capture.request(&runtime.store, "ses_seed", "msg_user", "Fix the build.");
     capture.step(&runtime.store, "ses_seed", "msg_step");
@@ -1084,7 +1365,8 @@ fn live_results_attach_before_the_first_read_and_drain_future_work_once() {
         prefix
             .events
             .iter()
-            .filter(|event| matches!(event, SourceEvent::Observation { .. }))
+            .filter(|event| matches!(event, SourceEvent::Observation { observation, .. }
+                if matches!(observation.kind, antiburn_checks::domain::ObservationKind::ToolResult { .. })))
             .count(),
         1
     );
@@ -1111,12 +1393,29 @@ fn live_results_attach_before_the_first_read_and_drain_future_work_once() {
         assert!(!drained.has_more);
     }
     assert_eq!(runtime.count("burn_check_session_attachment"), 1);
-    assert_eq!(runtime.count("burn_check_observation"), 1);
+    assert_eq!(
+        runtime.count("burn_check_observation"),
+        prefix
+            .events
+            .iter()
+            .filter(|event| matches!(event, SourceEvent::Observation { .. }))
+            .count() as u64
+    );
     capture.result(&runtime.store, "ses_barrier", "after_first_read", true);
     let ready = source
         .read_batch(after_first_read.publication_cursor)
         .unwrap();
-    assert_eq!(ready.events.len(), 1);
+    assert_eq!(
+        ready
+            .events
+            .iter()
+            .filter(
+                |event| matches!(event, SourceEvent::Observation { observation, .. }
+        if matches!(observation.kind, antiburn_checks::domain::ObservationKind::ToolResult { .. }))
+            )
+            .count(),
+        1
+    );
     assert!(
         ready
             .events
@@ -1148,7 +1447,7 @@ fn live_results_attach_before_the_first_read_and_drain_future_work_once() {
 #[test]
 fn expired_admitted_session_recovers_while_healthy_lease_and_window_continue() {
     let directory = tempfile::tempdir().unwrap();
-    let runtime = Runtime::new(directory.path(), FAILED_RETRY);
+    let runtime = Runtime::new(directory.path(), SYNTHETIC_RETRY);
     let mut capture = Capture::start(&runtime.store, &["ses_gap", "ses_other"], Some(0));
     runtime.sync();
     for session in ["ses_gap", "ses_other"] {
@@ -1355,7 +1654,7 @@ fn missing_required_result_content_blocks_only_that_candidate() {
         &runtime.store,
         "ses_missing",
         "missing",
-        "Shell",
+        "shell",
         json!({"command": "cargo check"}),
     );
     capture.finish(&runtime.store, "ses_missing", "missing", true, None);
@@ -1406,6 +1705,31 @@ fn definition_and_scope_fences_preserve_unknown_attempts_without_resending() {
                 .is_pending()
         );
         drop(task);
+        if fence != "definition" {
+            capture.begin(
+                &runtime.store,
+                "ses_fence",
+                "after_fence",
+                "shell",
+                json!({"command": "cargo check"}),
+            );
+            for (kind, fields) in [
+                ("session.tool.input.started", json!({"name":"shell"})),
+                (
+                    "session.tool.input.ended",
+                    json!({"text":"{\"command\":\"cargo check\"}"}),
+                ),
+            ] {
+                let mut fields = fields;
+                fields["assistantMessageID"] = json!("msg_step");
+                fields["id"] = json!("after_fence_call");
+                assert_eq!(
+                    capture.emit(&runtime.store, "ses_fence", kind, fields),
+                    ProcessResult::Advanced,
+                    "the {fence} fixture must prepare a valid call before the fence"
+                );
+            }
+        }
         let mut active = runtime.active.clone();
         match fence {
             "definition" => {
@@ -1459,12 +1783,18 @@ fn definition_and_scope_fences_preserve_unknown_attempts_without_resending() {
         );
         if fence != "definition" {
             let publication_head = runtime.adapter.publication_head().unwrap();
-            capture.begin(
-                &runtime.store,
-                "ses_fence",
-                "after_fence",
-                "Shell",
-                json!({"command": "cargo check"}),
+            assert_eq!(
+                capture.emit(
+                    &runtime.store,
+                    "ses_fence",
+                    "session.tool.called",
+                    json!({
+                        "assistantMessageID":"msg_step", "id":"after_fence_call",
+                        "input":{"command":"cargo check"}, "executed":false,
+                    }),
+                ),
+                ProcessResult::SessionGap("ses_fence".into()),
+                "the {fence} fence must reject a generic call from the old claim"
             );
             assert_eq!(
                 capture.emit(
@@ -1481,6 +1811,10 @@ fn definition_and_scope_fences_preserve_unknown_attempts_without_resending() {
                 ProcessResult::SessionGap("ses_fence".into()),
                 "the {fence} fence must reject a completed result from the old claim"
             );
+            assert!(
+                !has_hard_join_gap(&capture.joiners["ses_fence"]),
+                "the {fence} fixture must fail the Store fence, not the event join"
+            );
             assert_eq!(
                 runtime.adapter.publication_head().unwrap(),
                 publication_head
@@ -1489,6 +1823,9 @@ fn definition_and_scope_fences_preserve_unknown_attempts_without_resending() {
         let evaluator = runtime.evaluator.clone();
         drop(runtime);
         let store = Arc::new(Store::open(directory.path()).unwrap());
+        store
+            .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+            .unwrap();
         let restarted = Arc::new(
             StoreCheckStore::new(
                 store.clone(),
@@ -1524,9 +1861,13 @@ fn definition_and_scope_fences_preserve_unknown_attempts_without_resending() {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(outcomes.len(), 2, "{fence}");
-        assert!(
-            outcomes.iter().any(|outcome| outcome == "unknown"),
-            "{fence}"
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| *outcome == "unknown")
+                .count(),
+            1,
+            "{fence} must retain exactly one unknown attempt"
         );
     }
 }
@@ -1674,13 +2015,7 @@ fn v2_saved_answer_catches_up_after_restart_or_becomes_stale_after_a_gap_without
         );
         capture.result(&runtime.store, "ses_answer", "newer", true);
         runtime.evaluator.hold.store(false, Ordering::SeqCst);
-        let Poll::Ready(settled) = task
-            .as_mut()
-            .poll(&mut TaskContext::from_waker(Waker::noop()))
-        else {
-            panic!("the saved answer must settle");
-        };
-        assert_eq!(settled.unwrap().outcome, RunOutcome::Deferred);
+        assert_eq!(settle_ready_task(&mut task).outcome, RunOutcome::Deferred);
         drop(task);
         assert_eq!(runtime.count("burn_check_assessment_history"), 0);
         let (saved_id, saved_input, saved_answer): (String, String, String) = runtime.store.lock().query_row(

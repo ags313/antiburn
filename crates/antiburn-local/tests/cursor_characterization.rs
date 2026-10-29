@@ -205,6 +205,8 @@ impl RecordSink for CursorRecordingSink {
             NormalizedRecord::TurnContent(content) => self.contents.push(*content),
             NormalizedRecord::Observation(_)
             | NormalizedRecord::ToolResult(_)
+            | NormalizedRecord::PublicMessage(_)
+            | NormalizedRecord::ResponseCycle(_)
             | NormalizedRecord::Unusable(_) => {}
         }
     }

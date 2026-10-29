@@ -164,7 +164,7 @@ fn user_turn_with_content(turn_index: u64, content: &str) -> TurnRow {
 }
 
 #[test]
-fn instruction_epoch_survives_appends_and_resets_for_source_replacement() {
+fn source_resumes_survive_appends_and_follow_source_replacement() {
     let store = store();
     let (record, claim) = claimed_projection(&store, "instruction-epoch-publication", 100, 60);
     let key = record.key.clone();
@@ -189,11 +189,17 @@ fn instruction_epoch_survives_appends_and_resets_for_source_replacement() {
             .publish_projections(&record, None, &completion, &[], &initial_sources)
             .unwrap()
     );
-    let (initial_positions, initial_at) = store
-        .observe_burn_check_instruction_epoch(&key, 1, claim.source_generation, "rules-v1", 10_000)
-        .unwrap();
-    assert_eq!(initial_positions.get("s1"), Some(&1));
-    assert_eq!(initial_positions.get("second"), Some(&0));
+    let source_names = || {
+        store
+            .lock()
+            .prepare("SELECT source_key FROM source_resume ORDER BY source_key")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(source_names(), ["s1", "second"]);
 
     let mut appended_session = session("instruction-epoch-publication", 1_000);
     appended_session.source_fingerprint = Some("sv1:instruction-epoch-append".into());
@@ -248,19 +254,7 @@ fn instruction_epoch_survives_appends_and_resets_for_source_replacement() {
             )
             .unwrap()
     );
-    let (appended_positions, appended_at) = store
-        .observe_burn_check_instruction_epoch(
-            &key,
-            1,
-            append_claim.source_generation,
-            "rules-v1",
-            20_000,
-        )
-        .unwrap();
-    assert_eq!(appended_at, initial_at);
-    assert_eq!(appended_positions.get("s1"), Some(&1));
-    assert_eq!(appended_positions.get("second"), Some(&0));
-    assert_eq!(appended_positions.get("new-source"), Some(&0));
+    assert_eq!(source_names(), ["new-source", "s1", "second"]);
 
     let mut replaced_session = appended_session;
     replaced_session.source_fingerprint = Some("sv1:instruction-epoch-rewrite".into());
@@ -315,17 +309,7 @@ fn instruction_epoch_survives_appends_and_resets_for_source_replacement() {
             )
             .unwrap()
     );
-    let (replacement_positions, replacement_at) = store
-        .observe_burn_check_instruction_epoch(
-            &key,
-            1,
-            replacement_claim.source_generation,
-            "rules-v1",
-            30_000,
-        )
-        .unwrap();
-    assert!(replacement_at > initial_at);
-    assert_eq!(replacement_positions.get("s1"), Some(&3));
+    assert_eq!(source_names(), ["new-source", "s1", "second"]);
 
     let mut removed_session = replaced_session;
     removed_session.source_fingerprint = Some("sv1:instruction-epoch-source-removed".into());
@@ -365,18 +349,7 @@ fn instruction_epoch_survives_appends_and_resets_for_source_replacement() {
             )
             .unwrap()
     );
-    let (remaining_positions, removed_at) = store
-        .observe_burn_check_instruction_epoch(
-            &key,
-            1,
-            removal_claim.source_generation,
-            "rules-v1",
-            40_000,
-        )
-        .unwrap();
-    assert!(removed_at > replacement_at);
-    assert_eq!(remaining_positions.len(), 1);
-    assert_eq!(remaining_positions.get("s1"), Some(&3));
+    assert_eq!(source_names(), ["s1"]);
 }
 
 fn insert_waiting_prompt(store: &Store, remediation_id: &str, target_key: &str) {

@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use antiburn_checks::check_store::*;
 use antiburn_checks::compiler::{CompiledCheck, StatusResult};
+use antiburn_checks::decision::{DecisionAttempt, attempt_id};
 use antiburn_checks::definition_lifecycle::{
     EffectiveActivation, InactiveKind, LifecycleState, LifecycleTransition,
 };
@@ -13,19 +14,27 @@ use antiburn_checks::domain::{
     ActivationId, ActivationScope, FrozenCandidate, Generation, ObservationPosition, RunScope,
 };
 use antiburn_checks::engine::EvaluationDiagnostic;
-use antiburn_checks::fit::{PreparationFailure, PreparationRecord};
+use antiburn_checks::fit::{LocalPreparation, PreparationFailure, PreparationRecord};
+use antiburn_checks::results::{DecisionResult, decode_decision_result, decode_results};
 use antiburn_checks::source::{CommittedSourceObservation, PublicationCursor, SourceBatch};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use super::BurnCheckCandidateClaim;
+use super::trace_failure::{FailureCause, FailureLog};
+use super::trace_refs::{activation_ref, candidate_id_ref, candidate_ref, check_ref, decision_ref};
 use crate::store::Store;
 
 #[path = "runtime_attempts.rs"]
 mod attempts;
+#[path = "runtime_local.rs"]
+mod local;
 #[path = "runtime_page.rs"]
 mod page;
+#[path = "runtime_progress.rs"]
+mod progress;
+pub(super) use progress::parse_candidate_id;
 #[path = "runtime_recovery.rs"]
 mod recovery;
 #[path = "runtime_startup.rs"]
@@ -33,6 +42,9 @@ mod startup;
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;
+#[path = "runtime_tracing.rs"]
+mod trace;
+use trace::{StoreOperation, StoreTraceContext};
 
 /// SQLite persistence for one environment, session CWD, and live or replay run.
 pub struct StoreCheckStore {
@@ -41,7 +53,13 @@ pub struct StoreCheckStore {
     scope: ActivationScope,
     activation_scope_key: String,
     activations: Mutex<BTreeMap<ActivationId, EffectiveActivation>>,
+    publication_gate: Option<Arc<PublicationGate>>,
+    deferred_traces: Mutex<BTreeMap<[u8; 32], &'static str>>,
+    recovery_traces: Mutex<BTreeMap<Option<[u8; 32]>, [u8; 32]>>,
+    store_failure_traces: FailureLog,
 }
+
+type PublicationGate = dyn Fn(&EffectiveActivation) -> bool + Send + Sync;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct LifecycleRecord {
@@ -80,9 +98,26 @@ impl StoreCheckStore {
             activation_scope_key: Self::activation_scope_key(&scope),
             scope,
             activations: Mutex::new(BTreeMap::new()),
+            publication_gate: None,
+            deferred_traces: Mutex::new(BTreeMap::new()),
+            recovery_traces: Mutex::new(BTreeMap::new()),
+            store_failure_traces: FailureLog::default(),
         };
-        adapter.recover_abandoned().map_err(store_error)?;
+        adapter.store_result(
+            StoreTraceContext::Scope,
+            StoreOperation::StartupRecovery,
+            adapter.recover_abandoned(),
+        )?;
         Ok(adapter)
+    }
+
+    /// Checks current runtime admission before publication without holding Store locks.
+    pub fn with_publication_gate(
+        mut self,
+        gate: Arc<dyn Fn(&EffectiveActivation) -> bool + Send + Sync>,
+    ) -> Self {
+        self.publication_gate = Some(gate);
+        self
     }
 
     /// Returns the exact key shared by activation, history, and report queries.
@@ -92,66 +127,72 @@ impl StoreCheckStore {
 
     /// Lists persisted IDs so discovery can also reconcile removed definitions.
     pub fn definition_ids(&self) -> Result<Vec<String>, StoreError> {
-        let connection = self.store.lock();
-        let mut statement = connection.prepare("SELECT check_id FROM burn_check_activation WHERE activation_scope_key = ?1 ORDER BY check_id")
-            .map_err(|error| store_error(error.into()))?;
-        statement
-            .query_map([&self.activation_scope_key], |row| row.get(0))
-            .map_err(|error| store_error(error.into()))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|error| store_error(error.into()))
+        let result = (|| -> Result<Vec<String>> {
+            let connection = self.store.lock();
+            let mut statement = connection.prepare("SELECT check_id FROM burn_check_activation WHERE activation_scope_key = ?1 ORDER BY check_id")?;
+            Ok(statement
+                .query_map([&self.activation_scope_key], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        })();
+        self.store_result(
+            StoreTraceContext::Scope,
+            StoreOperation::DefinitionInventory,
+            result,
+        )
     }
 
     /// Loads pause transitions without reading or compiling definition files.
     pub fn active_pause_transitions(
         &self,
     ) -> Result<Vec<(String, LifecycleTransition)>, StoreError> {
-        let connection = self.store.lock();
-        let mut statement = connection
-            .prepare(
+        let result = (|| -> Result<Vec<(String, LifecycleTransition)>> {
+            let connection = self.store.lock();
+            let mut statement = connection.prepare(
                 "SELECT check_id, generation, lifecycle_json FROM burn_check_activation
              WHERE activation_scope_key = ?1 AND enabled = 1 ORDER BY check_id",
-            )
-            .map_err(|error| store_error(error.into()))?;
-        let records = statement
-            .query_map([&self.activation_scope_key], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|error| store_error(error.into()))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|error| store_error(error.into()))?;
-        records
-            .into_iter()
-            .map(|(id, generation, saved)| {
-                let record: LifecycleRecord = serde_json::from_str(&saved)?;
-                ensure!(
-                    record.version == 1
-                        && record.state == "active"
-                        && record.generation == generation,
-                    "active lifecycle does not match durable activation"
-                );
-                Ok((
-                    id,
-                    LifecycleTransition::Deactivated {
-                        revision: record.revision,
-                        project_root: record.project_root,
-                        scope: definition_scope(&record.definition_scope)?,
-                        source_paths: record.source_paths,
-                        inactive_kind: InactiveKind::Paused,
-                        next_generation: Generation(
-                            generation
-                                .checked_add(1)
-                                .context("activation generation is exhausted")?,
-                        ),
-                    },
-                ))
-            })
-            .collect::<Result<Vec<_>>>()
-            .map_err(store_error)
+            )?;
+            let records = statement
+                .query_map([&self.activation_scope_key], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            records
+                .into_iter()
+                .map(|(id, generation, saved)| {
+                    let record: LifecycleRecord = serde_json::from_str(&saved)?;
+                    ensure!(
+                        record.version == 1
+                            && record.state == "active"
+                            && record.generation == generation,
+                        "active lifecycle does not match durable activation"
+                    );
+                    Ok((
+                        id,
+                        LifecycleTransition::Deactivated {
+                            revision: record.revision,
+                            project_root: record.project_root,
+                            scope: definition_scope(&record.definition_scope)?,
+                            source_paths: record.source_paths,
+                            inactive_kind: InactiveKind::Paused,
+                            next_generation: Generation(
+                                generation
+                                    .checked_add(1)
+                                    .context("activation generation is exhausted")?,
+                            ),
+                        },
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()
+        })();
+        self.store_result(
+            StoreTraceContext::Scope,
+            StoreOperation::PauseInventory,
+            result,
+        )
     }
 
     /// Loads prior lifecycle metadata. Compilation stays at the host boundary.
@@ -160,8 +201,11 @@ impl StoreCheckStore {
         definition_id: &str,
         compiled: impl Into<Option<Arc<CompiledCheck>>>,
     ) -> Result<LifecycleState, StoreError> {
-        self.read_lifecycle(definition_id, compiled.into())
-            .map_err(store_error)
+        self.store_result(
+            StoreTraceContext::Definition(definition_id),
+            StoreOperation::LifecycleRead,
+            self.read_lifecycle(definition_id, compiled.into()),
+        )
     }
 
     fn read_lifecycle(
@@ -221,33 +265,47 @@ impl StoreCheckStore {
 
     /// Validates the durable identity before exposing compiled work to recovery.
     pub fn register_activation(&self, activation: &EffectiveActivation) -> Result<(), StoreError> {
-        self.validate_activation(activation).map_err(store_error)?;
+        let result = (|| -> Result<()> {
+            self.validate_durable_activation(activation)?;
+            self.activations
+                .lock()
+                .expect("activation mutex is not poisoned")
+                .insert(activation.id.clone(), activation.clone());
+            Ok(())
+        })();
+        self.store_result(
+            StoreTraceContext::Activation(&activation.id),
+            StoreOperation::ActivationRegistration,
+            result,
+        )
+    }
+
+    fn validate_durable_activation(&self, activation: &EffectiveActivation) -> Result<()> {
+        self.validate_activation(activation)?;
+        #[cfg(test)]
+        self.store
+            .burn_check_test_stage(super::test_hooks::Stage::BeforeActivationRegistration);
         let saved: Option<(i64, String, bool)> = self.store.lock().query_row(
             "SELECT generation, definition_revision, enabled FROM burn_check_activation WHERE check_id = ?1 AND activation_scope_key = ?2",
             params![activation.id.definition_id, self.activation_scope_key],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).optional().map_err(|error| store_error(error.into()))?;
-        if saved
-            != Some((
-                integer(activation.id.generation.0).map_err(store_error)?,
-                hex(&activation.revision),
-                true,
-            ))
-        {
-            return Err(StoreError {
-                message: "activation does not match durable generation and revision".into(),
-            });
-        }
-        self.activations
-            .lock()
-            .expect("activation mutex is not poisoned")
-            .insert(activation.id.clone(), activation.clone());
+        ).optional()?;
+        ensure!(
+            saved
+                == Some((
+                    integer(activation.id.generation.0)?,
+                    hex(&activation.revision),
+                    true,
+                )),
+            "activation does not match durable generation and revision"
+        );
         Ok(())
     }
 
     /// Reads a publication boundary without converting it to observation order.
     pub fn publication_head(&self) -> Result<PublicationCursor, StoreError> {
-        self.store
+        let result = self
+            .store
             .lock()
             .query_row(
                 "SELECT COALESCE(MAX(publication_sequence), 0) FROM native_tool_result_publication",
@@ -255,7 +313,44 @@ impl StoreCheckStore {
                 |row| row.get::<_, u64>(0),
             )
             .map(PublicationCursor)
-            .map_err(|error| store_error(error.into()))
+            .map_err(Into::into);
+        self.store_result(
+            StoreTraceContext::Scope,
+            StoreOperation::PublicationHead,
+            result,
+        )
+    }
+
+    /// Avoid provider discovery when no attached branch has due work.
+    pub(crate) fn has_due_candidate(
+        &self,
+        activation: &EffectiveActivation,
+        now_epoch: i64,
+    ) -> Result<bool> {
+        let branches = self.initialized_branches(activation)?;
+        if branches.is_empty() {
+            return Ok(false);
+        }
+        Ok(self.store.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM burn_check_candidate c
+             JOIN burn_check_activation a USING(check_id, activation_scope_key)
+             WHERE c.check_id = ?1 AND c.activation_scope_key = ?2 AND c.generation = ?3
+               AND c.generation = a.generation AND a.enabled = 1 AND c.state = 'pending'
+               AND c.branch_key IN (SELECT value FROM json_each(?5))
+               AND NOT EXISTS(SELECT 1 FROM burn_check_candidate busy
+                 WHERE busy.check_id = c.check_id AND busy.activation_scope_key = c.activation_scope_key
+                   AND busy.generation = c.generation AND busy.branch_key = c.branch_key
+                   AND busy.state IN ('claimed', 'dispatching', 'answered'))
+                AND NOT EXISTS(SELECT 1 FROM burn_check_cooldown cooldown
+                 WHERE cooldown.check_id = c.check_id AND cooldown.activation_scope_key = c.activation_scope_key
+                   AND cooldown.generation = c.generation AND cooldown.branch_key = c.branch_key
+                    AND cooldown.cooldown_until_epoch > ?4
+                    AND NOT (COALESCE(c.started_cooldown_until_epoch >= cooldown.cooldown_until_epoch, 0)
+                      AND EXISTS(SELECT 1 FROM burn_check_evaluation_attempt started
+                        WHERE started.candidate_id = c.candidate_id))))",
+            params![activation.id.definition_id, self.activation_scope_key, integer(activation.id.generation.0)?, now_epoch, serde_json::to_string(&branches)?],
+            |row| row.get(0),
+        )?)
     }
 
     fn validate_activation(&self, activation: &EffectiveActivation) -> Result<()> {
@@ -388,7 +483,7 @@ impl StoreCheckStore {
         let checkpoint = progress
             .encode()
             .map_err(|error| anyhow::anyhow!(error.message))?;
-        tx.execute("UPDATE burn_check_candidate SET state = 'cancelled' WHERE check_id = ?1 AND activation_scope_key = ?2 AND state IN ('pending', 'claimed', 'dispatching', 'answered')", params![definition_id, self.activation_scope_key])?;
+        let cancelled = tx.execute("UPDATE burn_check_candidate SET state = 'cancelled' WHERE check_id = ?1 AND activation_scope_key = ?2 AND state IN ('pending', 'claimed', 'dispatching', 'answered')", params![definition_id, self.activation_scope_key])?;
         tx.execute(
             "DELETE FROM burn_check_current_status WHERE check_id = ?1 AND activation_scope_key = ?2",
             params![definition_id, self.activation_scope_key],
@@ -427,6 +522,20 @@ impl StoreCheckStore {
             )?;
         }
         tx.commit()?;
+        self.deferred_traces
+            .lock()
+            .expect("trace mutex is not poisoned")
+            .clear();
+        ::tracing::debug!(
+            event = "burn_check_lifecycle_committed",
+            check_ref = check_ref(definition_id),
+            activation_ref = activation.map(|active| activation_ref(&active.id)),
+            generation = record.generation,
+            status = record.state,
+            cancelled_candidates = cancelled,
+            attached_branches = progress.selection.branches.len(),
+            replay = matches!(self.scope.run, RunScope::Replay(_)),
+        );
         Ok(())
     }
 
@@ -442,23 +551,94 @@ impl StoreCheckStore {
             fence: integer(claimed.fence)?,
         })
     }
+
+    fn registered_activation(&self, id: &ActivationId) -> Option<EffectiveActivation> {
+        self.activations
+            .lock()
+            .expect("activation mutex is not poisoned")
+            .get(id)
+            .cloned()
+    }
+
+    fn require_model_claim(&self, claimed: &ClaimedCandidate) -> Result<()> {
+        // A replaced activation can still have an incurred model attempt to settle.
+        if let Some(activation) = self.registered_activation(&claimed.candidate.activation) {
+            ensure!(
+                !activation.compiled.is_local(),
+                "local work cannot use provider preparation, attempts, or answers"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl CheckStore for StoreCheckStore {
+    fn load_terminal_candidate_ids(
+        &self,
+        candidate_ids: &[CandidateId],
+    ) -> Result<Vec<CandidateId>, StoreError> {
+        let result = (|| -> Result<Vec<CandidateId>> {
+            ensure!(
+                candidate_ids.len() <= antiburn_checks::engine::MAX_PENDING_CANDIDATES,
+                "terminal candidate query exceeds the scheduler bound"
+            );
+            if candidate_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let requested = candidate_ids
+                .iter()
+                .map(|id| (hex(&id.0), id.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let connection = self.store.lock();
+            let mut statement = connection.prepare("SELECT candidate_id FROM burn_check_candidate
+                WHERE activation_scope_key = ?1 AND candidate_id IN (SELECT value FROM json_each(?2))
+                  AND state IN ('accepted', 'coalesced', 'not_assessed', 'execution_failed', 'cancelled', 'stale')")?;
+            let rows = statement.query_map(
+                params![
+                    self.activation_scope_key,
+                    serde_json::to_string(&requested.keys().collect::<Vec<_>>())?
+                ],
+                |row| row.get::<_, String>(0),
+            )?;
+            rows.map(|row| {
+                requested
+                    .get(&row?)
+                    .cloned()
+                    .context("terminal query returned an unrequested candidate")
+            })
+            .collect()
+        })();
+        self.store_result(
+            StoreTraceContext::Scope,
+            StoreOperation::TerminalInventory,
+            result,
+        )
+    }
     fn activate(
         &self,
         definition_id: &str,
         transition: &LifecycleTransition,
         activation: Option<&EffectiveActivation>,
     ) -> Result<(), StoreError> {
-        self.persist_lifecycle(definition_id, transition, activation)
-            .map_err(store_error)?;
-        self.activations
-            .lock()
-            .expect("activation mutex is not poisoned")
-            .retain(|id, _| id.definition_id != definition_id);
+        self.store_result(
+            StoreTraceContext::Definition(definition_id),
+            StoreOperation::LifecycleWrite,
+            self.persist_lifecycle(definition_id, transition, activation),
+        )?;
         if let Some(activation) = activation {
-            self.register_activation(activation)?;
+            self.store_result(
+                StoreTraceContext::Activation(&activation.id),
+                StoreOperation::ActivationRegistration,
+                self.validate_durable_activation(activation),
+            )?;
+        }
+        let mut activations = self
+            .activations
+            .lock()
+            .expect("activation mutex is not poisoned");
+        activations.retain(|id, _| id.definition_id != definition_id);
+        if let Some(activation) = activation {
+            activations.insert(activation.id.clone(), activation.clone());
         }
         Ok(())
     }
@@ -466,7 +646,11 @@ impl CheckStore for StoreCheckStore {
         &self,
         activation: &EffectiveActivation,
     ) -> Result<SourceProgress, StoreError> {
-        self.progress(activation).map_err(store_error)
+        self.store_result(
+            StoreTraceContext::Activation(&activation.id),
+            StoreOperation::SourceProgress,
+            self.progress(activation),
+        )
     }
     fn apply_source_page(
         &self,
@@ -477,8 +661,11 @@ impl CheckStore for StoreCheckStore {
         next: &SourceProgress,
         candidates: &[FrozenCandidate],
     ) -> Result<(), StoreError> {
-        self.persist_page(activation, expected, page, observations, next, candidates)
-            .map_err(store_error)
+        self.store_result(
+            StoreTraceContext::Activation(&activation.id),
+            StoreOperation::SourcePage,
+            self.persist_page(activation, expected, page, observations, next, candidates),
+        )
     }
     fn record_overflow(&self, candidate: &FrozenCandidate) -> Result<(), StoreError> {
         if candidate.activation.scope != self.scope {
@@ -486,21 +673,30 @@ impl CheckStore for StoreCheckStore {
                 message: "overflow candidate belongs to another scope".into(),
             });
         }
-        self.store
+        let result = self
+            .store
             .record_burn_check_overflow(
                 &hex(&candidate.fingerprint),
                 "pending candidate limit reached",
                 now_epoch(),
             )
-            .map(|_| ())
-            .map_err(store_error)
+            .map(|_| ());
+        self.store_result(
+            StoreTraceContext::Candidate(candidate),
+            StoreOperation::Overflow,
+            result,
+        )
     }
     fn load_recovery(
         &self,
         after: Option<&CandidateId>,
         limit: usize,
     ) -> Result<Vec<RecoveryRecord>, StoreError> {
-        self.recovery_page(after, limit).map_err(store_error)
+        self.store_result(
+            StoreTraceContext::Scope,
+            StoreOperation::Recovery,
+            self.recovery_page(after, limit),
+        )
     }
     fn claim_due(
         &self,
@@ -508,88 +704,190 @@ impl CheckStore for StoreCheckStore {
         now_unix_ms: u64,
         bypass_check_cooldown: bool,
     ) -> Result<CandidateClaim, StoreError> {
-        self.claim(candidate, now_unix_ms, bypass_check_cooldown)
-            .map_err(store_error)
+        self.store_result(
+            StoreTraceContext::Candidate(candidate),
+            StoreOperation::Claim,
+            self.claim(candidate, now_unix_ms, bypass_check_cooldown),
+        )
     }
     fn record_dispatch_intent(
         &self,
         claimed: &ClaimedCandidate,
         attempted_at_unix_ms: u64,
         cooldown: Duration,
-        attempt_number: u8,
+        attempt: &DecisionAttempt,
     ) -> Result<ClaimOutcome, StoreError> {
-        self.dispatch(claimed, attempted_at_unix_ms, cooldown, attempt_number)
-            .map_err(store_error)
+        self.claim_store_result(
+            claimed,
+            StoreOperation::DispatchIntent,
+            Some(attempt),
+            self.dispatch(claimed, attempted_at_unix_ms, cooldown, attempt),
+        )
+    }
+    fn load_decision_progress(
+        &self,
+        claimed: &ClaimedCandidate,
+    ) -> Result<DecisionProgress, StoreError> {
+        let result = (|| -> Result<DecisionProgress> {
+            let activation = self
+                .registered_activation(&claimed.candidate.activation)
+                .context("decision progress requires its registered activation")?;
+            let claim = self.claim_record(claimed)?;
+            self.read_decision_progress(&self.store.lock(), &claim, &activation)
+        })();
+        self.claim_store_result(claimed, StoreOperation::DecisionProgress, None, result)
+    }
+    fn record_local_start(
+        &self,
+        claimed: &ClaimedCandidate,
+        now_unix_ms: u64,
+        cooldown: Duration,
+        preparation: &LocalPreparation,
+    ) -> Result<ClaimOutcome, StoreError> {
+        self.claim_store_result(
+            claimed,
+            StoreOperation::LocalStart,
+            None,
+            self.start_local(claimed, now_unix_ms, cooldown, preparation),
+        )
     }
     fn release_pre_dispatch_claim(
         &self,
         claimed: &ClaimedCandidate,
     ) -> Result<ClaimOutcome, StoreError> {
-        self.release_unattempted_claim(claimed).map_err(store_error)
+        self.claim_store_result(
+            claimed,
+            StoreOperation::ClaimRelease,
+            None,
+            self.release_unattempted_claim(claimed),
+        )
     }
     fn load_preparation(
         &self,
         claimed: &ClaimedCandidate,
     ) -> Result<Option<PreparationRecord>, StoreError> {
-        self.saved_preparation(claimed).map_err(store_error)
+        self.claim_store_result(
+            claimed,
+            StoreOperation::PreparationRead,
+            None,
+            self.saved_preparation(claimed),
+        )
     }
     fn record_preparation(
         &self,
         claimed: &ClaimedCandidate,
         preparation: &PreparationRecord,
     ) -> Result<ClaimOutcome, StoreError> {
-        self.save_preparation(claimed, preparation)
-            .map_err(store_error)
+        self.claim_store_result(
+            claimed,
+            StoreOperation::PreparationWrite,
+            None,
+            self.save_preparation(claimed, preparation),
+        )
     }
     fn record_preparation_rejection(
         &self,
         claimed: &ClaimedCandidate,
         failure: &PreparationFailure,
     ) -> Result<ClaimOutcome, StoreError> {
-        self.terminal_with_diagnostic(
+        self.claim_store_result(
             claimed,
-            &failure.detail,
-            true,
-            Some(&PreparationRecord::Rejected(failure.clone())),
+            StoreOperation::PreparationRejection,
             None,
+            self.terminal_with_diagnostic(
+                claimed,
+                &failure.detail,
+                true,
+                Some(&PreparationRecord::Rejected(failure.clone())),
+                None,
+            ),
         )
-        .map_err(store_error)
     }
     fn record_evaluation_failure(
         &self,
         claimed: &ClaimedCandidate,
         diagnostic: &EvaluationDiagnostic,
     ) -> Result<ClaimOutcome, StoreError> {
-        self.terminal_with_diagnostic(claimed, &diagnostic.detail, false, None, Some(diagnostic))
-            .map_err(store_error)
+        self.claim_store_result(
+            claimed,
+            StoreOperation::EvaluationFailure,
+            None,
+            self.terminal_with_diagnostic(
+                claimed,
+                &diagnostic.detail,
+                false,
+                None,
+                Some(diagnostic),
+            ),
+        )
     }
     fn record_attempt_failure(
         &self,
         claimed: &ClaimedCandidate,
-        attempt_number: u8,
+        attempt: &DecisionAttempt,
         outcome: AttemptFailure,
         diagnostic: &EvaluationDiagnostic,
     ) -> Result<ClaimOutcome, StoreError> {
-        self.settle_failure(claimed, attempt_number, outcome, diagnostic)
-            .map_err(store_error)
+        self.claim_store_result(
+            claimed,
+            StoreOperation::AttemptFailure,
+            Some(attempt),
+            self.settle_failure(claimed, attempt, outcome, diagnostic),
+        )
     }
-    fn record_answer(
+    fn record_decision_answer(
         &self,
         claimed: &ClaimedCandidate,
-        evaluated: &EvaluatedCandidate,
-    ) -> Result<(), StoreError> {
-        self.save_answer(claimed, evaluated).map_err(store_error)
+        attempt: &DecisionAttempt,
+        evaluated: &DecisionResult,
+    ) -> Result<ClaimOutcome, StoreError> {
+        self.claim_store_result(
+            claimed,
+            StoreOperation::DecisionAnswer,
+            Some(attempt),
+            self.save_decision_answer(claimed, attempt, evaluated),
+        )
     }
     fn accept(&self, assessment: &AssessmentAcceptance) -> Result<AcceptanceOutcome, StoreError> {
-        let claim = self
-            .claim_record(&assessment.claimed)
-            .map_err(store_error)?;
-        let answer = serde_json::to_value(&assessment.evaluated)
-            .map_err(|error| store_error(error.into()))?;
-        let actions =
-            serde_json::to_value(&assessment.actions).map_err(|error| store_error(error.into()))?;
+        let started = Instant::now();
+        #[cfg(test)]
         self.store
-            .try_accept_burn_check_answer(
+            .burn_check_test_stage(super::test_hooks::Stage::BeforeAcceptance);
+        let Some(activation) = self.registered_activation(&assessment.claimed.candidate.activation)
+        else {
+            self.trace_acceptance(
+                &assessment.claimed,
+                "stale",
+                "activation_unregistered",
+                started.elapsed(),
+            );
+            return Ok(AcceptanceOutcome::Stale);
+        };
+        if self
+            .publication_gate
+            .as_ref()
+            .is_some_and(|gate| !gate(&activation))
+        {
+            self.trace_acceptance(
+                &assessment.claimed,
+                "deferred",
+                "publication_gate",
+                started.elapsed(),
+            );
+            return Ok(AcceptanceOutcome::Deferred);
+        }
+        let result = (|| -> Result<AcceptanceOutcome> {
+            assessment
+                .evaluated
+                .validate_for_declarations(
+                    &activation.compiled.decisions,
+                    &activation.compiled.question_requirements(),
+                )
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+            let claim = self.claim_record(&assessment.claimed)?;
+            let answer = serde_json::to_value(&assessment.evaluated)?;
+            let actions = serde_json::to_value(&assessment.actions)?;
+            self.store.try_accept_burn_check_answer(
                 &claim,
                 &format!("assessment:{}", claim.candidate_id),
                 &answer,
@@ -597,21 +895,45 @@ impl CheckStore for StoreCheckStore {
                 assessment.status_write().map(status_name),
                 now_epoch(),
             )
-            .map_err(store_error)
+        })();
+        let outcome = self.claim_store_result(
+            &assessment.claimed,
+            StoreOperation::Acceptance,
+            None,
+            result,
+        )?;
+        let (status, reason) = match outcome {
+            AcceptanceOutcome::Accepted => ("accepted", "committed"),
+            AcceptanceOutcome::AlreadyAccepted => return Ok(outcome),
+            AcceptanceOutcome::Deferred => ("deferred", "durable_gate_or_source_pending"),
+            AcceptanceOutcome::Stale => ("stale", "publication_rights_revoked"),
+        };
+        self.trace_acceptance(&assessment.claimed, status, reason, started.elapsed());
+        Ok(outcome)
     }
     fn record_failure(
         &self,
         claimed: &ClaimedCandidate,
         detail: &str,
     ) -> Result<ClaimOutcome, StoreError> {
-        self.terminal(claimed, detail, false).map_err(store_error)
+        self.claim_store_result(
+            claimed,
+            StoreOperation::FailureSettlement,
+            None,
+            self.terminal(claimed, detail, false),
+        )
     }
     fn record_not_assessed(
         &self,
         claimed: &ClaimedCandidate,
         detail: &str,
     ) -> Result<ClaimOutcome, StoreError> {
-        self.terminal(claimed, detail, true).map_err(store_error)
+        self.claim_store_result(
+            claimed,
+            StoreOperation::NotAssessed,
+            None,
+            self.terminal(claimed, detail, true),
+        )
     }
 }
 

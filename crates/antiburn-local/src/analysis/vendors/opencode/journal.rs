@@ -1,4 +1,4 @@
-//! Bounded pre-alpha delivery from an immutable SQLite journal snapshot.
+//! Bounded delivery from an immutable SQLite journal snapshot.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -18,6 +18,10 @@ use crate::analysis::{
     ToolResultPosition, ToolResultStatus,
 };
 
+mod main_64;
+mod public;
+use public::PublicState;
+
 const PAGE_EVENTS: u64 = 4096;
 const CONTEXT_BYTES: usize = MAX_TOOL_RESULT_BYTES / 2;
 
@@ -33,12 +37,70 @@ pub struct OpenCodeJournalCursor {
     parser_revision: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     live: Option<LiveState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cold_replay: Option<ColdReplay>,
+    #[serde(skip)]
+    main_64: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ColdReplay {
+    output_sha256: [u8; 32],
+    assistant_projections: BTreeMap<String, Option<AssistantProjection>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssistantProjection {
+    parent_id: Value,
+}
+
+struct AssistantProjectionInputs {
+    values: BTreeMap<String, Option<AssistantProjection>>,
+    frozen: bool,
 }
 
 impl OpenCodeJournalCursor {
+    /// Decode only main parser 64's result-only live journal state 2.
+    pub fn decode_main_64_json(bytes: &[u8]) -> anyhow::Result<Self> {
+        main_64::decode(bytes)
+    }
+
+    /// Keep the read sequence and the validated conversion frontier on retry.
+    pub fn main_64_retry_json(&self, page: &Self) -> anyhow::Result<Option<String>> {
+        if !self.main_64 {
+            return Ok(None);
+        }
+        ensure!(
+            self.session_id == page.session_id
+                && self.owner_id == page.owner_id
+                && self.through_sequence <= page.through_sequence,
+            OpenCodeJournalReadError::SourceChanged
+        );
+        let frontier = page
+            .public_baseline()
+            .ok_or(OpenCodeJournalReadError::SourceChanged)?;
+        let mut cursor = self.clone();
+        cursor.live = Some(convert_live_v4(
+            cursor
+                .live
+                .take()
+                .ok_or(OpenCodeJournalReadError::SourceChanged)?,
+            frontier,
+        ));
+        cursor.parser_revision = PARSER_REVISION;
+        cursor.main_64 = false;
+        Ok(Some(serde_json::to_string(&cursor)?))
+    }
     /// The live window boundary replaces a legacy replay baseline on attachment.
     pub fn live_baseline(&self) -> Option<u64> {
         self.live.as_ref().map(|state| state.baseline)
+    }
+
+    /// New message kinds never use the older result seed boundary.
+    pub fn public_baseline(&self) -> Option<u64> {
+        self.live.as_ref().and_then(|state| state.public_baseline)
     }
 }
 
@@ -46,6 +108,7 @@ impl OpenCodeJournalCursor {
 #[derive(Debug, Clone)]
 pub struct OpenCodeToolResultPage {
     pub results: Vec<ToolResultObservation>,
+    pub evidence: crate::analysis::NativeEvidenceBatch,
     /// Ordered parent-message deletions. The publisher resolves durable tool bindings.
     pub message_removals: Vec<OpenCodeMessageRemoval>,
     pub cursor: OpenCodeJournalCursor,
@@ -61,6 +124,47 @@ pub struct OpenCodeToolResultPage {
     /// Strict replay does not collect these counters.
     pub live_input_events: usize,
     pub live_input_bytes: u64,
+    assistant_projections: BTreeMap<String, Option<AssistantProjection>>,
+}
+
+impl OpenCodeToolResultPage {
+    /// Retain the cold frontier and verify the same output on retry.
+    pub fn cold_retry_json(&self) -> anyhow::Result<Option<String>> {
+        let Some(live) = &self.cursor.live else {
+            return Ok(None);
+        };
+        ensure!(
+            self.cursor.parser_revision == PARSER_REVISION
+                && live.revision == LIVE_STATE_REVISION
+                && live.public_baseline == Some(self.cursor.through_sequence)
+                && self.cursor.cold_replay.is_none()
+                && !self.cursor.main_64,
+            OpenCodeJournalReadError::SourceChanged
+        );
+        let mut cursor = self.cursor.clone();
+        cursor.cold_replay = Some(ColdReplay {
+            output_sha256: self.cold_output_digest(PARSER_REVISION)?,
+            assistant_projections: self.assistant_projections.clone(),
+        });
+        let encoded = serde_json::to_string(&cursor)?;
+        ensure!(
+            encoded.len() <= 1024 * 1024,
+            "OpenCode live cursor exceeds its output budget"
+        );
+        Ok(Some(encoded))
+    }
+
+    fn cold_output_digest(&self, parser_revision: i64) -> anyhow::Result<[u8; 32]> {
+        let mut cursor = self.cursor.clone();
+        cursor.parser_revision = parser_revision;
+        Ok(Sha256::digest(serde_json::to_vec(&(
+            &cursor,
+            &self.evidence,
+            self.history_complete,
+            &self.assistant_projections,
+        ))?)
+        .into())
+    }
 }
 
 /// A validated whole-message deletion from the live journal.
@@ -89,7 +193,7 @@ impl std::fmt::Display for OpenCodeJournalReadError {
 
 impl std::error::Error for OpenCodeJournalReadError {}
 
-/// Read the next pre-alpha page without changing the source database.
+/// Read the next page without changing the source database.
 /// Reject a rewritten, removed, or reset prefix. A caller must not advance its
 /// persisted cursor until its result publication commits.
 pub fn read_opencode_tool_result_page(
@@ -134,6 +238,7 @@ pub fn opencode_journal_has_new_events(
         || cursor.owner_id != state.owner
         || cursor.parser_revision != PARSER_REVISION
         || cursor.live.is_none()
+        || cursor.cold_replay.is_some()
         || cursor.through_sequence != state.latest)
 }
 
@@ -199,6 +304,11 @@ struct MessageHeader {
     parent_id: Option<String>,
     #[serde(rename = "sessionID")]
     session_id: Option<String>,
+    #[serde(rename = "providerID")]
+    provider_id: Option<Value>,
+    #[serde(rename = "modelID")]
+    model_id: Option<Value>,
+    path: Option<Value>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -448,7 +558,7 @@ pub(super) fn read(
     if let Some(cursor) = after {
         ensure!(
             cursor.live.is_none()
-                && cursor.parser_revision == PARSER_REVISION
+                && compatible_parser_revision(cursor.parser_revision)
                 && cursor.session_id == session
                 && cursor.owner_id == owner
                 && cursor.through_sequence <= latest,
@@ -487,6 +597,19 @@ pub(super) fn read(
             requests.observe(&event.kind, &data, session, event.sequence);
             if let Some(id) = part_id(&event.kind, &data).filter(|id| selected.contains(id)) {
                 let state = parts.entry(id.clone()).or_default();
+                if state.first_terminal.is_none() && data["part"]["type"] == "tool" {
+                    state.facts = data["part"]["messageID"]
+                        .as_str()
+                        .zip(data["part"]["tool"].as_str())
+                        .map(|(message, name)| {
+                            requests.tool_facts(
+                                session,
+                                message,
+                                name,
+                                data["part"]["state"].get("input"),
+                            )
+                        });
+                }
                 let mut result = state.observe(&event.kind, &data, session, &id, event.sequence);
                 source_gap |= state.invalid
                     || (event.kind == "message.part.removed.1" && state.identity.is_none());
@@ -576,7 +699,22 @@ pub(super) fn read(
         tail || through == latest || advanced,
         OpenCodeJournalReadError::IncompleteHistory
     );
+    let evidence = crate::analysis::NativeEvidenceBatch {
+        source_format: SourceFormat::OpenCodeSqliteV1,
+        events: results
+            .iter()
+            .cloned()
+            .map(|result| crate::analysis::NativeEvidenceEvent {
+                fact: crate::analysis::NativeEvidenceFact::Message(
+                    crate::analysis::NativeMessageObservation::ToolResult(result),
+                ),
+                live_eligible: true,
+            })
+            .collect(),
+        history_complete: root && requests.main_session() && ordered && !source_gap,
+    };
     Ok(Some(OpenCodeToolResultPage {
+        evidence,
         results: results.into(),
         message_removals: Vec::new(),
         cursor: OpenCodeJournalCursor {
@@ -586,6 +724,8 @@ pub(super) fn read(
             prefix_hash: accepted_hash,
             parser_revision: PARSER_REVISION,
             live: None,
+            cold_replay: None,
+            main_64: false,
         },
         has_more: through < latest,
         snapshot_end: latest,
@@ -599,10 +739,11 @@ pub(super) fn read(
             && through == latest,
         live_input_events: 0,
         live_input_bytes: 0,
+        assistant_projections: BTreeMap::new(),
     }))
 }
 
-const LIVE_STATE_REVISION: u32 = 2;
+const LIVE_STATE_REVISION: u32 = 5;
 const LIVE_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 const LIVE_RESULTS: usize = 40;
 const LIVE_PARTS: usize = 128;
@@ -611,6 +752,7 @@ const LIVE_REQUEST_RECORDS: usize = 128;
 const LIVE_REQUEST_BYTES: usize = 64 * 1024;
 const LIVE_CONTEXT_BYTES: usize = 256 * 1024;
 const LIVE_CONTEXTS: usize = 16;
+const ASSISTANT_PROJECTION_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LiveState {
@@ -624,6 +766,33 @@ struct LiveState {
     next_context: u64,
     history_safe: bool,
     evidence_gap: bool,
+    #[serde(default)]
+    public: PublicState,
+    #[serde(default)]
+    public_baseline: Option<u64>,
+}
+
+impl LiveState {
+    fn has_unsafe_ownership(&self) -> bool {
+        // Message removals use the same flag but have their own exact removal events.
+        self.parts.values().any(|part| {
+            part.unsafe_ownership
+                && part
+                    .state
+                    .identity
+                    .as_ref()
+                    .is_some_and(|(owner, _, _, _)| !self.requests.is_removed_message(owner))
+        })
+    }
+}
+
+/// Convert only the immediate result-only predecessor after source validation.
+fn convert_live_v4(mut live: LiveState, frontier: u64) -> LiveState {
+    live.revision = LIVE_STATE_REVISION;
+    live.public = PublicState::default();
+    live.public.seed_historical_users(&live.requests, frontier);
+    live.public_baseline = Some(frontier);
+    live
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -638,6 +807,11 @@ impl LivePart {
     fn retained_bytes(&self, id: &str) -> usize {
         id.len()
             + 128
+            + self
+                .state
+                .facts
+                .as_ref()
+                .map_or(0, crate::analysis::NativeToolFacts::retained_bytes)
             + self
                 .state
                 .identity
@@ -706,6 +880,71 @@ fn live_boundary(
     boundary.ok_or_else(|| OpenCodeJournalReadError::SourceChanged.into())
 }
 
+fn compatible_parser_revision(revision: i64) -> bool {
+    revision == PARSER_REVISION || matches!(revision, 63..=66)
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn known_parser_numbers_do_not_admit_main_journal_state_two() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE event (id TEXT, type TEXT, aggregate_id TEXT, seq INTEGER, data TEXT);
+                 CREATE UNIQUE INDEX event_aggregate_seq_idx ON event(aggregate_id, seq);
+                 INSERT INTO event VALUES ('initial', 'session.created.1', 'root', 0, '{}');",
+            )
+            .unwrap();
+        let boundary = live_boundary(&connection, "root", 0).unwrap();
+        let current = LiveState {
+            revision: LIVE_STATE_REVISION,
+            baseline: 0,
+            origin: boundary,
+            boundary,
+            requests: Default::default(),
+            parts: Default::default(),
+            contexts: Default::default(),
+            next_context: 0,
+            history_safe: true,
+            evidence_gap: false,
+            public: Default::default(),
+            public_baseline: Some(0),
+        };
+        let metadata = JournalMetadata {
+            latest: 0,
+            owner: None,
+            root: true,
+            all_events_visible: true,
+        };
+        for parser_revision in [63, 64, 65, 66, PARSER_REVISION] {
+            let cursor = OpenCodeJournalCursor {
+                session_id: "root".into(),
+                owner_id: None,
+                through_sequence: 0,
+                prefix_hash: [0; 32],
+                parser_revision,
+                live: Some(current.clone()),
+                cold_replay: None,
+                main_64: false,
+            };
+            validate_live(&connection, "root", &cursor, &current, &metadata).unwrap();
+            for revision in [2, 4, 6] {
+                let mut incompatible = current.clone();
+                incompatible.revision = revision;
+                let error = validate_live(&connection, "root", &cursor, &incompatible, &metadata)
+                    .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<OpenCodeJournalReadError>(),
+                    Some(&OpenCodeJournalReadError::SourceChanged)
+                );
+            }
+        }
+    }
+}
+
 fn validate_live(
     connection: &Connection,
     session: &str,
@@ -716,9 +955,38 @@ fn validate_live(
     ensure!(
         cursor.session_id == session
             && cursor.owner_id == metadata.owner
-            && cursor.parser_revision == PARSER_REVISION
-            && live.revision == LIVE_STATE_REVISION
+            && ((compatible_parser_revision(cursor.parser_revision)
+                && live.revision == LIVE_STATE_REVISION
+                && live
+                    .public_baseline
+                    .is_some_and(|baseline| baseline <= metadata.latest))
+                || (cursor.parser_revision == 62 && live.revision == 4)
+                || (cursor.main_64
+                    && metadata.root
+                    && cursor.parser_revision == 64
+                    && live.revision == 2
+                    && live.public_baseline.is_none()
+                    && live.public == PublicState::default()))
             && cursor.through_sequence <= metadata.latest
+            && cursor.cold_replay.as_ref().is_none_or(|replay| {
+                matches!(cursor.parser_revision, 66 | PARSER_REVISION)
+                    && live.revision == LIVE_STATE_REVISION
+                    && live.baseline <= cursor.through_sequence
+                    && live.public_baseline == Some(cursor.through_sequence)
+                    && !cursor.main_64
+                    && replay.assistant_projections.len() <= LIVE_RESULTS
+                    && replay
+                        .assistant_projections
+                        .iter()
+                        .all(|(message, projection)| {
+                            !message.is_empty()
+                                && message.len() <= EVIDENCE_STRING_CAP
+                                && projection.as_ref().is_none_or(|projection| {
+                                    projection.parent_id.to_string().len()
+                                        <= ASSISTANT_PROJECTION_BYTES
+                                })
+                        })
+            })
             && live.origin == live_boundary(connection, session, 0)?
             && live.boundary == live_boundary(connection, session, cursor.through_sequence)?,
         OpenCodeJournalReadError::SourceChanged
@@ -783,6 +1051,11 @@ fn read_live(
 ) -> anyhow::Result<OpenCodeToolResultPage> {
     require_live_index(connection)?;
     let metadata = metadata(connection, session)?.ok_or(OpenCodeJournalReadError::Unavailable)?;
+    let cold_replay = after.and_then(|cursor| cursor.cold_replay.as_ref());
+    ensure!(
+        cold_replay.is_none() || after.is_some_and(|cursor| cursor.live.is_some()),
+        OpenCodeJournalReadError::SourceChanged
+    );
     let restored = after.and_then(|cursor| cursor.live.as_ref().map(|live| (cursor, live)));
     if let Some((cursor, live)) = restored {
         validate_live(connection, session, cursor, live, &metadata)?;
@@ -790,26 +1063,44 @@ fn read_live(
         ensure!(
             cursor.session_id == session
                 && cursor.owner_id == metadata.owner
+                && (compatible_parser_revision(cursor.parser_revision)
+                    || cursor.parser_revision == 62)
                 && cursor.through_sequence <= metadata.latest,
             OpenCodeJournalReadError::SourceChanged
         );
     }
+    let latest = if cold_replay.is_some() {
+        after.expect("a cold replay has a cursor").through_sequence
+    } else {
+        metadata.latest
+    };
+    // Rebuild the original bounded window before reading its appended suffix.
+    let restored = restored.filter(|_| cold_replay.is_none());
     let (events, input_bytes) = live_events(
         connection,
         session,
         restored.map(|(cursor, _)| cursor.through_sequence),
-        metadata.latest,
+        latest,
         cancel,
     )?;
     let cold = restored.is_none();
+    let mut assistant_projections = AssistantProjectionInputs {
+        values: cold_replay
+            .map(|replay| replay.assistant_projections.clone())
+            .unwrap_or_default(),
+        frozen: cold_replay.is_some(),
+    };
     let selected = cold.then(|| select_live_window(&events));
     let mut live = match restored {
+        Some((cursor, state)) if state.revision == 4 || cursor.main_64 => {
+            convert_live_v4(state.clone(), metadata.latest)
+        }
         Some((_, state)) => state.clone(),
         None => LiveState {
             revision: LIVE_STATE_REVISION,
             baseline: events
                 .first()
-                .map_or(metadata.latest, |event| event.sequence.saturating_sub(1)),
+                .map_or(latest, |event| event.sequence.saturating_sub(1)),
             origin: live_boundary(connection, session, 0)?,
             boundary: [0; 32],
             requests: request_context::RequestHistory::partial(metadata.root),
@@ -818,6 +1109,8 @@ fn read_live(
             next_context: 0,
             history_safe: true,
             evidence_gap: false,
+            public: PublicState::default(),
+            public_baseline: Some(latest),
         },
     };
     let mut through = restored.map_or(0, |(cursor, _)| cursor.through_sequence);
@@ -828,28 +1121,87 @@ fn read_live(
     let mut results = VecDeque::new();
     let mut message_removals = Vec::new();
     let mut output_bytes = 0;
+    let mut evidence = Vec::new();
+    let mut unsafe_ownership = live.has_unsafe_ownership();
     for (index, event) in events.iter().enumerate() {
         ensure!(!cancel(), "OpenCode live read was cancelled");
         ensure!(
             event.sequence == expected_start + index as u64,
             OpenCodeJournalReadError::IncompleteHistory
         );
-        if !cold
-            && !results.is_empty()
-            && (results.len() >= MAX_TOOL_RESULT_OBSERVATIONS
-                || output_bytes + event.bytes as usize + LIVE_REQUEST_BYTES + 16384
-                    > MAX_TOOL_RESULT_BYTES)
-        {
+        if !cold && evidence.len() >= LIVE_RESULTS {
             break;
         }
+        let previous_live = (!cold).then(|| live.clone());
+        let mut next_live = live;
         let result = observe_live(
             connection,
             session,
-            &mut live,
+            &mut next_live,
             event,
             selected.as_ref(),
             metadata.root,
+            &mut assistant_projections,
         )?;
+        let public_baseline = next_live.public_baseline.unwrap_or(latest);
+        let mut next_public = std::mem::take(&mut next_live.public);
+        let mut event_evidence = next_public.observe(
+            session,
+            event,
+            &next_live.requests,
+            metadata.root && next_live.history_safe,
+            public_baseline,
+        );
+        next_live.public = next_public;
+        for fact in &mut event_evidence {
+            let first = match &fact.fact {
+                crate::analysis::NativeEvidenceFact::Message(
+                    crate::analysis::NativeMessageObservation::User(user),
+                ) => user.context.first_eligible_position,
+                crate::analysis::NativeEvidenceFact::Message(
+                    crate::analysis::NativeMessageObservation::Public(public),
+                ) => public
+                    .context
+                    .as_ref()
+                    .map_or(public.position, |context| context.first_eligible_position),
+                _ => ToolResultPosition::OpenCodeEvent {
+                    sequence: event.sequence,
+                    item_index: 0,
+                },
+            };
+            fact.live_eligible = matches!(first, ToolResultPosition::OpenCodeEvent { sequence, .. } if sequence > public_baseline);
+        }
+        if let Some(result) = &result {
+            event_evidence.push(crate::analysis::NativeEvidenceEvent {
+                fact: crate::analysis::NativeEvidenceFact::Message(
+                    crate::analysis::NativeMessageObservation::ToolResult(result.clone()),
+                ),
+                live_eligible: event.sequence > next_live.baseline,
+            });
+        }
+        if cold {
+            event_evidence.clear();
+        }
+        let mut event_bytes = serde_json::to_vec(&event_evidence)?.len();
+        if !cold
+            && (!evidence.is_empty())
+            && (evidence.len() + event_evidence.len() > LIVE_RESULTS
+                || output_bytes + event_bytes > MAX_TOOL_RESULT_BYTES)
+        {
+            live = previous_live.expect("a live page retains the prior event state");
+            break;
+        }
+        if event_evidence.len() > LIVE_RESULTS || event_bytes > MAX_TOOL_RESULT_BYTES {
+            next_live.evidence_gap = true;
+            event_evidence.clear();
+            event_bytes = 0;
+        }
+        live = next_live;
+        unsafe_ownership |= live.has_unsafe_ownership();
+        if !cold {
+            output_bytes += event_bytes;
+            evidence.extend(event_evidence);
+        }
         if let Some(message_id) = removed_message(event, session) {
             message_removals.push(OpenCodeMessageRemoval {
                 message_id,
@@ -859,44 +1211,103 @@ fn read_live(
         if let Some(result) = result {
             let size = serde_json::to_vec(&result)?.len();
             ensure!(
-                size <= MAX_TOOL_RESULT_BYTES
-                    && (cold || output_bytes + size <= MAX_TOOL_RESULT_BYTES),
+                size <= MAX_TOOL_RESULT_BYTES && (cold || output_bytes <= MAX_TOOL_RESULT_BYTES),
                 "OpenCode live result exceeds its output budget"
             );
             if cold {
                 retain_latest(&mut results, &mut output_bytes, result, size);
             } else {
-                output_bytes += size;
                 results.push_back(result);
             }
         }
         through = event.sequence;
     }
     ensure!(
-        through == metadata.latest || !events.is_empty(),
+        through == latest || !events.is_empty(),
         OpenCodeJournalReadError::IncompleteHistory
     );
     live.boundary = live_boundary(connection, session, through)?;
     let history_complete =
         live.history_safe && !live.evidence_gap && metadata.root && live.requests.main_session();
-    Ok(OpenCodeToolResultPage {
+    if cold {
+        live.public.seed_historical_users(&live.requests, latest);
+        evidence = results
+            .iter()
+            .cloned()
+            .map(|result| crate::analysis::NativeEvidenceEvent {
+                fact: crate::analysis::NativeEvidenceFact::Message(
+                    crate::analysis::NativeMessageObservation::ToolResult(result),
+                ),
+                live_eligible: true,
+            })
+            .collect();
+    }
+    let admission_failure = if !metadata.root {
+        Some(ToolResultCompleteness::UnsafeOwnership)
+    } else {
+        live.requests
+            .admission_failure()
+            .or_else(|| (!live.history_safe).then_some(ToolResultCompleteness::UnsafeOrder))
+            .or_else(|| unsafe_ownership.then_some(ToolResultCompleteness::UnsafeOwnership))
+    };
+    let history_complete = history_complete && admission_failure.is_none();
+    let evidence_history_complete = history_complete && live.public.history_complete();
+    if let Some(reason) = admission_failure {
+        // Unsafe admission replaces this page's unusable facts and always fits the output budget.
+        evidence = vec![crate::analysis::NativeEvidenceEvent {
+            fact: crate::analysis::NativeEvidenceFact::AdmissionFailure(
+                crate::analysis::NativeAdmissionFailure {
+                    source_format: SourceFormat::OpenCodeSqliteV1,
+                    session_id: session.to_owned(),
+                    position: ToolResultPosition::OpenCodeEvent {
+                        sequence: through,
+                        item_index: u32::MAX,
+                    },
+                    reason,
+                },
+            ),
+            live_eligible: true,
+        }];
+    }
+    let cursor = OpenCodeJournalCursor {
+        session_id: session.to_owned(),
+        owner_id: metadata.owner,
+        through_sequence: through,
+        prefix_hash: [0; 32],
+        parser_revision: PARSER_REVISION,
+        live: Some(live),
+        cold_replay: None,
+        main_64: false,
+    };
+    ensure!(
+        serde_json::to_vec(&cursor)?.len() <= 1024 * 1024,
+        "OpenCode live cursor exceeds its output budget"
+    );
+    let page = OpenCodeToolResultPage {
+        evidence: crate::analysis::NativeEvidenceBatch {
+            source_format: SourceFormat::OpenCodeSqliteV1,
+            events: evidence,
+            history_complete: evidence_history_complete,
+        },
         results: results.into(),
         message_removals,
-        cursor: OpenCodeJournalCursor {
-            session_id: session.to_owned(),
-            owner_id: metadata.owner,
-            through_sequence: through,
-            prefix_hash: [0; 32],
-            parser_revision: PARSER_REVISION,
-            live: Some(live),
-        },
+        cursor,
         has_more: through < metadata.latest,
         snapshot_end: metadata.latest,
         history_complete,
         complete: false,
         live_input_events: events.len(),
         live_input_bytes: input_bytes,
-    })
+        assistant_projections: assistant_projections.values,
+    };
+    if let Some(replay) = cold_replay {
+        let parser_revision = after.expect("a cold replay has a cursor").parser_revision;
+        ensure!(
+            page.cold_output_digest(parser_revision)? == replay.output_sha256,
+            OpenCodeJournalReadError::SourceChanged
+        );
+    }
+    Ok(page)
 }
 
 fn retain_latest(
@@ -1009,6 +1420,7 @@ fn observe_live(
     event: &Event,
     selected: Option<&HashSet<String>>,
     root: bool,
+    assistant_projections: &mut AssistantProjectionInputs,
 ) -> anyhow::Result<Option<ToolResultObservation>> {
     let cold = selected.is_some();
     let Some(data) = event
@@ -1021,9 +1433,32 @@ fn observe_live(
     };
     let message_removal = removed_message(event, session);
     live.history_safe &= valid_event(&event.kind, &data, session) || message_removal.is_some();
+    if event.kind == "message.part.updated.1"
+        && identity(&data["part"]["id"])
+            .is_some_and(|id| live.public.is_removed_part(id) || live.requests.is_removed_part(id))
+    {
+        return Ok(None);
+    }
+    let part_removal = (event.kind == "message.part.removed.1" && data["sessionID"] == session)
+        .then(|| identity(&data["partID"]).zip(identity(&data["messageID"])))
+        .flatten();
+    let public_part_kind = part_removal
+        .and_then(|(id, owner)| live.public.non_tool_part_kind(id, owner))
+        .map(str::to_owned);
+    let bound_non_tool_removal = part_removal.is_some_and(|(id, owner)| {
+        public_part_kind.is_some() || live.requests.owns_non_tool_part(id, owner)
+    });
     if let Some(message) = &message_removal {
         live.requests
             .remove_message(message, LIVE_REQUEST_RECORDS, LIVE_REQUEST_BYTES);
+    } else if let Some((id, owner)) = part_removal {
+        live.requests.remove_part(
+            id,
+            owner,
+            public_part_kind.as_deref(),
+            LIVE_REQUEST_RECORDS,
+            LIVE_REQUEST_BYTES,
+        );
     } else {
         live.requests
             .observe(&event.kind, &data, session, event.sequence);
@@ -1058,7 +1493,7 @@ fn observe_live(
     let publish = selected.is_none_or(|selected| selected.contains(&id));
     let known = live.parts.contains_key(&id);
     if !known && event.kind == "message.part.removed.1" {
-        live.evidence_gap = true;
+        live.evidence_gap |= !bound_non_tool_removal;
         return Ok(None);
     }
     if !known && event.kind == "message.part.updated.1" && data["part"]["type"] != "tool" {
@@ -1070,6 +1505,15 @@ fn observe_live(
         last_sequence: event.sequence,
         unsafe_ownership: false,
     });
+    if entry.state.first_terminal.is_none() && data["part"]["type"] == "tool" {
+        entry.state.facts = data["part"]["messageID"]
+            .as_str()
+            .zip(data["part"]["tool"].as_str())
+            .map(|(message, name)| {
+                live.requests
+                    .tool_facts(session, message, name, data["part"]["state"].get("input"))
+            });
+    }
     let result = entry
         .state
         .observe(&event.kind, &data, session, &id, event.sequence);
@@ -1113,6 +1557,7 @@ fn observe_live(
                 message,
                 event.sequence,
                 &mut live.requests,
+                assistant_projections,
             )?;
         }
         let mut context = live.requests.freeze(session, message, event.sequence);
@@ -1180,19 +1625,44 @@ fn seed_live_assistant(
     message: &str,
     sequence: u64,
     requests: &mut request_context::RequestHistory,
+    projections: &mut AssistantProjectionInputs,
 ) -> anyhow::Result<()> {
     if requests.has_message(message) || requests.is_removed_message(message) {
         return Ok(());
     }
-    let info: Option<String> = connection.query_row(
-        "SELECT data FROM message WHERE id = ?1 AND session_id = ?2 AND length(CAST(data AS BLOB)) <= 16384",
-        params![message, session], |row| row.get(0)).optional()?;
-    if let Some(info) = info.and_then(|info| serde_json::from_str::<Value>(&info).ok())
-        && info["role"] == "assistant"
-    {
+    let projection = if let Some(projection) = projections.values.get(message) {
+        projection.clone()
+    } else {
+        ensure!(!projections.frozen, OpenCodeJournalReadError::SourceChanged);
+        ensure!(
+            projections.values.len() < LIVE_RESULTS,
+            "OpenCode cold ownership lookups exceed their count limit"
+        );
+        let info: Option<String> = connection.query_row(
+            "SELECT data FROM message WHERE id = ?1 AND session_id = ?2 AND length(CAST(data AS BLOB)) <= ?3",
+            params![message, session, ASSISTANT_PROJECTION_BYTES], |row| row.get(0)).optional()?;
+        let projection = info
+            .and_then(|info| serde_json::from_str::<Value>(&info).ok())
+            .filter(|info| info["role"] == "assistant")
+            .map(|info| AssistantProjection {
+                parent_id: info["parentID"].clone(),
+            });
+        ensure!(
+            projection.as_ref().is_none_or(|projection| {
+                projection.parent_id.to_string().len() <= ASSISTANT_PROJECTION_BYTES
+            }),
+            "OpenCode cold ownership lookup exceeds its byte limit"
+        );
+        // Retain absent lookups so later projection rows cannot change replay.
+        projections
+            .values
+            .insert(message.to_owned(), projection.clone());
+        projection
+    };
+    if let Some(projection) = projection {
         // Projection metadata supplies ownership only. It supplies no historical request text.
         let data = serde_json::json!({"sessionID": session, "info": {
-            "id": message, "sessionID": session, "role": "assistant", "parentID": info["parentID"]
+            "id": message, "sessionID": session, "role": "assistant", "parentID": projection.parent_id
         }});
         requests.observe("message.updated.1", &data, session, sequence);
         requests.bound(LIVE_REQUEST_RECORDS, LIVE_REQUEST_BYTES);
@@ -1276,6 +1746,10 @@ fn valid_event(kind: &str, data: &Value, session: &str) -> bool {
     }
 }
 
+#[cfg(test)]
+#[path = "journal/admission_tests.rs"]
+mod admission_tests;
+
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PartState {
     identity: Option<(String, Option<String>, Option<String>, String)>,
@@ -1283,6 +1757,8 @@ struct PartState {
     first_terminal: Option<u64>,
     context: Option<ToolResultContext>,
     invalid: bool,
+    #[serde(default)]
+    facts: Option<crate::analysis::NativeToolFacts>,
 }
 
 impl PartState {
@@ -1348,7 +1824,18 @@ impl PartState {
         if terminal {
             self.first_terminal.get_or_insert(sequence);
         }
+        let mut facts = (!self.invalid).then(|| self.facts.clone()).flatten();
+        if let Some(facts) = &mut facts {
+            facts.operation_paths = None;
+            if part
+                .pointer("/metadata/providerExecuted")
+                .is_some_and(|value| value != false)
+            {
+                facts.category = Some(crate::analysis::CheckToolCategory::Other);
+            }
+        }
         Some(ToolResultObservation {
+            facts,
             outcome: None,
             provider_executed: None,
             source_format: SourceFormat::OpenCodeSqliteV1,

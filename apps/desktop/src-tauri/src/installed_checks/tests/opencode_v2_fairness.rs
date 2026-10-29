@@ -133,7 +133,7 @@ async fn hot_v2_work_rotates_with_file_and_multiple_definitions_without_a_clock_
     std::fs::write(fixture.global.join("failed-retry-loop.yml"), &source).unwrap();
     std::fs::write(
         fixture.global.join("second.yml"),
-        source.replace("name: Failed retry loop", "name: Second check"),
+        source.replace("name: Synthetic retry review", "name: Second check"),
     )
     .unwrap();
     fixture

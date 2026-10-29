@@ -39,6 +39,155 @@ fn checks_command_reads_the_selected_database() {
 }
 
 #[test]
+fn malformed_present_legacy_schema_fails_without_json_output() {
+    let temp = tempdir().unwrap();
+    let data_root = platform_data_root(temp.path());
+    let database_dir = data_root.join("ai.antiburn.desktop");
+    std::fs::create_dir_all(&database_dir).unwrap();
+    let database_path = database_dir.join("antiburn.sqlite3");
+    create_fixture_database(&database_path);
+    let connection = Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE burn_check_assessment;
+        CREATE TABLE burn_check_assessment (check_id TEXT);",
+        )
+        .unwrap();
+    drop(connection);
+    let before = std::fs::read(&database_path).unwrap();
+    let mut command = default_lookup_command(temp.path(), &data_root);
+    let output = command
+        .args(["checks", "argument-session"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("could not query Antiburn check assessments")
+    );
+    assert_eq!(std::fs::read(database_path).unwrap(), before);
+}
+
+#[test]
+fn legacy_yaml_registry_keeps_evidence_and_native_findings_read_only() {
+    let temp = tempdir().unwrap();
+    let data_root = platform_data_root(temp.path());
+    let database_dir = data_root.join("ai.antiburn.desktop");
+    std::fs::create_dir_all(&database_dir).unwrap();
+    let database_path = database_dir.join("antiburn.sqlite3");
+    let connection = Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(include_str!(
+            "../../../crates/antiburn-checks-store/tests/fixtures/registry_v82.sql"
+        ))
+        .unwrap();
+    let mut evidence = SessionEvidenceAccumulator::new(EvidenceSource {
+        agent: "codex".to_owned(),
+        session_id: "s1".to_owned(),
+        kind: SourceKind::File,
+        capabilities: SourceCapabilities::codex(),
+    })
+    .evidence(&TurnFacts::default());
+    evidence.context = EvidenceValue::Complete(ContextEvidence {
+        max_request_context_tokens: ReportCatalogs::default().depth_cap_tokens + 1,
+        top_depth_examples: Vec::new(),
+    });
+    connection
+        .execute(
+            "INSERT INTO session_evidence
+                (environment_key, agent, session_id, status, evidence_json)
+             VALUES ('native', 'codex', 's1', 'ready', ?1)",
+            [serde_json::to_string(&evidence).unwrap()],
+        )
+        .unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO burn_check_assessment
+                (environment_key, agent, session_id, check_id, status, input_revision,
+                 result_revision, incarnation, request_count, created_at_epoch,
+                 updated_at_epoch, progress_json, result_json)
+             VALUES ('native', 'codex', 's1', 'legacy-check', 'completed', 'revision',
+                 'revision', 7, 1, 1, 1, '{}', '{\"findings\":[\"Saved native finding.\"]}');",
+        )
+        .unwrap();
+    connection.pragma_update(None, "query_only", true).unwrap();
+    assert!(connection.execute("DELETE FROM session", []).is_err());
+    drop(connection);
+    let before = std::fs::read(&database_path).unwrap();
+    let mut command = default_lookup_command(temp.path(), &data_root);
+    let output = command.args(["checks", "s1"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["freshness_evaluated"], false);
+    assert!(response.get("evidence").is_none());
+    let checks = response["checks"].as_array().unwrap();
+    assert_eq!(checks.len(), 2);
+    assert!(checks.iter().any(|check| {
+        check["source"] == "burn_check_assessment" && check["check_id"] == "legacy-check"
+    }));
+    assert!(checks.iter().any(|check| {
+        check["source"] == "session_evidence_badge" && check["check_id"] == "sessions_over_depth"
+    }));
+    assert!(
+        checks
+            .iter()
+            .all(|check| check["source"] != "predefined_yaml")
+    );
+    assert_eq!(std::fs::read(&database_path).unwrap(), before);
+    let connection =
+        Connection::open_with_flags(&database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        82
+    );
+}
+
+#[test]
+fn malformed_yaml_projection_schema_still_fails_the_cli_read() {
+    for (sql, expected) in [
+        ("PRAGMA user_version = 92", "opencode_v2_capture"),
+        (
+            "ALTER TABLE burn_check_assessment_history DROP COLUMN trigger_position",
+            "h.trigger_position",
+        ),
+    ] {
+        let temp = tempdir().unwrap();
+        let data_root = platform_data_root(temp.path());
+        let database_dir = data_root.join("ai.antiburn.desktop");
+        std::fs::create_dir_all(&database_dir).unwrap();
+        let database_path = database_dir.join("antiburn.sqlite3");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(include_str!(
+                "../../../crates/antiburn-checks-store/tests/fixtures/registry_v82.sql"
+            ))
+            .unwrap();
+        connection.execute_batch(sql).unwrap();
+        drop(connection);
+        let before = std::fs::read(&database_path).unwrap();
+        let mut command = default_lookup_command(temp.path(), &data_root);
+        let output = command.args(["checks", "s1"]).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("could not read predefined checks"),
+            "{error}"
+        );
+        assert!(error.contains(expected), "{error}");
+        assert_eq!(std::fs::read(&database_path).unwrap(), before);
+    }
+}
+
+#[test]
 fn checks_command_returns_only_new_problematic_findings() {
     let temp = tempdir().unwrap();
     let data_root = platform_data_root(temp.path());
@@ -407,8 +556,8 @@ fn delivery_fixture(
         )
         .unwrap();
     connection.execute("INSERT INTO burn_check_runtime_definition VALUES ('retry-loop',?1,2,'revision','Retry loop','available')", [scope]).unwrap();
-    connection.execute("INSERT INTO burn_check_current_status VALUES ('retry-loop',?1,2,'[\"native\",\"claude-code\",\"s1\"]','failure','a1',1)", [scope]).unwrap();
-    connection.execute("INSERT INTO burn_check_assessment_history VALUES ('a1',2,'assessed',1,?1,123)", [r#"{"outcomes":[{"outcome":{"Applied":{"result":"Failure","message":"Try another approach."}}}]}"#]).unwrap();
+    connection.execute("INSERT INTO burn_check_current_status VALUES ('retry-loop',?1,2,'[\"native\",\"claude-code\",\"s1\"]','failure','a1',1,0)", [scope]).unwrap();
+    connection.execute("INSERT INTO burn_check_assessment_history VALUES ('a1',2,'assessed',1,?1,123,'retry-loop',?2,'[\"native\",\"claude-code\",\"s1\"]',0)", rusqlite::params![r#"{"current_status":"Failure","outcomes":[{"index":0,"outcome":{"Applied":{"result":"Failure","message":"Try another approach."}}}]}"#, scope]).unwrap();
     let config_path = root.join("delivery-config.json");
     std::fs::write(
         &config_path,
@@ -469,6 +618,7 @@ fn cursor_desktop_delivery_reports_ready_and_excludes_other_sources() {
             [],
         )
         .unwrap();
+    connection.execute("UPDATE burn_check_assessment_history SET branch_key = '[\"native\",\"cursor\",\"s1\"]'", []).unwrap();
     let response = delivery_call(temp.path(), &config, "cursor:context", None);
     assert_eq!(response["state"], "ready");
     assert_eq!(response["snapshot"][0]["status"], "failure");
@@ -522,7 +672,7 @@ fn delivery_command_acknowledges_independent_consumers_without_database_writes()
             [],
         )
         .unwrap();
-    connection.execute("UPDATE burn_check_assessment_history SET actions_json = ?1", [r#"{"outcomes":[{"outcome":{"Applied":{"result":"Success","message":"Assessment cleared."}}}]}"#]).unwrap();
+    connection.execute("UPDATE burn_check_assessment_history SET actions_json = ?1", [r#"{"current_status":"Success","outcomes":[{"index":0,"outcome":{"Applied":{"result":"Success","message":"Assessment cleared."}}}]}"#]).unwrap();
     let clear = delivery_call(temp.path(), &config, "claude-code:context", None);
     assert_eq!(clear["updates"][0]["kind"], "cleared");
     delivery_call(
@@ -582,15 +732,7 @@ fn ordinary_yaml_reads_do_not_consume_native_delivery() {
             "ALTER TABLE session_evidence ADD COLUMN processed_fingerprint TEXT;
         ALTER TABLE session_evidence ADD COLUMN evidence_json TEXT;
         ALTER TABLE session_evidence ADD COLUMN diagnostics_json TEXT;
-        ALTER TABLE session_evidence ADD COLUMN published_fence INTEGER;
-        CREATE TABLE burn_check_assessment AS SELECT
-            NULL AS environment_key, NULL AS agent, NULL AS session_id, NULL AS check_id,
-            NULL AS status, NULL AS input_revision, NULL AS evaluator_revision,
-            NULL AS result_revision, NULL AS incarnation, NULL AS boundary_generation,
-            NULL AS boundary_activity_cursor, NULL AS boundary_at_epoch, NULL AS source_generation,
-            NULL AS source_fingerprint, NULL AS published_fence, NULL AS request_count,
-            NULL AS created_at_epoch, NULL AS updated_at_epoch, NULL AS last_error_category,
-            NULL AS progress_json, NULL AS result_json WHERE 0;",
+        ALTER TABLE session_evidence ADD COLUMN published_fence INTEGER;",
         )
         .unwrap();
     let ordinary = || {
@@ -645,6 +787,29 @@ fn saved_ready_findings_remain_deliverable_during_reassessment() {
         .unwrap();
     let repeated = delivery_call(temp.path(), &config, "claude-code:context", None);
     assert_eq!(repeated["snapshot"][0]["assessed_at_epoch"], 456);
+    assert_eq!(repeated["updates"], json!([]));
+}
+
+#[test]
+fn later_no_write_does_not_replace_or_repeat_a_saved_delivery() {
+    let temp = tempdir().unwrap();
+    let (connection, _, config) = delivery_fixture(temp.path());
+    let first = delivery_call(temp.path(), &config, "claude-code:context", None);
+    delivery_call(
+        temp.path(),
+        &config,
+        "claude-code:context",
+        first["receipt"].as_str(),
+    );
+    connection.execute(
+        "INSERT INTO burn_check_assessment_history
+         SELECT 'a2',generation,'assessed',1,?1,456,check_id,activation_scope_key,branch_key,1
+         FROM burn_check_assessment_history WHERE assessment_id = 'a1'",
+        [r#"{"current_status":"Failure","outcomes":[{"index":0,"outcome":"SkippedConditionFalse"}]}"#],
+    ).unwrap();
+    let repeated = delivery_call(temp.path(), &config, "claude-code:context", None);
+    assert_eq!(repeated["snapshot"][0]["message"], "Try another approach.");
+    assert_eq!(repeated["snapshot"][0]["assessed_at_epoch"], 123);
     assert_eq!(repeated["updates"], json!([]));
 }
 

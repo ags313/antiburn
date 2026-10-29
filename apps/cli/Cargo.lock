@@ -71,6 +71,7 @@ dependencies = [
  "antiburn-local",
  "anyhow",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
 ]

@@ -219,7 +219,6 @@ fn native_v2_publication_attribution_and_prepare_require_the_same_current_consum
                 id: "native-current".into(),
                 value: resolved,
                 check_preferences_revision: revision,
-                smart_master_generation: None,
                 created_at_epoch: 10,
             });
         let review = controller.prepare_auto_fix_with_receipt_at(
