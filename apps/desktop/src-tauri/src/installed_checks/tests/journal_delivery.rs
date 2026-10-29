@@ -1,5 +1,8 @@
 use super::*;
 use crate::insights_worker::journal::tests::{SyntheticJournal, run_page};
+use crate::store::native_tool_results::evidence::{
+    EvidenceEventKind, EvidencePublicationPayload, NativeEvidencePayload,
+};
 
 fn catch_up(host: &mut InstalledCheckHost<ScriptedEvaluator>) {
     for _ in 0..20 {
@@ -11,10 +14,58 @@ fn catch_up(host: &mut InstalledCheckHost<ScriptedEvaluator>) {
 }
 
 fn setup(store: &Store, global: &Path, project: &Path) {
+    store
+        .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+        .unwrap();
     std::fs::create_dir_all(global).unwrap();
     std::fs::create_dir_all(project.join(".antiburn/checks")).unwrap();
     std::fs::write(global.join("failed-retry-loop.yml"), CHECK).unwrap();
     store.replace_repositories(&[repository(project)]).unwrap();
+}
+
+fn result_in_message(source: &mut SyntheticJournal, message: &str, index: usize) {
+    let mut part = json!({"part":{
+        "id":format!("part-{index}"), "messageID":message, "sessionID":"native-session",
+        "type":"tool", "callID":format!("call-{index}"), "tool":"bash",
+        "state":{"status":"running", "input":{"command":"cargo test parser"}}
+    }});
+    source.event("message.part.updated.1", part.clone());
+    part["part"]["state"]["status"] = json!("error");
+    part["part"]["state"]["error"] = json!(format!("Parser failure {index}"));
+    source.event("message.part.updated.1", part);
+}
+
+#[tokio::test]
+async fn fresh_journal_user_before_attachment_keeps_result_seed_before_mixed_selection() {
+    for mixed in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let global = root.join("global/checks");
+        let project = root.join("project");
+        let store = Arc::new(Store::open_in_memory(&root).unwrap());
+        setup(&store, &global, &project);
+        std::fs::write(global.join("failed-retry-loop.yml"), format!("name: Event startup\non:\n  tool_result:\n{}  window: {{size: 4, min: 3}}\n  cooldown: 0s\nactions:\n  - type: status\n    input: {{result: failure}}\n", if mixed { "  user_message:\n" } else { "" })).unwrap();
+        let mut source = SyntheticJournal::new(16);
+        source.results(0..3);
+        source.index(&store, project.to_str().unwrap());
+        let mut host = InstalledCheckHost::new(
+            store.clone(),
+            Arc::new(ScriptedEvaluator::default()),
+            Some(global),
+        )
+        .unwrap();
+        host.reconcile(&Admission::Ready).unwrap();
+        assert!(run_page(&store, source.source(), 100).await);
+        source.event(
+            "message.updated.1",
+            json!({"info":{"id":"fresh-user","role":"user"}}),
+        );
+        source.event("message.part.updated.1", json!({"part":{"id":"fresh-text","messageID":"fresh-user","type":"text","text":"Fresh user work"}}));
+        source.index(&store, project.to_str().unwrap());
+        assert!(run_page(&store, source.source(), 101).await);
+        catch_up(&mut host);
+        super::assert_result_seed_before_fresh_user(&store, mixed);
+    }
 }
 
 #[tokio::test]
@@ -95,8 +146,28 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
     let state = root.join("state");
     let store = Arc::new(Store::open(&state).unwrap());
     setup(&store, &global, &project);
-    let mut source = SyntheticJournal::new(40 * 1024);
-    source.results(0..300);
+    let request_text = "x".repeat(16 * 1024);
+    let mut source = SyntheticJournal::new(request_text.len());
+    for index in 0..300 {
+        let assistant = format!("historical-assistant-{}", index / 20);
+        if index % 20 == 0 {
+            source.event(
+                "message.updated.1",
+                json!({"info":{"id":assistant,"sessionID":"native-session","role":"assistant",
+                    "parentID":"request","time":{"completed":1000}}}),
+            );
+        }
+        source.event(
+            "message.part.updated.1",
+            json!({"part":{
+                "id":format!("part-{index}"),"messageID":assistant,"sessionID":"native-session",
+                "type":"tool","callID":format!("call-{index}"),"tool":"bash",
+                "state":{"status":"error","input":{"command":"cargo test parser"},
+                    "error":format!("Parser failure {index}")}
+            }}),
+        );
+    }
+    let public_frontier = source.sequence as u64;
     source.index(&store, project.to_str().unwrap());
     let evaluator = Arc::new(ScriptedEvaluator::default());
     let mut host =
@@ -105,7 +176,20 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
     let activation = host.projects.values().next().unwrap().active[0].clone();
     assert_eq!(activation.bootstrap_publication.0, 0);
     assert!(run_page(&store, source.source(), 100).await);
+    assert_eq!(store.next_opencode_journal_attempt(100).unwrap(), Some(100));
+    assert!(run_page(&store, source.source(), 100).await);
     assert_eq!(store.next_opencode_journal_attempt(100).unwrap(), Some(101));
+    let cursor: String = store
+        .lock()
+        .query_row(
+            "SELECT cursor_json FROM opencode_journal_delivery",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let cursor: antiburn_local::analysis::OpenCodeJournalCursor =
+        serde_json::from_str(&cursor).unwrap();
+    assert_eq!(cursor.public_baseline(), Some(public_frontier));
     catch_up(&mut host);
     assert_eq!(
         store
@@ -126,9 +210,13 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
         InstalledCheckHost::new(store.clone(), evaluator.clone(), Some(global.clone())).unwrap();
     host.reconcile(&Admission::Ready).unwrap();
     assert_eq!(host.projects.values().next().unwrap().active[0], activation);
+    let assistant = "appended-assistant";
+    source.event(
+        "message.updated.1",
+        json!({"info":{"id":assistant, "sessionID":"native-session", "role":"assistant", "parentID":"request"}}),
+    );
     for index in 300..303 {
-        source.start_result(index);
-        source.result(index);
+        result_in_message(&mut source, assistant, index);
     }
     source.index(&store, project.to_str().unwrap());
     assert!(run_page(&store, source.source(), 101).await);
@@ -138,12 +226,70 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
         .lock()
         .query_row(
             "SELECT COUNT(*), SUM(live_eligible = 0), SUM(live_eligible = 1)
-           FROM native_tool_result_publication WHERE outcome = 'update'",
+           FROM native_tool_result_publication WHERE outcome = 'update' AND event_kind = 'tool_result'",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
     assert_eq!(counts, (46, 0, 46));
+    let mut publications = Vec::new();
+    let mut after = 0;
+    let mut exhausted = false;
+    for _ in 0..20 {
+        let page = store
+            .native_evidence_publications_after(after, 1000)
+            .unwrap();
+        let Some(last) = page.last() else {
+            exhausted = true;
+            break;
+        };
+        assert!(last.publication_sequence > after);
+        after = last.publication_sequence;
+        publications.extend(page);
+    }
+    assert!(exhausted, "synthetic evidence read exceeds its page budget");
+    let calls = publications
+        .iter()
+        .filter_map(|publication| match publication.payload.as_ref()? {
+            EvidencePublicationPayload::Native(NativeEvidencePayload::PublicMessage(message))
+                if publication.event_kind == EvidenceEventKind::ToolCall
+                    && message.record_id == assistant =>
+            {
+                Some((publication, message))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!calls.is_empty());
+    assert_eq!(
+        calls
+            .iter()
+            .map(|(_, message)| message.call_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("call-300"), Some("call-301"), Some("call-302")]
+    );
+    for (publication, message) in calls {
+        assert_eq!(message.record_id, assistant);
+        assert_eq!(message.session_id, "native-session");
+        assert!(message.eligible);
+        assert_eq!(publication.live_eligible, Some(true));
+        assert!(matches!(
+            message.context.as_ref().unwrap().first_eligible_position,
+            antiburn_local::analysis::ToolResultPosition::OpenCodeEvent { sequence, .. }
+                if sequence > public_frontier
+        ));
+    }
+    let resumed_cursor: String = store
+        .lock()
+        .query_row(
+            "SELECT cursor_json FROM opencode_journal_delivery",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let resumed_cursor: antiburn_local::analysis::OpenCodeJournalCursor =
+        serde_json::from_str(&resumed_cursor).unwrap();
+    assert_eq!(resumed_cursor.public_baseline(), cursor.public_baseline());
     assert_eq!(
         store
             .lock()
@@ -166,6 +312,8 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
         .unwrap();
     assert_eq!(outcome.outcome, RunOutcome::Accepted);
     let input = evaluator.inputs.lock().unwrap()[0].clone();
+    assert_eq!(input["requests"].as_array().unwrap().len(), 1);
+    assert_eq!(input["requests"][0]["text"], request_text);
     assert_eq!(input["activity"].as_array().unwrap().len(), 5);
     let work = input["activity"].to_string();
     for index in 300..303 {
@@ -217,8 +365,7 @@ async fn large_history_starts_at_the_live_frontier_and_appends_survive_restart()
     assert!(run_page(&store, source.source(), 200).await);
     assert_eq!(evaluator.inputs.lock().unwrap().len(), 1);
     assert_eq!(status_writes(&store, &host.definitions[0]), status);
-    source.start_result(303);
-    source.result(303);
+    result_in_message(&mut source, assistant, 303);
     source.index(&store, project.to_str().unwrap());
     assert!(run_page(&store, source.source(), 201).await);
     catch_up(&mut host);
@@ -513,7 +660,13 @@ async fn blocked_journal_delivery_is_unavailable_regardless_of_legacy_projection
                     .any(|log| log.contains("state=\"source_unavailable\""))
             );
 
-            store.lock().execute("UPDATE session SET source_label = 'opencode:replacement' WHERE agent = 'opencode'", []).unwrap();
+            store
+                .lock()
+                .execute(
+                    "UPDATE session SET incarnation = 8 WHERE agent = 'opencode'",
+                    [],
+                )
+                .unwrap();
             assert!(run_page(&store, source.source(), 110).await);
             catch_up(&mut host);
             let repaired = read_installed_checks(&store, &host.definitions).unwrap();

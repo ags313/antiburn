@@ -28,7 +28,6 @@
 //! commit or together with the rows a read returns. An [`Incarnation`] is
 //! the persisted creation identity of one session row.
 
-mod burn_check;
 mod check_preferences;
 pub(crate) use check_preferences::{check_preferences_snapshot_in, enabled_checks_in};
 pub(crate) mod codex_rollout_checkpoint;
@@ -41,9 +40,12 @@ pub mod model;
 pub(crate) mod provider_limit;
 pub(crate) mod provider_usage_history;
 mod remediation;
+mod retired_checks_migration;
 pub(crate) mod revision_sql;
 mod schema;
 mod selected_content;
+pub(crate) mod selected_source;
+pub(crate) use selected_source::native_opencode_sqlite_format;
 mod session_persistence;
 mod session_write;
 pub(crate) use session_write::SessionTitleRefreshGuard;
@@ -60,7 +62,8 @@ pub enum SessionCommitOutcome {
 mod source_fingerprint;
 pub(crate) use source_fingerprint::PendingSourceFingerprint;
 mod settings;
-pub(crate) use selected_content::{SELECTED_CONTENT_PROGRESS_REVISION, SelectedContentProgress};
+mod usage_accounting;
+pub use usage_accounting::BurnCheckUsageSummary;
 
 #[cfg(test)]
 mod privacy_tests;
@@ -98,11 +101,6 @@ use session_persistence::*;
 pub use session_persistence::{FencedTurnRowStore, HygieneSummaryRow, iso_from_epoch, now_rfc3339};
 use settings::read_settings;
 
-pub use burn_check::{
-    BurnCheckAssessment, BurnCheckCandidate, BurnCheckFailure, BurnCheckHistoryStatus,
-    BurnCheckInput, BurnCheckRequestAdmission, BurnCheckReservation, BurnCheckSampleOrigin,
-    BurnCheckSampledPair, BurnCheckUsageSummary, CachedAssessmentResponse,
-};
 pub use model::{
     ActiveCursor, AnalysisRecord, AppSettings, DisabledAgents, DiskSpaceDisplay, EvidenceClaim,
     EvidenceCompletion, EvidenceFailure, EvidenceRow, EvidenceStatus, HiddenMeters, Incarnation,
@@ -123,6 +121,13 @@ pub(crate) use remediation::{
 pub struct EvidenceBacklogCounts {
     pub pending: u64,
     pub processing: u64,
+}
+
+/// Replay inputs from one publication, read under one connection lock.
+pub(crate) struct PublishedReplay {
+    pub rows: Vec<TurnRow>,
+    pub record: AnalysisRecord,
+    pub relations: Vec<RelationRecord>,
 }
 
 /// Internal-scalar key holding the protected directories the last pass declined
@@ -318,6 +323,8 @@ pub struct Store {
     settings_snapshot: Arc<RwLock<AppSettings>>,
     limit_factor_learn: Arc<Mutex<()>>,
     insights_work_turn: Arc<AtomicUsize>,
+    #[cfg(test)]
+    burn_check_test_hooks: burn_checks::test_hooks::Hooks,
     /// The directory the engine's own state files (scan roots, ignored paths)
     /// live in. The engine never chooses this; the shell does.
     state_dir: PathBuf,
@@ -573,6 +580,8 @@ impl Store {
             settings_snapshot: Arc::clone(&self.settings_snapshot),
             limit_factor_learn: Arc::clone(&self.limit_factor_learn),
             insights_work_turn: Arc::clone(&self.insights_work_turn),
+            #[cfg(test)]
+            burn_check_test_hooks: Arc::clone(&self.burn_check_test_hooks),
             state_dir: self.state_dir.clone(),
         })
     }
@@ -591,6 +600,8 @@ impl Store {
             settings_snapshot: Arc::new(RwLock::new(AppSettings::default())),
             limit_factor_learn: Arc::new(Mutex::new(())),
             insights_work_turn: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            burn_check_test_hooks: Arc::new(Mutex::new(None)),
             state_dir,
         };
         store.migrate()?;
@@ -634,6 +645,7 @@ impl Store {
     fn migrate(&self) -> Result<()> {
         let mut guard = self.lock();
         let mut current: i64 = guard.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let is_new_database = current == 0;
         // PR builds used v49 for incarnation before main assigned v49 to remediation.
         if current == 49
             && guard.query_row(
@@ -702,12 +714,24 @@ impl Store {
             tx.commit()?;
             current = 56;
         }
+        current = schema::repair_branch_version(&mut guard, current)?;
         for (index, sql) in schema::MIGRATIONS.iter().enumerate() {
             let version = index as i64 + 1;
             if version <= current {
                 continue;
             }
             let tx = guard.transaction()?;
+            if version == retired_checks_migration::VERSION {
+                retired_checks_migration::prepare(
+                    &tx,
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                )
+                .with_context(|| format!("migration {version} preparation failed"))?;
+            }
+            if version == 85 {
+                schema::prepare_source_metadata(&tx)
+                    .with_context(|| format!("migration {version} preparation failed"))?;
+            }
             // The SQLite error is in the source chain either way, but a caller
             // that formats with `{}` rather than `{:#}` prints this line alone
             // — and tauri's setup hook is such a caller. A bare "migration 4
@@ -717,6 +741,12 @@ impl Store {
             // actionable rather than a trip to this file to guess.
             tx.execute_batch(sql)
                 .map_err(|error| anyhow::anyhow!("migration {version} failed: {error}"))?;
+            if is_new_database && version == 1 {
+                tx.execute(
+                    "INSERT INTO setting (key, value) VALUES (?1, 'true')",
+                    [retired_checks_migration::FRESH_INITIALIZATION_KEY],
+                )?;
+            }
             // `pragma_update` cannot be parameterized, and `version` is derived
             // from the compiled-in migration list, never from input.
             tx.pragma_update(None, "user_version", version)?;
@@ -2087,9 +2117,9 @@ impl Store {
         tx.execute("DELETE FROM session_relation", [])?;
         tx.execute("DELETE FROM remediation_contribution", [])?;
         tx.execute("DELETE FROM remediation", [])?;
-        burn_check::clear_local_burn_check_state(
-            &tx,
-            time::OffsetDateTime::now_utc().unix_timestamp(),
+        tx.execute(
+            "DELETE FROM setting WHERE key = ?1",
+            [usage_accounting::USAGE_LEDGER_KEY],
         )?;
         tx.execute("DELETE FROM burn_check_decision_usage", [])?;
         tx.execute("DELETE FROM session_analysis", [])?;
@@ -2106,6 +2136,8 @@ impl Store {
         tx.execute("DELETE FROM provider_limit_factor_point", [])?;
         tx.execute("DELETE FROM provider_usage_observation", [])?;
         tx.execute("DELETE FROM provider_usage_period", [])?;
+        tx.execute("DELETE FROM opencode_v2_capture", [])?;
+        tx.execute("DELETE FROM opencode_v2_selection", [])?;
         let sessions = tx.execute("DELETE FROM session", [])?;
         native_tool_results::clear_local_data_in(&tx)?;
         Store::clear_burn_check_session_data_in(&tx)?;
@@ -2129,7 +2161,8 @@ impl Store {
         Ok((sessions, revision_of(&connection)))
     }
 
-    /// Delete every antiburn-owned record for one session.
+    /// Delete local content and analysis for one session. Keep native V2 selection
+    /// history so retained V1 migration copies stay hidden.
     ///
     /// Local records only. The provider's transcript is never touched — see
     /// [`crate::commands::delete_session_data`].
@@ -2259,13 +2292,36 @@ impl Store {
         sources: &[SourcePublishOutcome],
         options: ToolResultPublishOptions<'_>,
     ) -> Result<bool> {
-        let source_sets = publication::SourceSets::new(sources)?;
         let config_attribution = crate::remediation::publication_config_attribution(
             self,
             &record.key,
             completion.status,
             &completion.evidence_json,
         )?;
+        self.publish_projections_with_config_attribution(
+            record,
+            started_at_epoch,
+            completion,
+            relations,
+            sources,
+            options,
+            &config_attribution,
+        )
+    }
+
+    /// Publishes projections with configuration attribution prepared before the write.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_projections_with_config_attribution(
+        &self,
+        record: &AnalysisRecord,
+        started_at_epoch: Option<i64>,
+        completion: &EvidenceCompletion,
+        relations: &[RelationRecord],
+        sources: &[SourcePublishOutcome],
+        options: ToolResultPublishOptions<'_>,
+        config_attribution: &crate::remediation::PublicationConfigAttribution,
+    ) -> Result<bool> {
+        let source_sets = publication::SourceSets::new(sources)?;
         let remediation_secret = (completion.status == PublishedEvidence::Ready)
             .then(|| self.provider_account_secret())
             .transpose()?;
@@ -2417,25 +2473,22 @@ impl Store {
             ],
         )?;
         if updated == 0 {
-            // This pass lost the claim race (a newer claim, or a newer
-            // source generation, already moved past it). Dropping the
-            // transaction without a commit rolls back the session_analysis
-            // upsert above, exactly as before this pass wrote turn rows: a
-            // lost race must not publish anything this pass computed. Its
-            // rows were never published either, so they are cleaned up here
-            // under their own fence, in a separate statement, rather than
-            // left to accumulate. No `source_resume` row was ever written
-            // for this pass — those writes happen only below, after a win
-            // is confirmed.
+            // Roll back this pass's projections. A repeated completion can
+            // already own the published fence, so preserve published rows.
             drop(transaction);
-            delete_turn_rows_for_fence(
-                &connection,
-                &turn_session_key(&record.key),
+            let cleanup = connection.transaction()?;
+            evidence_queue::discard_evidence_claim_rows_in(
+                &cleanup,
+                &record.key,
                 completion.claim_fence,
             )?;
+            cleanup.commit()?;
             return Ok(false);
         }
-        if let Some(batch) = options.batch {
+        // Stored V2 snapshots cannot prove live event continuity or corrections.
+        if let Some(batch) = options.batch.filter(|batch| {
+            batch.source_format != antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
+        }) {
             let source_format = serde_json::to_string(&batch.source_format)?;
             if batch.complete {
                 remove_native_tool_results_from_other_formats_in(
@@ -2537,6 +2590,17 @@ impl Store {
             )?;
         }
         transaction.commit()?;
+        if options.batch.is_some_and(|batch| {
+            batch.source_format == antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
+        }) {
+            ::tracing::debug!(
+                event = "stored_metrics_committed",
+                publication_origin = "stored_metrics",
+                live_evidence_ownership = "excluded",
+                metrics_claim_fence = completion.claim_fence,
+                metrics_source_generation = record.analyzed_generation,
+            );
+        }
         Ok(true)
     }
 
@@ -2650,24 +2714,24 @@ impl Store {
     /// — see the `v30` migration comment in `store::schema`.
     pub fn published_turn_rows(&self, key: &SessionKey) -> Result<Option<Vec<TurnRow>>> {
         let connection = self.lock();
-        let Some(evidence) = connection
-            .query_row(
-                EVIDENCE_BY_KEY_SQL,
-                params![key.environment_key, key.agent, key.session_id],
-                evidence_from_row,
-            )
-            .optional()?
-        else {
+        published_turn_rows_in(&connection, key)
+    }
+
+    /// Reads rows, analysis, and relations without mixing concurrent publications.
+    pub(crate) fn published_replay(&self, key: &SessionKey) -> Result<Option<PublishedReplay>> {
+        let connection = self.lock();
+        let Some(rows) = published_turn_rows_in(&connection, key)? else {
             return Ok(None);
         };
-        let Some(published_fence) = evidence.published_fence else {
+        let Some(record) = analysis_in(&connection, key)? else {
             return Ok(None);
         };
-        Ok(Some(query_turn_rows(
-            &connection,
-            &turn_session_key(key),
-            &FenceScope::single(published_fence),
-        )?))
+        let relations = relations_in(&connection, key)?;
+        Ok(Some(PublishedReplay {
+            rows,
+            record,
+            relations,
+        }))
     }
 
     /// Reads bounded private content from a publication that matches the
@@ -2933,42 +2997,7 @@ impl Store {
     /// One session's cached analysis, when it has been computed.
     pub fn analysis(&self, key: &SessionKey) -> Result<Option<AnalysisRecord>> {
         let connection = self.lock();
-        let mut statement = connection.prepare(
-            "SELECT environment_key, agent, session_id, model_breakdown_json,
-                    pricing_breakdown_json,
-                    inclusive_models_json, initial_context_json, source_summaries_json,
-                    provider_hints_json,
-                    source_fingerprint, pricing_generation, analyzed_generation,
-                    parser_revision, analyzer_revision, metrics_schema_revision
-               FROM session_analysis
-              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
-        )?;
-        Ok(statement
-            .query_row(
-                params![key.environment_key, key.agent, key.session_id],
-                |row| {
-                    Ok(AnalysisRecord {
-                        key: SessionKey::new(
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ),
-                        model_breakdown_json: row.get(3)?,
-                        pricing_breakdown_json: row.get(4)?,
-                        inclusive_models_json: row.get(5)?,
-                        initial_context_json: row.get(6)?,
-                        source_summaries_json: row.get(7)?,
-                        provider_hints_json: row.get(8)?,
-                        source_fingerprint: row.get(9)?,
-                        pricing_generation: row.get(10)?,
-                        analyzed_generation: row.get(11)?,
-                        parser_revision: row.get(12)?,
-                        analyzer_revision: row.get(13)?,
-                        metrics_schema_revision: row.get(14)?,
-                    })
-                },
-            )
-            .optional()?)
+        analysis_in(&connection, key)
     }
 
     /// Agent, activity timestamp, token breakdown, and provider hints for every
@@ -3137,33 +3166,7 @@ impl Store {
     /// Every relation recorded for a session.
     pub fn relations(&self, key: &SessionKey) -> Result<Vec<RelationRecord>> {
         let connection = self.lock();
-        let mut statement = connection.prepare(
-            "SELECT kind, related_id, label FROM session_relation
-              WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-              ORDER BY kind, related_id",
-        )?;
-        let rows = statement.query_map(
-            params![key.environment_key, key.agent, key.session_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
-        )?;
-        let mut relations = Vec::new();
-        for row in rows {
-            let (kind, related_id, label) = row?;
-            if let Some(kind) = RelationKind::parse(&kind) {
-                relations.push(RelationRecord {
-                    kind,
-                    related_id,
-                    label,
-                });
-            }
-        }
-        Ok(relations)
+        relations_in(&connection, key)
     }
 
     /// The session id this session recorded as its own fork parent, when
@@ -3529,6 +3532,89 @@ impl Store {
         }
         Ok(true)
     }
+}
+
+fn published_turn_rows_in(
+    connection: &Connection,
+    key: &SessionKey,
+) -> Result<Option<Vec<TurnRow>>> {
+    let Some(published_fence) = read_published_fence(connection, key)? else {
+        return Ok(None);
+    };
+    Ok(Some(query_turn_rows(
+        connection,
+        &turn_session_key(key),
+        &FenceScope::single(published_fence),
+    )?))
+}
+
+fn analysis_in(connection: &Connection, key: &SessionKey) -> Result<Option<AnalysisRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT environment_key, agent, session_id, model_breakdown_json,
+                pricing_breakdown_json,
+                inclusive_models_json, initial_context_json, source_summaries_json,
+                provider_hints_json,
+                source_fingerprint, pricing_generation, analyzed_generation,
+                parser_revision, analyzer_revision, metrics_schema_revision
+           FROM session_analysis
+          WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+    )?;
+    Ok(statement
+        .query_row(
+            params![key.environment_key, key.agent, key.session_id],
+            |row| {
+                Ok(AnalysisRecord {
+                    key: SessionKey::new(
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ),
+                    model_breakdown_json: row.get(3)?,
+                    pricing_breakdown_json: row.get(4)?,
+                    inclusive_models_json: row.get(5)?,
+                    initial_context_json: row.get(6)?,
+                    source_summaries_json: row.get(7)?,
+                    provider_hints_json: row.get(8)?,
+                    source_fingerprint: row.get(9)?,
+                    pricing_generation: row.get(10)?,
+                    analyzed_generation: row.get(11)?,
+                    parser_revision: row.get(12)?,
+                    analyzer_revision: row.get(13)?,
+                    metrics_schema_revision: row.get(14)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn relations_in(connection: &Connection, key: &SessionKey) -> Result<Vec<RelationRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT kind, related_id, label FROM session_relation
+          WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
+          ORDER BY kind, related_id",
+    )?;
+    let rows = statement.query_map(
+        params![key.environment_key, key.agent, key.session_id],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
+    let mut relations = Vec::new();
+    for row in rows {
+        let (kind, related_id, label) = row?;
+        if let Some(kind) = RelationKind::parse(&kind) {
+            relations.push(RelationRecord {
+                kind,
+                related_id,
+                label,
+            });
+        }
+    }
+    Ok(relations)
 }
 
 fn read_repository_policy_generation(connection: &Connection) -> Result<u64> {

@@ -24,26 +24,26 @@ import {
 
 describe("static app search", () => {
   it.each([
-    "ignoredInstructions",
-    "skillOpportunities",
-    "overExploring",
-    "scopeCreep",
-  ] as const)("hides unavailable smart check %s from search", (check) => {
+    "sessionsOverDepth",
+    "unusedSkills",
+    "overuseOfFastMode",
+    "modelOverthinking",
+  ] as const)("keeps local check %s available without a decision connection", (check) => {
     expect(
       searchApp("", "macos", false).some(
         (result) => result.target.kind === "check" && result.target.check === check,
       ),
-    ).toBe(false)
+    ).toBe(true)
     expect(
       searchApp("", "macos", true).some(
         (result) => result.target.kind === "check" && result.target.check === check,
       ),
     ).toBe(true)
   })
-  it("resolves the backend Over-exploring key", () => {
-    expect(searchApp("over_exploring")[0]?.target).toEqual({
+  it("resolves a local check key", () => {
+    expect(searchApp("sessionsOverDepth")[0]?.target).toEqual({
       kind: "check",
-      check: "overExploring",
+      check: "sessionsOverDepth",
     })
   })
   it("searches installed check names and routes to their effective identity", () => {
@@ -62,17 +62,17 @@ describe("static app search", () => {
       target: { kind: "installedCheck", check: "installed:failed-retry-loop" },
     })
   })
-  it.each(["Scope Creep", "scopeCreep", "scope_creep"])("resolves %s", (query) => {
-    expect(searchApp(query)[0]?.target).toEqual({ kind: "check", check: "scopeCreep" })
+  it.each(["sessionsOverDepth", "sessionsoverdepth"])("resolves %s", (query) => {
+    expect(searchApp(query)[0]?.target).toEqual({ kind: "check", check: "sessionsOverDepth" })
   })
   it.each(["macos", "windows", "linux"] as const)(
-    "opens and focuses unassessed Skill Opportunities on %s without changing values",
+    "opens and focuses unassessed local checks on %s without changing values",
     async (platform) => {
       HTMLElement.prototype.scrollIntoView = vi.fn()
-      const result = searchApp("Skill Opportunities", platform)[0]!
+      const result = searchApp("sessionsOverDepth", platform)[0]!
       expect(result).toMatchObject({
-        label: "Skill opportunities",
-        target: { kind: "check", check: "skillOpportunities" },
+        label: "Session overdepth",
+        target: { kind: "check", check: "sessionsOverDepth" },
       })
       if (result.target.kind !== "check") throw new Error("Expected a check destination")
       const categories = [
@@ -93,7 +93,7 @@ describe("static app search", () => {
       })
       await screen.findByRole("button", { name: /Not assessed \(1\)/ })
       expect(
-        screen.queryByRole("button", { name: /Skill opportunities/ }),
+        screen.queryByRole("button", { name: /Session overdepth/ }),
       ).not.toBeInTheDocument()
       view.rerender(
         createElement(BurnChecksView, {
@@ -104,7 +104,7 @@ describe("static app search", () => {
         }),
       )
       const row = await screen.findByRole("button", {
-        name: /Skill opportunities.*Not assessed/,
+        name: /Session overdepth.*Not assessed/,
       })
       await waitFor(() => expect(row).toHaveFocus())
       expect(row).toHaveAttribute("aria-pressed", "true")
@@ -171,9 +171,9 @@ describe("static app search", () => {
       kind: "setting",
       control: "cacheChurnCheck",
     })
-    expect(searchApp("skill improvements")[0]?.target).toEqual({
+    expect(searchApp("unusedSkills")[0]?.target).toEqual({
       kind: "check",
-      check: "skillOpportunities",
+      check: "unusedSkills",
     })
     expect(searchApp("  SOuNd  ")[0]?.label).toBe("Sound")
   })

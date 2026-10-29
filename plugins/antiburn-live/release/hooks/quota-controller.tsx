@@ -3,13 +3,7 @@ import {
   parseUsageCommand,
   renderUsageHelp,
 } from "../../../../packages/antiburn-plugin-core/product.mjs"
-import type {
-  EngineInterface,
-  On,
-  Register,
-  RenderInput,
-  SessionAuthorization,
-} from "claude-code"
+import type { EngineInterface, On, Register, RenderInput, SessionAuthorization } from "claude-code"
 import type { UsageState } from "../types"
 import { APP_URL } from "./brand"
 import { retryAfterTime, type AccountUsageResult } from "./account-usage"
@@ -32,10 +26,12 @@ import {
 import {
   BRAND_MARK_SVG,
   meterDescription,
-  meterSvg,
+  responsiveMeterSvg,
+  RESPONSIVE_FRAME_WIDTH,
   usageStatusSvg,
   secondaryTextSvg,
 } from "./usage-graphics"
+import { renderUsageMeterBand } from "./usage-meter-band"
 import { desktopPercentage, PRESENTATION, usageLayout } from "./usage-presentation"
 
 import {
@@ -93,7 +89,10 @@ export async function fetchAccountUsage($: EngineInterface): Promise<AccountUsag
   try {
     const response = await $.http.fetch("https://api.anthropic.com/api/oauth/usage", {
       auth: authorization.handle,
-      headers: { "anthropic-beta": "oauth-2025-04-20", accept: "application/json" },
+      headers: {
+        "anthropic-beta": "oauth-2025-04-20",
+        accept: "application/json",
+      },
     })
     if (!response.ok)
       return {
@@ -371,10 +370,9 @@ async function openTerminalWebsite($: EngineInterface): Promise<void> {
   try {
     const windows = (await $.env.get("OS")) === "Windows_NT"
     if (windows) {
-      const result = await $.process.run(
-        ["cmd.exe", "/c", "start", "", "https://antiburn.com"],
-        { timeoutMs: 5000 },
-      )
+      const result = await $.process.run(["cmd.exe", "/c", "start", "", "https://antiburn.com"], {
+        timeoutMs: 5000,
+      })
       if (result.exitCode === 0) return
     } else {
       try {
@@ -402,8 +400,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
     visibleSites.delete(visibleSites.values().next().value!)
   visibleSites.add(e.requestId)
   const activate = (action: () => Promise<unknown>) => {
-    if (uiEnabled && generation === uiGeneration && visibleSites.has(e.requestId))
-      return action()
+    if (uiEnabled && generation === uiGeneration && visibleSites.has(e.requestId)) return action()
   }
   const ui = $.ui.resolve(e)
   const { Box, Text, Button, Link } = ui
@@ -562,45 +559,28 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
 
   if (isDesktop && columns >= 24) {
     terminalHoverBinding(e.requestId, "desktop")
-    const layout = usageLayout(columns * 8, "inline")
-    return (
-      <Box key="usage-band" position="relative" flexDirection="row" alignItems="center">
-        <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
-        {mark}
-        <Box width={PRESENTATION.brandGap / 8} flexShrink={0} />
-        <Box
-          key="usage-meters"
-          flexDirection={layout.inline ? "row" : "column"}
-          gap={layout.inline ? 3 : layout.stackedGap / 16}
-        >
-          {windows.map((window) => (
-            <Box
-              key={`meter-${window.kind}`}
-              height={layout.meterHeight / 16}
-              alignItems="center"
-            >
-              <ui.Svg
-                key={`meter-graphic-${window.kind}`}
-                source={meterSvg(window, layout.meterWidth, now)}
-                alt={`${meterDescription(window, now, true)}${snapshot.status === "error" ? ". Usage unavailable · Last known" : ""}`}
-                width={layout.meterWidth}
-                height={layout.meterHeight}
-                isInteractive
-              />
-            </Box>
-          ))}
-        </Box>
-        <Box width={PRESENTATION.brandInset / 8} flexShrink={0} />
-      </Box>
-    )
+    return renderUsageMeterBand({
+      ui,
+      layout: usageLayout(columns * 8, "inline"),
+      windows,
+      mark,
+      renderMeter: (window) => (
+        <ui.Svg
+          key={`meter-graphic-${window.kind}`}
+          source={responsiveMeterSvg(window, now)}
+          alt={`${meterDescription(window, now, true)}${snapshot.status === "error" ? ". Usage unavailable · Last known" : ""}`}
+          width={RESPONSIVE_FRAME_WIDTH}
+          height={18}
+          isInteractive
+        />
+      ),
+    })
   }
   const content = Math.max(1, columns - (isDesktop ? 3 : 12))
   const inlineColumns = Math.max(1, Math.floor((content - 3) / 2))
   const isInline =
     columns >= 80 &&
-    windows.every(
-      (window) => window.label.length + percentage(window).length + 2 <= inlineColumns,
-    )
+    windows.every((window) => window.label.length + percentage(window).length + 2 <= inlineColumns)
   const meterColumns = isInline ? inlineColumns : content
   const geometry = (window: UsageWindow) => {
     const trackColumns = Math.max(
@@ -642,8 +622,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
     const isRevealed = revealed === window.kind
     const isPaceRevealed = revealed === `pace-${window.kind}`
     const { count, value, markerCell } = geometry(window)
-    const isPaceReached =
-      window.percent !== null && value !== null && window.percent / 100 >= value
+    const isPaceReached = window.percent !== null && value !== null && window.percent / 100 >= value
     const cells = count * 2 - 1
     const copy = isRevealed
       ? resetText(window, now)
@@ -680,12 +659,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
       return dotCells
     }
 
-    const target = (
-      detail: "reset" | "pace",
-      text: string,
-      color?: string,
-      dimColor?: boolean,
-    ) =>
+    const target = (detail: "reset" | "pace", text: string, color?: string, dimColor?: boolean) =>
       e.surface === "terminal" && "Client" in ui ? (
         <ui.Client
           key={`usage-hover-${detail}-${window.kind}`}
@@ -815,11 +789,7 @@ async function renderUsage($: EngineInterface, e: RenderInput<"AbovePrompt">) {
                 overflow="hidden"
               >
                 <Text wrap="truncate-end">
-                  {segment(
-                    markerCell + 1,
-                    cells,
-                    copy !== null && isPaceRevealed && copyOnRight,
-                  )}
+                  {segment(markerCell + 1, cells, copy !== null && isPaceRevealed && copyOnRight)}
                 </Text>
               </Box>
             )}
@@ -1188,14 +1158,7 @@ export function registerQuota(on: On, options: { usageUiEnabled: boolean }) {
       terminalHoverBinding(e.requestId, "hidden")
       return next(e)
     }
-    let composeChecks = false
-    try {
-      const development = await $.antiburnDevelopment.describe()
-      composeChecks = development?.id === "antiburn-dev" && development.capabilities.liveChecks
-    } catch {
-      // Keep quota available if the optional development feature fails.
-    }
-    const checks = composeChecks ? await next(e) : undefined
+    const downstream = await next(e)
     try {
       const { Box } = $.ui.resolve(e)
       return (
@@ -1210,14 +1173,14 @@ export function registerQuota(on: On, options: { usageUiEnabled: boolean }) {
               : 0
           }
         >
-          {checks}
+          {downstream}
           {await renderUsage($, e)}
         </Box>
       )
     } catch {
       // Use the host drawing when quota rendering fails.
     }
-    return composeChecks ? checks! : next(e)
+    return downstream
   })
 }
 
@@ -1234,7 +1197,11 @@ export const register: Register = (on) => {
           const description = describeCommands()
           return {
             ...description,
-            capabilities: { ...description.capabilities, usage: true, usageUiEnabled },
+            capabilities: {
+              ...description.capabilities,
+              usage: true,
+              usageUiEnabled,
+            },
           }
         },
       },

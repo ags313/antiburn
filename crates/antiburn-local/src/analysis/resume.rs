@@ -98,6 +98,28 @@ pub struct StreamSnapshot {
     /// False when a request was unreadable, the collection limit was reached,
     /// or an identity conflict prevented complete retention.
     pub user_messages_complete: bool,
+    /// Ordered native evidence encoded as typed JSON, never raw postcard values.
+    pub native_evidence_json: Vec<String>,
+    pub native_evidence_complete: bool,
+    /// The first observed unsafe admission remains known after collection eviction.
+    #[serde(deserialize_with = "deserialize_admission_state")]
+    pub native_admission_failure_json: Option<String>,
+}
+
+fn deserialize_admission_state<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let json = Option::<String>::deserialize(deserializer)?;
+    if let Some(json) = &json {
+        let failure = serde_json::from_str::<crate::analysis::NativeAdmissionFailure>(json)
+            .map_err(serde::de::Error::custom)?;
+        if !failure.valid() {
+            return Err(serde::de::Error::custom(
+                "invalid admission failure binding",
+            ));
+        }
+    }
+    Ok(json)
 }
 
 impl StreamSnapshot {
@@ -165,6 +187,9 @@ mod tests {
             user_messages_json: Vec::new(),
             user_message_conflicts: Vec::new(),
             user_messages_complete: true,
+            native_evidence_json: Vec::new(),
+            native_evidence_complete: true,
+            native_admission_failure_json: None,
         }
     }
 
@@ -194,5 +219,38 @@ mod tests {
         let mut encoded = snapshot.encode();
         encoded.truncate(encoded.len() / 2);
         assert!(StreamSnapshot::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn invalid_admission_reasons_cannot_restore_a_snapshot() {
+        for reason in [
+            crate::analysis::ToolResultCompleteness::Complete,
+            crate::analysis::ToolResultCompleteness::Incomplete,
+        ] {
+            let mut snapshot = sample_snapshot(RESUME_SNAPSHOT_REVISION);
+            snapshot.native_admission_failure_json = Some(
+                serde_json::to_string(&crate::analysis::NativeAdmissionFailure {
+                    source_format: crate::analysis::SourceFormat::ClaudeJsonl,
+                    session_id: "s1".into(),
+                    position: crate::analysis::ToolResultPosition::Jsonl {
+                        record_index: 0,
+                        item_index: 0,
+                    },
+                    reason,
+                })
+                .unwrap(),
+            );
+            assert!(StreamSnapshot::decode(&snapshot.encode()).is_err());
+        }
+    }
+
+    #[test]
+    fn snapshot_admission_state_is_a_required_field() {
+        let snapshot = sample_snapshot(RESUME_SNAPSHOT_REVISION);
+        let mut json = serde_json::to_value(snapshot).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("native_admission_failure_json");
+        assert!(serde_json::from_value::<StreamSnapshot>(json).is_err());
     }
 }

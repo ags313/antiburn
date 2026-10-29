@@ -758,6 +758,7 @@ fn subagents_overflow() -> SessionEvidence {
                 parent_call_id: None,
                 child_model: None,
                 provenance: crate::analysis::RelationProvenance::TaskToolUse,
+                config_binding: None,
             },
         )));
     }
@@ -1074,6 +1075,7 @@ fn native_child_models_require_one_exact_call_and_reject_truncated_identities() 
                 Some(&id),
                 None,
                 crate::analysis::RelationProvenance::TaskToolUse,
+                None,
             );
         }
         accumulator.observe_child_models(joined_id.as_deref(), std::iter::once("claude-opus-4-6"));
@@ -1100,6 +1102,7 @@ fn native_child_model_pairs_are_bounded_and_survive_json_and_binary_replay() {
         Some("call-1"),
         None,
         crate::analysis::RelationProvenance::TaskToolUse,
+        None,
     );
     accumulator.observe_child_models(Some("call-1"), std::iter::once(long_string().as_str()));
     assert!(
@@ -1154,6 +1157,7 @@ fn subagent_string_overflow() -> SessionEvidence {
             parent_call_id: None,
             child_model: None,
             provenance: crate::analysis::RelationProvenance::TaskToolUse,
+            config_binding: None,
         },
     )));
     accumulator.evidence(&TurnFacts::default())
@@ -1509,6 +1513,9 @@ fn native_result(result_id: &str, content: &str) -> ToolResultObservation {
     use crate::analysis::ToolResultChange;
 
     ToolResultObservation {
+        facts: None,
+        outcome: None,
+        provider_executed: None,
         context: None,
         source_format: crate::analysis::SourceFormat::ClaudeJsonl,
         session_id: "s1".to_owned(),
@@ -1540,6 +1547,360 @@ fn identical_native_tool_result_replays_are_deduplicated() {
 
     assert_eq!(sink.tool_result_observations().len(), 1);
     assert!(sink.tool_result_observations_complete());
+}
+
+#[test]
+fn restored_generic_results_receive_every_unsafe_admission_with_exact_byte_accounting() {
+    use crate::analysis::{
+        NativeEvidenceFact, NativeMessageObservation, ToolResultAdmission, ToolResultContext,
+    };
+    for admission in [
+        ToolResultAdmission::UnsafeIdentity,
+        ToolResultAdmission::UnsafeOrder,
+        ToolResultAdmission::UnsafeOwnership,
+    ] {
+        let mut sink = composite_with_rows("claude", "s1");
+        let mut result = native_result("result-1", "retained output");
+        result.context = Some(ToolResultContext::pending(result.position, true));
+        sink.record(NormalizedRecord::ToolResult(Box::new(result)));
+        sink.observe_source_outcome(VisitOutcome::AcceptedFull);
+        sink.finish(SessionSummary::default());
+        let snapshot = sink
+            .snapshot(AdapterResume {
+                point: crate::analysis::ResumePoint {
+                    offset: 0,
+                    tail_hash: 0,
+                    tail_len: 0,
+                },
+                adapter: crate::analysis::AdapterSnapshot(Vec::new()),
+            })
+            .unwrap();
+        let snapshot = StreamSnapshot::decode(&snapshot.encode()).unwrap();
+        let mut restored = composite_with_rows("claude", "s1");
+        restored.restore_tool_result_observations(&snapshot);
+        restored.tool_result_admission_gap(admission);
+        let generic: Vec<_> = restored
+            .native_evidence()
+            .iter()
+            .filter_map(|event| match &event.fact {
+                NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(value)) => {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(generic, restored.tool_result_observations());
+        assert_eq!(generic.len(), 1);
+        assert_eq!(generic[0].admission(), admission);
+        let context = generic[0].context.as_ref().unwrap();
+        assert!(!context.main_session && !context.complete_through_event);
+        assert_eq!(
+            restored.native_evidence_bytes,
+            restored
+                .native_evidence
+                .iter()
+                .map(|event| serde_json::to_vec(event).unwrap().len())
+                .sum::<usize>()
+        );
+        assert_eq!(
+            restored.tool_result_observation_sizes,
+            restored
+                .tool_result_observations
+                .iter()
+                .map(|result| serde_json::to_vec(result).unwrap().len())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            restored.tool_result_observations_bytes,
+            restored.tool_result_observation_sizes.iter().sum::<usize>()
+        );
+        restored.record(NormalizedRecord::ToolResult(Box::new(generic[0].clone())));
+        assert_eq!(restored.native_evidence().len(), 1);
+        assert_eq!(
+            restored.native_evidence_bytes,
+            serde_json::to_vec(&restored.native_evidence[0])
+                .unwrap()
+                .len()
+        );
+    }
+}
+
+#[test]
+fn unsafe_generic_result_growth_keeps_the_collection_inside_its_byte_bound() {
+    use crate::analysis::{
+        NativeEvidenceEvent, NativeEvidenceFact, NativeMessageObservation, ToolResultAdmission,
+        ToolResultContext,
+    };
+    let mut sink = composite_with_rows("claude", "s1");
+    let mut result = native_result("limit", "");
+    let mut context = ToolResultContext::pending(result.position, true);
+    context.complete_through_event = true;
+    result.context = Some(context);
+    let envelope = NativeEvidenceEvent {
+        fact: NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(result.clone())),
+        live_eligible: false,
+    };
+    let overhead = serde_json::to_vec(&envelope).unwrap().len();
+    result.content = Some("x".repeat(MAX_NATIVE_EVIDENCE_BYTES - overhead - 1));
+    sink.record(NormalizedRecord::ToolResult(Box::new(result)));
+    assert_eq!(sink.native_evidence_bytes, MAX_NATIVE_EVIDENCE_BYTES - 1);
+    sink.tool_result_admission_gap(ToolResultAdmission::UnsafeOwnership);
+    assert!(sink.native_evidence().is_empty());
+    assert_eq!(sink.native_evidence_bytes, 0);
+    assert!(!sink.native_evidence_complete());
+    assert_eq!(sink.tool_result_observations().len(), 1);
+    assert_eq!(
+        sink.tool_result_observations()[0].admission(),
+        ToolResultAdmission::UnsafeOwnership
+    );
+}
+
+#[test]
+fn generic_evidence_count_limit_keeps_a_recent_window_without_history_growth() {
+    use crate::analysis::{NativeActivityObservation, NativeEvidenceFact, ToolResultPosition};
+    let mut sink = composite_with_rows("claude", "s1");
+    let fact = |index| {
+        NativeEvidenceFact::Activity(NativeActivityObservation {
+            source_format: crate::analysis::SourceFormat::ClaudeJsonl,
+            session_id: "s1".into(),
+            position: ToolResultPosition::Jsonl {
+                record_index: index,
+                item_index: 0,
+            },
+            token: format!("activity-{index:08}"),
+            native_at_ms: None,
+        })
+    };
+    for index in 100_000..100_000 + MAX_NATIVE_EVIDENCE_OBSERVATIONS as u64 * 2 {
+        sink.retain_native_evidence(fact(index));
+    }
+    assert_eq!(sink.native_evidence.len(), MAX_NATIVE_EVIDENCE_OBSERVATIONS);
+    assert!(!sink.native_evidence_complete);
+    let before = serde_json::to_vec(&sink.native_evidence).unwrap().len();
+    assert!(sink.native_admission_failure.is_none());
+    let bytes_before = sink.native_evidence_bytes;
+    sink.observe_source_outcome(VisitOutcome::AcceptedFull);
+    sink.finish(SessionSummary::default());
+    let snapshot = sink
+        .snapshot(AdapterResume {
+            point: crate::analysis::ResumePoint {
+                offset: 0,
+                tail_hash: 0,
+                tail_len: 0,
+            },
+            adapter: crate::analysis::AdapterSnapshot(Vec::new()),
+        })
+        .unwrap();
+    let snapshot = StreamSnapshot::decode(&snapshot.encode()).unwrap();
+    let mut restored = composite_with_rows("claude", "s1");
+    restored.restore_native_evidence(&snapshot);
+    assert_eq!(restored.native_evidence, sink.native_evidence);
+    assert_eq!(restored.native_evidence_bytes, bytes_before);
+    assert!(!restored.native_evidence_complete);
+    let start = 100_000 + MAX_NATIVE_EVIDENCE_OBSERVATIONS as u64 * 2;
+    for index in start..start + MAX_NATIVE_EVIDENCE_OBSERVATIONS as u64 {
+        restored.retain_native_evidence(fact(index));
+    }
+    assert_eq!(
+        restored.native_evidence.len(),
+        MAX_NATIVE_EVIDENCE_OBSERVATIONS
+    );
+    assert_eq!(restored.native_evidence_bytes, bytes_before);
+    assert_eq!(
+        serde_json::to_vec(&restored.native_evidence).unwrap().len(),
+        before
+    );
+    assert_eq!(restored.native_evidence.first().unwrap().fact, fact(start));
+}
+
+#[test]
+fn generic_evidence_byte_limit_rejects_oversize_facts_and_stops_history_growth() {
+    use crate::analysis::{NativeEvidenceFact, NativeMessageObservation};
+    let mut sink = composite_with_rows("claude", "s1");
+    let fact = |index, content_bytes| {
+        let mut result = native_result(&format!("result-{index:08}"), "");
+        result.content = Some("x".repeat(content_bytes));
+        NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(result))
+    };
+    for index in 0..8 {
+        sink.retain_native_evidence(fact(index, MAX_NATIVE_EVIDENCE_BYTES / 4));
+    }
+    assert!(sink.native_evidence.len() < MAX_NATIVE_EVIDENCE_OBSERVATIONS);
+    assert_eq!(sink.native_evidence.len(), 3);
+    assert!(!sink.native_evidence_complete);
+    let bytes_before = sink.native_evidence_bytes;
+    let encoded_before = postcard::to_allocvec(
+        &sink
+            .native_evidence
+            .iter()
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap()
+    .len();
+    for index in 8..16 {
+        sink.retain_native_evidence(fact(index, MAX_NATIVE_EVIDENCE_BYTES / 4));
+    }
+    assert_eq!(sink.native_evidence.len(), 3);
+    assert_eq!(sink.native_evidence_bytes, bytes_before);
+    assert!(sink.native_evidence_bytes <= MAX_NATIVE_EVIDENCE_BYTES);
+    assert_eq!(
+        sink.native_evidence_bytes,
+        sink.native_evidence
+            .iter()
+            .map(|event| serde_json::to_vec(event).unwrap().len())
+            .sum::<usize>()
+    );
+    assert_eq!(
+        postcard::to_allocvec(
+            &sink
+                .native_evidence
+                .iter()
+                .map(|event| serde_json::to_string(event).unwrap())
+                .collect::<Vec<_>>()
+        )
+        .unwrap()
+        .len(),
+        encoded_before
+    );
+    let prior = sink.native_evidence.clone();
+    sink.retain_native_evidence(fact(16, MAX_NATIVE_EVIDENCE_BYTES));
+    assert_eq!(sink.native_evidence, prior);
+    assert_eq!(sink.native_evidence_bytes, bytes_before);
+    assert!(sink.native_admission_failure.is_none());
+}
+
+#[test]
+fn typed_source_admission_invalidates_every_public_kind_and_survives_snapshot_eviction() {
+    use crate::analysis::{
+        NativeAdmissionFailure, NativeEvidenceFact, NativeMessageObservation,
+        ToolResultCompleteness, ToolResultPosition,
+    };
+    for reason in [
+        ToolResultCompleteness::UnsafeIdentity,
+        ToolResultCompleteness::UnsafeOrder,
+        ToolResultCompleteness::UnsafeOwnership,
+    ] {
+        let mut sink = composite_with_rows("codex", "facts");
+        crate::analysis::reader_for("codex")
+            .visit(
+                &crate::analysis::SessionInput {
+                    agent: "codex".into(),
+                    session_id: "facts".into(),
+                    source_format: crate::analysis::SourceFormat::CodexRolloutJsonl,
+                    source: RawSource::Jsonl(
+                        include_str!("../../../tests/fixtures/public_events/codex.jsonl").into(),
+                    ),
+                    fork_parent_session_id: None,
+                },
+                &mut sink,
+            )
+            .unwrap();
+        sink.observe_source_outcome(VisitOutcome::AcceptedFull);
+        let mut future = sink
+            .native_evidence
+            .iter()
+            .find_map(|event| match &event.fact {
+                NativeEvidenceFact::Message(NativeMessageObservation::Public(value)) => {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        future.record_id = "future".into();
+        let failure = NativeAdmissionFailure {
+            source_format: crate::analysis::SourceFormat::CodexRolloutJsonl,
+            session_id: "facts".into(),
+            position: ToolResultPosition::Jsonl {
+                record_index: 12,
+                item_index: u32::MAX,
+            },
+            reason,
+        };
+        sink.native_admission_failure(failure.clone());
+        assert!(
+            sink.native_evidence
+                .iter()
+                .any(|event| matches!(event.fact, NativeEvidenceFact::ResponseCycle(_)))
+        );
+        for event in &sink.native_evidence {
+            match &event.fact {
+                NativeEvidenceFact::Message(NativeMessageObservation::User(value)) => {
+                    assert!(!value.context.main_session);
+                    assert_eq!(
+                        value.message.completeness,
+                        crate::analysis::UserMessageCompleteness::Complete
+                    );
+                    assert_eq!(
+                        value.message.change,
+                        crate::analysis::UserMessageChange::Present
+                    );
+                }
+                NativeEvidenceFact::Message(NativeMessageObservation::Public(value)) => {
+                    assert!(!value.eligible);
+                    assert_eq!(value.completeness, reason);
+                }
+                NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(value)) => {
+                    assert_eq!(value.completeness, reason)
+                }
+                NativeEvidenceFact::ResponseCycle(value) => {
+                    assert!(!value.context.main_session && !value.context.complete_through_event)
+                }
+                _ => {}
+            }
+        }
+        if reason == ToolResultCompleteness::UnsafeIdentity {
+            for index in 0..MAX_NATIVE_EVIDENCE_OBSERVATIONS {
+                sink.native_activity(crate::analysis::NativeActivityObservation {
+                    source_format: failure.source_format,
+                    session_id: "facts".into(),
+                    position: ToolResultPosition::Jsonl {
+                        record_index: 100 + index as u64,
+                        item_index: 0,
+                    },
+                    token: index.to_string(),
+                    native_at_ms: None,
+                });
+            }
+            assert!(
+                !sink
+                    .native_evidence
+                    .iter()
+                    .any(|event| matches!(event.fact, NativeEvidenceFact::AdmissionFailure(_)))
+            );
+        }
+        let snapshot = sink
+            .snapshot(AdapterResume {
+                point: crate::analysis::ResumePoint {
+                    offset: 0,
+                    tail_hash: 0,
+                    tail_len: 0,
+                },
+                adapter: crate::analysis::AdapterSnapshot(Vec::new()),
+            })
+            .unwrap();
+        let snapshot = StreamSnapshot::decode(&snapshot.encode()).unwrap();
+        let mut restored = composite_with_rows("codex", "facts");
+        restored.restore_tool_result_observations(&snapshot);
+        restored.restore_user_messages(&snapshot);
+        assert_eq!(restored.native_admission_failure.as_ref(), Some(&failure));
+        restored.record(NormalizedRecord::PublicMessage(Box::new(future)));
+        assert!(restored.native_evidence.iter().any(|event| matches!(&event.fact, NativeEvidenceFact::Message(NativeMessageObservation::Public(value)) if value.record_id == "future" && !value.eligible && value.completeness == reason)));
+        assert!(
+            restored
+                .tool_result_observations
+                .iter()
+                .all(|result| result.completeness == reason)
+        );
+        assert_eq!(
+            restored.native_evidence_bytes,
+            restored
+                .native_evidence
+                .iter()
+                .map(|event| serde_json::to_vec(event).unwrap().len())
+                .sum::<usize>()
+        );
+    }
 }
 
 #[test]

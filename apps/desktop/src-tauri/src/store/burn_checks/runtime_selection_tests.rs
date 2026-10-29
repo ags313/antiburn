@@ -86,7 +86,7 @@ fn membership_correction_durably_invalidates_all_work_states_and_only_its_branch
             }
             "dispatching" => {
                 adapter
-                    .record_dispatch_intent(&claim(&adapter, &pending), 100_000, Duration::ZERO, 1)
+                    .dispatch_review(&claim(&adapter, &pending), 100_000, Duration::ZERO, 1)
                     .unwrap();
             }
             "answered" => {

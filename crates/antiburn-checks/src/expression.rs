@@ -1,4 +1,4 @@
-//! Parser for the currently supported expression syntax.
+//! Parser for pure Burn Check expressions.
 
 use serde::Serialize;
 use serde_json::Number;
@@ -24,6 +24,20 @@ pub enum Expression {
     Literal(ExpressionLiteral),
     /// A static property or array-index path.
     Path(Vec<PathSegment>),
+    /// Access on a computed value, including dynamic keys and projections.
+    Access {
+        /// The value that owns the selected fields.
+        base: Box<Self>,
+        /// Access steps in authored order.
+        segments: Vec<AccessSegment>,
+    },
+    /// A supported pure function call.
+    Call {
+        /// The function to call.
+        function: ExpressionFunction,
+        /// Arguments in authored order.
+        arguments: Vec<Self>,
+    },
     /// Boolean negation.
     Not(Box<Self>),
     /// A supported binary operation.
@@ -35,6 +49,57 @@ pub enum Expression {
         /// The right operand.
         right: Box<Self>,
     },
+}
+
+/// One step in access on a computed value.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum AccessSegment {
+    /// A fixed object key or array length.
+    Property(String),
+    /// A fixed nonnegative array index.
+    Index(usize),
+    /// A string key or nonnegative integral index evaluated at runtime.
+    Dynamic(Box<Expression>),
+    /// Selection over ordered array items or sorted object values.
+    Projection,
+}
+
+/// A supported pure expression function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum ExpressionFunction {
+    StrictEquals,
+    Contains,
+    StartsWith,
+    EndsWith,
+    Join,
+    Format,
+    ToJSON,
+    FromJSON,
+}
+
+impl ExpressionFunction {
+    fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "strictequals" => Some(Self::StrictEquals),
+            "contains" => Some(Self::Contains),
+            "startswith" => Some(Self::StartsWith),
+            "endswith" => Some(Self::EndsWith),
+            "join" => Some(Self::Join),
+            "format" => Some(Self::Format),
+            "tojson" => Some(Self::ToJSON),
+            "fromjson" => Some(Self::FromJSON),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn accepts_arity(self, count: usize) -> bool {
+        match self {
+            Self::StrictEquals | Self::Contains | Self::StartsWith | Self::EndsWith => count == 2,
+            Self::Join => (1..=2).contains(&count),
+            Self::Format => count >= 2,
+            Self::ToJSON | Self::FromJSON => count == 1,
+        }
+    }
 }
 
 /// A literal value in an expression.
@@ -86,6 +151,19 @@ impl Expression {
         match self {
             Self::Literal(_) => {}
             Self::Path(segments) => visitor(segments),
+            Self::Access { base, segments } => {
+                base.visit_paths(visitor);
+                for segment in segments {
+                    if let AccessSegment::Dynamic(expression) = segment {
+                        expression.visit_paths(visitor);
+                    }
+                }
+            }
+            Self::Call { arguments, .. } => {
+                for argument in arguments {
+                    argument.visit_paths(visitor);
+                }
+            }
             Self::Not(value) => value.visit_paths(visitor),
             Self::Binary { left, right, .. } => {
                 left.visit_paths(visitor);
@@ -93,12 +171,35 @@ impl Expression {
             }
         }
     }
+
+    /// Visits each computed access chain and all nested expressions.
+    pub fn visit_accesses(&self, visitor: &mut impl FnMut(&Self, &[AccessSegment])) {
+        match self {
+            Self::Access { base, segments } => {
+                visitor(base, segments);
+                base.visit_accesses(visitor);
+                for segment in segments {
+                    if let AccessSegment::Dynamic(expression) = segment {
+                        expression.visit_accesses(visitor);
+                    }
+                }
+            }
+            Self::Call { arguments, .. } => {
+                for argument in arguments {
+                    argument.visit_accesses(visitor);
+                }
+            }
+            Self::Not(value) => value.visit_accesses(visitor),
+            Self::Binary { left, right, .. } => {
+                left.visit_accesses(visitor);
+                right.visit_accesses(visitor);
+            }
+            Self::Literal(_) | Self::Path(_) => {}
+        }
+    }
 }
 
-/// Parses one expression using the supported operators and static access paths.
-///
-/// Function calls, projections, dynamic indexes, arithmetic, and assignment are
-/// not supported yet.
+/// Parses one expression with pure calls, access, and supported operators.
 ///
 /// # Errors
 /// Returns a stable unsupported-feature or expression-syntax error.
@@ -217,20 +318,18 @@ impl ExpressionParser {
     fn parse_primary(&mut self, depth: usize) -> Result<ParsedExpression, ExpressionError> {
         self.check_parse_depth(depth)?;
         let mut expression_depth = 1;
+        let mut grouped = matches!(self.current(), TokenKind::LeftParen);
         let mut expression = match self.advance() {
             TokenKind::Identifier(value) => match value.as_str() {
                 "true" => Expression::Literal(ExpressionLiteral::Boolean(true)),
                 "false" => Expression::Literal(ExpressionLiteral::Boolean(false)),
                 "null" => Expression::Literal(ExpressionLiteral::Null),
-                _ => {
-                    if matches!(self.current(), TokenKind::LeftParen) {
-                        return Err(self.error(
-                            DiagnosticCode::CompileUnsupportedFeature,
-                            "Function calls are not supported yet.",
-                        ));
-                    }
-                    Expression::Path(vec![PathSegment::Property(value)])
+                _ if matches!(self.current(), TokenKind::LeftParen) => {
+                    let call = self.parse_call(&value, depth)?;
+                    expression_depth = call.depth;
+                    call.expression
                 }
+                _ => Expression::Path(vec![PathSegment::Property(value)]),
             },
             TokenKind::String(value) => Expression::Literal(ExpressionLiteral::String(value)),
             TokenKind::Number(value) => Expression::Literal(ExpressionLiteral::Number(value)),
@@ -265,13 +364,14 @@ impl ExpressionParser {
                     self.advance();
                     match self.advance() {
                         TokenKind::Identifier(name) => {
-                            push_access(&mut expression, PathSegment::Property(name), self)?;
+                            push_access(
+                                &mut expression,
+                                AccessSegment::Property(name),
+                                &mut grouped,
+                            );
                         }
                         TokenKind::Star => {
-                            return Err(self.error(
-                                DiagnosticCode::CompileUnsupportedFeature,
-                                "Projection syntax is not supported yet.",
-                            ));
+                            push_access(&mut expression, AccessSegment::Projection, &mut grouped);
                         }
                         _ => {
                             return Err(self.error(
@@ -283,46 +383,95 @@ impl ExpressionParser {
                 }
                 TokenKind::LeftBracket => {
                     self.advance();
-                    let segment = match self.advance() {
-                        TokenKind::String(name) => PathSegment::Property(name),
-                        TokenKind::Number(number) => {
-                            let Some(index) = number
+                    let selector = self.parse_binary(0, depth + 1)?;
+                    expression_depth = expression_depth.max(selector.depth + 1);
+                    let segment = match selector.expression {
+                        Expression::Literal(ExpressionLiteral::String(name)) => {
+                            AccessSegment::Property(name)
+                        }
+                        Expression::Literal(ExpressionLiteral::Number(ref number))
+                            if number
                                 .as_u64()
                                 .and_then(|value| usize::try_from(value).ok())
-                            else {
-                                return Err(self.error(
-                                    DiagnosticCode::CompileUnsupportedFeature,
-                                    "Only nonnegative literal array indexes are supported.",
-                                ));
-                            };
-                            PathSegment::Index(index)
+                                .is_some() =>
+                        {
+                            AccessSegment::Index(
+                                number
+                                    .as_u64()
+                                    .and_then(|value| usize::try_from(value).ok())
+                                    .expect("checked index"),
+                            )
                         }
-                        _ => {
-                            return Err(self.error(
-                                DiagnosticCode::CompileUnsupportedFeature,
-                                "Dynamic bracket access is not supported yet.",
-                            ));
-                        }
+                        expression => AccessSegment::Dynamic(Box::new(expression)),
                     };
                     if !matches!(self.advance(), TokenKind::RightBracket) {
                         return Err(self.error(
                             DiagnosticCode::CompileInvalidExpression,
-                            "Expected `]` after a fixed bracket key or index.",
+                            "Expected `]` after a bracket key or index.",
                         ));
                     }
-                    push_access(&mut expression, segment, self)?;
+                    push_access(&mut expression, segment, &mut grouped);
                 }
                 TokenKind::LeftParen => {
                     return Err(self.error(
                         DiagnosticCode::CompileUnsupportedFeature,
-                        "Function and method calls are not supported yet.",
+                        "Method calls and calls on computed values are not supported.",
                     ));
                 }
                 _ => break,
             }
         }
+        if expression_depth > MAX_EXPRESSION_DEPTH {
+            return Err(self.expression_depth_error());
+        }
         Ok(ParsedExpression {
             expression,
+            depth: expression_depth,
+        })
+    }
+
+    fn parse_call(
+        &mut self,
+        name: &str,
+        depth: usize,
+    ) -> Result<ParsedExpression, ExpressionError> {
+        let Some(function) = ExpressionFunction::parse(name) else {
+            return Err(self.error(
+                DiagnosticCode::CompileUnsupportedFeature,
+                "Unknown expression function.",
+            ));
+        };
+        self.advance();
+        let mut arguments = Vec::new();
+        let mut expression_depth = 1;
+        if !matches!(self.current(), TokenKind::RightParen) {
+            loop {
+                let argument = self.parse_binary(0, depth + 1)?;
+                expression_depth = expression_depth.max(argument.depth + 1);
+                arguments.push(argument.expression);
+                if !matches!(self.current(), TokenKind::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+        }
+        if !matches!(self.advance(), TokenKind::RightParen) {
+            return Err(self.error(
+                DiagnosticCode::CompileInvalidExpression,
+                "Expected `)` after function arguments.",
+            ));
+        }
+        if !function.accepts_arity(arguments.len()) {
+            return Err(self.error(
+                DiagnosticCode::CompileInvalidExpression,
+                "Wrong number of expression function arguments.",
+            ));
+        }
+        Ok(ParsedExpression {
+            expression: Expression::Call {
+                function,
+                arguments,
+            },
             depth: expression_depth,
         })
     }
@@ -369,19 +518,32 @@ impl ExpressionParser {
     }
 }
 
-fn push_access(
-    expression: &mut Expression,
-    segment: PathSegment,
-    parser: &ExpressionParser,
-) -> Result<(), ExpressionError> {
-    if let Expression::Path(segments) = expression {
-        segments.push(segment);
-        Ok(())
-    } else {
-        Err(parser.error(
-            DiagnosticCode::CompileInvalidExpression,
-            "Property access requires a context path.",
-        ))
+fn push_access(expression: &mut Expression, segment: AccessSegment, grouped: &mut bool) {
+    if *grouped && matches!(expression, Expression::Access { .. }) {
+        let base = std::mem::replace(expression, Expression::Literal(ExpressionLiteral::Null));
+        *expression = Expression::Access {
+            base: Box::new(base),
+            segments: vec![segment],
+        };
+        *grouped = false;
+        return;
+    }
+    *grouped = false;
+    match (expression, segment) {
+        (Expression::Path(segments), AccessSegment::Property(name)) => {
+            segments.push(PathSegment::Property(name))
+        }
+        (Expression::Path(segments), AccessSegment::Index(index)) => {
+            segments.push(PathSegment::Index(index))
+        }
+        (Expression::Access { segments, .. }, segment) => segments.push(segment),
+        (expression, segment) => {
+            let base = std::mem::replace(expression, Expression::Literal(ExpressionLiteral::Null));
+            *expression = Expression::Access {
+                base: Box::new(base),
+                segments: vec![segment],
+            };
+        }
     }
 }
 
@@ -583,3 +745,7 @@ fn number_error(start: usize) -> ExpressionError {
         message: format!("Invalid finite JSON number at expression byte {start}."),
     }
 }
+
+#[cfg(test)]
+#[path = "expression/tests.rs"]
+mod tests;

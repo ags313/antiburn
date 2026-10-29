@@ -193,16 +193,19 @@ export function isPureEngineReleaseChange(files, readAtRef) {
  * Rust sources and compares the result with this map.
  */
 export const CROSS_WORKSPACE_INPUTS = {
-  ".antiburn/checks/failed-retry-loop.yml": ["checks"],
+  ".agents/skills/antiburn-checks/SKILL.md": ["checks"],
+  ".antiburn/checks/fast-mode-value.yml": ["checks", "shell"],
+  ".antiburn/checks/ignored-instructions.yml": ["checks", "shell"],
+  ".antiburn/checks/over-exploring.yml": ["checks", "shell"],
+  ".antiburn/checks/scope-creep.yml": ["checks", "shell"],
+  ".antiburn/checks/skill-opportunities.yml": ["checks"],
   "apps/desktop/interface-scale.json": ["shell"],
   "apps/desktop/src/views/main-window/burn-checks/tests/fixtures/installed-check-report.json":
     ["shell"],
   "apps/desktop/src/views/SettingsView.tsx": ["shell"],
   "apps/desktop/src/views/settings/PrivacyPane.tsx": ["shell"],
   "docs/analytics.md": ["shell"],
-  "docs/burn-check/examples/failed-retry-loop.yml": ["checks", "shell"],
-  "docs/burn-check/examples/over-exploring.yml": ["checks"],
-  "docs/burn-check/examples/scope-creep.yml": ["checks"],
+  "docs/burn-check/tests/expression-parity.json": ["checks"],
   "docs/check-coverage.md": ["engine", "shell"],
   "docs/privacy-policy.md": ["shell"],
   "docs/session-coverage.md": ["engine"],
@@ -362,7 +365,11 @@ export function routeChanges(files) {
 
   for (const file of files) {
     for (const id of crossWorkspaceReaders(file)) direct.add(id);
-    if (file.startsWith("docs/burn-check/")) route.validator = true;
+    if (
+      file.startsWith("docs/burn-check/") ||
+      /^\.antiburn\/checks\/[^/]+\.ya?ml$/.test(file)
+    )
+      route.validator = true;
     if (isDocumentationPath(file)) continue;
     const name = file.slice(file.lastIndexOf("/") + 1);
 
@@ -386,6 +393,15 @@ export function routeChanges(files) {
     ) {
       route.ci_scripts = true;
       route.licenses = true;
+    } else if (
+      file === "scripts/run-opencode-wsl-acceptance.ps1" ||
+      file === "scripts/opencode-wsl-acceptance.test.mjs" ||
+      file.startsWith(
+        "crates/antiburn-local/tests/fixtures/opencode_wsl_acceptance/",
+      )
+    ) {
+      direct.add("engine");
+      route.ci_scripts = true;
     } else if (file.startsWith("scripts/")) {
       route.ci_scripts = true;
     } else {

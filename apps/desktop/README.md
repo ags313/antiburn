@@ -12,13 +12,52 @@ server, or backend.
 
 ## Data and network requests
 
-- **Model-based Checks:** Settings → Checks controls authored YAML discovery and
-  review of new local session activity. **Decision model** exposes Jev only. The connection
-  uses native credential storage. Requests contain selected tool results and
-  available user-slot text, not full transcripts. Partial fields, truncated text,
-  and source gaps are identified for the model; missing images are not analyzed.
-  Provider usage charges can apply. Built-in smart-check execution and historical
-  enrollment are suspended; saved results, preferences, and implementations remain.
+- **OpenCode V2 sessions:** Native stored analysis reads a bounded, read-only SQLite
+  snapshot. Live YAML Checks can observe the existing registered local service
+  over authenticated HTTP after Antiburn proves that its process has the selected
+  database open. Credentials stay in memory. Antiburn does not start the service,
+  install a plugin, or change its database. A feed disconnect creates an evidence
+  gap; later safe results can resume from a new boundary without replaying missed
+  work. Request history before attachment stays partial. Bounded WSL stored reads
+  require existing Linux curl and an already-running default registered OpenCode 2
+  service. They use a separate transfer format without native live-check
+  eligibility. See [source coverage](../../docs/session-coverage.md) for limits.
+  OpenCode 2 releases are admitted by default. Required data shapes and source
+  identity checks, not an exact release allowlist, control reader eligibility.
+- **Model-based checks:** A fresh setup without a connection stays off. Settings →
+  Checks preserves the saved master setting. Check cards and navigation
+  appear only for discovered definitions; Settings controls stay available.
+  The connection list under **Model-based checks** supports Jev, Ollama endpoints
+  that support System One, Cloudflare, or Custom. Add and edit use a connection
+  dialog. Inactive rows keep **Use** visible. Each row puts **Edit** and **Remove**
+  in its actions menu.
+  **Use** selects a saved connection. Saving an inactive connection does not select it.
+  Removing the selected connection turns checks off and clears selection, even
+  when other connections remain. Saved results and usage remain available. The app
+  manages supported model limits; unknown Custom limits block execution.
+  Custom supports direct System One and Cloudflare-envelope responses, not arbitrary chat APIs. Credentials use native
+  credential storage or memory. Model requests contain the definition's selected
+  public messages, tool calls/results, response-cycle or session facts, current
+  instruction text, and declared skill descriptions, not automatic full
+  transcripts. Local status checks send no model request. They still require
+  **Run checks** to be on and a configured connection to be selected. The
+  connection's credential and authentication rules, and the source and runtime
+  requirements, still apply. Skill inventory inputs contain declared
+  metadata, not full bodies; selected tool results can still contain file text. Current-file inputs
+  remain frozen for delayed decisions and retries. Partial fields, truncated
+  text, and source gaps are identified for the model; missing images are not analyzed.
+  Native Jev uses the saved TypeSafe credential with `jev-latest` and long
+  context enabled. New Jev releases do not require profile migrations. Requests
+  retain the alias; observed served models and known prices are per attempt.
+  Provider usage charges can apply. Check files shows only enabled folders with
+  confirmed files and reloads when you revisit Checks settings. Model usage shows
+  recorded values and omits absent estimates and unknown counts. The app retains
+  the full local accounting records.
+  With **Run checks** off, the app still reads and parses bounded local YAML
+  definitions and watches their directories, including at cold startup. This
+  supplies names, diagnostics, paused cards, and file counts. It does not restore
+  provider configuration, discover model capabilities, catch up session sources,
+  or run assessments.
 - **Model prices:** The app downloads public prices from models.dev at startup
   and once an hour while it runs. The request contains no session data or
   credentials.
@@ -137,19 +176,20 @@ a system SQLite.
 
 ## Debugging
 
-### Smart Check diagnostics
+### Provider and Burn Check diagnostics
 
-The [Rust eval guide](src-tauri/eval/README.md) documents one ignored `live`
-entry point per check and shared environment-only provider selection. Use
-`ANTIBURN_EVAL_SUITE`, exact `ANTIBURN_EVAL_CASES`, and a positive
-`ANTIBURN_EVAL_LIMIT` to select bounded work. Timestamped captures include
-per-case outcomes, citation diagnostics, errors, abstentions, accuracy, usage,
-and latency. Scores do not gate delivery; no strict thresholds, frozen hashes,
-previous passing captures, recipes, or Python tool are required. Production
-protocol and authority validation still apply. Do not select every ignored test.
+The [Rust eval guide](src-tauri/eval/README.md) covers shared provider protocol
+validation and isolated YAML replay. Use exact cases and a positive request
+limit for authorized live replay. Captures retain synthetic inputs, answers,
+errors, usage, and latency. Protocol success does not prove model quality or
+native source support. Do not select every ignored test.
+
+Use the [operator acceptance guide](../../docs/runbooks/burn-check-live-acceptance.md)
+for bounded provider checks and native event probes. These manual checks are
+separate from automated validation.
 
 ```sh
-ANTIBURN_EVAL_PROVIDER=ollama-nimble ANTIBURN_EVAL_LIMIT=3 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --offline --test over_exploring live -- --ignored --exact --nocapture --test-threads=1
+cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml --offline --test provider_validation
 ```
 
 See [`docs/debugging.md`](../../docs/debugging.md) for development modes,
@@ -163,17 +203,50 @@ and IPC. The Rust analytics module tests consent, endpoint injection, and the
 payload schema. `cargo-deny` rejects known telemetry dependencies in the local
 engine. Release and dependency checks run through the required CI gate.
 
-YAML Burn Checks use Jev, separate from analytics. Hosted requests can incur
-charges. The master **Model-based Checks** setting controls discovery and
-activation; **Decision model** configures Jev. Built-in Ignored Instructions,
-Scope Creep, Over-exploring, and Skill Opportunities do not run or enroll history.
-Their saved results and alternative-provider profiles remain; these profiles do
-not add YAML decision routes.
+YAML Burn Checks use the active System One connection, separate from analytics.
+Hosted requests can incur charges. In **Settings → Checks → Model-based checks**,
+turn **Run checks** off while configuring the connection. Choose **Add
+connection**, enter its fields, and select **Add connection** in the dialog.
+The first connection becomes selected without enabling checks. For another saved
+connection, select **Use**, then enable **Run checks** when ready. **Edit** and
+**Save** change its configuration without selecting another connection. Saving a
+change to the selected connection updates that connection; turn checks off first
+to avoid starting work with the saved change. A test sends synthetic input and
+can incur charges. **Remove** deletes a saved connection, not its past results.
+**Check files** and **Model usage** are accordions inside the card. **Check files** lists
+actual container folders with file counts and a native open action. **Model
+usage** shows recorded device-wide requests and estimated cost. See
+[decision connections](../../docs/burn-check/authoring.md#decision-connections)
+for required fields and capability limits.
 
-Terminal results with safe identity and order can enter a live window even when
-optional fields or retained history are partial. Quality fields preserve those
-limits. A missing required expression value can make one candidate not assessable
-without blocking later results. User-slot text can include extension/API input;
+If a connection operation needs recovery, use its explicit retry action. That
+action remains available even when removal has already deleted the connection
+row. Reading settings does not finish a pending operation. Keep typed changes
+until recovery confirms completion or you choose to discard them.
+
+Settings owns decision routing. A YAML decision `model` field is rejected as
+unknown; the app does not rewrite the definition. Observed coding-agent model
+fields remain source facts. A valid definition can wait for a compatible
+connection without losing its source progress or accepted status.
+
+Message windows can select admitted user text, completed public assistant text,
+explicit tool calls, and terminal tool results. Source-specific proof controls
+availability; a call and its result have separate identities. Complete response
+cycles are available only from characterized Codex intervals and continuous
+OpenCode V2 execution periods. Session events record an observation attachment or
+120 seconds without observed source activity, not agent creation or measured work
+time. New activity cancels unfinished idle work.
+
+Cursor Desktop has a separate ordered snapshot tool-result route. Only its
+characterized native inline main-session source with recorded header order,
+exact bubble/call identities, and current ready cached evidence qualifies. It
+does not supply separate public message/call, cycle, or session-observation
+events. Cursor CLI and generic stores do not inherit the route. See the
+[Cursor source contract](../../docs/session-coverage.md#cursor-desktop-yaml-tool-evidence).
+
+Safe identity and order can allow partial optional fields or retained history.
+Quality fields preserve those limits. A missing required expression value can
+make one candidate not assessable without blocking later events. User-slot text can include extension/API input;
 it is not proof of human approval. OpenCode synthetic parts are excluded, mixed
 messages retain real user text, and generated-only replacements leave request
 history partial. Unknown delivery does not
@@ -182,9 +255,7 @@ or clean whole session. See the [Burn Checks guide](../../docs/burn-check/README
 
 The source and result limits are in
 [`session-coverage.md`](../../docs/session-coverage.md) and
-[`check-coverage.md`](../../docs/check-coverage.md). The
-[Smart Burn Checks guide](../../docs/smart-burn-checks.md) records the retained
-built-in implementation and its separate evidence capabilities.
+[`check-coverage.md`](../../docs/check-coverage.md).
 
 Burn Check remediation stays local. After a separate review and confirmation,
 each Auto Fix changes one winning control. It uses the global or user control
@@ -195,8 +266,12 @@ for an eligible optional built-in tool. Findings that share one global target
 across projects are grouped, and every project context is revalidated. Model and
 reasoning targets remain pinned to publication attribution. Claude fast mode
 writes `false`. Before replacing an existing config file, Auto Fix leaves its
-exact prior content in a sibling `.bak` file. Copy provides a bounded fallback
-when an exact prompt is not available. See the
+exact prior content in a sibling `.bak` file. Each explicit Copy prepares fresh
+text from current data, including retries after clipboard failure. It provides
+a bounded inspection fallback for incomplete selections or oversized combined
+text. Existing watches and
+full watch capacity do not block valid text; Copy does not rearm attempts or
+prove verification or savings. See the
 [remediation guide](../../docs/remediation.md) for supported agents, safety
 checks, recovery, bounds, and privacy.
 
@@ -263,8 +338,10 @@ Settings teardown, and the memory rules behind those policies.
   the first run fires the existing notification that identifies the menu-bar
   companion and warms the popover's hidden renderer for the first click.
 - **Settings.** An ordinary decorated window, created on demand and destroyed
-  on close. A source list on the left, one pane on the right; every control
-  writes through immediately. Remote-host connection forms save explicitly after
+  on close. A source list on the left, one pane on the right; ordinary preference
+  controls write through immediately. Decision-provider drafts save explicitly;
+  **Use** selects a saved connection. Saving an inactive connection preserves
+  selection. Testing does not save or select a draft. Remote-host connection forms save explicitly after
   validation; canceling a form preserves the existing host configuration.
   General → Application controls the menu-bar or system-tray icon. macOS also
   controls Dock visibility and always keeps at least one entry point visible.

@@ -1,4 +1,4 @@
-//! Append-safe leases and atomic pre-alpha OpenCode journal publication.
+//! Append-safe leases and atomic OpenCode journal publication.
 
 use antiburn_local::analysis::{OpenCodeJournalCursor, OpenCodeToolResultPage, PARSER_REVISION};
 use antiburn_local::discovery::ACTIVE_SESSION_WINDOW_SECS;
@@ -6,42 +6,37 @@ use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::super::publications::{
-    PublicationPolicy, ToolResultBatch, publish_coverage_in, reconcile_with_policy,
+    PublicationGapKind, PublicationPolicy, ToolResultBatch, publish_coverage_in,
+};
+use crate::store::selected_source::{
+    LIVE_ACTIVATION_SQL, OPENCODE_V1_SOURCE_SQL, ROOT_SESSION_SQL,
 };
 use crate::store::{Incarnation, SessionKey, Store};
-
-#[path = "journal/message_removals.rs"]
-mod message_removals;
 
 const JOURNAL_POLL_SECS: i64 = 1;
 const DORMANT_POLL_SECS: i64 = 30;
 const MAX_READ_ATTEMPTS: i64 = 5;
 
-const CANDIDATES: &str = "WITH source_sessions AS (
-    SELECT s.*, NOT EXISTS(SELECT 1 FROM session_relation r
-        WHERE r.environment_key = s.environment_key AND r.agent = s.agent
-           AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
-             OR (r.related_id = s.session_id AND r.kind = 'subagent'))) AS main_session
-       FROM session s WHERE s.environment_key = 'native' AND s.agent = 'opencode'
-         AND s.source_kind = 'providerDb' AND s.wsl_distro IS NULL
+fn candidates_sql() -> String {
+    format!(
+        "WITH source_sessions AS (
+    SELECT s.*, ({ROOT_SESSION_SQL}) AS main_session
+       FROM session s WHERE ({OPENCODE_V1_SOURCE_SQL}) AND s.wsl_distro IS NULL
          AND s.cwd IS NOT NULL AND s.cwd <> ''
-         AND EXISTS(SELECT 1 FROM burn_check_activation a
-           WHERE a.enabled = 1 AND json_extract(a.activation_scope_key, '$.environment') = s.environment_key
-             AND json_extract(a.activation_scope_key, '$.session_cwd') = s.cwd
-             AND json_extract(a.activation_scope_key, '$.run') = 'Live')
+         AND ({LIVE_ACTIVATION_SQL})
 ), candidates AS (
     SELECT s.environment_key, s.agent, s.session_id, s.incarnation, s.source_label,
            s.cwd, s.source_generation, s.updated_at_epoch,
            d.cursor_json, d.baseline_sequence, d.retry_count, d.observed_generation,
            d.pending, d.blocked, d.lease_expires_at_epoch, d.next_attempt_at_epoch,
               d.service_ticket, d.history_gap, d.last_error, s.main_session,
-           (d.incarnation IS NULL OR d.incarnation <> s.incarnation
-               OR d.source_label <> s.source_label OR d.cwd IS NOT s.cwd
-               OR d.parser_revision <> ?1 OR d.main_session <> s.main_session) AS reset
+            (d.incarnation IS NULL OR d.incarnation <> s.incarnation
+                OR d.source_label <> s.source_label OR d.cwd IS NOT s.cwd
+                 OR d.main_session <> s.main_session) AS reset
       FROM source_sessions s LEFT JOIN opencode_journal_delivery d
         ON d.environment_key = s.environment_key AND d.agent = s.agent
        AND d.session_id = s.session_id
-     WHERE s.main_session
+      WHERE s.main_session AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62, 63, 64, 65, 66))
 ), scheduled AS (
     SELECT *, CASE WHEN reset THEN ?2 ELSE MAX(COALESCE(lease_expires_at_epoch, ?2),
         CASE WHEN observed_generation <> source_generation THEN ?2
@@ -50,7 +45,9 @@ const CANDIDATES: &str = "WITH source_sessions AS (
      WHERE (reset AND updated_at_epoch >= ?3)
         OR (NOT reset AND blocked = 0 AND (pending = 1
             OR observed_generation <> source_generation OR next_attempt_at_epoch IS NOT NULL))
-)";
+)"
+    )
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct OpenCodeJournalClaim {
@@ -61,6 +58,7 @@ pub(crate) struct OpenCodeJournalClaim {
     source_generation: i64,
     claim_fence: i64,
     cursor_json: Option<String>,
+    parser_revision: Option<i64>,
     pub(crate) baseline_sequence: Option<u64>,
     pub(crate) requires_full_read: bool,
     history_gap: bool,
@@ -78,9 +76,38 @@ impl OpenCodeJournalClaim {
         );
         self.cursor_json
             .as_deref()
-            .map(serde_json::from_str)
+            .map(|encoded| {
+                let value: serde_json::Value = serde_json::from_str(encoded)?;
+                let parser = value["parser_revision"]
+                    .as_i64()
+                    .ok_or_else(|| anyhow::anyhow!("journal parser revision is invalid"))?;
+                ensure!(
+                    self.parser_revision == Some(parser),
+                    "journal parser binding mismatch"
+                );
+                let layout = if value["live"].is_null() {
+                    None
+                } else {
+                    Some(
+                        value["live"]["revision"]
+                            .as_u64()
+                            .ok_or_else(|| anyhow::anyhow!("journal live revision is invalid"))?,
+                    )
+                };
+                ensure!(
+                    matches!(
+                        (parser, layout),
+                        (64, Some(2)) | (62, Some(4)) | (63..=66, Some(5)) | (62..=66, None)
+                    ) || (parser == PARSER_REVISION && matches!(layout, None | Some(5))),
+                    "journal parser and live layout are incompatible"
+                );
+                if (parser, layout) == (64, Some(2)) {
+                    OpenCodeJournalCursor::decode_main_64_json(encoded.as_bytes())
+                } else {
+                    Ok(serde_json::from_value(value)?)
+                }
+            })
             .transpose()
-            .map_err(Into::into)
     }
 }
 
@@ -150,15 +177,18 @@ impl Store {
         let candidate = tx
             .query_row(
                 &format!(
-                    "{CANDIDATES}
+                    "{}
             SELECT environment_key, agent, session_id, incarnation, source_label, cwd,
                    source_generation, cursor_json, baseline_sequence,
                     COALESCE(retry_count, 0), reset, observed_generation, history_gap, main_session,
-                    COALESCE(last_error NOT IN ('journal-history-incomplete',
-                        'journal-main-session-unavailable'), 0)
+                     COALESCE(last_error NOT IN ('journal-history-incomplete',
+                         'journal-main-session-unavailable'), 0),
+                     (SELECT d.parser_revision FROM opencode_journal_delivery d WHERE d.environment_key = scheduled.environment_key
+                       AND d.agent = scheduled.agent AND d.session_id = scheduled.session_id)
               FROM scheduled WHERE due_at <= ?2
                ORDER BY {order} service_ticket, session_id
-             LIMIT 1"
+             LIMIT 1",
+                    candidates_sql()
                 ),
                 params![PARSER_REVISION, now, now - ACTIVE_SESSION_WINDOW_SECS],
                 |row| {
@@ -176,8 +206,10 @@ impl Store {
                         source_generation: generation,
                         claim_fence: 0,
                         cursor_json: if reset { None } else { row.get(7)? },
+                        parser_revision: row.get(15)?,
                         baseline_sequence: if reset { None } else { row.get(8)? },
                         requires_full_read: reset
+                            || row.get::<_, Option<i64>>(15)? != Some(PARSER_REVISION)
                             || row.get::<_, Option<i64>>(11)? != Some(generation)
                             || row.get::<_, bool>(14)?,
                         history_gap: if reset { false } else { row.get(12)? },
@@ -213,7 +245,7 @@ impl Store {
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
             ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
                 incarnation = excluded.incarnation, source_label = excluded.source_label,
-                cwd = excluded.cwd, parser_revision = excluded.parser_revision,
+                 cwd = excluded.cwd,
                 cursor_json = excluded.cursor_json, baseline_sequence = excluded.baseline_sequence,
                 pending = 1, blocked = 0, claim_fence = excluded.claim_fence,
                 lease_expires_at_epoch = excluded.lease_expires_at_epoch,
@@ -285,44 +317,104 @@ impl Store {
             .live_baseline()
             .or(claim.baseline_sequence)
             .unwrap_or(page.snapshot_end);
-        let mut batch = ToolResultBatch {
-            source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2,
-            results: page.results.clone(),
-            complete: false,
-        };
-        if !claim.main_session {
-            use antiburn_local::analysis::ToolResultCompleteness;
-            for result in &mut batch.results {
-                if matches!(
-                    result.completeness,
-                    ToolResultCompleteness::Complete | ToolResultCompleteness::Incomplete
-                ) {
-                    result.completeness = ToolResultCompleteness::UnsafeOwnership;
-                }
-                if let Some(context) = &mut result.context {
-                    context.main_session = false;
-                }
+        let history_complete = page.history_complete
+            && page.evidence.history_complete
+            && !claim.history_gap
+            && claim.main_session;
+        let unsafe_reason = page.evidence.events.iter().find_map(|event| {
+            if let antiburn_local::analysis::NativeEvidenceFact::AdmissionFailure(failure) =
+                &event.fact
+            {
+                super::super::admission::reason(failure.reason)
+            } else {
+                None
             }
-        }
-        let history_complete = page.history_complete && !claim.history_gap && claim.main_session;
-        let gap_reason = if !claim.main_session {
+        });
+        let gap_reason = if unsafe_reason.is_some() {
+            unsafe_reason
+        } else if !claim.main_session {
             Some("journal-main-session-unavailable")
         } else {
             (!history_complete).then_some("journal-history-incomplete")
         };
-        message_removals::reconcile_page(
+        let consumed = super::super::evidence::reconcile_evidence_in(
             &tx,
-            claim,
+            &claim.key,
             generation,
-            &batch,
-            &page.message_removals,
+            claim.claim_fence,
+            &page.evidence,
             PublicationPolicy {
+                invalidation_effects: None,
                 baseline: Some(baseline),
                 history_complete: Some(history_complete),
                 gap_reason,
+                gap_kind: if claim.main_session {
+                    PublicationGapKind::Partial
+                } else {
+                    PublicationGapKind::Invalidated
+                },
                 suppress_coverage: false,
+                live_eligible: None,
             },
+            now * 1000,
         )?;
+        super::super::observers::frontier_in(
+            &tx,
+            &claim.key,
+            &cursor_json,
+            consumed
+                && unsafe_reason.is_none()
+                && !page.has_more
+                && generation == claim.source_generation,
+            now * 1000,
+        )?;
+        if !consumed {
+            let retry = match claim.cursor()? {
+                Some(cursor) if cursor.live_baseline().is_some() => {
+                    cursor.main_64_retry_json(&page.cursor)?
+                }
+                _ => page.cold_retry_json()?,
+            };
+            let retry_baseline = retry.as_ref().and(page.cursor.live_baseline());
+            tx.execute(
+                "UPDATE opencode_journal_delivery SET pending = 1, lease_expires_at_epoch = NULL,
+                next_attempt_at_epoch = ?4, cursor_json = COALESCE(?5, cursor_json),
+                baseline_sequence = CASE WHEN ?5 IS NOT NULL THEN ?7 ELSE baseline_sequence END,
+                parser_revision = CASE WHEN ?5 IS NOT NULL THEN ?6 ELSE parser_revision END
+                WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3",
+                params![
+                    claim.key.environment_key,
+                    claim.key.agent,
+                    claim.key.session_id,
+                    now,
+                    retry,
+                    PARSER_REVISION,
+                    retry_baseline
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(true);
+        }
+        let coverage_reason: Option<String> = tx
+            .query_row(
+                "SELECT gap_reason FROM native_tool_result_publication
+             WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
+               AND source_format = ?4 AND outcome IN ('coverage_gap', 'coverage_complete')
+             ORDER BY publication_sequence DESC LIMIT 1",
+                params![
+                    claim.key.environment_key,
+                    claim.key.agent,
+                    claim.key.session_id,
+                    serde_json::to_string(
+                        &antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1
+                    )?
+                ],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let history_complete = history_complete
+            && coverage_reason.as_deref() != Some("native-message-removal-unbound");
         let pending = page.has_more || generation != claim.source_generation;
         let next_attempt = if pending {
             now
@@ -336,7 +428,7 @@ impl Store {
             SET cursor_json = ?4, baseline_sequence = ?5, observed_generation = ?6,
                 pending = ?7, lease_expires_at_epoch = NULL,
                 next_attempt_at_epoch = ?8, retry_count = 0, last_error = ?9, history_gap = ?12,
-                service_ticket = CASE WHEN ?7 THEN service_ticket ELSE NULL END
+                service_ticket = CASE WHEN ?7 THEN service_ticket ELSE NULL END, parser_revision = ?13
             WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
               AND claim_fence = ?10 AND cursor_json IS ?11",
             params![
@@ -351,7 +443,8 @@ impl Store {
                 gap_reason,
                 claim.claim_fence,
                 claim.cursor_json,
-                !history_complete
+                !history_complete,
+                PARSER_REVISION
             ],
         )?;
         ensure!(updated == 1, "journal cursor compare-and-swap failed");
@@ -375,13 +468,14 @@ impl Store {
         let retries = claim.retry_count + i64::from(!cancelled);
         let pending = !failure.blocked() && retries < MAX_READ_ATTEMPTS;
         if !cancelled {
+            super::super::observers::break_continuity_in(&tx, &claim.key)?;
             publish_coverage_in(
                 &tx,
                 &claim.key,
                 generation,
                 claim.claim_fence,
                 &ToolResultBatch {
-                    source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2,
+                    source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
                     results: Vec::new(),
                     complete: false,
                 },
@@ -430,6 +524,11 @@ impl Store {
             !claim.requires_full_read,
             "journal recovery requires a validated page"
         );
+        if generation == claim.source_generation
+            && let Some(receipt) = claim.cursor_json.as_deref()
+        {
+            super::super::observers::frontier_in(&tx, &claim.key, receipt, true, now * 1000)?;
+        }
         let next_attempt = if generation != claim.source_generation {
             now
         } else {
@@ -456,10 +555,7 @@ impl Store {
 
     pub(crate) fn next_opencode_journal_attempt(&self, now: i64) -> Result<Option<i64>> {
         Ok(self.lock().query_row(
-            &format!(
-                "{CANDIDATES}
-            SELECT MIN(due_at) FROM scheduled"
-            ),
+            &format!("{} SELECT MIN(due_at) FROM scheduled", candidates_sql()),
             params![PARSER_REVISION, now, now - ACTIVE_SESSION_WINDOW_SECS],
             |row| row.get(0),
         )?)
@@ -497,7 +593,7 @@ fn current_generation(
           AND d.claim_fence = ?4 AND d.cursor_json IS ?5 AND d.lease_expires_at_epoch > ?6
           AND d.incarnation = ?7 AND s.incarnation = ?7
           AND s.source_kind = 'providerDb' AND s.wsl_distro IS NULL AND s.source_label = ?8 AND s.cwd IS ?9
-          AND d.source_label = ?8 AND d.cwd IS ?9 AND d.parser_revision = ?10
+          AND d.source_label = ?8 AND d.cwd IS ?9 AND d.parser_revision IN (?10, 62, 63, 64, 65, 66)
           AND d.main_session = ?11 AND ?11 = (NOT EXISTS (
               SELECT 1 FROM session_relation r WHERE r.environment_key = s.environment_key
                 AND r.agent = s.agent AND ((r.session_id = s.session_id AND r.kind = 'forkParent')
@@ -510,3 +606,11 @@ fn current_generation(
 #[cfg(test)]
 #[path = "journal/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "journal/cold_retry_tests.rs"]
+mod cold_retry_tests;
+
+#[cfg(test)]
+#[path = "journal_regression_tests.rs"]
+mod regression_tests;

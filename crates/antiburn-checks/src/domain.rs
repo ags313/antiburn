@@ -81,6 +81,16 @@ pub enum EvidenceDependency {
         id: String,
         version: EvidenceVersion,
     },
+    /// Exact native evidence required by a complete response cycle or host event.
+    SourceEvidence {
+        id: String,
+        version: EvidenceVersion,
+    },
+    /// The attachment must retain this observed activity revision.
+    SessionActivity {
+        attachment_epoch: String,
+        activity_revision: u64,
+    },
 }
 
 /// Frozen values and the evidence facts that make them valid.
@@ -95,8 +105,12 @@ pub struct FrozenContext {
 /// The normalized event kind that drives selection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ObservationKind {
-    /// A user-slot message that supplies context but does not trigger a run.
+    /// An admitted user-slot message.
     UserMessage(Message),
+    /// A complete public assistant message.
+    AssistantMessage(Message),
+    /// An explicit tool request, separate from its result.
+    ToolCall(Message),
     /// A finalized native tool result.
     ToolResult {
         /// The normalized message representation.
@@ -105,6 +119,17 @@ pub enum ObservationKind {
         category: String,
         /// Final source result status.
         status: String,
+    },
+    /// One complete, source-proven response cycle.
+    TurnEnd { turn: Value },
+    /// One host attachment boundary.
+    SessionStart { reason: SessionStartReason },
+    /// One persisted idle boundary for an exact activity revision.
+    SessionIdle {
+        attachment_epoch: String,
+        activity_revision: u64,
+        idle_seconds: u32,
+        last_activity_at_ms: Option<i64>,
     },
     /// An observation that is retained for ordering but does not select a window.
     Other,
@@ -120,6 +145,9 @@ pub struct ObservationDraft {
     /// Immutable first-terminal publication, when the publisher retains it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_terminal_publication: Option<crate::source::PublicationCursor>,
+    /// First admitted boundary for a non-result event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_eligible_publication: Option<crate::source::PublicationCursor>,
     /// Source version used to detect corrections.
     pub version: EvidenceVersion,
     /// Observation payload kind.
@@ -139,6 +167,7 @@ impl ObservationDraft {
             branch: self.branch,
             native_order: self.native_order,
             first_terminal_publication: self.first_terminal_publication,
+            first_eligible_publication: self.first_eligible_publication,
             version: self.version,
             kind: self.kind,
             context: self.context,
@@ -159,6 +188,9 @@ pub struct Observation {
     /// Immutable first-terminal publication, when the publisher retains it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_terminal_publication: Option<crate::source::PublicationCursor>,
+    /// First admitted boundary for a non-result event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_eligible_publication: Option<crate::source::PublicationCursor>,
     /// Source version used to detect corrections.
     pub version: EvidenceVersion,
     /// Observation payload kind.
@@ -169,7 +201,25 @@ pub struct Observation {
     pub complete: bool,
 }
 
-/// An immutable candidate prepared from one rolling tool-result window.
+/// The host evidence that starts an attached observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStartReason {
+    New,
+    Resumed,
+    Attached,
+}
+
+/// A source-proven response-cycle outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseCycleStatus {
+    Completed,
+    Cancelled,
+    Error,
+}
+
+/// An immutable candidate prepared from one event or rolling message window.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FrozenCandidate {
     /// Definition generation that owns the candidate.

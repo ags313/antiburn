@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.6 — responsive meters and anchored hover details
+
+- Share responsive Desktop meter geometry between the public and development builds.
+- Keep visible meters and reset/pace interaction frames aligned during resizing.
+- Anchor hover captions to their controls and choose the side with room for the text.
+- Keep hover details readable in inline and stacked layouts, with keyboard focus and reduced motion.
+- Preserve Terminal rendering, quota behavior and the embedded 0.2.1 shared core.
+
+## 0.2.5 — mod composition and responsive Desktop usage
+
+- Preserve unrelated AbovePrompt mods in either stacking order.
+- Call downstream rendering once and retain its UI if quota rendering fails.
+- Keep surveys, hidden bands, usage spacing and host row budgets unchanged.
+- Remove the optional development-plugin probe from public rendering.
+- Fill the host-allocated Desktop meter slots without assuming a fixed cell size.
+- Keep glyphs and dots at their existing size as the window changes.
+- Preserve Terminal rendering and the existing quota behavior.
+- Add a browser geometry regression gate across sizes, breakpoints and readings.
+
 ## 0.2.4 — listing metadata
 
 - Add 17 discovery keywords for usage, limits, reset times and pace.

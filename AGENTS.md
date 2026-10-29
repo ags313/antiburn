@@ -70,7 +70,7 @@ See [main-window navigation](docs/main-window-navigation.md) for the boundaries.
 
 Use `docs/burn-check/specification.md` and the supported subset in
 `docs/burn-check/authoring.md` for Burn Checks work. The exact draft label is
-`v1-prealpha`: experimental, not yet standardized, and open to breaking syntax,
+`v1-alpha`: experimental, not yet standardized, and open to breaking syntax,
 semantic, and capability changes with no backward compatibility promise.
 Keep the current draft precise. Revisit proposed remaining work against user
 needs and source evidence before implementing it. When the actual contract

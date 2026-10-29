@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::store::burn_checks::trace_failure::{FailureCause, FailureLog};
+use crate::store::burn_checks::trace_refs;
 use antiburn_checks::diagnostics::{Diagnostic, DiagnosticCode};
 use antiburn_checks::domain::ActivationId;
 use sha2::{Digest, Sha256};
@@ -12,6 +14,180 @@ use crate::insights_report::installed_checks::{
 };
 
 const MAX_DIAGNOSTICS_PER_FILE: usize = 8;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RuntimeStage {
+    Worker,
+    WorkerStartup,
+    IdleDeadline,
+    IdleCatchUp,
+    DisableSettlement,
+    TaskJoin,
+    DirectoryWatch,
+    Reconcile,
+    SourceCatchUp,
+    AssessmentSettlement,
+    Clock,
+    WorkProbe,
+    PreparationStart,
+    CurrentContext,
+    AuthenticationWrite,
+    UsageWrite,
+}
+
+impl RuntimeStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::WorkerStartup => "worker_startup",
+            Self::IdleDeadline => "idle_deadline",
+            Self::IdleCatchUp => "idle_catch_up",
+            Self::DisableSettlement => "disable_settlement",
+            Self::TaskJoin => "task_join",
+            Self::DirectoryWatch => "directory_watch",
+            Self::Reconcile => "reconcile",
+            Self::SourceCatchUp => "source_catch_up",
+            Self::AssessmentSettlement => "assessment_settlement",
+            Self::Clock => "clock",
+            Self::WorkProbe => "work_probe",
+            Self::PreparationStart => "preparation_start",
+            Self::CurrentContext => "current_context",
+            Self::AuthenticationWrite => "authentication_write",
+            Self::UsageWrite => "usage_write",
+        }
+    }
+}
+
+pub(super) fn job_result<T>(
+    activation: &ActivationId,
+    stage: RuntimeStage,
+    result: anyhow::Result<T>,
+) -> Result<T, antiburn_checks::check_store::StoreError> {
+    static PREVIOUS: std::sync::OnceLock<FailureLog> = std::sync::OnceLock::new();
+    let cause = result.as_ref().err().map(FailureCause::classify);
+    if PREVIOUS.get_or_init(Default::default).changed(
+        trace_refs::activation_ref(activation),
+        stage.as_str(),
+        cause,
+    ) {
+        let cause = cause.expect("failed result has a category");
+        ::tracing::error!(event = "installed_check_settlement_failed", stage = stage.as_str(),
+            reason = cause.category, sqlite_code = cause.sqlite_code, io_kind = ?cause.io_kind,
+            check_ref = trace_refs::check_ref(&activation.definition_id), activation_ref = trace_refs::activation_ref(activation));
+    }
+    runtime_result(activation, stage, result)
+}
+
+pub(super) fn worker_result<T>(
+    stage: RuntimeStage,
+    result: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    result.map_err(|error| {
+        let failure = RuntimeFailure::classify(stage, &error);
+        error.context(failure)
+    })
+}
+
+pub(super) fn trace_worker_result(result: anyhow::Result<()>) {
+    if let Err(error) = result {
+        error
+            .downcast_ref::<RuntimeFailure>()
+            .copied()
+            .unwrap_or_else(|| RuntimeFailure::classify(RuntimeStage::Worker, &error))
+            .trace("installed_checks_stopped");
+    }
+}
+
+pub(super) fn runtime_result<T>(
+    activation: &ActivationId,
+    stage: RuntimeStage,
+    result: anyhow::Result<T>,
+) -> Result<T, antiburn_checks::check_store::StoreError> {
+    static PREVIOUS: std::sync::OnceLock<FailureLog> = std::sync::OnceLock::new();
+    let cause = result.as_ref().err().map(FailureCause::classify);
+    if PREVIOUS.get_or_init(Default::default).changed(
+        trace_refs::activation_ref(activation),
+        stage.as_str(),
+        cause,
+    ) {
+        let cause = cause.expect("failed result has a category");
+        ::tracing::error!(event = "burn_check_runtime_operation_failed", stage = stage.as_str(),
+            reason = cause.category, sqlite_code = cause.sqlite_code, io_kind = ?cause.io_kind,
+            check_ref = trace_refs::check_ref(&activation.definition_id), activation_ref = trace_refs::activation_ref(activation));
+    }
+    result.map_err(|error| antiburn_checks::check_store::StoreError {
+        message: error.to_string(),
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct RuntimeFailure {
+    stage: RuntimeStage,
+    cause: FailureCause,
+}
+
+impl std::fmt::Display for RuntimeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.stage.as_str())
+    }
+}
+
+impl std::fmt::Debug for RuntimeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl std::error::Error for RuntimeFailure {}
+
+impl RuntimeFailure {
+    pub(super) fn classify(stage: RuntimeStage, error: &anyhow::Error) -> Self {
+        Self {
+            stage,
+            cause: FailureCause::classify(error),
+        }
+    }
+
+    pub(super) fn trace(&self, event: &'static str) {
+        ::tracing::error!(event, stage = self.stage.as_str(), reason = self.cause.category,
+            sqlite_code = self.cause.sqlite_code, io_kind = ?self.cause.io_kind);
+    }
+
+    pub(super) fn trace_shutdown(&self) {
+        ::tracing::warn!(event = "installed_check_shutdown_failed", stage = self.stage.as_str(),
+            reason = self.cause.category, sqlite_code = self.cause.sqlite_code,
+            io_kind = ?self.cause.io_kind);
+    }
+
+    pub(super) fn trace_if_changed(&self, previous: &mut Option<Self>, event: &'static str) {
+        if previous.as_ref() != Some(self) {
+            self.trace(event);
+            *previous = Some(*self);
+        }
+    }
+
+    pub(super) fn diagnostic(&self) -> InstalledCheckDiagnostic {
+        let mut details = vec![
+            detail("Runtime stage", self.stage.as_str()),
+            detail("Failure category", self.cause.category),
+        ];
+        if let Some(code) = self.cause.sqlite_code {
+            details.push(detail("SQLite code", code.to_string()));
+        }
+        payload(
+            "storage-failed",
+            InstalledCheckDiagnosticSeverity::Error,
+            "The check could not finish updating",
+            if matches!(self.cause.category, "sqlite" | "io") {
+                "Check available disk space and local data access, then refresh Checks. Earlier saved findings remain available when their evidence is valid."
+            } else {
+                "Refresh Checks. If the problem continues, collect local diagnostics for support. Earlier saved findings remain available when their evidence is valid."
+            },
+            None,
+            details,
+        )
+    }
+}
 
 pub(super) struct SlowPhase {
     phase: &'static str,
@@ -138,27 +314,27 @@ pub(super) fn definition_diagnostic(
         ),
         ConfigMissingField => (
             "Add the required field",
-            "The check is missing a required field. Add the field shown in Details and save the file.",
+            "The check is missing a required field. Add the field shown in Technical details and save the file.",
         ),
         ConfigUnknownField => (
             "Remove the unsupported field",
-            "This version does not recognize the field shown in Details. Remove it or use a supported field.",
+            "This version does not recognize the field shown in Technical details. Remove it or use a supported field.",
         ),
         ConfigInvalidType => (
             "Correct the field type",
-            "The field shown in Details has the wrong type. Use the object, array, text, number, or boolean required by the check format.",
+            "The field shown in Technical details has the wrong type. Use the object, array, text, number, or boolean required by the check format.",
         ),
         ConfigInvalidValue => (
             "Correct the field value",
-            "The field shown in Details has an invalid value. Check its allowed values and relationships.",
+            "The field shown in Technical details has an invalid value. Check its allowed values and relationships.",
         ),
         CompileUnsupportedFeature => (
             "Use a supported check feature",
-            "This feature is not supported in v1-prealpha. Update the definition to the supported authoring format.",
+            "This feature is not supported in v1-alpha. Update the definition to the supported authoring format.",
         ),
         CompileInvalidExpression => (
             "Fix the expression",
-            "The expression does not use supported syntax. Check the expression in the field shown in Details.",
+            "The expression does not use supported syntax. Check the expression in the field shown in Technical details.",
         ),
         CompileUnknownReference => (
             "Correct the expression reference",
@@ -174,7 +350,7 @@ pub(super) fn definition_diagnostic(
         ),
         CompileInvalidDecision => (
             "Correct the decision",
-            "Use the supported Choice decision format, including its model, input, question, and criteria.",
+            "Use a decision with input and typed output questions. Each question must follow its Choice, Score, or Noul format. Select the model in Settings → Checks.",
         ),
         CompileInvalidAction => (
             "Correct the status action",
@@ -190,7 +366,7 @@ pub(super) fn definition_diagnostic(
         ),
         DiscoveryReadFailed => (
             "Check file access",
-            "antiburn cannot read this check file. Check its permissions, use UTF-8 text, and keep the file within 256 KiB.",
+            "Cannot read this check file. Check its permissions, use UTF-8 text, and keep the file within 256 KiB.",
         ),
         DiscoveryPaused => (
             "Check is paused",
@@ -202,7 +378,7 @@ pub(super) fn definition_diagnostic(
         ),
         RuntimeInvalidDecision => (
             "The model response is invalid",
-            "The response does not match the answers defined by this check. Review the decision in the YAML file and test the Jev connection in Settings → Checks.",
+            "The response does not match the answers defined by this check. Review the decision in the YAML file and test the selected connection in Settings → Checks.",
         ),
         RuntimeInvalidContext => (
             "Check context is unavailable",
@@ -232,14 +408,14 @@ pub(super) fn definition_diagnostic(
     let (code, title, message) = if criteria_field && diagnostic.code == ConfigInvalidValue {
         (
             diagnostic.code.as_str(),
-            "Correct the Choice criteria",
-            "Use 2 to 26 Choice criteria. Add or remove labels to stay within that range.",
+            "Correct the question criteria",
+            "For Choice, use at least two distinct labels with nonblank criteria. For Score, use an ordered array with at least two nonblank descriptions. The selected connection sets the supported upper limit in Settings → Checks.",
         )
     } else if fit_field && matches!(diagnostic.code, ConfigInvalidType | ConfigInvalidValue) {
         (
             "fit-config-invalid",
             "Correct the input fitting rules",
-            "Use recent for arrays and truncate for text. Select valid input paths and remove overlapping rules. Check the field shown in Details.",
+            "Use recent for arrays and truncate for text. Select valid input paths and remove overlapping rules. Check the field shown in Technical details.",
         )
     } else {
         (diagnostic.code.as_str(), title, message)
@@ -287,12 +463,12 @@ impl SafeDiagnostic {
             ConfigUnknownField => "This field is not supported.",
             ConfigInvalidType => "The field has an incorrect type.",
             ConfigInvalidValue => "The field has an invalid value.",
-            CompileUnsupportedFeature => "Burn Checks do not support this feature in pre-alpha.",
+            CompileUnsupportedFeature => "Burn Checks do not support this feature in v1-alpha.",
             CompileInvalidExpression => "The expression syntax is invalid.",
             CompileUnknownReference => "The expression references an unavailable field.",
             CompileInvalidWindow => "Window size must be 1 through 40, with 1 <= min <= size.",
             CompileInvalidCooldown => "Cooldown must be an integer duration ending in s, m, or h.",
-            CompileInvalidDecision => "The decision does not match the Choice contract.",
+            CompileInvalidDecision => "The decision does not match its typed question format.",
             CompileInvalidAction => "The action does not match the status-action contract.",
             DiscoveryInvalidId => "The filename must match [a-z][a-z0-9-]*.yml or .yaml.",
             DiscoveryDuplicateId => "Multiple files define the same check ID in this scope.",
@@ -469,11 +645,15 @@ impl DiagnosticLog {
         }
         ::tracing::debug!(
             event = "installed_check_condition_filtered",
-            check_id = %activation.id.definition_id,
+            activation_ref = trace_refs::activation_ref(&activation.id),
             generation = activation.id.generation.0,
-            reason = if current.condition_failed { "condition_failed" }
-                else if current.condition_unavailable { "condition_unavailable" }
-                else { "condition_false" },
+            reason = if current.condition_failed {
+                "condition_failed"
+            } else if current.condition_unavailable {
+                "condition_unavailable"
+            } else {
+                "condition_false"
+            },
             condition_false = current.condition_false,
             condition_unavailable = current.condition_unavailable,
             condition_failed = current.condition_failed,
@@ -494,12 +674,9 @@ impl DiagnosticLog {
             for diagnostic in diagnostics {
                 ::tracing::error!(
                     event = "installed_check_invalid",
-                    path = %path.display(),
                     code = diagnostic.code,
                     line = diagnostic.line,
                     column = diagnostic.column,
-                    config_location = diagnostic.location,
-                    message = diagnostic.message,
                 );
             }
         }
@@ -507,15 +684,13 @@ impl DiagnosticLog {
     }
 }
 
-pub(super) fn lifecycle(
-    check_id: &str,
-    transition: &antiburn_checks::definition_lifecycle::LifecycleTransition,
-) {
+pub(super) fn lifecycle(transition: &antiburn_checks::definition_lifecycle::LifecycleTransition) {
     use antiburn_checks::definition_lifecycle::LifecycleTransition;
     match transition {
         LifecycleTransition::Activated(active) => ::tracing::debug!(
             event = "installed_check_activated",
-            check_id,
+            check_ref = trace_refs::check_ref(&active.id.definition_id),
+            activation_ref = trace_refs::activation_ref(&active.id),
             generation = active.id.generation.0,
             bootstrap_publication = active.bootstrap_publication.0,
             repository_root_available = active.project_root.is_some(),
@@ -526,7 +701,6 @@ pub(super) fn lifecycle(
             ..
         } => ::tracing::debug!(
             event = "installed_check_deactivated",
-            check_id,
             generation = next_generation.0,
             reason = match inactive_kind {
                 antiburn_checks::definition_lifecycle::InactiveKind::Invalid => "invalid",
@@ -535,7 +709,6 @@ pub(super) fn lifecycle(
         ),
         LifecycleTransition::Removed { next_generation } => ::tracing::debug!(
             event = "installed_check_removed",
-            check_id,
             generation = next_generation.0,
         ),
         LifecycleTransition::Unchanged(_) | LifecycleTransition::UnchangedInactive => {}
@@ -600,6 +773,7 @@ impl SourceState {
                 "SELECT COUNT(*) FROM session s WHERE s.environment_key = ?1 AND s.cwd = ?2
               AND ({main_session})
               AND ((s.agent = 'opencode' AND s.source_kind = 'providerDb'
+                AND s.source_label = 'opencode:' || s.session_id
                 AND NOT EXISTS(SELECT 1 FROM opencode_journal_delivery d
                   WHERE d.environment_key = s.environment_key AND d.agent = s.agent
                     AND d.session_id = s.session_id))
@@ -706,14 +880,22 @@ impl SourceState {
     ) {
         ::tracing::debug!(
             event = "installed_check_source_state",
-            check_id = %activation.id.definition_id,
+            check_ref = trace_refs::check_ref(&activation.id.definition_id),
+            activation_ref = trace_refs::activation_ref(&activation.id),
             generation = activation.id.generation.0,
-            state = if self.queued > 0 || self.in_flight > 0 { "checking" }
-                else if self.waiting_for_data > 0 || self.pending_delivery > 0 { "waiting_for_data" }
-                else if self.ready_sessions == 0 && self.inactive_sessions > 0 { "no_eligible_source" }
-                else if self.ready_sessions == 0 { "source_unavailable" }
-                else if self.waiting_for_window > 0 { "waiting_for_window" }
-                else { "waiting_for_results" },
+            state = if self.queued > 0 || self.in_flight > 0 {
+                "checking"
+            } else if self.waiting_for_data > 0 || self.pending_delivery > 0 {
+                "waiting_for_data"
+            } else if self.ready_sessions == 0 && self.inactive_sessions > 0 {
+                "no_eligible_source"
+            } else if self.ready_sessions == 0 {
+                "source_unavailable"
+            } else if self.waiting_for_window > 0 {
+                "waiting_for_window"
+            } else {
+                "waiting_for_results"
+            },
             waiting_for_data = self.waiting_for_data,
             ready_sessions = self.ready_sessions,
             inactive_sessions = self.inactive_sessions,
@@ -725,23 +907,37 @@ impl SourceState {
             partial_branches = self.partial_branches,
             queued = self.queued,
             in_flight = self.in_flight,
-            status_write_revision = self.last_status_write.as_ref().map(|(revision, _)| *revision),
-            last_written_status = self.last_status_write.as_ref().map(|(_, status)| status.as_str()),
+            status_write_revision = self
+                .last_status_write
+                .as_ref()
+                .map(|(revision, _)| *revision),
+            last_written_status =
+                self.last_status_write
+                    .as_ref()
+                    .map(|(_, status)| match status.as_str() {
+                        "success" => "success",
+                        "failure" => "failure",
+                        _ => "unknown",
+                    }),
         );
     }
 }
+
+#[cfg(test)]
+#[path = "tracing_tests.rs"]
+mod tracing_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn too_many_choice_criteria_has_located_actionable_definition_copy() {
-        let criteria = (0..27)
+    fn too_few_choice_criteria_has_located_actionable_definition_copy() {
+        let criteria = (0..1)
             .map(|index| format!("          label{index}: Criterion {index}.\n"))
             .collect::<String>();
         let yaml = format!(
-            "name: Criteria\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {{activity: available}}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria:\n{criteria}actions:\n  - type: status\n    input: {{result: failure}}\n"
+            "name: Criteria\non:\n  tool_result:\ndecisions:\n  review:\n    input: {{activity: available}}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria:\n{criteria}actions:\n  - type: status\n    input: {{result: failure}}\n"
         );
         let errors = antiburn_checks::compiler::compile(&yaml).unwrap_err();
         let error = errors
@@ -755,8 +951,8 @@ mod tests {
             Some(source(Path::new("/workspace/demo/checks/criteria.yml"))),
         );
         assert_eq!(diagnostic.code, "config-invalid-value");
-        assert_eq!(diagnostic.title, "Correct the Choice criteria");
-        assert!(diagnostic.message.contains("2 to 26"));
+        assert_eq!(diagnostic.title, "Correct the question criteria");
+        assert!(diagnostic.message.contains("at least two"));
         assert!(diagnostic.source.unwrap().line.is_some());
     }
 }

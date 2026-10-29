@@ -41,8 +41,8 @@ jobs:
         run: |
           node --test scripts/assemble-claude-mod.test.mjs
           node --test packages/antiburn-plugin-core/test/*.test.mjs
-          node scripts/assemble-antiburn-shell.mjs
-          node scripts/assemble-antiburn-shell.mjs --verify
+          node scripts/assemble-antiburn-core-plugin.mjs
+          node scripts/assemble-antiburn-core-plugin.mjs --verify
           node scripts/assemble-claude-mod.mjs --check
 
       - name: Validate the release and marketplace
@@ -69,3 +69,17 @@ jobs:
 
       - name: Check isolated local plugin lifecycle
         run: node scripts/check-claude-mod-lifecycle.mjs
+
+  usage-layout:
+    name: Claude Desktop usage geometry
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: corepack enable
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @antiburn/desktop exec playwright install --with-deps chromium
+      - run: node scripts/check-claude-usage-layout.mjs

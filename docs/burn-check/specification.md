@@ -1,19 +1,48 @@
-# Burn Checks specification — v1-prealpha
+# Burn Checks specification: v1-alpha
 
-**Audience:** authors, parser/compiler implementers, and source-adapter owners.
-**Scope:** the current draft language for authored Burn Checks. MUST, MUST NOT,
-and SHOULD define precise requirements within this draft; they do not promise
-stability or support for every capability.
+Use this reference to write definitions, build parsers and compilers, or implement
+source adapters. MUST states a requirement. MUST NOT states a prohibition.
+SHOULD states a recommendation. These terms apply within this draft. They do not
+promise language stability or support for every capability.
 
-> **Experimental draft: `v1-prealpha`.** Burn Checks are not yet standardized.
+> **Experimental draft: `v1-alpha`.** Burn Checks are not yet standardized.
 > Syntax, semantics, and capabilities may change, including breaking changes.
 > There is no backward compatibility promise. A schema-valid definition can use
 > features the runtime or a source adapter cannot execute. See the
 > [supported subset](authoring.md#supported-subset).
 
+## Current implementation
+
+The runtime supports local status checks and independent model decision blocks
+with Choice, Score, and Noul questions. It accepts seven events in three
+families: public messages and tool calls/results, proven response-cycle ends,
+and host session observations. Each source must prove its event and bindings.
+The desktop emits `session_start` reason `attached` only. `session_idle` records
+a 120-second observation boundary, not real idle time, model occupancy, or savings.
+
+Cursor Desktop has a separate ordered snapshot tool-result route. Its accepted
+user-slot prefix supplies result context, not a separate public user event. It
+does not add public assistant/call, response-cycle, or host-session events. See
+the [source contract](../session-coverage.md#cursor-desktop-yaml-tool-evidence).
+
+Message actions are not supported, including behind `if: false`. Effective
+`agent.skills`, `repo.branch`, historical instruction activation, and historical
+effective skill inventories are also unavailable. Remote, WSL, child, and
+historical-only sources do not start new live checks. Native fix prompts, Auto
+Fix, verification watches, burn estimates, and savings are not Burn Check
+capabilities. Broader draft forms do not promise product support.
+
+Missing capabilities are unassigned future work. Beta and stable scope are not
+set, and missing features are not usable today. Use the
+[authoring guide](authoring.md#supported-subset) for the implemented subset,
+[session coverage](../session-coverage.md#burn-check-source-facts) for accepted
+source shapes and producer versions, and [provider contracts](provider-contracts.md)
+for typed output and connection limits. Schema acceptance, compiler admission,
+source proof, and provider compatibility are separate requirements.
+
 ## 1. Version and compatibility
 
-The specification label is exactly **`v1-prealpha`**. It identifies this draft,
+The specification label is exactly **`v1-alpha`**. It identifies this draft,
 not a YAML field or an internal serialization version. A check MUST NOT add a
 YAML `version` or `$schema` instance field. The JSON Schema dialect is
 Draft 2020-12; it is separate from the specification label.
@@ -24,9 +53,9 @@ hosted `$id`; authors and editors MUST use the checked-in asset or a verified
 equivalent. A runtime MUST use this asset or a verified equivalent and test
 structural parity. Editor validation does not activate a definition.
 
-The [authoring guide](authoring.md#supported-subset) states implemented capabilities. Runtimes
-MUST reject unsupported definitions before activation and MUST NOT silently
-remove unsupported fields or actions.
+The [authoring guide](authoring.md#supported-subset) states implemented
+capabilities. Runtimes MUST reject unsupported definitions before activation and
+MUST NOT silently remove unsupported fields or actions.
 
 Before changing the contract, maintainers MUST review the impact on authored
 definitions, source/provider capabilities, execution, and persisted state. They
@@ -79,6 +108,28 @@ assessments remain available.
 File presence MUST NOT bypass provider configuration, user pause settings,
 source availability, or shared resource limits.
 
+The desktop MUST keep a fresh setup without a connection disabled. It MUST
+preserve explicit saved off and disable execution when saved storage is malformed
+or unreadable. Saving an inactive connection MUST NOT select it. Creating the
+first connection selects it without enabling checks. Removing the selected
+connection MUST disable checks and clear selection without choosing a replacement
+or deleting accepted results, evidence, or usage. Empty connection settings MUST
+remain empty across restart. YAML check cards and navigation MUST require
+a discovered global or repository definition. Settings MUST keep the master
+toggle and decision-model setup available without definitions. A discovered
+check without a configured System One provider MUST show an actionable setup
+error in its detail; absence of definitions MUST NOT create a placeholder check
+or error.
+
+Turning the master setting off stops execution, not local definition discovery.
+The desktop can read and parse bounded YAML definitions and watch their
+installation directories, including at cold startup, to show names, diagnostics,
+and paused cards. Current limits are 256 KiB per definition and 128 files per
+folder, with the existing directory-access gates. This discovery MUST NOT restore
+provider configuration, discover model capabilities, catch up session sources,
+or run assessments. File presence MUST NOT enable checks or bypass execution
+gates.
+
 ## 3. YAML and document structure
 
 Authors MUST provide one mapping document containing JSON-compatible values.
@@ -103,12 +154,17 @@ Root fields:
 | `decisions`   | No       | One or more named model decisions when present                                |
 | `actions`     | Yes      | Nonempty ordered list of status and/or message actions                        |
 
+Omitting `decisions` selects local execution. A present `decisions` field MUST be
+a nonempty mapping; null, an empty mapping, or an invalid declaration MUST NOT
+fall back to local execution. The runtime supports named independent blocks with
+mixed Choice, Score, and Noul questions.
+
 Unknown keys MUST be errors at every defined level. Names for decisions,
 inputs, outputs, Choice labels, and aliases MUST match
 `[a-z][a-z0-9_]*`. Fixed text fields MUST be nonblank. Fixed text fields MUST
 NOT contain `${{` interpolation.
 
-Decision entries contain `model`, `input`, and `output`, with an optional `fit`
+Decision entries contain `input` and `output`, with an optional `fit`
 mapping. Inputs are nonempty maps. `fit` authorizes loss only at selected paths
 in that decision's evaluated input; see [input fitting](#85-input-fitting).
 Outputs are nonempty maps with at most eight questions per decision.
@@ -137,15 +193,15 @@ Different message event entries are alternatives. Multiple session event
 entries are alternatives. If an entry has multiple filters, all filters in
 that entry MUST match. Array values are nonempty unique alternative lists.
 
-| Event               | Meaning                                                | Direct context                                                                        | Specific filters                           |
-| ------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `session_start`     | A new, resumed, or attached observation starts         | `session.start_reason`                                                                | `reason: [new, resumed, attached]`         |
-| `session_idle`      | The configured observation policy emits an idle period | `session.idle_seconds`, optional `session.last_activity_at`, optional measured period | None                                       |
-| `user_message`      | The host accepts a distinct message in the user slot   | `message`                                                                             | None                                       |
-| `assistant_message` | A public assistant message completes                   | `message`                                                                             | None                                       |
-| `tool_call`         | The agent requests a tool operation                    | `message`                                                                             | `tools`, `paths`, `paths-ignore`           |
-| `tool_result`       | A tool operation has a final observed result           | `message`                                                                             | `tools`, `paths`, `paths-ignore`, `status` |
-| `turn_end`          | The host proves the end of a response cycle            | `turn`                                                                                | `status`                                   |
+| Event               | Meaning                                                | Direct context                                              | Specific filters                           |
+| ------------------- | ------------------------------------------------------ | ----------------------------------------------------------- | ------------------------------------------ |
+| `session_start`     | A new, resumed, or attached observation starts         | `session.start_reason`                                      | `reason: [new, resumed, attached]`         |
+| `session_idle`      | The configured observation policy emits an idle period | `session.idle_seconds`, optional `session.last_activity_at` | None                                       |
+| `user_message`      | The host accepts a distinct message in the user slot   | `message`                                                   | None                                       |
+| `assistant_message` | A public assistant message completes                   | `message`                                                   | None                                       |
+| `tool_call`         | The agent requests a tool operation                    | `message`                                                   | `tools`, `paths`, `paths-ignore`           |
+| `tool_result`       | A tool operation has a final observed result           | `message`                                                   | `tools`, `paths`, `paths-ignore`, `status` |
+| `turn_end`          | The host proves the end of a response cycle            | `turn`                                                      | `status`                                   |
 
 `tool_result.status` reads `message.tool.result.status` and accepts
 `completed`, `error`, `cancelled`, and `unknown`. `turn_end.status` reads
@@ -168,9 +224,13 @@ scope or use current settings as historical attribution. A user message has
 no generating model and does not match these filters. Authors can use an
 explicit top-level condition to test a current session setting.
 
-Use only observed provider/model and service-tier evidence. A provider may be
-derived from a reviewed fixed route. A configured tier is not proof of the
-effective tier if the provider can override it. Missing is never `false`.
+Use recorded provider/model and mode evidence. A provider may be derived from
+a reviewed fixed route. Mode evidence may report speed, a selected catalog mode,
+a recorded requested-tier preference, or a low-confidence requester model-ID
+suffix hint. It need not prove the tier actually served. Current settings and
+unbound display labels do not establish past requester mode. State the evidence
+kind and each source's limits. Do not claim savings from a mode hint. Missing is
+never `false`.
 
 ### 4.2 Tool and path filters
 
@@ -178,13 +238,13 @@ effective tier if the provider can override it. Missing is never `false`.
 `write`, `delegate`, `skill`, `mcp`, and `other`. The original host tool name
 is separate.
 
-The current supported subset accepts only `shell`, `read`, `search`, `edit`,
-and `other`. The compiler MUST reject `write`, `delegate`, `skill`, and `mcp`
-before activation, including behind a false condition, because the production
-adapter does not emit them. The draft schema retains these categories; schema
-validation alone does not establish runtime support. The adapter maps native
-`Bash`/`Test` to `shell`, `Edit` to `edit`, `Read` to `read`, `Search` to `search`,
-and `Other` to `other`. It does not infer additional categories from tool text.
+The adapter MUST derive check-facing categories from reviewed native tool
+identities. A metric category that combines several tools does not establish a
+more specific category. In particular, the adapter MUST NOT recover `write`,
+`delegate`, `skill`, or `mcp` from a collapsed `other` metric category or infer
+them from result text. These check-facing categories MUST NOT change the metric
+categories used by native deterministic checks. Schema acceptance alone does
+not establish source support.
 
 Path patterns match recorded repository-relative paths with `/` separators,
 without a leading `./`. Matching is case-sensitive on every platform. `*`
@@ -196,7 +256,9 @@ backslashes, and unsupported wildcard syntax.
 `paths` requires at least one recorded path to match. `paths-ignore` vetoes an
 event if any recorded path matches; the veto wins when both filters are set.
 When a path filter is set and paths are unavailable, the event does not match
-and the runtime records why. Paths outside the repository are not repo-relative
+and the runtime records why. A known included path can match a partial set when
+no ignore filter requires proof that a veto path is absent. A partial set cannot
+pass `paths-ignore`; a known ignored path always vetoes it. Paths outside the repository are not repo-relative
 and MUST NOT be inferred from command text. A known empty path list cannot
 match `paths` and does not trigger a `paths-ignore` veto.
 
@@ -220,13 +282,35 @@ contains no nested turn-end or session events. The adapter MUST use a proven
 host response-cycle boundary. It MUST NOT infer completion from inactivity, a
 stored transcript row, file modification time, or a similarly named event with
 different semantics. Incomplete cycles are unavailable and prevent
-assessment.
+assessment. Every member MUST have a unique public identity and one exact current
+source-version binding. A member correction or removal invalidates dependent
+unfinished work and stale accepted evidence. Standalone usable messages remain
+eligible when a cycle is unavailable. See
+[session coverage](../session-coverage.md#burn-check-source-facts) for admitted
+native boundaries, producer pins, and source-specific limits.
+
+`session_start` describes an observation attachment, not necessarily native
+session creation. The desktop persists one start with reason `attached` for a new
+attachment, including an empty source. It also initializes an existing admitted
+attachment once after successful upgrade validation, without reseeding results.
+The draft and compiler accept `new` and `resumed`, but the desktop currently emits
+only `attached`.
 
 `session_idle` is a persisted observation, not a claim that a session remains
-idle. Activity resets its timer. UI actions, heartbeats, and Antiburn notices
-do not reset it. A queued idle candidate is cancelled when activity resumes;
-unclaimed actions are suppressed. Restart MUST NOT duplicate an idle period.
-The draft uses a 120-second observation policy, not a universal host idle signal.
+idle. Genuine admitted native activity resets the 120-second interval using local
+observation time. Exact replay, historical baseline facts, recorded selection
+changes, UI actions, heartbeats, and Antiburn notices do not reset it. Publication
+requires a usable source frontier and the exact current source, attachment epoch,
+continuity, and activity revision. Recovery after lost continuity starts a fresh
+observation interval.
+
+New activity MUST cancel unfinished idle candidates. Claim, local start, provider
+dispatch, and acceptance MUST recheck attachment and activity dependencies. An
+already accepted idle assessment remains valid at its recorded boundary. Start
+candidates bind the exact attachment; they do not require unchanged later
+activity. Restart MUST preserve the deadline and emitted revision without
+duplicating an idle observation. The 120-second policy is not a universal host
+idle signal or a measured activity partition.
 
 ## 5. Windows and scheduling
 
@@ -256,6 +340,11 @@ the triggering message. A configured window bounds only `window.messages`; it
 does not bound `session.requests`, a full turn, or an instruction/skill
 inventory.
 
+All selected message alternatives share one window. Each admitted public text,
+call, or result record counts once under its own identity. A call and its result
+MUST NOT deduplicate each other. The window contains only matching records, not
+every record between its first and last members.
+
 Source quality is evidence for the model, not a whole-session admission gate.
 The runtime preserves usable results and request text when a source omits fields,
 truncates content, or reports a history gap. Known limitations appear in
@@ -268,6 +357,17 @@ can make that candidate not assessable; it does not suppress later candidates
 from the session. Unknown scope or identity and unusable ordering remain unsafe
 to select.
 
+A source can report a selection-segment reset when it loses continuity. The
+runtime clears that branch's current window and pending candidates before it
+selects later messages. It keeps partial-history quality, identity history,
+cooldowns, saved assessments, and uncertain provider attempts. A reset does not
+write success, authorize a provider resend, or clear unrelated branches. A source
+quality gap alone is not a segment reset. It preserves frozen candidates; later
+candidates retain the partial-coverage limit. An update with unsafe identity,
+scope, or order revokes the affected branch's saved assessments and pending
+candidates and resets its selection window. These are adapter/runtime signals,
+not YAML fields or new trigger types.
+
 During cooldown, a message window replaces its pending candidate with the
 latest ready candidate. Replaced candidates are recorded as coalesced. Without
 a window, each event is a separate bounded source-order candidate. Overflow is
@@ -277,8 +377,13 @@ not consume a model attempt.
 
 Durations use integer strings with `s`, `m`, or `h`, such as `0s`, `60s`,
 `5m`, or `1h`, without leading zeros. Model-run cooldown defaults to `60s`;
-local checks default to `0s`. Cooldown starts at the first provider attempt
-(or local evaluation start). Retries do not reset it. Zero cooldown does not
+local checks default to `0s`. Cooldown starts at the first durable provider dispatch intent
+or durable local evaluation start. Local start and its cooldown MUST save
+together, once; a later action failure does not reset or remove that cooldown.
+A filtered top-level condition does not start local evaluation. Retries, later
+decision blocks, and resumed work MUST NOT reset or extend cooldown. A resumed
+candidate bypasses only its own already-started cooldown; unrelated candidates
+and runtime gates still apply. Zero cooldown does not
 disable single-flight execution.
 
 Source adapters order native records before assigning durable observation
@@ -291,8 +396,8 @@ progress must recover together so replay does not publish duplicate work.
 
 Automatic live review attaches to supported active native main sessions when
 checks are enabled and configured. Fresh attachment may seed a bounded recent
-window and assess only its latest ready candidate once. It MUST NOT replay each
-older window or traverse the complete historical backlog. The attachment marker,
+tool-result window and assess only its latest ready candidate once. It MUST NOT
+replay each older window or traverse the complete historical backlog. The attachment marker,
 including an empty seed, MUST persist with selector progress. Restart of unchanged
 work MUST resume that progress without repeating the startup assessment. A new
 effective definition generation establishes a new attachment boundary.
@@ -313,13 +418,21 @@ ready candidate. A check without `on.window` MUST also create only this latest
 startup candidate; later non-window live candidates remain separate. Startup
 coverage MUST remain partial. Existing observed work MUST NOT be reseeded.
 
-After attachment, only new safely admitted first-terminal results trigger work.
-Pending/running mutations can advance their source position. Their first terminal
-position fixes logical result order; later corrections retain it and the frozen
-request context. A correction MUST NOT become a new attempt merely because its
-publication follows activation. Deduplication and stale-removal checks apply
-across pages and restart. An unknown historical membership cannot be recovered
-by guessing from the current rolling window.
+The recent seed remains result-only, including for a mixed message check. New
+user messages, assistant messages, calls, and cycles use a separate future-only
+attachment boundary; retained old records do not become live triggers. An adapter
+may retain a proven cycle start for a later terminal under its source contract.
+Session observations use their persisted attachment and activity boundaries.
+
+After attachment, new safely admitted first-terminal results and first-eligible
+public events can trigger work. Pending/running mutations can advance their source
+position. A result's first terminal position or another event's first eligible
+position fixes its logical order. Corrections retain that position and frozen
+event context. A correction MUST NOT become a new attempt merely because its
+publication follows activation. Separate per-kind identities, first eligibility,
+deduplication, and stale-removal checks persist across pages and restart. Page
+absence MUST NOT imply removal. An unknown historical membership cannot be
+recovered by guessing from the current rolling window.
 
 Both native delivery routes schedule productive continuation immediately and
 use durable fair rotation across restart. Active sessions and changed cursors
@@ -335,11 +448,31 @@ contract; it MUST use isolated state and MUST NOT alter live status. See
 reader bounds and integrity limits. Neither path proves unrecorded activity or
 extends accepted producer versions.
 
+### 5.2 Public-event admission bounds
+
+The current runtime admits a new public or host event and its published source
+context within 4 MiB (4,194,304 bytes), 262,144 JSON values, and depth 64 with the
+combined root at one. A complete cycle contains at most 4,096 messages and 4,096
+exact member bindings. The event envelope, copied messages, and bindings share
+the byte bound; a smaller native source bound still applies. These are runtime
+admission limits, not YAML fields or provider input limits.
+
+Unsafe identity, ownership, or order MUST produce an explicit unsafe update.
+Missing cycle proof or an exceeded cycle bound MUST NOT create a partial
+`turn_end`. An adapter can continue publishing independent bounded messages. A
+bound ineligible correction can withdraw an earlier event without exposing the
+new payload. Source delivery MUST preserve its cursor when required bounded
+continuation has not committed; it MUST NOT silently discard output or treat a
+bounded page as a complete current inventory.
+
 ## 6. Context and data model
 
 Values are JSON-compatible: null, Boolean, finite number, string, array, or
-string-keyed object. Timestamps are RFC 3339 strings. Optional values are
-absent when not observed; they are not represented by guessed strings, zero,
+string-keyed object. Instruction `observed_at` and message `occurred_at` use
+RFC 3339 strings when supplied. Turn `started_at` and `ended_at`, and
+`session.last_activity_at`, use recorded integer Unix milliseconds. Timestamps
+MUST NOT establish source order or drive the local idle interval. Optional values
+are absent when not observed; they are not represented by guessed strings, zero,
 false, or fabricated nulls.
 
 ### 6.1 Trigger and collection roots
@@ -355,10 +488,9 @@ false, or fabricated nulls.
 | `session.source_coverage`              | `complete` or `partial` for published source membership at the trigger                                                   |
 | `session.start_reason`                 | `new`, `resumed`, or `attached` on `session_start`                                                                       |
 | `session.idle_seconds`                 | Observed idle duration, at least 120, on `session_idle`                                                                  |
-| `session.last_activity_at`             | Optional timestamp of observed activity                                                                                  |
+| `session.last_activity_at`             | Optional recorded Unix-millisecond activity time on `session_idle`                                                       |
 | `session.model`                        | Current observed model selection, not proof of past execution                                                            |
-| `session.fast_mode`                    | Current observed effective mode setting when supported                                                                   |
-| `session.last_activity_period`         | Optional finished measured interval associated with the idle event                                                       |
+| `session.fast_mode`                    | Current recorded mode selection when supported; not proof of past execution or served tier                               |
 | `global.instructions`, `global.skills` | Observed instruction or skill snapshots                                                                                  |
 | `repo.root`, `repo.branch`             | Observed project root and branch; either may be absent when unknown                                                      |
 | `repo.instructions`, `repo.skills`     | Observed project instruction or skill snapshots                                                                          |
@@ -368,11 +500,22 @@ The four context roots `session`, `global`, `repo`, and `agent` exist in every
 phase. Individual values and inventories can still be unavailable. With no
 known project, repo collections are unavailable. A known project with a
 completed supported inventory containing no entries has a known empty array.
-An unsupported or unfinished inventory is unavailable. Do not infer an
-effective skill inventory by merging generic lists.
+An absent collection is unavailable. A partial supported scan can retain known
+entries with explicit completeness and limit fields. Do not infer an effective
+skill inventory by merging generic lists.
 
 Global check location and global input context are separate. A global check
 may select repo instructions; a project check may select global instructions.
+
+`session.model` and `session.fast_mode` are optional on every trigger family.
+They require explicit native selection evidence, not the latest requester,
+mutable metrics, or current Settings. The host freezes the last proven selection
+through the event. It MUST NOT use it to fill message or turn attribution.
+`session.start_reason` requires a configured `session_start` alternative;
+`session.idle_seconds` and `session.last_activity_at` require `session_idle`.
+These fields remain absent on the other session alternative. Whole-record reads,
+literal brackets, projections, and dynamic access follow the same closed shapes
+and phase rules as direct access.
 
 ### 6.2 Message and tool records
 
@@ -390,7 +533,7 @@ session by default.
 | `message.occurred_at`                | Optional source time for acceptance, message completion, tool request, or final result according to kind |
 | `message.kind`                       | `user_message`, `assistant_message`, `tool_call`, or `tool_result`                                       |
 | `message.role`                       | `user` for user messages, `assistant` for assistant messages/calls, `tool` for results                   |
-| `message.model`, `message.fast_mode` | Optional proven generating/requesting model and effective mode; absent for user messages                 |
+| `message.model`, `message.fast_mode` | Optional recorded generating/requesting model and fast-mode evidence; absent for user messages           |
 | `message.content`                    | Public user/assistant text; absent on tool messages                                                      |
 | `message.tool`                       | Required on tool calls/results; absent on user/assistant messages                                        |
 | `message.tool.call_id`               | Required on calls; on results only with a proven call link                                               |
@@ -400,6 +543,8 @@ session by default.
 | `message.tool.paths`                 | Optional known repo-relative operation paths                                                             |
 | `message.tool.result.status`         | Required on results: `completed`, `error`, `cancelled`, or `unknown`                                     |
 | `message.tool.result.content`        | Observed result value; absent if the host does not expose it                                             |
+| `message.tool.result.outcome`        | Optional source-reported program or child-work outcome; separate from tool execution status              |
+| `message.tool.provider_executed`     | Optional source flag that the provider executed the tool rather than the local host                      |
 | `message.tool.result.output_bytes`   | Optional observed result size after host truncation; does not prove completeness                         |
 | `message.quality`                    | Optional source-quality facts, including missing arguments, result content, or source gaps               |
 
@@ -407,6 +552,8 @@ Arguments unavailable from a host are absent, not `{}`. Missing call
 arguments or result content make the selected tool message partial. A proven
 linked result with unavailable arguments remains eligible for assessment, and
 the model receives the available fields and quality facts.
+Native text input remains an exact string in `arguments`, including JSON-looking
+text. The adapter MUST NOT parse that string into an object or infer paths from it.
 An orphan result without a proven call link omits `call_id` and `arguments` by
 design. Empty known output differs from unavailable output. Host truncation is
 recorded as input-quality metadata. The schema does not promise diffs, parsed
@@ -416,6 +563,29 @@ can use the remaining fields; a category filter cannot match an unavailable
 value. A recorded tool name can normalize to native `Other`, including when
 the normalizer has no more specific class. This is distinct from missing category
 evidence and does not prove a draft `write`, `delegate`, `skill`, or `mcp` class.
+
+When `message.fast_mode` is known, `message.quality.fast_mode_evidence` can state
+the source of that Boolean:
+
+| Value                       | Meaning                                                                                              |
+| --------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `reported-speed`            | Claude's accepted assistant record reports fast or standard speed.                                   |
+| `selected-catalog-model`    | OpenCode selects a reviewed Fast/Ultrafast catalog ID.                                               |
+| `requested-tier-preference` | Codex records a matching owned tier preference before the request context.                           |
+| `model-id-suffix-hint`      | Pi's recorded requester model ID ends in a fast-mode-like token. This is a low-confidence name hint. |
+
+These qualifiers are not numeric confidence or provider guarantees. A positive
+hint can match `fast_mode: true` without endpoint or served-tier proof. A valid
+judgment's label probability does not make its mode evidence more certain.
+
+When OpenCode V2 records them, `result.outcome` carries a `kind` and native facts.
+`shell` can include `state`, `exit`, `signal`, `timed_out`, and `shell_id`.
+`code_mode` can include `error`. `subagent` includes `session_id` and a recorded
+work state. A completed tool with shell exit `7` still has result status
+`completed`. A background launch can complete while its work remains `running`.
+Missing facts stay unavailable. These fields do not prove task correctness or
+create separate results for nested Code Mode activity. They add source facts;
+they do not add YAML syntax, triggers, or status values.
 
 ### 6.3 Requests, instructions, skills, and attribution
 
@@ -436,78 +606,214 @@ request/answer forms in this draft do not imply runtime support.
 Instruction records contain an absolute `path`, `content`, `scope`, and
 `observed_at`. Scope has an absolute root or `null`, and `globs`. A null root
 means global scope and requires an empty glob list. Current instruction files
-do not prove which rules applied to past actions. If scope cannot be
-represented, the instruction record is incomplete.
+do not prove which rules applied to past actions. Omit a rule with scope that
+cannot be represented and retain an explicit collection limit. Do not make it
+unconditional.
 
 Skill records contain `name`, declared `description`, and absolute `path`.
-Missing declared descriptions are empty strings. Selecting a skill list does
-not read its files. Current availability does not prove past availability.
+Missing declared descriptions are empty strings. The collector reads declared
+metadata without copying skill bodies into inventory input. Selected tool
+results can separately contain file text. Using a saved skill list does
+not reread its files. Current availability does not prove past availability.
+
+Each current scope has optional `instructions` and `skills` arrays, separate
+`instructions_complete` and `skills_complete` Booleans, matching `*_limits`
+arrays, and an optional `snapshot_revision`. Omit an unavailable array. Use `[]`
+only for a known scan with no observed entries. Keep useful known entries beside
+limits; one unavailable scope must not erase another scope or recorded correction.
+
+Capture current inventories only when the authored condition or candidate needs
+them, on every trigger family. Capture condition reads before evaluating that
+condition. Capture candidate-only reads after filters, conditions, and any window
+minimum pass. The collection time is not the native event's historical time. Merge
+the snapshot into candidate context before its fingerprint and save it atomically
+with the candidate. Do not change the native observation or its evidence version.
+Delayed decisions, safe retries, restart, and acceptance reuse the saved snapshot
+without reading current files again.
 
 Model and mode fields retain the same type at every scope. User-message records
 have no generating model. Tool results use proven requester attribution, not a
-model named in tool output. A turn or activity period exposes a singular model
+model named in tool output. A turn exposes a singular model
 or mode only when its complete nonempty request set has one proven uniform
-value for that field. Derive model and mode independently. Never fill
-historical attribution from current session settings.
+value for that field. Include generating requests without public text; do not
+derive this set from the public message list alone. Derive model and mode
+independently. Never fill historical attribution from current session settings.
 
-### 6.4 Turn and measured activity records
+### 6.4 Turn records
 
 A turn has `id`, `source`, required `status` (`completed`, `cancelled`, or
-`error`), ordered `messages`, and optional proven `started_at` and `ended_at`.
+`error`), ordered `messages`, and optional recorded Unix-millisecond `started_at`
+and `ended_at`.
 It may have `model` or `fast_mode` only under the uniform-attribution rule.
 Turn messages use the same record shape as current messages and windows.
+Native terminal reasons and error codes do not enter the closed `turn` root.
 
-`session.last_activity_period` is a bounded historical measurement, not
-whole-session totals or a live timer. Its fields may include `started_at`,
-`ended_at`, uniform optional `model`/`fast_mode`, optional `completed_turns`,
-and nonnegative finite durations `active_seconds`,
-`model_in_flight_seconds`, `tool_only_seconds`, `other_seconds`, and
-`unknown_seconds`.
-
-Measurement requires complete operation membership and interval coverage.
-Count overlapping operations once; model-in-flight time takes precedence over
-tool-only time. Exclude inactive waits and proven human-wait suspension. An
-unfinished operation, missing boundary, clock discontinuity, lost membership,
-or possible hidden active gap makes affected duration data unavailable, not
-zero. A known active interval with unknown cause belongs in
-`unknown_seconds`. Transcript timestamp gaps and token counts cannot establish
-this partition. Tool-only time is not proof of a bottleneck or counterfactual
-speedup.
+The context does not split elapsed time into model-active and tool-only periods.
+Transcript gaps, token counts, and tool durations cannot prove those periods, how
+long another setup would take, or savings. The separate 120-second `session_idle`
+policy records an observation; it does not measure these durations.
 
 ## 7. Decisions and provider results
 
-Each decision has a literal `provider/model` identifier, nonempty `input`, and
-nonempty `output`. A question has one of these forms:
+The runtime supports local checks without `decisions` and model checks with one
+or more independent named decision blocks. Each block contains one to eight
+named questions, which may mix the supported types.
+
+Each decision has nonempty `input` and `output`. The host's selected Settings
+connection supplies the decision provider and model. A decision-level `model`
+field is an unknown-field error. Observed coding-agent fields (`on.*.models`,
+`message.model`, `turn.model`, and `session.model`) describe source facts only;
+they do not select the decision connection. A question has one of these forms:
 
 | Type   | Configuration                                                                                    | Result                                              |
 | ------ | ------------------------------------------------------------------------------------------------ | --------------------------------------------------- |
 | Choice | Nonblank `question` and `criteria` mapping of at least two named labels to nonblank descriptions | One declared label string                           |
 | Score  | Nonblank `question` and ordered `criteria` array of at least two nonblank descriptions           | Finite number from zero to the last criterion index |
-| Noul   | Nonblank `question`                                                                              | Finite yes/no probability from zero to one          |
+| Noul   | Nonblank `question`; no authored `criteria`                                                      | Finite yes-probability from zero to one             |
 
-Every decision block uses the same frozen trigger/context. Decision inputs
-cannot read other decision outputs. Mapping order creates no dependency.
-Prepare every block before provider calls and complete all blocks before
-actions. If any block is unavailable, invalid, or fails, the check is not
-assessed and no actions run. Independent calls may execute concurrently within
-shared resource limits.
+Every decision block uses the same frozen trigger/context and one captured
+connection snapshot. Decision inputs MUST NOT read `decisions`, including their
+own outputs or details. Mapping order creates no input dependency. The runtime
+MUST prepare and fit every block before the first inference call. It MUST send
+one complete request per block with all that block's questions together, then
+execute blocks sequentially in authored order under candidate concurrency and
+branch single flight. It MUST NOT split questions into separate requests.
+Complete and validate all blocks before actions. If any block is unavailable,
+invalid, terminally failed, or has unknown delivery, the check is not assessed
+and no actions run. Preserve incurred usage and successful sibling answers.
 
-The currently supported `typesafe/jev-1.13.0` route accepts 2–26 Choice criteria.
-The compiler rejects excess criteria before activation with a located diagnostic.
-This is a route limit, not a general draft-language maximum.
+Choice and Score questions require at least two criteria. Preserve each Choice
+label/description binding and Score criterion order. Choice labels have no
+positional meaning; provider requests do not promise authored map order. The
+language has no fixed criteria maximum. The host MUST check the selected
+connection's criteria limit and output capabilities before scheduling, separately
+from language validation.
+It MUST repeat this check when the selected connection or its capabilities
+change. A capability mismatch pauses scheduling without invalidating the
+definition; selecting a compatible connection restores eligibility without a
+YAML edit.
 
-Provider capabilities declare whether Choice probabilities, Choice/Score
-confidence, or Score distributions are available. Reject references to
-unsupported details before scheduling. Never invent probabilities from a
-label or substitute self-reported confidence. Choice/Score probability arrays
-must have exactly the expected labels/length, finite values in `[0,1]`, and
-sum to one within a documented, tested adapter tolerance. Reject extra/missing
-results and invalid scores. Noul requires a supported yes/no probability
-result, not a converted Boolean.
+Provider capabilities declare each question type's support, criterion interval,
+probabilities, and confidence separately. Reject references to unsupported
+details before scheduling, including indirect reads, projections, function
+arguments, and whole-object reads. A whole details object requires the optional
+details it exposes. Numeric input overrides MUST NOT establish output support.
+See the [pinned provider contracts](provider-contracts.md); these limits do not
+imply support for other models or runner versions.
+
+Actions read these closed result records, where `review` and the question names
+stand for authored identifiers:
+
+| Expression                                        | Type and meaning                                                                |
+| ------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `decisions.review.outputs.verdict`                | Choice: declared label string                                                   |
+| `decisions.review.details.verdict.probabilities`  | Optional Choice map of declared labels to raw probabilities                     |
+| `decisions.review.details.verdict.confidence`     | Optional Choice provider confidence                                             |
+| `decisions.review.outputs.severity`               | Score: finite number in `[0, criteria.length - 1]`, including fractions         |
+| `decisions.review.details.severity.probabilities` | Optional Score array in authored criterion order; use `[0]` for the first level |
+| `decisions.review.details.severity.confidence`    | Optional Score provider confidence                                              |
+| `decisions.review.outputs.applies`                | Noul: finite yes-probability in `[0, 1]`, never a Boolean                       |
+| `decisions.review.details.applies`                | Noul: closed empty record `{}`; no probabilities or separate confidence         |
+
+Unavailable optional details MUST be absent, not null or invented values.
+Confidence MUST NOT replace a label probability or Score distribution. The
+answer set MUST match the declared names and types exactly; missing, extra,
+unknown, duplicate, or wrong-type answers are invalid. Choice labels MUST match
+the declaration. Available Choice maps MUST have exactly the declared labels.
+Available Score arrays MUST have exactly one value per criterion. Every
+probability and confidence MUST be finite and in `[0, 1]`. Distribution sums
+MUST satisfy `abs(sum - 1.0) <= 0.02` under `f64` arithmetic. Score sums MUST
+follow criterion index order, `0` through `n-1`, not lexicographic wire-key order.
+Choice sums follow label-map order. Preserve raw valid
+values; do not normalize distributions, replace a valid Choice label, or
+recompute a Score. At the provider boundary, Score legend and probability keys
+MUST be exactly `0` through `n-1`, and each legend value MUST equal the authored
+criterion at that index. The language exposes the validated distribution as an
+array, not the wire index map or legend.
 
 An `uncertain` Choice label is ordinary authored output. It is not an
 execution state and has no implicit action behavior. A probability threshold
 is an author policy, not an accuracy claim.
+
+### 7.1 Attempts, recovery, and publication
+
+Each attempt identity MUST contain candidate, decision name, and attempt number,
+independently of provider identity. Each decision permits at most two attempts;
+only a known-safe transient failure permits the second. Assessment totals use
+checked `u64` counts. A durable dispatch intent MUST precede admission and I/O.
+Persist each validated block answer before the next block can send, and recheck
+current claim, generation, source, and runtime gates before each intent.
+
+Safe retry and restart MUST reuse successful sibling answers and the exact saved
+request for the unfinished block. They MUST NOT resend completed blocks, refit
+saved requests, or create a third attempt. An unresolved intent becomes unknown
+on recovery. Unknown delivery in any block prevents every further automatic send
+for that candidate and all action publication. Late usage remains attached to the
+original attempt even when its answer loses publication rights.
+
+After all answers are durable, publication recovery MUST validate the complete
+typed set and saved preparation without model discovery, client construction, or
+transport admission. Current master, selected configuration, authentication,
+source, claim, generation, connection-transition, and shutdown gates still apply.
+A connection switch MUST cancel unfinished work; switching A to B and back to A
+MUST NOT revive it. Atomic acceptance commits assessment history, ordered action
+outcomes, optional status, and watermark together.
+
+Historical accepted status, time, input, provenance, and usage MUST remain
+readable under a bounded read-only legacy decoder. Such evidence MUST NOT
+authorize execution. Incompatible old pending work MUST stop explicitly without
+inference, a YAML shim, a fresh budget, or replay. A malformed saved candidate
+MUST NOT stop unrelated candidates from recovering; storage errors still propagate.
+
+Finite replay MUST count durable-total attempts and invocation-new intents
+separately as `u64`. Its hard allowance applies before every new intent,
+including retries. Before the first new intent, it MUST cover at least one send
+for every unfinished block. Exhaustion settles `LimitReached` with no actions or
+watermark; it is terminal and cannot resume automatically after the invocation.
+Saved-answer recovery consumes zero new intents. Local replay can run with zero
+provider allowance under its event and evaluation bounds.
+
+### 7.2 Local execution
+
+A local check MUST evaluate status actions against its frozen candidate without
+model discovery, warm-up, model input preparation, provider client/transport
+construction, transport admission, or inference. It MUST create zero provider
+attempts and zero usage records, including unknown-usage placeholders. Local
+execution has no decision input, fitting report, provider request, or model
+connection provenance. A `decisions` reference is a compiler error when that root
+is undeclared, including behind a false condition. Message actions remain
+unsupported, also behind false conditions.
+
+The master setting, configured selected connection, credential/authentication
+rules, repository pause, activation generation, source validity, and shutdown
+gates still apply. Missing model output support and failed cached model discovery
+alone MUST NOT block local work. These rules apply with Jev, Ollama, Cloudflare,
+Custom direct, and Custom envelope selected; they do not remove each route's
+configuration or credential requirements. Testing a connection remains separate
+and can send a chargeable provider request.
+
+Local execution MUST use the existing claim and branch single-flight rules.
+Local preparation, the zero-result/zero-attempt answer, and the first local
+cooldown MUST save atomically before action acceptance. A repeated start MUST
+NOT change the saved start, answer, budget, or cooldown. Restart MUST restore
+started work rather than create a provider attempt or start local work again.
+Missing, invalid, or incompatible local preparation MUST stop that candidate;
+it MUST NOT create a fresh budget or fall back to model preparation.
+
+The runtime MUST check selected evidence dependencies and shared action budgets
+before accepting the ordered plan. The existing atomic acceptance commits action
+outcomes, an optional status write, and the accepted watermark together. A valid
+no-write assessment preserves the earlier status-writing assessment, explanation,
+evidence, and write time. Missing evidence and evaluation failure MUST NOT
+synthesize success. A blocked saved local answer remains recoverable while the
+existing runtime and durable acceptance gates require deferral.
+
+Local evidence MUST identify the exact status-writing candidate as **Frozen
+local context**. It describes values available to the actions, not proof that
+every value was read or sent to a model. The report MUST NOT label it assessed
+model input, add model connection provenance, or show a missing-model-input
+warning. Source invalidation and retention keep the same status-writing evidence
+binding. See [local status checks](authoring.md#local-status-checks).
 
 ## 8. Expressions and input preparation
 
@@ -528,8 +834,9 @@ finite numbers use decimal/exponent text. Arrays and objects require `toJSON`.
 Unavailable values are errors, not null or empty strings. A complete message
 template must be a nonblank string.
 
-Only decision input values and action message text support substitution. Names,
-descriptions, models, filters, questions, and criteria are fixed text.
+Decision input values and action message text support substitution. Status
+`input.result` accepts whole expressions, not embedded text templates. Names,
+descriptions, filters, questions, and criteria are fixed text.
 
 | Phase                                              | Available roots                                                                                       |
 | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
@@ -585,10 +892,21 @@ Comparison behavior:
   null or using `||` does not erase the missing-data state.
 
 Unknown fields on closed normalized records are compiler errors, including
-literal bracket keys. Tool arguments/results and `fromJSON` values are open
-JSON subtrees; their keys are checked at runtime. Optional known fields and
+literal bracket keys. Tool arguments, result content, and `fromJSON`
+values are open JSON subtrees; their keys are checked at runtime. The normalized
+tool result and outcome records remain closed. Optional known fields and
 dynamic source-data keys may be unavailable. Check variants before reading
 variant-specific fields.
+
+Dynamic access MUST NOT bypass closed-record validation. A dynamic object key
+requires an open JSON object. Dynamic array indexes and projections retain the
+declared item type for all following access. A function return value permits
+access only when its result type supports it.
+
+Value identity is separate from evidence provenance. Aliases and indexes retain
+the selected frozen value's identity. `fromJSON` retains the dependencies of its
+input but creates fresh object and array identities. Separate conversions do not
+compare equal merely because they use the same source or produce equal content.
 
 ### 8.3 Functions and projections
 
@@ -652,19 +970,49 @@ depend on fields read or copied; copying a whole record selects its whole
 subtree. Preserve source references, original indexes, conditions, and
 completeness through conversion. Mapping cannot erase a missing dependency.
 
-The runtime enforces shared per-run expression depth, step, iteration, and
-generated-byte limits. The draft's initial engineering values are depth 32,
-10,000 evaluation steps, and 1,000 visited iteration items; these are runtime
-limits, not schema syntax. A release MUST document its actual limits and
-diagnostics. Exceeding a limit prevents assessment.
+For the deployed request-history collection, membership operations require the
+frozen `session.requests_complete` value to be `true`. Missing or false values
+make those operations unavailable. This includes operations after conversion of
+the array or its enclosing record. A whole copy of available partial history
+remains usable; this does not establish complete historical membership.
+
+The deployed runtime uses a separate bounded budget for top-level `if`, before
+window selection. One assessment budget MUST cover recursive decision input
+preparation and all action planning, including action conditions, results, and
+messages. Nested templates, map aliases, and later actions MUST NOT reset it.
+This boundary applies across every decision block, not separately to each block
+or provider attempt. Action replanning restores the saved post-input snapshot;
+it does not accumulate abandoned plans or change immutable preparation.
+
+The deployed limits are recursive depth 32, starting at one; 10,000 evaluation
+steps; 1,000 visited items; 8 MiB (8,388,608 bytes) of cumulative generated data;
+and a separate 8 MiB cumulative materialization allowance. Fixed container entries
+MUST count as visited items. Source and alias copies MUST reserve materialized
+bytes before cloning. Fixed text and container construction MUST count before
+allocation. These limits are
+runtime bounds, not schema syntax or YAML fields. They are separate from fitting,
+source parser, and provider request limits.
+
+Expression evaluation MUST report budget exhaustion as `EvaluationLimitExceeded`;
+the input preparation boundary records `PreparationResourceLimit`. Exhaustion
+MUST remain in effect. It prevents the whole assessment and all status writes, including writes planned
+before the crossing operation. Saved preparation MUST retain the consumed
+budget. Recovery MUST validate and restore it for action planning, not replace
+it with a fresh budget. An absent or incompatible snapshot does not authorize a
+reset for already prepared work. See the
+[deployed evaluation limits](authoring.md#shared-evaluation-limits).
 
 ### 8.5 Input fitting
 
 An optional decision-level `fit` mapping authorizes bounded loss from the
 evaluated decision input when the complete provider request exceeds its limits.
 Without `fit`, or with `fit: {}`, the runtime MUST preserve every input value.
+Missing rules alone MUST NOT produce a warning. An input-size explanation MUST
+follow an actual preparation or provider failure, not a prediction based on the
+absence of `fit`.
 Fitting MUST NOT change source evidence, the frozen original input, questions,
 criteria, or values outside an authorized target.
+It MUST NOT add automatic loss, summary calls, or other model preparation calls.
 
 For example, this decision fragment permits shortening only the result text:
 
@@ -780,8 +1128,8 @@ candidate. Later candidates remain eligible; an earlier status remains unchanged
 The runtime MUST preserve the frozen original input separately from the prepared
 provider input. A permitted known-safe provider retry MUST use the identical
 prepared input, omissions, question, criteria, and request identity. Restart
-recovery MUST bind the preparation profile to the complete compiled decision
-policy and provider capabilities, and validate the saved request against its
+recovery MUST bind one preparation profile to the complete compiled decision
+set and provider capabilities, and validate every saved request against its
 input, omission report, and fixed construction. It MUST NOT silently refit an
 already dispatched request under changed limits or policy. An incompatible
 profile settles with zero additional attempts; an earlier safe attempt remains
@@ -793,8 +1141,26 @@ Unknown delivery still does not authorize a resend.
 The current release applies the [deployed preparation limits](authoring.md#preparation-limits)
 to original input size, nodes and depth, rule/path size, target expansion,
 traversal, attempted turns, and cumulative serialized-request validation work.
-These are release resource limits, not new YAML fields or a shared evidence
+These are release resource limits, not YAML fields or a shared evidence
 retention cap. Admission can stop before checking whether the request fits.
+
+One 64 MiB (67,108,864-byte) fitting-work allowance covers all blocks, turns,
+input measurements, and complete-request construction/validation, including each
+accepted request. Save its consumed count as an immutable fact. Validation of the
+saved set uses a distinct shared 64 MiB pass across all blocks. That pass MUST NOT
+fit, change, or replace a saved request, and is not another fitting allowance.
+
+The full ready preparation record, including its tag, profile, names, originals,
+fitted inputs, requests, omission reports, and budget, MUST fit within 8 MiB,
+65,536 JSON values, and depth 64 with the complete root at depth one. Admission
+MUST check before retaining another block. Typed results have a separate 512 KiB,
+65,536-value, depth-64 bound. Before the first call, reserve worst-case result
+capacity from exact declarations and all optional detail shapes, including the
+longest Choice label and bounded numeric encodings. Check actual results again
+before saving. These bounds limit runtime work and retained state, not the
+language's number of independent blocks. Strict saved decoders MUST reject
+duplicates before insertion, unknown versions, invalid budgets, and crossing
+values before allocation.
 
 `NoFit` means local request validation still fails with the current permissions
 and effective retention/marker limits. Its typed `no_fit_reason` is one of:
@@ -837,9 +1203,10 @@ Action conditions are independent and evaluate against the same frozen context
 and decision results. Actions cannot read another action's outcome or prior
 status. Apply valid status writes in list order; the last valid write sets
 current status. A skipped or invalid action does not block independent later
-actions. Persist every action outcome atomically. Model checks run no actions
+actions, except that shared evaluation-budget exhaustion prevents the whole
+assessment. Persist every action outcome atomically. Model checks run no actions
 if their decision set is invalid or incomplete. Local checks without a model
-decision are valid draft syntax but require compiler/runtime support.
+decision use the same action and acceptance rules with zero provider attempts.
 
 `input.result` is exactly `success` or `failure`, or a whole expression that
 returns exactly one of those case-sensitive strings. It does not coerce
@@ -853,23 +1220,43 @@ No action, invalid action, unavailable data, or provider failure leaves the
 prior status unchanged. A valid accepted assessment advances its watermark
 even if all actions skip; a not-assessed result does not. An older assessment
 cannot replace a newer accepted status or claim a later notice. Keep history
-when status changes. Display success as **No concern in this assessment**,
-not “Resolved.”
+when status changes. Describe a retained success as a saved check result, not
+"Resolved" or the result of work still running. When showing progress beside a
+saved result, keep both meanings clear in one status panel.
 
-The maintained Failed retry loop example fails only for `stuck` at or above
-0.95 confidence. Its success action uses the exact complement of that condition,
-so uncertain and below-threshold answers explicitly write success. This is an
-authored policy, not an engine fallback. For definitions with no matching action,
-acceptance MUST retain the prior status-writing assessment, explanation, evidence,
-and write time while advancing the accepted watermark. Without a prior write,
-engine status remains unassessed. The runtime MUST NOT synthesize a success action
-when no condition matches.
+The maintained Over-exploring example fails only for `likely_excess` with label
+probability at or above 0.95. Its success action uses the exact complement, so
+uncertain and below-threshold answers explicitly write success. Ignored
+instructions instead requires `no_conflict` at probability 0.95 or above to
+write success; an uncertain answer writes no result. These are authored policies,
+not engine fallbacks.
 
-The desktop intentionally displays an eligible YAML check as provisionally
-passing once its first assessment is queued. It keeps the card in Failed, Passed,
-or Not assessed and appends Checking or a known event countdown to the result.
-This display policy does not create a status write or increase clean-session
-counts. A saved failure remains visible during later checking.
+For definitions with no matching action, acceptance MUST retain the prior
+status-writing assessment, explanation, evidence, and write time while advancing
+the accepted watermark. Without a prior write, engine status remains unassessed.
+The runtime MUST NOT synthesize a success action when no condition matches.
+
+Model evidence MUST show each decision's saved original evaluated input, exact
+fitted input, and nonempty omission report from the status-writing assessment,
+not the latest assessment or reread source. Connection provenance MUST identify
+that assessment's provider/model and available revisions, not current Settings.
+Local evidence remains **Frozen local context** without model provenance.
+Historical accepted preparation MUST preserve available input and provenance;
+it MUST NOT invent an original input or named block that the record did not save.
+Diagnostics MUST use typed codes and context with friendly text, not raw provider
+errors or response bodies.
+
+The desktop keeps a YAML check in Not assessed until its first accepted status
+write. A saved success puts it in Passed; a saved failure puts it in Failed.
+Queued or running work appends Checking beside that result without moving the
+card to a separate group. A known event countdown can appear in detail when
+source delivery is current. Checking does not create a status write or increase
+clean-session counts. A saved failure remains visible during later checking.
+
+Source alerts describe current failures, not missing history alone. A healthy
+capture with partial earlier history does not show a capture alert. The host
+retains the gap and its evidence limits without claiming that an event was lost.
+An agent that uses file updates does not require a live service connection.
 
 Message text is separate from status text. `status.input.message` explains a
 status to the user; it is not an in-agent notice. Each applied status action
@@ -892,23 +1279,27 @@ delivery.
 
 The [examples](README.md#examples) state their current support and missing
 capabilities. Message-window examples illustrate selected-message claims, not
-complete turns; Fast Mode Value requires a measured activity period.
+complete turns. Fast mode value requires recorded requester fast-mode evidence
+and affirmative task evidence, not an idle event or a measured activity period.
+It suggests a standard-mode trial for similar non-urgent work without promising
+route availability, served tier, lower cost, or savings.
 Example text MUST NOT imply that current instruction files prove past
 applicability, that a skill was never used, or that timing occupancy proves
 counterfactual savings.
 
-| Term                  | Definition                                                                                          |
-| --------------------- | --------------------------------------------------------------------------------------------------- |
-| Activation generation | Durable identity for one effective definition and enabled state                                     |
-| Assessment            | One accepted or rejected evaluation of a frozen candidate                                           |
-| Candidate             | Trigger and selected evidence frozen for a possible assessment                                      |
-| Completeness          | Whether the source proves selected membership and required content                                  |
-| Current status        | Latest accepted status write for one check/branch/generation                                        |
-| Native order          | Source-proven position within a producer's data, distinct from timestamps and delivery order        |
-| Not assessed          | No valid decision could be made because evidence, capability, limits, or execution were unavailable |
-| Response cycle        | Host interaction boundary that can include automatic continuation and tools                         |
-| Uncertain answer      | A valid authored model result whose meaning is uncertain; not an execution failure                  |
-| Window                | Rolling array of selected matching messages ending at a trigger                                     |
+| Term                        | Definition                                                                                          |
+| --------------------------- | --------------------------------------------------------------------------------------------------- |
+| Activation generation       | Durable identity for one effective definition and enabled state                                     |
+| Assessment                  | One accepted or rejected evaluation of a frozen candidate                                           |
+| Candidate                   | Trigger and selected evidence frozen for a possible assessment                                      |
+| Completeness                | Whether the source proves selected membership and required content                                  |
+| Current status              | Latest accepted status write for one check/branch/generation                                        |
+| Native order                | Source-proven position within a producer's data, distinct from timestamps and delivery order        |
+| Not assessed (saved status) | No accepted status write yet; a valid no-write assessment can leave this status unchanged           |
+| Not-assessed candidate      | Evidence, capability, limits, or execution prevented assessment; this is separate from saved status |
+| Response cycle              | Host interaction boundary that can include automatic continuation and tools                         |
+| Uncertain answer            | A valid authored model result whose meaning is uncertain; not an execution failure                  |
+| Window                      | Rolling array of selected matching messages ending at a trigger                                     |
 
 Runtime capabilities belong in [authoring](authoring.md#supported-subset).
 Source and result limits belong in [session coverage](../session-coverage.md)

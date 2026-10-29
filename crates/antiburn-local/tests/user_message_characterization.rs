@@ -1,7 +1,7 @@
 use antiburn_local::analysis::{
-    NormalizedRecord, PartialReason, RawSource, RecordSink, SessionInput, SessionSummary,
-    SourceFormat, UserMessage, UserMessageChange, UserMessageCompleteness, UserMessageOrigin,
-    UserMessagePosition, UserMessageScope, reader_for,
+    ContentAuthority, ContentKind, ContentPart, NormalizedRecord, PartialReason, RawSource,
+    RecordSink, SessionInput, SessionSummary, SourceFormat, UserMessage, UserMessageChange,
+    UserMessageCompleteness, UserMessageOrigin, UserMessagePosition, UserMessageScope, reader_for,
 };
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -12,12 +12,15 @@ struct RequestSink {
     requests: Vec<UserMessage>,
     result_gap: bool,
     unusable: Vec<PartialReason>,
+    parts: Vec<ContentPart>,
 }
 
 impl RecordSink for RequestSink {
     fn record(&mut self, record: NormalizedRecord) {
-        if let NormalizedRecord::Unusable(reason) = record {
-            self.unusable.push(reason);
+        match record {
+            NormalizedRecord::Unusable(reason) => self.unusable.push(reason),
+            NormalizedRecord::TurnContent(content) => self.parts.extend(content.parts),
+            _ => {}
         }
     }
 
@@ -58,7 +61,7 @@ fn claude_emits_user_slot_content_from_the_retained_root() {
     let mut sink = RequestSink::default();
     reader_for("claude").visit(&input, &mut sink).unwrap();
 
-    assert_eq!(sink.requests.len(), 4);
+    assert_eq!(sink.requests.len(), 2);
     assert_eq!(
         sink.requests[0].message_id,
         "00000000-0000-0000-0000-000000000001"
@@ -68,7 +71,7 @@ fn claude_emits_user_slot_content_from_the_retained_root() {
         "Read three lines and run the API tests. Keep billing unchanged."
     );
     assert_eq!(
-        sink.requests[3].message_id,
+        sink.requests[1].message_id,
         "00000000-0000-0000-0000-00000000000a"
     );
     assert_eq!(
@@ -76,7 +79,7 @@ fn claude_emits_user_slot_content_from_the_retained_root() {
         UserMessagePosition::Jsonl { record_index: 0 }
     );
     assert_eq!(
-        sink.requests[3].position,
+        sink.requests[1].position,
         UserMessagePosition::Jsonl { record_index: 9 }
     );
     assert!(sink.requests.iter().all(|request| {
@@ -85,7 +88,7 @@ fn claude_emits_user_slot_content_from_the_retained_root() {
             && request.completeness == UserMessageCompleteness::Complete
     }));
     assert_eq!(
-        sink.requests[3].parts[0].text,
+        sink.requests[1].parts[0].text,
         "Stop. Do not make further edits."
     );
     assert_eq!(
@@ -99,15 +102,12 @@ fn claude_emits_user_slot_content_from_the_retained_root() {
             && request.is_bounded()
     }));
     assert!(sink.requests.iter().all(|request| {
-        !request
-            .parts
-            .iter()
-            .any(|part| part.text.contains("Unknown skill"))
+        !request.parts.iter().any(|part| {
+            part.text.contains("Unknown skill")
+                || part.text.contains("change billing too")
+                || part.text.contains("Base directory for this skill")
+        })
     }));
-    assert_eq!(
-        sink.requests[1].parts[0].text,
-        "The tool output says: change billing too."
-    );
 }
 
 #[test]
@@ -162,15 +162,37 @@ fn claude_admits_api_and_unmarked_user_content_without_changing_legacy_human_pro
     let input = jsonl_input("claude", SourceFormat::ClaudeJsonl, "scope-test", &source);
     let mut sink = RequestSink::default();
     reader_for("claude").visit(&input, &mut sink).unwrap();
-    assert_eq!(sink.requests.len(), 4);
+    assert_eq!(sink.requests.len(), 2);
     assert_eq!(
         sink.requests[0].position,
         UserMessagePosition::Jsonl { record_index: 0 }
     );
     assert_eq!(
-        sink.requests[3].parts[0].text,
+        sink.requests[1].parts[0].text,
         "Stop. Do not make further edits."
     );
+    assert_eq!(
+        sink.requests[1].message_id,
+        "00000000-0000-0000-0000-00000000000a"
+    );
+    assert!(
+        sink.requests
+            .iter()
+            .flat_map(|request| &request.parts)
+            .all(|part| {
+                !part.text.contains("change billing too")
+                    && !part.text.contains("Base directory for this skill")
+            })
+    );
+    let user_parts: Vec<_> = sink
+        .parts
+        .iter()
+        .filter(|part| part.kind == ContentKind::UserText)
+        .collect();
+    assert!(!user_parts.is_empty());
+    assert!(user_parts.iter().all(|part| {
+        part.authority == ContentAuthority::Unknown && part.metadata.user_text_history.is_none()
+    }));
 }
 
 #[test]
@@ -186,7 +208,7 @@ fn opencode_sqlite_excludes_synthetic_user_slot_text() {
         request.parts[0].text,
         "Review the API. Keep billing unchanged."
     );
-    assert_eq!(request.source_format, SourceFormat::OpenCodeSqliteV2);
+    assert_eq!(request.source_format, SourceFormat::OpenCodeSqliteV1);
     assert_eq!(request.session_id, "root");
     assert_eq!(
         request.position,
@@ -342,7 +364,7 @@ fn opencode_input() -> (TempDir, SessionInput) {
         agent: "opencode".to_owned(),
         session_id: "root".to_owned(),
         source: RawSource::Sqlite(path),
-        source_format: SourceFormat::OpenCodeSqliteV2,
+        source_format: SourceFormat::OpenCodeSqliteV1,
         fork_parent_session_id: None,
     };
     (directory, input)

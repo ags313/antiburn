@@ -13,9 +13,9 @@ use crate::analysis::evidence::{
     ProviderIncident, QuotaIncident, RelationConfidence, RepeatedContext,
     RepeatedContextAccounting, SessionCoverageRecord, SessionEvidence, SessionEvidenceIdentity,
     SessionProvenance, SessionProviderEvidence, SessionQuotaEvidence, SourceAcceptance,
-    SourceCapabilities, SourceKind, SubagentChild, SubagentEvidence, SubagentExample, ToolClass,
-    ToolDefinition, ToolEvidence, ToolUse, cap_string, insert_diagnostic_field,
-    record_diagnostic_set_cap,
+    SourceCapabilities, SourceKind, SubagentChild, SubagentConfigBinding, SubagentEvidence,
+    SubagentExample, ToolClass, ToolDefinition, ToolEvidence, ToolUse, cap_string,
+    insert_diagnostic_field, record_diagnostic_set_cap,
 };
 use crate::analysis::evidence_query::TurnFacts;
 use crate::analysis::initial_context::{InitialContextTokenSource, SourceOrigin};
@@ -43,6 +43,12 @@ pub const MAX_TOOL_RESULT_OBSERVATIONS: usize = 4096;
 /// Maximum total JSON-text bytes retained for native tool-result observations
 /// and conflict identities in a composite sink and resume snapshot.
 pub const MAX_TOOL_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum events retained in the separate generic native evidence collection.
+pub const MAX_NATIVE_EVIDENCE_OBSERVATIONS: usize = 4096;
+
+/// Maximum JSON bytes retained in the separate generic native evidence collection.
+pub const MAX_NATIVE_EVIDENCE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Maximum number of user-message observations and conflict identities
 /// retained per composite sink and resume snapshot.
@@ -231,7 +237,9 @@ impl SessionEvidenceAccumulator {
                 self.observe_event(event);
             }
             NormalizedRecord::Observation(observation) => self.observe_observation(observation),
-            NormalizedRecord::ToolResult(_) => {}
+            NormalizedRecord::ToolResult(_)
+            | NormalizedRecord::PublicMessage(_)
+            | NormalizedRecord::ResponseCycle(_) => {}
             NormalizedRecord::TurnContent(_) => {}
             NormalizedRecord::Unusable(reason) => {
                 self.diagnostics.records_observed =
@@ -424,12 +432,14 @@ impl SessionEvidenceAccumulator {
                 parent_call_id,
                 child_model,
                 provenance,
+                config_binding,
             } => self.observe_subagent_spawn(
                 *ts_ms,
                 parent_model.as_deref(),
                 parent_call_id.as_deref(),
                 child_model.as_deref(),
                 *provenance,
+                config_binding.as_ref(),
             ),
             EvidenceObservation::SubagentModel {
                 parent_call_id,
@@ -553,6 +563,7 @@ impl SessionEvidenceAccumulator {
         parent_call_id: Option<&str>,
         child_model: Option<&str>,
         provenance: crate::analysis::interface::RelationProvenance,
+        config_binding: Option<&SubagentConfigBinding>,
     ) {
         self.subagent_spawn_count = self.subagent_spawn_count.saturating_add(1);
         let child_parent_model = parent_model.and_then(|model| {
@@ -580,6 +591,15 @@ impl SessionEvidenceAccumulator {
                 }
                 Some(capped)
             });
+        let mut duplicate_call = false;
+        if let Some(id) = &parent_call_id {
+            for child in &mut self.subagent_children {
+                if child.parent_call_id.as_ref() == Some(id) {
+                    child.config_binding = None;
+                    duplicate_call = true;
+                }
+            }
+        }
         if self.subagent_children.len() == MAX_SUBAGENT_CHILDREN {
             self.subagents_cap_exceeded = true;
             self.note_collection_cap("subagents.children");
@@ -593,9 +613,24 @@ impl SessionEvidenceAccumulator {
                 child_model: EvidenceValue::Unsupported,
                 confidence: RelationConfidence::Observed,
                 provenance,
+                config_binding: None,
             });
             if let Some(model) = child_model {
                 self.insert_child_model(index, model);
+            }
+            if !duplicate_call
+                && self.capabilities.source_format
+                    == crate::analysis::SourceFormat::OpenCodeSqliteV2
+                && provenance == crate::analysis::RelationProvenance::SessionParentLink
+                && let Some(binding) = config_binding
+                && self.subagent_children[index].parent_call_id.is_some()
+                && self.subagent_children[index].observed_child_models.len() == 1
+                && self.subagent_children[index]
+                    .observed_child_models
+                    .contains(&binding.model_id)
+                && self.config_binding_is_bounded(binding)
+            {
+                self.subagent_children[index].config_binding = Some(binding.clone());
             }
         }
         if let Some(ts_ms) = ts_ms {
@@ -620,6 +655,32 @@ impl SessionEvidenceAccumulator {
                 });
             }
         }
+    }
+
+    fn config_binding_is_bounded(&mut self, binding: &SubagentConfigBinding) -> bool {
+        let mut valid = true;
+        for (field, value) in [
+            (
+                "subagents.children.config_binding.agent_id",
+                &binding.agent_id,
+            ),
+            (
+                "subagents.children.config_binding.provider_id",
+                &binding.provider_id,
+            ),
+            (
+                "subagents.children.config_binding.model_id",
+                &binding.model_id,
+            ),
+        ] {
+            if value.len() > EVIDENCE_STRING_CAP {
+                cap_string(field, value, &mut self.diagnostics);
+                self.subagents_cap_exceeded = true;
+                valid = false;
+            }
+            valid &= !value.trim().is_empty() && !value.chars().any(char::is_control);
+        }
+        valid
     }
 
     /// Adds models only when exactly one native parent call matches the child metadata.
@@ -654,6 +715,13 @@ impl SessionEvidenceAccumulator {
     }
 
     fn insert_child_model(&mut self, index: usize, model: &str) {
+        if self.subagent_children[index]
+            .config_binding
+            .as_ref()
+            .is_some_and(|binding| binding.model_id != model)
+        {
+            self.subagent_children[index].config_binding = None;
+        }
         let capped = cap_string(
             "subagents.children.observed_child_models",
             model,
@@ -1760,6 +1828,11 @@ fn subagent_children_retained_bytes(children: &[SubagentChild], capacity: usize)
                 .map(|child| {
                     child.parent_model.as_ref().map_or(0, String::capacity)
                         + child.parent_call_id.as_ref().map_or(0, String::capacity)
+                        + child.config_binding.as_ref().map_or(0, |binding| {
+                            binding.agent_id.capacity()
+                                + binding.provider_id.capacity()
+                                + binding.model_id.capacity()
+                        })
                         + child
                             .observed_child_models
                             .iter()
@@ -1818,6 +1891,7 @@ pub struct CompositeSink {
     /// Set by [`RecordSink::finish`], `None` before the first call. See
     /// [`Self::snapshot`].
     pre_finish: Option<PreFinishState>,
+    pending_native_finish: Option<PreFinishState>,
     tool_result_observations: Vec<ToolResultObservation>,
     tool_result_observation_sizes: Vec<usize>,
     native_tool_result_indices: HashMap<String, usize>,
@@ -1829,12 +1903,17 @@ pub struct CompositeSink {
     user_message_conflicts: BTreeSet<String>,
     user_messages_bytes: usize,
     user_messages_complete: bool,
+    native_evidence: Vec<crate::analysis::NativeEvidenceEvent>,
+    native_evidence_bytes: usize,
+    native_evidence_complete: bool,
+    native_admission_failure: Option<crate::analysis::NativeAdmissionFailure>,
 }
 
 impl RecordSink for CompositeSink {
     fn record(&mut self, mut record: NormalizedRecord) {
         if matches!(record, NormalizedRecord::Unusable(_)) {
             self.user_messages_complete = false;
+            self.native_evidence_complete = false;
         }
         if let NormalizedRecord::ToolResult(result) = &mut record
             && let Some(context) = &mut result.context
@@ -1869,6 +1948,29 @@ impl RecordSink for CompositeSink {
             }
             self.observe_native_tool_result((**result).clone());
         }
+        match &mut record {
+            NormalizedRecord::PublicMessage(value) => {
+                if let crate::analysis::NativeMessageObservation::Public(finalized) = self
+                    .finalize_native_message(crate::analysis::NativeMessageObservation::Public(
+                        (**value).clone(),
+                    ))
+                {
+                    **value = finalized;
+                }
+                self.retain_native_evidence(crate::analysis::NativeEvidenceFact::Message(
+                    crate::analysis::NativeMessageObservation::Public((**value).clone()),
+                ));
+            }
+            NormalizedRecord::ToolResult(value) => {
+                self.retain_native_evidence(crate::analysis::NativeEvidenceFact::Message(
+                    crate::analysis::NativeMessageObservation::ToolResult((**value).clone()),
+                ))
+            }
+            NormalizedRecord::ResponseCycle(value) => self.retain_native_evidence(
+                crate::analysis::NativeEvidenceFact::ResponseCycle((**value).clone()),
+            ),
+            _ => {}
+        }
         self.evidence.observe(&record);
         if let Some(turn_rows) = &mut self.turn_rows {
             turn_rows.observe(&record);
@@ -1877,12 +1979,112 @@ impl RecordSink for CompositeSink {
     }
 
     fn user_message(&mut self, request: UserMessage) {
+        if self.user_messages.iter().any(|prior| prior == &request) {
+            return;
+        }
+        let Some(observation) = crate::analysis::public_events::user_observation(request.clone())
+        else {
+            self.observe_user_message(request);
+            return;
+        };
+        let message = self
+            .finalize_native_message(crate::analysis::NativeMessageObservation::User(observation));
         self.observe_user_message(request);
+        self.retain_native_evidence(crate::analysis::NativeEvidenceFact::Message(message));
+    }
+
+    fn finalize_native_message(
+        &mut self,
+        message: crate::analysis::NativeMessageObservation,
+    ) -> crate::analysis::NativeMessageObservation {
+        let position = message.position();
+        let (source_format, session_id) = match &message {
+            crate::analysis::NativeMessageObservation::User(value) => (
+                value.message.source_format,
+                value.message.session_id.as_str(),
+            ),
+            crate::analysis::NativeMessageObservation::Public(value) => {
+                (value.source_format, value.session_id.as_str())
+            }
+            crate::analysis::NativeMessageObservation::ToolResult(value) => {
+                (value.source_format, value.session_id.as_str())
+            }
+        };
+        let is_result = matches!(
+            &message,
+            crate::analysis::NativeMessageObservation::ToolResult(_)
+        );
+        let (prefix, clipped) = self.native_prefix(source_format, session_id, position, !is_result);
+        let main = match &message {
+            crate::analysis::NativeMessageObservation::User(value) => value.context.main_session,
+            crate::analysis::NativeMessageObservation::Public(value) => value
+                .context
+                .as_ref()
+                .is_some_and(|context| context.main_session),
+            crate::analysis::NativeMessageObservation::ToolResult(value) => value
+                .context
+                .as_ref()
+                .is_some_and(|context| context.main_session),
+        };
+        let mut message = crate::analysis::public_events::freeze_message(
+            message,
+            position,
+            prefix,
+            self.user_messages_complete && !clipped,
+            main,
+        );
+        if let Some(failure) = &self.native_admission_failure {
+            message.invalidate_admission(failure.reason);
+        }
+        message
+    }
+
+    fn native_activity(&mut self, activity: crate::analysis::NativeActivityObservation) {
+        self.retain_native_evidence(crate::analysis::NativeEvidenceFact::Activity(activity));
+    }
+
+    fn native_context(
+        &mut self,
+        source_format: crate::analysis::SourceFormat,
+        session_id: &str,
+        position: crate::analysis::ToolResultPosition,
+        main_session: bool,
+    ) -> crate::analysis::NativeEventContext {
+        let (user_messages, clipped) =
+            self.native_prefix(source_format, session_id, position, true);
+        crate::analysis::NativeEventContext {
+            first_eligible_position: position,
+            main_session,
+            complete_through_event: main_session && self.user_messages_complete && !clipped,
+            user_messages,
+        }
+    }
+
+    fn session_selection(&mut self, selection: crate::analysis::NativeSessionSelectionObservation) {
+        self.retain_native_evidence(crate::analysis::NativeEvidenceFact::SessionSelection(
+            selection,
+        ));
     }
 
     fn tool_result_gap(&mut self) {
         self.tool_result_observations_complete = false;
         self.user_messages_complete = false;
+        self.native_evidence_complete = false;
+    }
+
+    fn pending_native_content(&mut self, reason: crate::analysis::PartialReason) {
+        if self.turn_rows.is_some() && self.pending_native_finish.is_none() {
+            self.pending_native_finish = Some(PreFinishState {
+                metrics: self.metrics.snapshot(),
+                evidence: EvidenceSnapshot {
+                    record: self.evidence.coverage_record(),
+                    resume: self.evidence.resume_state(),
+                },
+            });
+        }
+        let record = NormalizedRecord::Unusable(reason);
+        self.evidence.observe(&record);
+        self.metrics.record(record);
     }
 
     fn tool_result_admission_gap(&mut self, admission: crate::analysis::ToolResultAdmission) {
@@ -1893,6 +2095,10 @@ impl RecordSink for CompositeSink {
             ToolResultAdmission::UnsafeOwnership => ToolResultCompleteness::UnsafeOwnership,
             ToolResultAdmission::Admitted | ToolResultAdmission::Unavailable => return,
         };
+        let completeness = self
+            .native_admission_failure
+            .as_ref()
+            .map_or(completeness, |failure| failure.reason);
         for result in &mut self.tool_result_observations {
             result.completeness = completeness;
             if let Some(context) = &mut result.context {
@@ -1900,21 +2106,67 @@ impl RecordSink for CompositeSink {
                 context.complete_through_event = false;
             }
         }
+        for event in &mut self.native_evidence {
+            if self.native_admission_failure.is_some()
+                || matches!(
+                    event.fact,
+                    crate::analysis::NativeEvidenceFact::Message(
+                        crate::analysis::NativeMessageObservation::ToolResult(_)
+                    )
+                )
+            {
+                event.fact.invalidate_admission(completeness);
+            }
+        }
+        self.native_evidence_bytes = self
+            .native_evidence
+            .iter()
+            .map(|event| {
+                serde_json::to_vec(event)
+                    .expect("native evidence encodes")
+                    .len()
+            })
+            .sum();
+        while self.native_evidence_bytes > MAX_NATIVE_EVIDENCE_BYTES {
+            let removed = self.native_evidence.remove(0);
+            self.native_evidence_bytes -= serde_json::to_vec(&removed)
+                .expect("native evidence encodes")
+                .len();
+        }
         self.tool_result_gap();
-        self.tool_result_observations_bytes = self
+        self.tool_result_observation_sizes = self
             .tool_result_observations
             .iter()
             .map(|result| {
-                serde_json::to_string(result)
+                serde_json::to_vec(result)
                     .expect("source result encodes")
                     .len()
             })
-            .sum::<usize>()
-            + self
-                .native_tool_result_conflicts
-                .iter()
-                .map(String::len)
-                .sum::<usize>();
+            .collect();
+        self.tool_result_observations_bytes =
+            self.tool_result_observation_sizes.iter().sum::<usize>()
+                + self
+                    .native_tool_result_conflicts
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>();
+    }
+
+    fn native_admission_failure(&mut self, failure: crate::analysis::NativeAdmissionFailure) {
+        if !failure.valid() {
+            self.tool_result_gap();
+            return;
+        }
+        let first = self.native_admission_failure.is_none();
+        if first {
+            self.native_admission_failure = Some(failure.clone());
+        }
+        self.tool_result_admission_gap(failure.admission());
+        if first {
+            self.retain_native_evidence(crate::analysis::NativeEvidenceFact::AdmissionFailure(
+                failure,
+            ));
+        }
     }
 
     fn finish(&mut self, summary: SessionSummary) {
@@ -1922,13 +2174,18 @@ impl RecordSink for CompositeSink {
         // Only a sink with turn rows can snapshot, so a sink without them
         // does not pay for the clone.
         if self.turn_rows.is_some() {
-            self.pre_finish = Some(PreFinishState {
-                metrics: self.metrics.snapshot(),
-                evidence: EvidenceSnapshot {
-                    record: self.evidence.coverage_record(),
-                    resume: self.evidence.resume_state(),
-                },
-            });
+            self.pre_finish =
+                Some(
+                    self.pending_native_finish
+                        .take()
+                        .unwrap_or_else(|| PreFinishState {
+                            metrics: self.metrics.snapshot(),
+                            evidence: EvidenceSnapshot {
+                                record: self.evidence.coverage_record(),
+                                resume: self.evidence.resume_state(),
+                            },
+                        }),
+                );
         }
         self.evidence.observe_summary(&summary);
         if let Some(turn_rows) = &mut self.turn_rows {

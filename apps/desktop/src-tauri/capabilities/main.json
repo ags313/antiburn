@@ -48,7 +48,6 @@
     "allow-get-checks-report",
     "allow-get-allowance-usage",
     "allow-get-burn-check-aggregate-wins",
-    "allow-get-burn-check-target-evidence",
     "allow-get-installed-check-evidence",
     "allow-get-burn-check-remediation-progress",
     "allow-get-main-window-visible",

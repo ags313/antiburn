@@ -3,10 +3,13 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use crate::actions::{ActionPlan, ChoiceResult};
+use crate::actions::ActionPlan;
+use crate::decision::{DecisionAttempt, DecisionBlock, QuestionRequirements};
 use crate::definition_lifecycle::{EffectiveActivation, LifecycleTransition};
 use crate::domain::{FrozenCandidate, ObservationPosition};
-use crate::fit::{PreparationFailure, PreparationRecord};
+use crate::fit::{LocalPreparation, PreparationFailure, PreparationRecord};
+use crate::results::DecisionResult;
+pub use crate::results::EvaluatedAssessment;
 use crate::selection::SelectionState;
 use crate::source::{CommittedSourceObservation, PublicationCursor, SourceBatch};
 
@@ -31,8 +34,6 @@ pub struct ClaimedCandidate {
     pub prior_status: Option<crate::compiler::StatusResult>,
     /// Monotonic Store fence. A prior process cannot settle a newer claim.
     pub fence: u64,
-    /// Next dispatch number, one or two. Safe settled attempts survive restart.
-    pub next_attempt: u8,
 }
 
 /// Durable source and selector progress for one activation.
@@ -135,29 +136,171 @@ pub enum CandidateClaim {
     Stale,
 }
 
-/// A validated evaluator response ready for action planning.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct EvaluatedCandidate {
-    /// Provider output validated against the compiled Choice declaration.
-    pub choices: Vec<ChoiceResult>,
-    /// Number of provider dispatch attempts used to obtain the response.
-    pub attempts: u8,
+/// Exact durable model attempt rows for one candidate.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DecisionProgress {
+    pub attempts: Vec<SavedDecisionAttempt>,
 }
 
-impl EvaluatedCandidate {
-    /// Validates persisted or evaluator-supplied results before actions can run.
-    pub fn validate(
-        &self,
-        check: &crate::compiler::CompiledCheck,
-    ) -> Result<(), crate::actions::ChoiceResultError> {
-        if self.choices.len() != 1 || !(1..=2).contains(&self.attempts) {
-            return Err(crate::actions::ChoiceResultError {
-                code: crate::diagnostics::DiagnosticCode::RuntimeInvalidDecision,
-                message: "Assessment requires one Choice result and one or two attempts.".into(),
-            });
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedDecisionAttempt {
+    pub attempt: DecisionAttempt,
+    pub outcome: DecisionAttemptOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DecisionAttemptOutcome {
+    DispatchIntent,
+    SafeTransient,
+    Unknown,
+    Permanent,
+    Answer(DecisionResult),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidatedDecisionProgress {
+    pub attempts: u64,
+    pub state: DecisionProgressState,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DecisionProgressState {
+    Next {
+        attempt: DecisionAttempt,
+        unfinished_decisions: u64,
+    },
+    Complete(EvaluatedAssessment),
+    Terminal(DecisionProgressTerminal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecisionProgressTerminal {
+    UnresolvedIntent,
+    Unknown,
+    Permanent,
+    AttemptsExhausted,
+}
+
+/// Binds exact durable rows to authored order and required answer details.
+pub fn validate_decision_progress(
+    declarations: &[DecisionBlock],
+    requirements: &[QuestionRequirements],
+    progress: &DecisionProgress,
+) -> Result<ValidatedDecisionProgress, StoreError> {
+    use std::collections::BTreeMap;
+    let invalid = || StoreError {
+        message: "invalid saved decision progress".into(),
+    };
+    crate::decision::validate_requirements(declarations, requirements).map_err(|_| invalid())?;
+    let mut rows = BTreeMap::new();
+    for row in &progress.attempts {
+        row.attempt.validate().map_err(|_| invalid())?;
+        if !declarations
+            .iter()
+            .any(|block| block.name == row.attempt.decision)
+            || rows
+                .insert(
+                    (row.attempt.decision.as_str(), row.attempt.number),
+                    &row.outcome,
+                )
+                .is_some()
+        {
+            return Err(invalid());
         }
-        self.choices[0].validate_declaration(&check.decision)
     }
+    let attempts = u64::try_from(rows.len()).map_err(|_| invalid())?;
+    let mut answers = Vec::new();
+    let mut state = None;
+    for (index, block) in declarations.iter().enumerate() {
+        let first = rows.remove(&(block.name.as_str(), 1));
+        let second = rows.remove(&(block.name.as_str(), 2));
+        if state.is_some() {
+            if first.is_some() || second.is_some() {
+                return Err(invalid());
+            }
+            continue;
+        }
+        let (number, outcome) = match (first, second) {
+            (None, None) => (1, None),
+            (None, Some(_)) => return Err(invalid()),
+            (Some(DecisionAttemptOutcome::SafeTransient), second) => (2, second),
+            (Some(first), None) => (1, Some(first)),
+            (Some(_), Some(_)) => return Err(invalid()),
+        };
+        match outcome {
+            Some(DecisionAttemptOutcome::Answer(answer)) => {
+                answer
+                    .validate_for_declaration(block, requirements)
+                    .map_err(|_| invalid())?;
+                if answer.attempts() != number {
+                    return Err(invalid());
+                }
+                answers.push(answer);
+            }
+            Some(DecisionAttemptOutcome::DispatchIntent) => {
+                state = Some(DecisionProgressState::Terminal(
+                    DecisionProgressTerminal::UnresolvedIntent,
+                ))
+            }
+            Some(DecisionAttemptOutcome::Unknown) => {
+                state = Some(DecisionProgressState::Terminal(
+                    DecisionProgressTerminal::Unknown,
+                ))
+            }
+            Some(DecisionAttemptOutcome::Permanent) => {
+                state = Some(DecisionProgressState::Terminal(
+                    DecisionProgressTerminal::Permanent,
+                ))
+            }
+            Some(DecisionAttemptOutcome::SafeTransient) => {
+                state = Some(DecisionProgressState::Terminal(
+                    DecisionProgressTerminal::AttemptsExhausted,
+                ))
+            }
+            None => {
+                state = Some(DecisionProgressState::Next {
+                    attempt: DecisionAttempt::new(block.name.clone(), number)
+                        .map_err(|_| invalid())?,
+                    unfinished_decisions: u64::try_from(declarations.len() - index)
+                        .map_err(|_| invalid())?,
+                })
+            }
+        }
+    }
+    if !rows.is_empty() {
+        return Err(invalid());
+    }
+    #[derive(Serialize)]
+    struct BorrowedAnswers<'a> {
+        version: u8,
+        decisions: &'a [&'a DecisionResult],
+        attempts: u64,
+    }
+    crate::bounded_json::measure_json(
+        &BorrowedAnswers {
+            version: crate::results::RESULT_VERSION,
+            decisions: &answers,
+            attempts,
+        },
+        crate::results::RESULT_LIMITS,
+    )
+    .map_err(|_| invalid())?;
+    let state = match state {
+        Some(state) => state,
+        None => {
+            let evaluated = EvaluatedAssessment::new(
+                declarations,
+                requirements,
+                answers.into_iter().cloned().collect(),
+            )
+            .map_err(|_| invalid())?;
+            if evaluated.attempts() != attempts {
+                return Err(invalid());
+            }
+            DecisionProgressState::Complete(evaluated)
+        }
+    };
+    Ok(ValidatedDecisionProgress { attempts, state })
 }
 
 /// An assessment submitted for atomic acceptance.
@@ -166,7 +309,7 @@ pub struct AssessmentAcceptance {
     /// The claimed immutable candidate.
     pub claimed: ClaimedCandidate,
     /// Validated decisions from the evaluator.
-    pub evaluated: EvaluatedCandidate,
+    pub evaluated: EvaluatedAssessment,
     /// Ordered actions and the resulting status, if any.
     pub actions: ActionPlan,
 }
@@ -232,11 +375,14 @@ pub struct RecoveryRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RecoveryWork {
     /// No unresolved dispatch exists; the candidate can be claimed.
-    Pending(FrozenCandidate),
+    Pending {
+        candidate: FrozenCandidate,
+        resumed: bool,
+    },
     /// Retry acceptance using the persisted answer and original claim.
     Answered {
         claimed: ClaimedCandidate,
-        evaluated: EvaluatedCandidate,
+        evaluated: EvaluatedAssessment,
     },
 }
 
@@ -306,6 +452,16 @@ pub trait CheckStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<RecoveryRecord>, StoreError>;
 
+    /// Returns requested IDs whose durable state is proven terminal.
+    ///
+    /// Use a closed terminal-state list. Omit unfinished, missing, unknown, and
+    /// out-of-scope IDs. Each call contains at most the pending queue capacity.
+    /// Propagate read failures; missing state is not permission to remove work.
+    fn load_terminal_candidate_ids(
+        &self,
+        candidate_ids: &[CandidateId],
+    ) -> Result<Vec<CandidateId>, StoreError>;
+
     /// Claims one due candidate while enforcing generation and branch single flight.
     fn claim_due(
         &self,
@@ -320,6 +476,12 @@ pub trait CheckStore: Send + Sync {
         &self,
         claimed: &ClaimedCandidate,
     ) -> Result<ClaimOutcome, StoreError>;
+
+    /// Loads exact attempts under the current claim, including settled siblings.
+    fn load_decision_progress(
+        &self,
+        claimed: &ClaimedCandidate,
+    ) -> Result<DecisionProgress, StoreError>;
 
     /// Loads the immutable preparation saved before an earlier attempt.
     fn load_preparation(
@@ -338,6 +500,16 @@ pub trait CheckStore: Send + Sync {
         Ok(ClaimOutcome::Current)
     }
 
+    /// Saves local preparation, its empty answer, and first cooldown atomically.
+    /// Repeating the same answered claim must not change its start or cooldown.
+    fn record_local_start(
+        &self,
+        claimed: &ClaimedCandidate,
+        now_unix_ms: u64,
+        cooldown: Duration,
+        preparation: &LocalPreparation,
+    ) -> Result<ClaimOutcome, StoreError>;
+
     /// Saves a typed local rejection and settles without a new provider attempt.
     fn record_preparation_rejection(
         &self,
@@ -353,7 +525,7 @@ pub trait CheckStore: Send + Sync {
         claimed: &ClaimedCandidate,
         attempted_at_unix_ms: u64,
         cooldown: Duration,
-        attempt_number: u8,
+        attempt: &DecisionAttempt,
     ) -> Result<ClaimOutcome, StoreError>;
 
     /// Atomically settles one exact attempt and saves its typed diagnostic.
@@ -362,17 +534,18 @@ pub trait CheckStore: Send + Sync {
     fn record_attempt_failure(
         &self,
         claimed: &ClaimedCandidate,
-        attempt_number: u8,
+        attempt: &DecisionAttempt,
         outcome: AttemptFailure,
         diagnostic: &crate::engine::EvaluationDiagnostic,
     ) -> Result<ClaimOutcome, StoreError>;
 
     /// Persists a received validated response before acceptance is attempted.
-    fn record_answer(
+    fn record_decision_answer(
         &self,
         claimed: &ClaimedCandidate,
-        evaluated: &EvaluatedCandidate,
-    ) -> Result<(), StoreError>;
+        attempt: &DecisionAttempt,
+        evaluated: &DecisionResult,
+    ) -> Result<ClaimOutcome, StoreError>;
 
     /// Atomically accepts history, action outcomes, status, and watermark.
     fn accept(&self, assessment: &AssessmentAcceptance) -> Result<AcceptanceOutcome, StoreError>;

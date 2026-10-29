@@ -1,12 +1,25 @@
 use std::sync::Arc;
 
+use antiburn_local::analysis::jev::{JevInputField, JevInputSelection};
+
+const INPUT_SELECTION: JevInputSelection = JevInputSelection::from_fields(&[
+    JevInputField::UserMessage,
+    JevInputField::AssistantMessage,
+    JevInputField::BashCommandInput,
+    JevInputField::BashCommandOutput,
+    JevInputField::FileEditPath,
+    JevInputField::ReadFilePath,
+    JevInputField::SearchFilesQuery,
+    JevInputField::OtherToolInput,
+]);
+
 use antiburn_local::analysis::{
     CompositeSink, CoverageReason, EventSource, EvidenceSource, EvidenceValue, MemoryTurnRowStore,
     NormalizedRecord, PartialReason, RawSource, RecordSink, SessionCollector, SessionEvidence,
     SessionEvidenceAccumulator, SessionInput, SessionMetricsAccumulator, SessionSummary,
     SourceCapabilities, SourceKind, ToolResultChange, ToolResultCompleteness,
     ToolResultObservation, ToolResultPosition, ToolResultStatus, TurnContent, TurnRowSink,
-    TurnRowStore, VisitOutcome, reader_for,
+    TurnRowStore, VisitOutcome, reader_for, reader_for_input,
 };
 use antiburn_local::discovery::Explorers;
 use antiburn_local::insights::{
@@ -73,7 +86,7 @@ fn scope_sources(records: &str) -> (TempDir, Vec<SessionInput>) {
     }
     drop(connection);
     let sqlite = SessionInput {
-        source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2,
+        source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
         ..sqlite_input(&path, "root")
     };
     let jsonl = SessionInput {
@@ -128,7 +141,7 @@ fn persisted_scope_field_availability_requires_supported_source_and_explicit_sel
                     )
                     .unwrap();
                     select_session_content(
-                        &prepare_session_content("root", input.source_format, content, Vec::new()),
+                        &prepare_session_content("root", input.source_format, content),
                         selection,
                     )
                 };
@@ -142,11 +155,11 @@ fn persisted_scope_field_availability_requires_supported_source_and_explicit_sel
                         .unwrap();
                     assert!(availability.selected);
                     let (capability, state) = match (input.source_format, observed) {
-                        (SourceFormat::OpenCodeSqliteV2, true) => (
+                        (SourceFormat::OpenCodeSqliteV1, true) => (
                             JevFieldCapability::Conditional,
                             JevFieldAvailabilityState::Observed,
                         ),
-                        (SourceFormat::OpenCodeSqliteV2, false) => (
+                        (SourceFormat::OpenCodeSqliteV1, false) => (
                             JevFieldCapability::Conditional,
                             JevFieldAvailabilityState::NotObserved,
                         ),
@@ -160,13 +173,10 @@ fn persisted_scope_field_availability_requires_supported_source_and_explicit_sel
                     assert_eq!(availability.state, state);
                     assert_eq!(
                         availability.observed_parts > 0,
-                        input.source_format == SourceFormat::OpenCodeSqliteV2 && observed
+                        input.source_format == SourceFormat::OpenCodeSqliteV1 && observed
                     );
                 }
-                for selection in [
-                    JevInputSelection::ALL,
-                    antiburn_local::analysis::ignored_instructions::INPUT_SELECTION,
-                ] {
+                for selection in [JevInputSelection::ALL, INPUT_SELECTION] {
                     let excluded = query(selection);
                     assert!(
                         excluded
@@ -239,7 +249,7 @@ fn scope_workflows_survive_storage_and_explicit_field_selection() {
                 .map(|a| a.source.call_id.as_deref().unwrap())
                 .collect();
             let expected = if input.source_format
-                == antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
+                == antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1
             {
                 vec![
                     "call_fallback",
@@ -361,7 +371,7 @@ fn scope_workflows_survive_storage_and_explicit_field_selection() {
                     .iter()
                     .all(|p| p.part.metadata.user_answers.is_empty() && p.part.text.is_empty())
             );
-            let legacy = query(antiburn_local::analysis::ignored_instructions::INPUT_SELECTION);
+            let legacy = query(INPUT_SELECTION);
             assert!(
                 legacy
                     .parts
@@ -379,12 +389,7 @@ fn scope_workflows_survive_storage_and_explicit_field_selection() {
             );
             let user_selection = JevInputSelection::from_fields(&[JevInputField::UserMessage]);
             let selected_user = antiburn_local::analysis::jev_evidence::select_session_content(
-                &antiburn_local::analysis::jev_evidence::prepare_session_content(
-                    "root",
-                    input.source_format,
-                    user,
-                    Vec::new(),
-                ),
+                &antiburn_local::analysis::jev_evidence::prepare_session_content("root", input.source_format, user),
                 user_selection,
             );
             assert!(
@@ -392,12 +397,7 @@ fn scope_workflows_survive_storage_and_explicit_field_selection() {
                 "synthetic plan text is not ordinary user authority"
             );
             let selected = antiburn_local::analysis::jev_evidence::select_session_content(
-                &antiburn_local::analysis::jev_evidence::prepare_session_content(
-                    "root",
-                    input.source_format,
-                    content,
-                    Vec::new(),
-                ),
+                &antiburn_local::analysis::jev_evidence::prepare_session_content("root", input.source_format, content),
                 selection,
             );
             assert_eq!(
@@ -619,12 +619,7 @@ fn synthetic_attachment_approval_text_never_binds_to_a_plan_workflow() {
                 }
                 let selection = JevInputSelection::from_fields(&[JevInputField::UserMessage]);
                 let user = select_session_content(
-                    &prepare_session_content(
-                        "root",
-                        input.source_format,
-                        query(selection),
-                        Vec::new(),
-                    ),
+                    &prepare_session_content("root", input.source_format, query(selection)),
                     selection,
                 );
                 assert!(
@@ -912,7 +907,7 @@ fn sqlite_input(path: &std::path::Path, session_id: &str) -> SessionInput {
         session_id: session_id.to_owned(),
         source: RawSource::Sqlite(path.to_owned()),
         fork_parent_session_id: None,
-        source_format: Default::default(),
+        source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
     }
 }
 
@@ -924,8 +919,21 @@ fn opencode_formats_keep_distinct_native_source_contracts() {
     let sqlite = sqlite_input(&path, "root");
     assert_eq!(
         reader_for("opencode").capabilities(&sqlite).source_format,
+        SourceFormat::OpenCodeSqliteV1
+    );
+    let v2 = SessionInput {
+        source_format: SourceFormat::OpenCodeSqliteV2,
+        ..sqlite.clone()
+    };
+    let v2_reader = reader_for_input(&v2);
+    let v2_capabilities = v2_reader.capabilities(&v2);
+    assert_eq!(
+        v2_capabilities.source_format,
         SourceFormat::OpenCodeSqliteV2
     );
+    assert!(v2_capabilities.model_identity);
+    assert!(v2_capabilities.tool_invocations);
+    assert!(v2_reader.normalize(&v2).is_err());
 
     let jsonl = SessionInput {
         agent: "opencode".to_owned(),
@@ -1057,9 +1065,8 @@ fn sqlite_tool_lifecycle_keeps_requests_distinct_from_results() {
         let selected = antiburn_local::analysis::jev_evidence::select_session_content(
             &antiburn_local::analysis::jev_evidence::prepare_session_content(
                 "root",
-                antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2,
+                antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
                 published,
-                Vec::new(),
             ),
             selection,
         );
@@ -1094,8 +1101,8 @@ fn sqlite_tool_lifecycle_keeps_requests_distinct_from_results() {
 
     let (_, store) = evidence_and_rows(&input);
     store.with_connection(|connection| {
-        use antiburn_local::analysis::ignored_instructions::{
-            INPUT_SELECTION, prepare_session_content, select_session_content,
+        use antiburn_local::analysis::jev_evidence::{
+            prepare_session_content, select_session_content,
         };
         use antiburn_local::analysis::{
             FenceScope, TurnSessionKey, query_turn_content_offset_selected,
@@ -1117,9 +1124,8 @@ fn sqlite_tool_lifecycle_keeps_requests_distinct_from_results() {
         let selected = select_session_content(
             &prepare_session_content(
                 "root",
-                antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2,
+                antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
                 published,
-                Vec::new(),
             ),
             INPUT_SELECTION,
         );
@@ -1325,7 +1331,7 @@ fn sqlite_human_history_binds_exact_decoded_text_and_rejects_injected_or_wrong_i
             )
             .unwrap();
             let prepared =
-                prepare_session_content("root", SourceFormat::OpenCodeSqliteV2, published, vec![]);
+                prepare_session_content("root", SourceFormat::OpenCodeSqliteV1, published);
             if control != "native" {
                 assert!(
                     prepared.actions.iter().all(|action| action
@@ -1443,7 +1449,7 @@ fn sqlite_command_results_abstain_for_incomplete_or_ambiguous_native_calls() {
             )
             .unwrap();
             let prepared =
-                prepare_session_content("root", SourceFormat::OpenCodeSqliteV2, published, vec![]);
+                prepare_session_content("root", SourceFormat::OpenCodeSqliteV1, published);
             let prepared = select_session_content(
                 &prepared,
                 JevInputSelection::from_fields(&[
@@ -1573,8 +1579,7 @@ fn legacy_shell_results_stay_unknown_while_native_sqlite_read_has_observed_exten
             ]),
         )
         .unwrap();
-        let prepared =
-            prepare_session_content("root", SourceFormat::OpenCodeSqliteV2, published, vec![]);
+        let prepared = prepare_session_content("root", SourceFormat::OpenCodeSqliteV1, published);
         let action = prepared
             .actions
             .iter()
@@ -1865,14 +1870,20 @@ fn native_repeated_context_reaches_reports_without_capability_overrides() {
             if case == "duplicate_export" {
                 export[4]["messageID"] = json!("m1");
             }
-            for source in [
-                RawSource::Sqlite(path.clone()),
-                RawSource::Jsonl(
-                    export
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("\n"),
+            for (source, source_format) in [
+                (
+                    RawSource::Sqlite(path.clone()),
+                    antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
+                ),
+                (
+                    RawSource::Jsonl(
+                        export
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                    antiburn_local::analysis::SourceFormat::OpenCodeJsonl,
                 ),
             ] {
                 let export_only_gap = matches!(source, RawSource::Jsonl(_))
@@ -1882,6 +1893,7 @@ fn native_repeated_context_reaches_reports_without_capability_overrides() {
                     );
                 let input = SessionInput {
                     source,
+                    source_format,
                     fork_parent_session_id: (case == "known_fork").then(|| "parent".to_owned()),
                     ..sqlite_input(&path, "root")
                 };
@@ -2081,9 +2093,19 @@ fn completed_skill_results_publish_identity_without_inventory() {
                 json!({"type":"message","messageID":"m1","sessionID":"root","time":{"created":10},"payload":message}),
                 json!({"type":"part","messageID":"m1","payload":part}),
             ].iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
-            for source in [RawSource::Sqlite(path.clone()), RawSource::Jsonl(export)] {
+            for (source, source_format) in [
+                (
+                    RawSource::Sqlite(path.clone()),
+                    antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
+                ),
+                (
+                    RawSource::Jsonl(export),
+                    antiburn_local::analysis::SourceFormat::OpenCodeJsonl,
+                ),
+            ] {
                 let input = SessionInput {
                     source,
+                    source_format,
                     ..sqlite_input(&path, "root")
                 };
                 let (evidence, _) = evidence_and_rows(&input);
@@ -2517,9 +2539,19 @@ fn native_task_requires_child_identity_and_both_models() {
             json!({"type":"part","messageID":"r1","payload":task}),
             json!({"type":"message","sessionID":"child","messageID":"c1","time":{"created":30},"payload":child}),
         ].iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
-        for source in [RawSource::Sqlite(path.clone()), RawSource::Jsonl(export)] {
+        for (source, source_format) in [
+            (
+                RawSource::Sqlite(path.clone()),
+                antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
+            ),
+            (
+                RawSource::Jsonl(export),
+                antiburn_local::analysis::SourceFormat::OpenCodeJsonl,
+            ),
+        ] {
             let input = SessionInput {
                 source,
+                source_format,
                 ..sqlite_input(&path, "root")
             };
             let (evidence, store) = evidence_and_rows(&input);
@@ -2617,18 +2649,25 @@ fn child_model_changes_and_missing_tasks_do_not_pollute_parent_totals() {
             }
         }
         drop(connection);
-        for source in [
-            RawSource::Sqlite(path.clone()),
-            RawSource::Jsonl(
-                export
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+        for (source, source_format) in [
+            (
+                RawSource::Sqlite(path.clone()),
+                antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
+            ),
+            (
+                RawSource::Jsonl(
+                    export
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                antiburn_local::analysis::SourceFormat::OpenCodeJsonl,
             ),
         ] {
             let input = SessionInput {
                 source,
+                source_format,
                 ..sqlite_input(&path, "root")
             };
             let (evidence, store) = evidence_and_rows(&input);
@@ -2938,6 +2977,35 @@ fn insert_journal_event(connection: &Connection, sequence: i64, event_type: &str
         .unwrap();
 }
 
+fn drain_live_journal_page(
+    path: &std::path::Path,
+    mut page: antiburn_local::analysis::OpenCodeToolResultPage,
+) -> antiburn_local::analysis::OpenCodeToolResultPage {
+    let mut pages = 1;
+    while page.has_more {
+        let next = antiburn_local::analysis::read_opencode_live_tool_result_page(
+            path,
+            "root",
+            Some(&page.cursor),
+            None,
+            &|| false,
+        )
+        .unwrap();
+        assert!(next.evidence.events.len() <= 40);
+        assert_ne!(next.cursor, page.cursor);
+        page.results.extend(next.results);
+        page.message_removals.extend(next.message_removals);
+        page.evidence.events.extend(next.evidence.events);
+        page.evidence.history_complete &= next.evidence.history_complete;
+        page.cursor = next.cursor;
+        page.has_more = next.has_more;
+        page.history_complete &= next.history_complete;
+        pages += 1;
+        assert!(pages <= 100);
+    }
+    page
+}
+
 fn part_event(part_id: &str, call_id: &str, status: &str, created: i64) -> Value {
     let mut state = json!({"status": status, "input": {"command": format!("run-{call_id}")}});
     match status {
@@ -2962,7 +3030,7 @@ fn part_event(part_id: &str, call_id: &str, status: &str, created: i64) -> Value
 
 async fn visit_claimed_native(path: &std::path::Path) -> NativeResultCapturingSink {
     let input = SessionInput {
-        source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2,
+        source_format: antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1,
         ..sqlite_input(path, "root")
     };
     let (latest, rows) = Explorers::DISK
@@ -3431,7 +3499,7 @@ async fn recent_results_continue_after_both_native_and_shared_byte_and_count_lim
         }
         connection.execute_batch("COMMIT").unwrap();
         let input = SessionInput {
-            source_format: SourceFormat::OpenCodeSqliteV2,
+            source_format: SourceFormat::OpenCodeSqliteV1,
             ..sqlite_input(&path, "root")
         };
         let (hash, rows) = Explorers::DISK
@@ -4011,6 +4079,7 @@ fn live_journal_removed_user_cannot_gain_tool_ownership_after_restart_or_context
                     &|| false,
                 )
                 .unwrap();
+                let pressure = drain_live_journal_page(&path, pressure);
                 assert!(pressure.history_complete);
                 let saved = serde_json::to_value(&pressure.cursor).unwrap();
                 let requests = &saved["live"]["requests"];
@@ -4152,6 +4221,7 @@ fn live_journal_message_removal_tombstone_overflow_keeps_bounded_fail_closed_sta
     let cursor = serde_json::from_str(&serde_json::to_string(&initial.cursor).unwrap()).unwrap();
     let full =
         read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false).unwrap();
+    let full = drain_live_journal_page(&path, full);
     assert!(full.history_complete);
     assert!(full.results.is_empty());
     assert_eq!(full.message_removals.len(), 128);
@@ -4689,6 +4759,7 @@ fn live_journal_warm_eviction_does_not_refreeze_an_unknown_old_correction() {
     let pressure =
         read_opencode_live_tool_result_page(&path, "root", Some(&initial.cursor), None, &|| false)
             .unwrap();
+    let pressure = drain_live_journal_page(&path, pressure);
     let saved = serde_json::to_value(&pressure.cursor).unwrap();
     assert_eq!(saved["live"]["parts"].as_object().unwrap().len(), 128);
     assert!(saved["live"]["parts"].get("part-0").is_none());
@@ -4812,6 +4883,7 @@ fn live_journal_corrections_leave_evicted_frozen_context_unavailable() {
             &|| false,
         )
         .unwrap();
+        let page = drain_live_journal_page(&path, page);
         let correction = page
             .results
             .iter()
@@ -4995,7 +5067,9 @@ fn live_journal_output_continuations_keep_one_shared_prefix_and_deliver_each_ter
             read_opencode_live_tool_result_page(&path, "root", Some(&cursor), None, &|| false)
                 .unwrap();
         pages += 1;
-        assert!(serde_json::to_vec(&page.cursor).unwrap().len() < 200 * 1024);
+        assert!(serde_json::to_vec(&page.cursor).unwrap().len() < 1024 * 1024);
+        assert!(page.evidence.events.len() <= 40);
+        assert!(serde_json::to_vec(&page.evidence.events).unwrap().len() <= 4 * 1024 * 1024);
         assert!(
             page.results
                 .iter()
@@ -5013,9 +5087,9 @@ fn live_journal_output_continuations_keep_one_shared_prefix_and_deliver_each_ter
         if !page.has_more {
             break;
         }
-        assert!(pages < 4);
+        assert!(pages < 16);
     }
-    assert_eq!(pages, 2);
+    assert!((8..=16).contains(&pages));
     assert_eq!(
         terminal_ids,
         (0..80)
@@ -5207,7 +5281,31 @@ async fn journal_only_mutations_change_discovery_fingerprints() {
 #[tokio::test]
 async fn wal_appends_and_descendant_changes_during_a_claimed_read_keep_the_pinned_snapshot() {
     use antiburn_local::analysis::SourceFormat;
-    use std::cell::Cell;
+
+    struct AppendDuringRead<'a> {
+        writer: &'a Connection,
+        changed: bool,
+        captured: NativeResultCapturingSink,
+    }
+
+    impl RecordSink for AppendDuringRead<'_> {
+        fn record(&mut self, record: NormalizedRecord) {
+            if !self.changed {
+                insert_session(self.writer, "child", Some("root"), None, 2_000);
+                insert_journal_event(self.writer, 5, "message.part.updated.1", delivery_result(1));
+                self.changed = true;
+            }
+            self.captured.record(record);
+        }
+
+        fn tool_result_gap(&mut self) {
+            self.captured.tool_result_gap();
+        }
+
+        fn finish(&mut self, summary: SessionSummary) {
+            self.captured.finish(summary);
+        }
+    }
 
     let (_directory, path) = create_database();
     let writer = Connection::open(&path).unwrap();
@@ -5215,6 +5313,13 @@ async fn wal_appends_and_descendant_changes_during_a_claimed_read_keep_the_pinne
         .execute_batch("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;")
         .unwrap();
     delivery_journal(&writer, 16);
+    insert_message(
+        &writer,
+        "snapshot-message",
+        "root",
+        1_000,
+        r#"{"role":"user"}"#,
+    );
     insert_journal_event(&writer, 4, "message.part.updated.1", delivery_result(0));
     let (hash, rows) = Explorers::DISK
         .provider_db_fingerprint(&AgentKind::OpenCode, &path, "root")
@@ -5222,29 +5327,25 @@ async fn wal_appends_and_descendant_changes_during_a_claimed_read_keep_the_pinne
         .unwrap();
     let claim = format!("sv1:db:{hash}:{rows}");
     let input = SessionInput {
-        source_format: SourceFormat::OpenCodeSqliteV2,
+        source_format: SourceFormat::OpenCodeSqliteV1,
         ..sqlite_input(&path, "root")
     };
-    let changed = Cell::new(false);
-    let mut sink = NativeResultCapturingSink::default();
+    let mut sink = AppendDuringRead {
+        writer: &writer,
+        changed: false,
+        captured: NativeResultCapturingSink::default(),
+    };
     let outcome = reader_for("opencode")
-        .visit_db_claimed(
-            &input,
-            &claim,
-            &|| {
-                if !changed.replace(true) {
-                    insert_session(&writer, "child", Some("root"), None, 2_000);
-                    insert_journal_event(&writer, 5, "message.part.updated.1", delivery_result(1));
-                }
-                false
-            },
-            &mut sink,
-        )
+        .visit_db_claimed(&input, &claim, &|| false, &mut sink)
         .unwrap();
     assert_eq!(outcome, VisitOutcome::AcceptedFull);
-    assert!(changed.get());
-    assert_eq!(sink.results.len(), 1);
-    assert_eq!(sink.results[0].result_id.as_deref(), Some("part-0"));
+    assert!(sink.changed);
+    assert!(sink.captured.summary.is_some());
+    assert_eq!(sink.captured.results.len(), 1);
+    assert_eq!(
+        sink.captured.results[0].result_id.as_deref(),
+        Some("part-0")
+    );
     let mut stale = NativeResultCapturingSink::default();
     assert_eq!(
         reader_for("opencode")

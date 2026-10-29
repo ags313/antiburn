@@ -81,6 +81,7 @@ const MAX_PENDING_FORK_BYTES: usize = 1024 * 1024;
 mod completed;
 mod environment;
 pub(crate) mod live;
+mod public;
 mod scope;
 
 pub struct CodexSessionReader;
@@ -104,6 +105,7 @@ impl SessionReader for CodexSessionReader {
             ContextWindowSource::Inferred
         };
         Ok(NormalizedSession {
+            accounting: None,
             agent: input.agent.clone(),
             session_id: input.session_id.clone(),
             events,
@@ -125,7 +127,7 @@ impl SessionReader for CodexSessionReader {
                     BufReader::new(File::open(path)?),
                     &|| false,
                     sink,
-                    CodexStreamState::for_input(input),
+                    CodexStreamState::for_input(input).into(),
                 )?,
                 RawSource::Jsonl(content) => {
                     let suffix: &[u8] = if content.ends_with('\n') { b"" } else { b"\n" };
@@ -134,7 +136,7 @@ impl SessionReader for CodexSessionReader {
                         BufReader::new(source),
                         &|| false,
                         sink,
-                        CodexStreamState::for_input(input),
+                        CodexStreamState::for_input(input).into(),
                     )?
                 }
                 RawSource::Sqlite(path) => {
@@ -156,7 +158,7 @@ impl SessionReader for CodexSessionReader {
                     anyhow::bail!("Copilot bundle is not a Codex source")
                 }
             };
-            let summary = state.finish(sink);
+            let summary = state.parser.finish(sink);
             sink.finish(summary);
             Ok(VisitOutcome::Unvalidated)
         })()
@@ -199,7 +201,7 @@ impl CodexSessionReader {
     /// [rp]: crate::analysis::source_validity::ResumePoint
     pub fn empty_adapter_snapshot() -> crate::analysis::resume::AdapterSnapshot {
         crate::analysis::resume::AdapterSnapshot(
-            postcard::to_allocvec(&CodexStreamState::default())
+            postcard::to_allocvec(&public::ReadState::default())
                 .expect("a default CodexStreamState always encodes"),
         )
     }
@@ -228,7 +230,7 @@ impl CodexSessionReader {
                 BufReader::new(pinned.reader(limit)),
                 cancel,
                 sink,
-                CodexStreamState::for_input(input),
+                CodexStreamState::for_input(input).into(),
             )?;
             let outcome = match guarantee {
                 AppendOnlyGuarantee::Evidenced => match pinned.recheck_prefix()? {
@@ -245,7 +247,7 @@ impl CodexSessionReader {
             if matches!(outcome, VisitOutcome::SourceChanged(_)) {
                 return Ok(outcome);
             }
-            let summary = state.finish(sink);
+            let summary = state.parser.finish(sink);
             sink.finish(summary);
             Ok(outcome)
         })()
@@ -297,7 +299,7 @@ impl CodexSessionReader {
                     });
                 }
             };
-            let initial_state: CodexStreamState = postcard::from_bytes(&resume.adapter.0)
+            let initial_state: public::ReadState = postcard::from_bytes(&resume.adapter.0)
                 .context("decoding Codex adapter snapshot")?;
             let mut initial_state = initial_state;
             initial_state.session_id = input.session_id.clone();
@@ -338,7 +340,7 @@ impl CodexSessionReader {
                     adapter: crate::analysis::resume::AdapterSnapshot(adapter),
                 })
             };
-            let summary = state.finish(sink);
+            let summary = state.parser.finish(sink);
             sink.finish(summary);
             Ok(ResumedVisit {
                 outcome,
@@ -359,8 +361,8 @@ impl CodexSessionReader {
         reader: impl BufRead,
         cancel: &dyn Fn() -> bool,
         sink: &mut dyn RecordSink,
-        mut state: CodexStreamState,
-    ) -> anyhow::Result<CodexStreamState> {
+        mut state: public::ReadState,
+    ) -> anyhow::Result<public::ReadState> {
         let mut reader = BoundedJsonlReader::new(reader);
 
         while let Some(record) = reader.next_record(cancel) {
@@ -370,6 +372,7 @@ impl CodexSessionReader {
                 FramedRecord::Skipped(skip) => match skip {
                     RecordSkip::Oversized { .. } | RecordSkip::IncompleteTail { .. } => {
                         state.scope.invalidate();
+                        state.public.0.invalidate();
                         sink.record(NormalizedRecord::Unusable(skip.partial_reason()));
                     }
                     RecordSkip::ReadFailed { index, kind } => {
@@ -384,10 +387,38 @@ impl CodexSessionReader {
                         .context("Codex transcript record is not valid UTF-8")?;
                     let Ok(value) = serde_json::from_str::<Value>(record) else {
                         state.scope.invalidate();
+                        state.public.0.invalidate();
                         sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
                         continue;
                     };
-                    state.observe(value, bytes.len(), record_index, sink);
+                    let mut public = std::mem::take(&mut state.public.0);
+                    public.begin(&value, record_index, &state.native_turn_id, sink);
+                    {
+                        let mut capture = public::CycleSink::new(
+                            &mut public,
+                            &value,
+                            state.native_turn_id.as_deref(),
+                            sink,
+                        );
+                        state.parser.observe(
+                            value.clone(),
+                            bytes.len(),
+                            record_index,
+                            &mut capture,
+                        );
+                    }
+                    if state.completed.replaces_exec_content(&value) {
+                        public.close_replaced_output(&value);
+                    }
+                    public.end(
+                        &value,
+                        record_index,
+                        state.completed.admits(&state.session_id),
+                        &state.session_id,
+                        (&state.native_request, state.native_turn_id.as_deref()),
+                        sink,
+                    );
+                    state.public.0 = public;
                 }
             }
         }
@@ -458,6 +489,13 @@ struct CodexStreamState {
     native_calls: HashMap<String, Option<CodexNativeCall>>,
     #[serde(default)]
     native_call_bytes: usize,
+    native_provider: Option<String>,
+    native_request: crate::analysis::NativeRequestAttribution,
+    native_settings: Option<crate::analysis::NativeRequestAttribution>,
+    native_mode_contexts: HashMap<String, Option<String>>,
+    native_completed_mode: Option<bool>,
+    native_turn_id: Option<String>,
+    native_cwd: Option<String>,
     record_offset: u64,
 }
 
@@ -465,6 +503,7 @@ struct CodexStreamState {
 struct CodexNativeCall {
     name: String,
     arguments: Option<Value>,
+    facts: crate::analysis::NativeToolFacts,
     retained_bytes: usize,
 }
 
@@ -514,6 +553,20 @@ impl CodexStreamState {
         }
     }
 
+    fn report_ordinal_regression(&self, value: &Value, index: u64, sink: &mut dyn RecordSink) {
+        if self.completed.ordinal_regresses(value) {
+            sink.native_admission_failure(crate::analysis::NativeAdmissionFailure {
+                source_format: self.source_format,
+                session_id: self.session_id.clone(),
+                position: ToolResultPosition::Jsonl {
+                    record_index: index,
+                    item_index: u32::MAX,
+                },
+                reason: ToolResultCompleteness::UnsafeOrder,
+            });
+        }
+    }
+
     fn observe(
         &mut self,
         value: Value,
@@ -521,7 +574,7 @@ impl CodexStreamState {
         record_index: u64,
         sink: &mut dyn RecordSink,
     ) {
-        if record_to_event(&value).is_some_and(|event| event.ts_ms.is_none()) {
+        if !has_required_timestamp(&value) {
             self.scope.invalidate();
             sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
             return;
@@ -669,6 +722,11 @@ impl CodexStreamState {
         record_index: Option<u64>,
         sink: &mut dyn RecordSink,
     ) {
+        if usage_is_owned && let Some(index) = record_index {
+            self.report_ordinal_regression(&value, index, sink);
+        }
+        self.observe_native_request(&value, usage_is_owned);
+        let completed_facts = self.completed_facts(&value);
         let mut native_sink = CompletedRecordSink {
             sink,
             model: self.current_model.as_deref(),
@@ -683,6 +741,7 @@ impl CodexStreamState {
             completed_item_id: value["payload"]["item"]["id"].as_str().map(str::to_owned),
             completed_status: codex_host_status(value["payload"]["item"]["status"].as_str()),
             results: Vec::new(),
+            facts: completed_facts,
         };
         let completed = self
             .completed
@@ -698,11 +757,14 @@ impl CodexStreamState {
         if completed {
             return;
         }
-        if usage_is_owned
-            && let Some(record_index) = record_index
-            && !self.completed.replaces_exec_content(&value)
-        {
-            self.capture_native_tool_result(&value, record_index, sink);
+        if usage_is_owned && let Some(record_index) = record_index {
+            if self.completed.replaces_exec_content(&value) {
+                if let Some((call_id, call)) = self.native_call(&value["payload"]) {
+                    self.emit_native_call(&value, record_index, call_id, &call, sink);
+                }
+            } else {
+                self.capture_native_tool_result(&value, record_index, sink);
+            }
         }
         observe_resource_evidence(&value, usage_is_owned, sink);
         let record_type = value.get("type").and_then(Value::as_str);
@@ -727,6 +789,7 @@ impl CodexStreamState {
                         parent_call_id: None,
                         child_model: None,
                         provenance: RelationProvenance::SpawnAgentCall,
+                        config_binding: None,
                     },
                 )));
             }
@@ -834,6 +897,130 @@ impl CodexStreamState {
         }
     }
 
+    fn native_call<'a>(&self, payload: &'a Value) -> Option<(&'a str, CodexNativeCall)> {
+        let inferred_name = match payload["type"].as_str()? {
+            "tool_search_call" => Some("tool_search"),
+            "web_search_call" => Some("web_search"),
+            "function_call" | "custom_tool_call" => None,
+            _ => return None,
+        };
+        let call_id = payload["call_id"]
+            .as_str()
+            .or_else(|| payload["callId"].as_str())
+            .filter(|id| !id.is_empty())?;
+        let name = payload["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .or(inferred_name)?;
+        let namespace = payload["namespace"].as_str();
+        let qualified = namespace.and_then(|namespace| {
+            crate::analysis::native_tool_facts::codex_namespaced_mcp_name(namespace, name)
+        });
+        let name = qualified.as_deref().unwrap_or(name);
+        let raw_arguments = payload
+            .get("arguments")
+            .or_else(|| payload.get("input"))
+            .or_else(|| payload.get("query"));
+        let arguments = raw_arguments.and_then(|value| match value {
+            Value::Object(_) => Some(value.clone()),
+            Value::String(text) => serde_json::from_str::<Value>(text)
+                .ok()
+                .filter(Value::is_object)
+                .or_else(|| {
+                    (payload["type"] == "custom_tool_call" && payload.get("input") == Some(value))
+                        .then(|| value.clone())
+                })
+                .or_else(|| {
+                    (payload.get("query") == Some(value))
+                        .then(|| serde_json::json!({"query": value}))
+                }),
+            _ => None,
+        });
+        let mut facts = crate::analysis::NativeToolFacts::for_call(
+            self.source_format,
+            name,
+            arguments.as_ref(),
+            self.native_cwd.as_deref(),
+            self.native_request.clone(),
+        );
+        if qualified.is_none()
+            && payload
+                .get("namespace")
+                .is_some_and(|value| !value.is_null())
+            && (namespace.is_none()
+                || namespace.is_some_and(|namespace| namespace.starts_with("mcp__"))
+                || name.starts_with("mcp__"))
+        {
+            facts.category = Some(crate::analysis::CheckToolCategory::Other);
+        }
+        let retained_bytes = name.len()
+            + facts.retained_bytes()
+            + arguments
+                .as_ref()
+                .and_then(|value| serde_json::to_vec(value).ok())
+                .map_or(0, |bytes| bytes.len());
+        Some((
+            call_id,
+            CodexNativeCall {
+                name: name.to_owned(),
+                arguments,
+                facts,
+                retained_bytes,
+            },
+        ))
+    }
+
+    fn emit_native_call(
+        &self,
+        record: &Value,
+        record_index: u64,
+        call_id: &str,
+        call: &CodexNativeCall,
+        sink: &mut dyn RecordSink,
+    ) {
+        let payload = &record["payload"];
+        let input = if payload["type"] == "custom_tool_call" {
+            payload["input"]
+                .as_str()
+                .map(|text| crate::analysis::NativeToolInput::Text(text.to_owned()))
+        } else {
+            call.arguments
+                .clone()
+                .map(crate::analysis::NativeToolInput::Json)
+        };
+        if input.is_none() {
+            return;
+        }
+        let position = ToolResultPosition::Jsonl {
+            record_index,
+            item_index: 0,
+        };
+        sink.record(NormalizedRecord::PublicMessage(Box::new(
+            crate::analysis::PublicMessageObservation {
+                source_format: self.source_format,
+                session_id: self.session_id.clone(),
+                record_id: payload["id"].as_str().unwrap_or(call_id).to_owned(),
+                part_id: None,
+                call_id: Some(call_id.to_owned()),
+                position,
+                revision: record_index.saturating_add(1),
+                change: ToolResultChange::Update,
+                eligible: self.completed.admits(&self.session_id),
+                completeness: ToolResultCompleteness::Complete,
+                context: Some(crate::analysis::NativeEventContext::pending(
+                    position,
+                    self.completed.admits(&self.session_id),
+                )),
+                payload: crate::analysis::PublicMessagePayload::ToolCall {
+                    tool_name: call.name.clone(),
+                    input,
+                    facts: Some(call.facts.clone()),
+                    provider_executed: None,
+                },
+            },
+        )));
+    }
+
     fn capture_native_tool_result(
         &mut self,
         record: &Value,
@@ -846,43 +1033,9 @@ impl CodexStreamState {
         let payload = &record["payload"];
         match payload["type"].as_str() {
             Some("function_call" | "custom_tool_call" | "tool_search_call" | "web_search_call") => {
-                let inferred_name = match payload["type"].as_str() {
-                    Some("tool_search_call") => Some("tool_search"),
-                    Some("web_search_call") => Some("web_search"),
-                    _ => None,
-                };
-                let (Some(call_id), Some(name)) = (
-                    payload["call_id"]
-                        .as_str()
-                        .or_else(|| payload["callId"].as_str())
-                        .filter(|id| !id.is_empty()),
-                    payload["name"]
-                        .as_str()
-                        .filter(|name| !name.is_empty())
-                        .or(inferred_name),
-                ) else {
+                let Some((call_id, call)) = self.native_call(payload) else {
                     return;
                 };
-                let raw_arguments = payload
-                    .get("arguments")
-                    .or_else(|| payload.get("input"))
-                    .or_else(|| payload.get("query"));
-                let arguments = raw_arguments.and_then(|value| match value {
-                    Value::Object(_) => Some(value.clone()),
-                    Value::String(text) => serde_json::from_str::<Value>(text)
-                        .ok()
-                        .filter(Value::is_object)
-                        .or_else(|| {
-                            (payload["type"] == "custom_tool_call"
-                                && payload.get("input") == Some(value))
-                            .then(|| value.clone())
-                        })
-                        .or_else(|| {
-                            (payload.get("query") == Some(value))
-                                .then(|| serde_json::json!({"query": value}))
-                        }),
-                    _ => None,
-                });
                 if let Some(existing) = self.native_calls.get_mut(call_id) {
                     if let Some(call) = existing.take() {
                         self.native_call_bytes =
@@ -893,24 +1046,13 @@ impl CodexStreamState {
                 if self.native_calls.len() >= MAX_NATIVE_TOOL_CALLS {
                     return;
                 }
-                let retained_bytes = name.len()
-                    + arguments
-                        .as_ref()
-                        .and_then(|value| serde_json::to_vec(value).ok())
-                        .map_or(0, |bytes| bytes.len());
-                let total_bytes = call_id.len().saturating_add(retained_bytes);
+                let total_bytes = call_id.len().saturating_add(call.retained_bytes);
                 if total_bytes > MAX_NATIVE_TOOL_CALL_BYTES.saturating_sub(self.native_call_bytes) {
                     return;
                 }
                 self.native_call_bytes += total_bytes;
-                self.native_calls.insert(
-                    call_id.to_owned(),
-                    Some(CodexNativeCall {
-                        name: name.to_owned(),
-                        arguments,
-                        retained_bytes,
-                    }),
-                );
+                self.emit_native_call(record, record_index, call_id, &call, sink);
+                self.native_calls.insert(call_id.to_owned(), Some(call));
             }
             Some(
                 "function_call_output"
@@ -940,6 +1082,9 @@ impl CodexStreamState {
                     && content_complete;
                 sink.record(NormalizedRecord::ToolResult(Box::new(
                     ToolResultObservation {
+                        facts: linked.map(|call| call.facts.clone()),
+                        outcome: None,
+                        provider_executed: None,
                         context: Some(crate::analysis::ToolResultContext::pending(
                             ToolResultPosition::Jsonl {
                                 record_index,
@@ -976,6 +1121,133 @@ impl CodexStreamState {
             }
             _ => {}
         }
+    }
+
+    fn observe_native_request(&mut self, record: &Value, owned: bool) {
+        let payload = &record["payload"];
+        if record["type"] == "session_meta" {
+            self.native_settings = None;
+            self.native_provider = payload["model_provider"]
+                .as_str()
+                .and_then(crate::analysis::native_tool_facts::identity);
+        } else if record["type"] == "turn_context" {
+            self.native_request = crate::analysis::NativeRequestAttribution::observed(
+                self.native_provider.as_deref(),
+                payload["model"].as_str(),
+            );
+            self.native_turn_id = payload["turn_id"]
+                .as_str()
+                .and_then(crate::analysis::native_tool_facts::identity);
+            self.native_cwd = payload["cwd"]
+                .as_str()
+                .filter(|cwd| cwd.len() <= 4096)
+                .map(str::to_owned);
+            self.native_request.fast_mode = self.native_settings.as_ref().and_then(|settings| {
+                (owned
+                    && settings.provider.is_some()
+                    && settings.model.is_some()
+                    && settings.provider == self.native_request.provider
+                    && settings.model == self.native_request.model)
+                    .then_some(settings.fast_mode)
+                    .flatten()
+            });
+            self.native_completed_mode = None;
+            if let Some(turn) = &self.native_turn_id {
+                let key = crate::digest::sha256_hex(turn.as_bytes());
+                let digest = crate::digest::sha256_hex(
+                    serde_json::json!([payload, &self.native_request])
+                        .to_string()
+                        .as_bytes(),
+                );
+                if let Some(previous) = self.native_mode_contexts.get_mut(&key) {
+                    if previous.as_ref() != Some(&digest) {
+                        *previous = None;
+                    }
+                    if previous.is_some() {
+                        self.native_completed_mode = self.native_request.fast_mode;
+                    }
+                } else if self.native_mode_contexts.len() < MAX_NATIVE_TOOL_CALLS {
+                    self.native_mode_contexts.insert(key, Some(digest));
+                    self.native_completed_mode = self.native_request.fast_mode;
+                }
+            }
+        } else if record["type"] == "event_msg" && payload["type"] == "thread_settings_applied" {
+            if !owned
+                || !self.completed.admits(&self.session_id)
+                || payload["thread_id"].as_str() != Some(self.session_id.as_str())
+            {
+                return;
+            }
+            // A changed selection is not a request. Wait for its next turn context.
+            self.native_provider = payload["thread_settings"]["model_provider_id"]
+                .as_str()
+                .and_then(crate::analysis::native_tool_facts::identity);
+            let mut settings = crate::analysis::NativeRequestAttribution::observed(
+                self.native_provider.as_deref(),
+                payload["thread_settings"]["model"].as_str(),
+            );
+            settings.fast_mode = match payload["thread_settings"]["service_tier"].as_str() {
+                Some("priority") => Some(true),
+                Some("default") => Some(false),
+                _ => None,
+            };
+            self.native_settings = Some(settings);
+            self.native_request = Default::default();
+            self.native_completed_mode = None;
+            self.native_turn_id = None;
+            self.native_cwd = None;
+        }
+    }
+
+    fn completed_facts(&self, record: &Value) -> Option<crate::analysis::NativeToolFacts> {
+        let payload = &record["payload"];
+        if record["type"] != "event_msg" || payload["type"] != "item_completed" {
+            return None;
+        }
+        let item = &payload["item"];
+        let category = match item["type"].as_str()? {
+            "FileChange" => crate::analysis::CheckToolCategory::Edit,
+            "CommandExecution" => crate::analysis::CheckToolCategory::Shell,
+            _ => return None,
+        };
+        let same_turn = self
+            .native_turn_id
+            .as_deref()
+            .is_some_and(|turn| payload["turn_id"] == turn);
+        let mut facts = crate::analysis::NativeToolFacts {
+            requester: if same_turn {
+                self.native_request.clone()
+            } else {
+                Default::default()
+            },
+            category: Some(category),
+            operation_paths: None,
+        };
+        facts.requester.fast_mode = same_turn.then_some(self.native_completed_mode).flatten();
+        if same_turn && category == crate::analysis::CheckToolCategory::Edit {
+            let Some(changes) = item["changes"].as_object() else {
+                return Some(facts);
+            };
+            if changes.len() > 256 {
+                return Some(facts);
+            }
+            let mut paths = Vec::new();
+            for (path, change) in changes {
+                if !matches!(change["type"].as_str(), Some("add" | "delete" | "update")) {
+                    return Some(facts);
+                }
+                paths.push(path.clone());
+                if let Some(target) = change.get("move_path").filter(|target| !target.is_null()) {
+                    let Some(target) = target.as_str() else {
+                        return Some(facts);
+                    };
+                    paths.push(target.to_owned());
+                }
+            }
+            facts.operation_paths =
+                crate::analysis::NativeOperationPaths::observed(self.native_cwd.as_deref(), paths);
+        }
+        Some(facts)
     }
 
     fn observe_model_and_effort(&mut self, value: &Value, usage_is_owned: bool) {
@@ -1096,6 +1368,7 @@ impl CodexStreamState {
             ContextWindowSource::Inferred
         };
         SessionSummary {
+            accounting: None,
             cache_write_tokens_available: self.cache_write_tokens_available,
             context_window: self.context_window,
             context_window_source,
@@ -1123,6 +1396,7 @@ struct CompletedRecordSink<'a> {
     completed_item: bool,
     completed_item_id: Option<String>,
     completed_status: ToolResultStatus,
+    facts: Option<crate::analysis::NativeToolFacts>,
 }
 
 impl RecordSink for CompletedRecordSink<'_> {
@@ -1137,6 +1411,7 @@ impl RecordSink for CompletedRecordSink<'_> {
                 self.session_id,
                 record_index,
                 self.completed_status,
+                self.facts.clone(),
             )
         {
             self.results.push(result);
@@ -1164,6 +1439,7 @@ fn completed_native_result(
     session_id: &str,
     record_index: u64,
     status: ToolResultStatus,
+    mut facts: Option<crate::analysis::NativeToolFacts>,
 ) -> Option<ToolResultObservation> {
     let input = content
         .parts
@@ -1190,7 +1466,25 @@ fn completed_native_result(
         && arguments.is_some()
         && !input.truncated
         && !result.truncated;
+    if complete
+        && status == ToolResultStatus::Success
+        && let (Some(request), Some(read), Some(facts)) = (
+            input.metadata.read_request.as_ref(),
+            result.metadata.read_result.as_ref(),
+            facts.as_mut(),
+        )
+        && read.status == crate::analysis::jev_evidence::JevReadStatus::Success
+        && read.returned_extent.is_some()
+        && !read.truncated
+        && read.request_reference_id.as_deref() == Some(request.reference_id.as_str())
+        && facts.category == Some(crate::analysis::CheckToolCategory::Shell)
+    {
+        facts.category = Some(crate::analysis::CheckToolCategory::Read);
+    }
     Some(ToolResultObservation {
+        facts,
+        outcome: None,
+        provider_executed: None,
         context: None,
         source_format,
         session_id: session_id.to_owned(),
@@ -2044,6 +2338,10 @@ fn codex_fork_owned_offset(content: &str) -> (Option<usize>, bool) {
 /// echoes of `response_item` turns). `task_complete` also returns `None` here,
 /// but [`task_complete_observation`] reads its `error` object separately, for
 /// the `QuotaIncident` or `ProviderIncident` observation.
+fn has_required_timestamp(record: &Value) -> bool {
+    record_to_event(record).is_none_or(|event| event.ts_ms.is_some())
+}
+
 fn record_to_event(record: &Value) -> Option<NormalizedEvent> {
     let obj = record.as_object()?;
     let ts = obj.get("timestamp").and_then(parse_ts);
@@ -2293,8 +2591,9 @@ fn function_call_event(payload: &Map<String, Value>, ts: Option<i64>) -> Option<
     let qualified = payload
         .get("namespace")
         .and_then(Value::as_str)
-        .filter(|namespace| namespace.starts_with("mcp__") && resource_name(namespace))
-        .map(|namespace| format!("{namespace}__{name}"));
+        .and_then(|namespace| {
+            crate::analysis::native_tool_facts::codex_namespaced_mcp_name(namespace, name)
+        });
     ev.tools.push(tool_call_from_input(
         qualified.as_deref().unwrap_or(name),
         input,
@@ -3192,6 +3491,81 @@ mod tests {
     }
 
     #[test]
+    fn native_mode_context_fingerprints_are_bounded_and_survive_resume() {
+        let mut state = CodexStreamState {
+            native_provider: Some("openai".into()),
+            native_settings: Some(crate::analysis::NativeRequestAttribution {
+                provider: Some("openai".into()),
+                model: Some("synthetic-model".into()),
+                fast_mode: Some(true),
+            }),
+            ..Default::default()
+        };
+        for index in 0..=MAX_NATIVE_TOOL_CALLS {
+            state.observe_native_request(
+                &serde_json::json!({"type":"turn_context","payload":{
+                    "turn_id":format!("turn-{index}"),"model":"synthetic-model","cwd":"/synthetic"
+                }}),
+                true,
+            );
+        }
+        assert_eq!(state.native_mode_contexts.len(), MAX_NATIVE_TOOL_CALLS);
+        assert_eq!(state.native_request.fast_mode, Some(true));
+        assert_eq!(state.native_completed_mode, None);
+        let bytes = postcard::to_allocvec(&state).unwrap();
+        assert!(bytes.len() < 600 * 1024);
+        let mut restored: CodexStreamState = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.native_mode_contexts, state.native_mode_contexts);
+        restored.observe_native_request(
+            &serde_json::json!({"type":"turn_context","payload":{
+                "turn_id":"turn-0","model":"synthetic-model","cwd":"/different"
+            }}),
+            true,
+        );
+        assert_eq!(restored.native_completed_mode, None);
+        assert_eq!(restored.native_mode_contexts.len(), MAX_NATIVE_TOOL_CALLS);
+    }
+
+    #[test]
+    fn native_mode_ignores_inherited_snapshots_metric_carry_and_provider_mismatches() {
+        let mut state = CodexStreamState {
+            session_id: "facts".into(),
+            ..Default::default()
+        };
+        let header = serde_json::json!({"type":"session_meta","payload":{
+            "id":"facts","cli_version":"0.160.1","thread_source":"user","history_mode":"legacy","model_provider":"openai"
+        }});
+        state.observe_native_request(&header, true);
+        state
+            .completed
+            .observe(&header, true, &mut ObservationCapturingSink::default());
+        let mut settings = serde_json::json!({"type":"event_msg","payload":{
+            "type":"thread_settings_applied","thread_id":"facts","thread_settings":{
+                "model":"synthetic-model","model_provider_id":"openai","service_tier":"priority"
+            }
+        }});
+        let context = serde_json::json!({"type":"turn_context","payload":{"turn_id":"turn-1","model":"synthetic-model"}});
+        state.observe_native_request(&settings, false);
+        state.observe_native_request(&context, true);
+        assert_eq!(state.native_request.fast_mode, None);
+        state.observe_native_request(&settings, true);
+        state.native_provider = Some("different-provider".into());
+        state.observe_native_request(&context, true);
+        assert_eq!(state.native_request.fast_mode, None);
+        state.observe_model_and_effort(&settings, true);
+        settings["payload"]["thread_settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("service_tier");
+        state.observe_native_request(&settings, true);
+        state.observe_model_and_effort(&settings, true);
+        state.observe_native_request(&context, true);
+        assert_eq!(state.current_speed.as_deref(), Some("fast"));
+        assert_eq!(state.native_request.fast_mode, None);
+        assert!(state.native_settings.as_ref().unwrap().retained_bytes() <= 8192);
+    }
+
+    #[test]
     fn non_object_codex_records_fail_closed() {
         for record in [
             serde_json::json!([]),
@@ -3232,7 +3606,14 @@ mod tests {
         // output records and do not change the eventless or inertness gates.
         // Source facts use the new type names and bounded user-slot callback.
         // These changes do not change the eventless or inertness gates.
-        const EXPECTED_FINGERPRINT: u64 = 1_643_323_657_805_475_238;
+        // Default accounting and tool-outcome fields read no new Codex keys.
+        // They do not change the eventless or inertness gates.
+        // Completed results carry check facts computed before this byte range.
+        // This range reads no new source keys or inertness rules for those facts.
+        // MCP names reuse namespace/name and preserve the pinned trailing delimiter.
+        // Read categories use typed extents. Neither change adds source keys.
+        // Full and live readers share the event timestamp check. It reads no new keys.
+        const EXPECTED_FINGERPRINT: u64 = 4_904_148_983_723_535_706;
         let source = include_str!("codex.rs").replace("\r\n", "\n");
         let start = source.find("fn observe_model_and_effort").unwrap();
         let end = source.find("\n#[cfg(test)]\nmod tests").unwrap();
@@ -4151,6 +4532,8 @@ mod tests {
                 NormalizedRecord::Unusable(reason) => self.unusable.push(reason),
                 NormalizedRecord::MetricsEvent(_)
                 | NormalizedRecord::ToolResult(_)
+                | NormalizedRecord::PublicMessage(_)
+                | NormalizedRecord::ResponseCycle(_)
                 | NormalizedRecord::TurnContent(_) => {}
             }
         }
@@ -4344,6 +4727,9 @@ mod tests {
                 user_messages_json: Vec::new(),
                 user_message_conflicts: Vec::new(),
                 user_messages_complete: true,
+                native_evidence_json: Vec::new(),
+                native_evidence_complete: true,
+                native_admission_failure_json: None,
             }
         }
 

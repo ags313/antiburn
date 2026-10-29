@@ -20,7 +20,7 @@ fn rule(path: &str, strategy: FitStrategy) -> FitRule {
 
 fn source(fit: &str) -> String {
     format!(
-        "name: Fit\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {{z: [], a: []}}\n    fit:\n{fit}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {{yes: Yes., no: No.}}\nactions:\n  - type: status\n    input: {{result: failure}}\n"
+        "name: Fit\non:\n  tool_result:\ndecisions:\n  review:\n    input: {{z: [], a: []}}\n    fit:\n{fit}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {{yes: Yes., no: No.}}\nactions:\n  - type: status\n    input: {{result: failure}}\n"
     )
 }
 
@@ -28,8 +28,7 @@ fn source(fit: &str) -> String {
 fn yaml_mapping_order_survives_compilation_and_controls_turns() {
     let check = compile(&source("      z: recent\n      a: recent")).unwrap();
     assert_eq!(
-        check
-            .decision
+        check.decisions[0]
             .fit
             .iter()
             .map(|rule| rule.path.as_str())
@@ -39,7 +38,7 @@ fn yaml_mapping_order_survives_compilation_and_controls_turns() {
     let mut turns = Vec::new();
     let (input, report) = fit_input(
         json!({"a": [1,2,3], "z": [4,5,6]}),
-        &check.decision.fit,
+        &check.decisions[0].fit,
         |input, _| {
             turns.push((
                 input["z"].as_array().unwrap().len(),

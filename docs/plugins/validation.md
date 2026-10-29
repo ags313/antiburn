@@ -1,6 +1,6 @@
 # Claude plugin validation scope
 
-The current repository candidate is **antiburn 0.2.4**, pinned to artifact
+The submitted 0.2.4 candidate is **antiburn 0.2.4**, pinned to artifact
 `ceb2800b4bb9b25744624b7ee309ef9532f596d0`. It retains 24 files and
 the embedded 0.2.1 shared core. Version 0.2.4 adds 17 discovery keywords and
 updates the README and privacy version label. Runtime code, types and assets
@@ -11,6 +11,103 @@ The plugin-owned 512px PNG has identical decompressed image data to the existing
 512px desktop icon, no metadata, and a total size of 156,269 bytes (below 256 KiB).
 The immutable 0.2.2 artifact remains available at
 `beb44113c1ad61ac540a29e7b6cfdfdbab0ff43f`.
+
+## 0.2.6 responsive-meter candidate — 28 October 2026
+
+The candidate artifact is `f9dabe20b7dac6d33a4e8fecad88e93f1fff87d5`, with 26 public files
+and the embedded 0.2.1 shared core. It packages the merged #778/#779 source tree
+at `143d4b05681938cb362e828ecc27d2e082638176` with version 0.2.6 and updated
+bundled documentation. Runtime, types and assets are byte-identical to that
+merged baseline. Relative to the public 0.2.5 pin
+`af3d284cc5a28fa57eb992a1953c6be436efed0a`, the runtime changes are responsive
+meter geometry and aligned reset/pace hover interactions. The icon refinement
+belongs to the development build; the public icon is unchanged.
+
+The 27 October merged-baseline pass recorded 16 packaging, 61 shared-core,
+208 public and 267 development tests passing, deterministic assembly, strict
+catalog/public validation, disposable lifecycle and installed-file equality
+(26 public and 43 development files). Browser geometry/hover/resize checks
+passed. A public Terminal smoke on Claude Code 2.1.311 displayed numeric usage
+and passed help, details and refresh with zero reported model tokens/cost in
+that session. These are baseline observations, not a new 0.2.6 native run.
+Versioned package bytes and upgrade behavior need their own validation.
+
+The baseline's [plugin workflow passed](https://github.com/antiburn/antiburn/actions/runs/40431324152).
+A [newer broad CI run](https://github.com/antiburn/antiburn/actions/runs/40477741996)
+still failed repository quality and the Windows-to-WSL bridge gate; its repository
+secret scan passed. This is not overall CI-green evidence for either a future
+candidate head or promotion. Local results do not replace hosted CI.
+
+Local 0.2.6 checks on 28 October use Node 25.9.0 and Claude Code 2.1.312.
+All 16 packaging tests, 208 staged public tests and 267 staged development tests
+pass. Deterministic assembly, strict catalog/public validation and capability
+policy pass. Disposable lifecycle passes in user/project/local scopes, including
+public/dev independence and a synthetic 0.2.6-to-0.2.7 update. A separate local
+Git rehearsal upgrades the exact public 0.2.5 artifact to this exact 0.2.6
+artifact; all 26 installed files match, including after reinstall, and removal
+passes. These local transports do not certify hosted delivery.
+
+Scoped formatting and JavaScript lint pass. The lockfile-pinned secret scan
+passes. The initial full-tree quality check failed at 99 against the required 100. Follow-up fixes merge duplicate imports, remove unnecessary spreads,
+make existing hook fallbacks explicit and preserve discovery JSON output without
+console logging. The full-tree gate now passes at 100 with seven warnings and
+zero errors; no thresholds or suppressions changed. The 61 shared-core tests,
+17 CI-runner tests, 267 development tests and scoped shared-core/assembler
+JavaScript type checks pass. The public artifact remains unchanged.
+No fresh native SDK TypeScript check was run; the merged baseline also left
+fresh SDK coverage open.
+
+A disposable hosted candidate-branch installation passes fresh installation,
+already-current update, reinstall and removal. Every installed public file
+matches the immutable 0.2.6 artifact (26 files). This verifies candidate-branch
+delivery, not an older-version hosted upgrade or the permanent main route after
+promotion. The pre-push local upgrade evidence above retains its local scope.
+
+Full native Desktop acceptance of the changed meters remains open: continuous
+resize, 59/60/61-column transitions, both layouts and themes, reduced motion,
+keyboard focus, caption side selection, indicator alignment, and public real
+usage. Browser captures and development synthetic previews do not certify those
+native paths. The transient startup command warning remains a known limitation.
+Hosted upgrades from the immutable 0.2.4 and public 0.2.5 artifacts, fresh install,
+retained-data reinstall/removal and complete installed-byte equality remain
+promotion gates. Repeat delivery verification through the permanent main route
+after authorized merge. No portal validation, publication or new tag is implied.
+
+## 0.2.5 composition candidate — 21 October 2026
+
+Claude Code 2.1.306 on macOS passes 200 public runtime tests (28 new composition
+cases), 249 development tests and 17 shared-core tests. TypeScript passes against
+the host's 2.1.306 SDK declarations, with `allowJs` for the embedded shared core.
+Scoped TypeScript/assembler lint and formatting pass. Strict public and catalog
+validation and the public capability policy pass. The candidate catalog selects artifact
+`7bfc87ad4145326e25d5b2e267096e08d5f498b6`; packaging checks compare all 24 files
+against that immutable commit and the authoritative assembler inputs.
+The isolated user/project/local lifecycle passes for independent public/dev
+installation, enable/disable, removal and retained-data reinstall. A separate
+local Git transport updates the exact immutable 0.2.4 artifact to the exact
+0.2.5 package, preserving synthetic data through removal and reinstall. These
+checks do not establish hosted delivery or native multi-mod rendering.
+
+The local 0.2.5 candidate composes the downstream AbovePrompt tree before usage
+without probing plugin identity. The host SDK defines first-listed plugins and
+first-registered hooks as outermost. A failed hook yields to the chain beneath,
+or retains its last downstream result. Antiburn calls downstream outside its
+quota-rendering catch, so quota failures return the saved UI without another
+call. `maxRows` and `scroll` remain unchanged: the host scrolls the combined tree.
+Usage spacing and quota layout stay unchanged; preserved mods can increase the
+combined height and trigger host scrolling.
+
+The runtime matrix covers unrelated prepend and append mods on Terminal and
+Desktop, one/four/eight-row budgets, surveys, hidden bands and quota clock
+failures. The other public hooks forward unowned events or intentionally own
+Antiburn command output. The local development plugin also replaces standalone
+usage and SessionMode output; those unpublished paths are outside this fix.
+Native multi-mod clickthroughs, hosted 0.2.4-to-0.2.5 updates and directory review
+remain pending. Historical native evidence below does not certify this patch.
+
+The owner reports that 0.2.4 passed its security scan and remains in policy
+review at tag `claude-plugin-v0.2.4` (`f795e08059e993d7f226c4891c845a9f91e63c68`).
+This candidate leaves that tag and its immutable artifact unchanged.
 
 ## Directory findings — 21 October 2026
 
@@ -276,3 +373,25 @@ into main distributes its pinned plugin without a GitHub Release or tag.
 Every push, PR readiness change and catalog promotion needs the user's explicit
 approval for that action. Release drafts, tags and publication need separate
 authorization. See [distribution](distribution.md).
+
+## Desktop usage width regression gate
+
+Run `node scripts/check-claude-usage-layout.mjs` after installing the desktop
+workspace dependencies and Playwright Chromium. The plugin workflow runs this
+check in a separate job. It renders the release SVG in flex-allocated frames
+across 315 combinations of host cell sizes, column breakpoints and quota values.
+It checks real frame bounds, unscaled glyphs, whole-dot fills and the trailing
+inset. Host runtime tests cover the corresponding Box and Svg properties.
+
+The Desktop ready state uses host flex allocation and a fluid SVG viewport.
+`bodyColumns` remains a cell-based stacking breakpoint. It is not a CSS pixel
+measurement. `Svg` dimensions are pixels; the host clamps its bounded frame to
+the flexible slot. The root SVG has no viewBox, so resizing changes the number
+of dots without scaling the glyphs. Terminal and unavailable-state rendering
+keep their existing paths.
+
+Before distribution, also verify the candidate in native Claude Desktop at wide
+and minimum window sizes. Check inline and stacked readings, reset hover/focus,
+keyboard pace details, and the final percentage against the right inset. Browser
+geometry tests complement this native check. They do not certify another host
+version or its SVG/CSS implementation.

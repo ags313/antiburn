@@ -32,8 +32,5 @@ export type AntiburnDescription = {
 declare module "claude-code" {
   interface EngineInterface {
     antiburn: { describe(): Promise<AntiburnDescription> }
-    antiburnDevelopment: {
-      describe(): Promise<{ id: string; capabilities: { liveChecks: boolean } }>
-    }
   }
 }

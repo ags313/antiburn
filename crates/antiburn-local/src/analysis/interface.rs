@@ -84,6 +84,8 @@ pub enum NormalizedRecord {
     MetricsEvent(Box<NormalizedEvent>),
     Observation(Box<EvidenceObservation>),
     ToolResult(Box<ToolResultObservation>),
+    PublicMessage(Box<crate::analysis::PublicMessageObservation>),
+    ResponseCycle(Box<crate::analysis::ResponseCycleObservation>),
     /// One turn's captured message content. An adapter emits this
     /// immediately after the `MetricsEvent` it belongs to, and only when it
     /// has at least one part. The metrics and evidence sinks ignore it; only
@@ -133,6 +135,13 @@ pub struct ToolResultObservation {
     /// Immutable request prefix and source admission. Old payloads stay unavailable.
     #[serde(default)]
     pub context: Option<ToolResultContext>,
+    #[serde(default)]
+    pub outcome: Option<crate::analysis::NativeToolOutcome>,
+    #[serde(default)]
+    pub provider_executed: Option<bool>,
+    /// Check-facing facts from the exact native call binding.
+    #[serde(default)]
+    pub facts: Option<crate::analysis::NativeToolFacts>,
 }
 
 /// Source-proven context at one logical result's first terminal position.
@@ -215,17 +224,25 @@ impl UserMessage {
                 UserMessagePosition::Jsonl { .. },
                 UserMessageOrigin::CodexRetainedUserText
             ) | (
-                SourceFormat::OpenCodeSqliteV2,
+                SourceFormat::OpenCodeSqliteV1,
                 UserMessagePosition::OpenCodeSqlite { .. },
                 UserMessageOrigin::OpenCodeUserText
             ) | (
-                SourceFormat::OpenCodeSqliteV2,
+                SourceFormat::OpenCodeSqliteV1,
                 UserMessagePosition::OpenCodeEvent { .. },
+                UserMessageOrigin::OpenCodeUserText
+            ) | (
+                SourceFormat::OpenCodeSqliteV2,
+                UserMessagePosition::OpenCodeV2Event { .. },
                 UserMessageOrigin::OpenCodeUserText
             ) | (
                 SourceFormat::PiV3Jsonl,
                 UserMessagePosition::Jsonl { .. },
                 UserMessageOrigin::PiUserContent
+            ) | (
+                SourceFormat::CursorIdeComposer,
+                UserMessagePosition::Jsonl { .. },
+                UserMessageOrigin::CursorDesktopUserContent
             )
         );
         let byte_contract_matches = matches!(self.position,
@@ -309,6 +326,8 @@ pub enum UserMessagePosition {
     OpenCodeSqlite { created_at_ms: i64 },
     /// Durable journal position at which the complete native request is visible.
     OpenCodeEvent { sequence: u64 },
+    /// Durable V2 event position at which the delivered request is visible.
+    OpenCodeV2Event { sequence: u64 },
 }
 
 /// Native field pattern that identifies user-slot content without sender attribution.
@@ -322,6 +341,8 @@ pub enum UserMessageOrigin {
     OpenCodeUserText,
     /// Pi's user-role message content, including extension and API messages.
     PiUserContent,
+    /// Cursor Desktop user text from the ordered native bubble list.
+    CursorDesktopUserContent,
 }
 
 /// Native proof that the request belongs to the main session.
@@ -354,6 +375,8 @@ pub enum ToolResultPosition {
     },
     /// Durable per-session OpenCode journal sequence and item order within it.
     OpenCodeEvent { sequence: u64, item_index: u32 },
+    /// Durable per-session OpenCode V2 event sequence and item order.
+    OpenCodeV2Event { sequence: u64, item_index: u32 },
 }
 
 /// The mutation applied to one logical result.
@@ -385,7 +408,7 @@ pub enum ToolResultCompleteness {
     UnsafeOwnership,
 }
 
-/// Admission for a pre-alpha result, independent of available result content.
+/// Admission for a result, independent of available result content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolResultAdmission {
     Admitted,
@@ -537,6 +560,7 @@ impl ContentPart {
 
 /// Source authority for one private content part. `Unknown` means the source
 /// did not establish who supplied the text; consumers must not infer it.
+/// A user role does not prove that a human supplied or approved the text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentAuthority {
     User,
@@ -545,6 +569,13 @@ pub enum ContentAuthority {
     Developer,
     Tool,
     Unknown,
+}
+
+/// The producer identifies an accepted request slot, not its human sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserTextOrigin {
+    AcceptedUserSlot,
 }
 
 impl ContentAuthority {
@@ -633,6 +664,7 @@ pub enum EvidenceObservation {
         parent_call_id: Option<String>,
         child_model: Option<String>,
         provenance: RelationProvenance,
+        config_binding: Option<crate::analysis::SubagentConfigBinding>,
     },
     /// A native call result identifies a model used by its child.
     SubagentModel {
@@ -775,9 +807,20 @@ pub struct SessionSummary {
     pub late_tools: Vec<(usize, ToolCall)>,
     pub initial_context: Option<InitialContextBreakdown>,
     pub skill_descriptions: HashMap<String, String>,
+    pub accounting: Option<crate::analysis::SourceAccounting>,
 }
 
 pub trait RecordSink {
+    /// The reader proves that this source is a child of the requested parent.
+    fn source_member(&mut self, _session_id: &str, _label: &str) {}
+
+    /// A database reader starts one native session within its shared snapshot.
+    fn begin_source(&mut self, _session_id: &str) {}
+
+    /// The reader finishes that native session before starting another one.
+    /// The final `finish` call still supplies the inclusive summary.
+    fn source_summary(&mut self, _session_id: &str, _summary: SessionSummary) {}
+
     /// Projection-only consumers can leave journal delivery to its durable reader.
     fn tool_results_requested(&self) -> bool {
         true
@@ -791,14 +834,52 @@ pub trait RecordSink {
     /// source outcome and coverage to reject incomplete or conflicting batches.
     fn user_message(&mut self, _message: UserMessage) {}
 
+    /// Freeze source positions and request context before a cycle retains a member.
+    fn finalize_native_message(
+        &mut self,
+        message: crate::analysis::NativeMessageObservation,
+    ) -> crate::analysis::NativeMessageObservation {
+        message
+    }
+
+    fn native_activity(&mut self, _activity: crate::analysis::NativeActivityObservation) {}
+
+    /// Return the source binding and request prefix at one native boundary.
+    fn native_context(
+        &mut self,
+        _source_format: SourceFormat,
+        _session_id: &str,
+        position: ToolResultPosition,
+        main_session: bool,
+    ) -> crate::analysis::NativeEventContext {
+        crate::analysis::NativeEventContext::pending(position, main_session)
+    }
+
+    /// Explicit selection updates do not reset source activity.
+    fn session_selection(
+        &mut self,
+        _selection: crate::analysis::NativeSessionSelectionObservation,
+    ) {
+    }
+
+    /// Report unfinished content at EOF without retaining a permanent source gap.
+    fn pending_native_content(&mut self, reason: PartialReason) {
+        self.record(NormalizedRecord::Unusable(reason));
+    }
+
     /// The adapter cannot prove complete tool-result publication history.
     /// This does not change legacy metrics or snapshot attribution.
     fn tool_result_gap(&mut self) {}
 
-    /// A source-wide identity, order, or ownership defect also invalidates
-    /// observations restored from an earlier resume snapshot.
+    /// Preserve legacy result admission, including results restored from a snapshot.
+    /// Use `native_admission_failure` for a proven defect in all public evidence.
     fn tool_result_admission_gap(&mut self, _admission: ToolResultAdmission) {
         self.tool_result_gap();
+    }
+
+    /// Report an observed unsafe source boundary, not missing retained history.
+    fn native_admission_failure(&mut self, failure: crate::analysis::NativeAdmissionFailure) {
+        self.tool_result_admission_gap(failure.admission());
     }
 
     /// The adapter calls this once after the last record.
@@ -856,6 +937,7 @@ impl SessionCollector {
             }
         }
         Ok(NormalizedSession {
+            accounting: summary.accounting,
             agent: self.agent,
             session_id: self.session_id,
             events: self.events,
@@ -872,7 +954,9 @@ impl RecordSink for SessionCollector {
         match record {
             NormalizedRecord::MetricsEvent(event) => self.events.push(*event),
             NormalizedRecord::Observation(_) => {}
-            NormalizedRecord::ToolResult(_) => {}
+            NormalizedRecord::ToolResult(_)
+            | NormalizedRecord::PublicMessage(_)
+            | NormalizedRecord::ResponseCycle(_) => {}
             NormalizedRecord::TurnContent(_) => {}
             NormalizedRecord::Unusable(reason) => {
                 self.partial_reasons.insert(reason);
@@ -968,6 +1052,7 @@ pub trait SessionReader: Send + Sync {
         let session = self.normalize(input)?;
         let NormalizedSession {
             events,
+            accounting,
             cache_write_tokens_available,
             context_window,
             context_window_source,
@@ -978,6 +1063,7 @@ pub trait SessionReader: Send + Sync {
             sink.record(NormalizedRecord::MetricsEvent(Box::new(event)));
         }
         sink.finish(SessionSummary {
+            accounting,
             cache_write_tokens_available,
             context_window,
             context_window_source,

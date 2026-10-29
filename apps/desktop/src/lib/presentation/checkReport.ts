@@ -1,12 +1,7 @@
 import { pluralize } from "./text"
 import type { CheckId, ChecksReportPayload } from "../insightsIpc"
-import {
-  aggregateBurnCheckPresentation,
-  checkHasProvisionalResult,
-  type BurnCheckPresentation,
-} from "./checkStatus"
+import { aggregateBurnCheckPresentation, type BurnCheckPresentation } from "./checkStatus"
 import { activeChecksReport } from "../snoozedBurnChecks"
-import { smartCheckReviewPresentation } from "./smartCheckReview"
 import { checkRows, isInstalledCheck, type CheckRow } from "./checkRows"
 import { checkStatusFacts } from "./checkRowStatus"
 
@@ -23,7 +18,6 @@ export interface ChecksPresentation {
   failures: CheckRow[]
   awaiting?: CheckRow[]
   wins: CheckRow[]
-  checking: CheckRow[]
   unavailable: CheckRow[]
   refreshUnavailable: boolean
   noActiveChecks?: boolean
@@ -51,15 +45,10 @@ export function checksPresentation(
   const activeReport = activeChecksReport(report, snoozed)
   const activeRows = checkRows(activeReport)
   const activeAssessed = activeRows.filter(
-    (category) =>
-      checkStatusFacts(category).lifecycle != null &&
-      smartCheckReviewPresentation(category).terminalLabel == null,
+    (category) => checkStatusFacts(category).lifecycle != null,
   )
   const activeUnavailable = activeRows.filter(
-    (category) =>
-      (checkStatusFacts(category).lifecycle == null ||
-        smartCheckReviewPresentation(category).terminalLabel != null) &&
-      !checkStatusFacts(category).checking,
+    (category) => checkStatusFacts(category).lifecycle == null,
   )
   const snoozedCategories = checkRows(report).filter((category) => snoozed.has(category.id))
   const noEnabledChecks = report.evidenceSettled && checkRows(report).length === 0
@@ -75,22 +64,7 @@ export function checksPresentation(
     awaiting: activeAssessed.filter(
       (category) => category.lifecycle === "awaitingVerification",
     ),
-    wins: activeRows.filter(
-      (category) =>
-        smartCheckReviewPresentation(category).terminalLabel == null &&
-        checkStatusFacts(category).lifecycle === "passing" &&
-        !checkHasProvisionalResult(category),
-    ),
-    checking: activeRows.filter(
-      (category) =>
-        !isInstalledCheck(category) &&
-        checkStatusFacts(category).checking &&
-        category.finding === 0 &&
-        category.clean === 0 &&
-        category.lifecycle !== "awaitingVerification" &&
-        category.lifecycle !== "failing" &&
-        smartCheckReviewPresentation(category).terminalLabel == null,
-    ),
+    wins: activeRows.filter((category) => checkStatusFacts(category).lifecycle === "passing"),
     unavailable: activeUnavailable,
     refreshUnavailable,
     noActiveChecks,
@@ -98,10 +72,10 @@ export function checksPresentation(
     burnChecks: noActiveChecks
       ? {
           ...burnChecks,
-          headline: noEnabledChecks ? "No checks enabled" : "No active checks",
+          headline: noEnabledChecks ? "No checks enabled" : "All checks are snoozed",
           accessibleDescription: noEnabledChecks
             ? "No Burn Checks enabled."
-            : "No active Burn Checks.",
+            : "All checks are snoozed.",
         }
       : burnChecks,
     estimate: {
@@ -121,7 +95,12 @@ export function checksHeroPresentation(
     return { result: "No checks enabled", summary: null, state: "pending", tone: "text-label" }
   }
   if (presentation.noActiveChecks) {
-    return { result: "No active checks", summary: null, state: "pending", tone: "text-label" }
+    return {
+      result: "All checks are snoozed",
+      summary: null,
+      state: "pending",
+      tone: "text-label",
+    }
   }
   const failureCount = presentation.failures.length
   if (failureCount > 0) {
@@ -153,7 +132,7 @@ export function checksHeroPresentation(
   )
   const completePass = passed.length > 0
   return {
-    result: completePass ? "No issues found" : "No checks assessed",
+    result: completePass ? "No issues in available results" : "No checks assessed",
     summary: completePass
       ? `${passed.length} ${pluralize(passed.length, "check", "checks")} passed`
       : null,

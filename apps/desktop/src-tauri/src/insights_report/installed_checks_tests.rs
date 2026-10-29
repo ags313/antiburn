@@ -1,18 +1,100 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use antiburn_checks::actions::{ActionOutcome, ActionOutcomeKind, ActionPlan, ChoiceResult};
-use antiburn_checks::check_store::{AcceptanceOutcome, CheckStore, EvaluatedCandidate};
+use antiburn_checks::actions::{ActionOutcome, ActionOutcomeKind, ActionPlan};
+use antiburn_checks::check_store::{AcceptanceOutcome, CheckStore, EvaluatedAssessment};
 use antiburn_checks::compiler::{StatusResult, compile};
 use antiburn_checks::definition_lifecycle::{EffectiveActivation, LifecycleTransition};
 use antiburn_checks::discovery::DefinitionScope;
 use antiburn_checks::domain::{
     ActivationId, BranchId, FrozenContext, Generation, Message, ObservationPosition,
 };
+use antiburn_checks::results::{ChoiceResult, DecisionResult, NamedAnswer, QuestionResult};
 use serde_json::json;
 
 use super::*;
 use crate::store::burn_checks::{BurnCheckCandidateClaim, StoreCheckStore};
+use crate::store::native_tool_results::request_origin;
+
+#[path = "installed_checks_filter_tests.rs"]
+mod filters;
+#[path = "installed_checks_input_size_tests.rs"]
+mod input_size;
+#[path = "installed_checks_local_tests.rs"]
+mod local;
+#[path = "installed_checks_multi_tests.rs"]
+mod multi;
+#[path = "installed_checks_opencode_v2_tests.rs"]
+mod opencode_v2;
+#[path = "installed_checks_served_model_tests.rs"]
+mod served_models;
+
+const REPORT_CHECK: &str = "name: Report fixture\non:\n  tool_result:\ndecisions:\n  review:\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    input: {result: failure}\n";
+
+#[test]
+fn diagnostic_groups_merge_the_same_issue_and_keep_the_blocking_severity() {
+    for severities in [
+        [
+            InstalledCheckDiagnosticSeverity::Info,
+            InstalledCheckDiagnosticSeverity::Error,
+        ],
+        [
+            InstalledCheckDiagnosticSeverity::Error,
+            InstalledCheckDiagnosticSeverity::Info,
+        ],
+    ] {
+        let mut groups = DiagnosticGroups::default();
+        for (index, severity) in severities.into_iter().enumerate() {
+            let mut diagnostic = storage_diagnostic();
+            diagnostic.severity = severity;
+            diagnostic.affected_session_count = index as u64;
+            groups
+                .add(
+                    diagnostic,
+                    Some(("opencode".into(), format!("session-{index}"))),
+                )
+                .unwrap();
+        }
+        groups
+            .add(
+                storage_diagnostic(),
+                Some(("opencode".into(), "session-0".into())),
+            )
+            .unwrap();
+        let diagnostics = groups.finish();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].severity,
+            InstalledCheckDiagnosticSeverity::Error
+        );
+        assert_eq!(diagnostics[0].affected_session_count, 2);
+    }
+}
+
+#[test]
+fn diagnostic_groups_preserve_distinct_codes_sources_and_details() {
+    use crate::installed_checks::diagnostics::detail;
+    let mut groups = DiagnosticGroups::default();
+    let diagnostic = storage_diagnostic();
+    groups.add(diagnostic.clone(), None).unwrap();
+    let mut other_code = diagnostic.clone();
+    other_code.code = "source-unavailable".into();
+    groups.add(other_code, None).unwrap();
+    for path in [".antiburn/checks/first.yml", ".antiburn/checks/second.yml"] {
+        let mut located = diagnostic.clone();
+        located.source = Some(InstalledCheckDiagnosticSource {
+            reference: path.into(),
+            path: path.into(),
+            line: Some(1),
+            column: Some(1),
+        });
+        groups.add(located, None).unwrap();
+    }
+    let mut with_details = diagnostic;
+    with_details.details.push(detail("Decision", "review"));
+    groups.add(with_details, None).unwrap();
+    assert_eq!(groups.finish().len(), 5);
+}
 
 pub(crate) fn definition(project: &str) -> InstalledCheckDefinition {
     InstalledCheckDefinition {
@@ -24,6 +106,7 @@ pub(crate) fn definition(project: &str) -> InstalledCheckDefinition {
         name: "Failed retry loop".into(),
         aliases: vec!["repeated failures".into()],
         description: Some("Detects repeated failures without recovery.".into()),
+        is_local: false,
         decision_name: Some("review".into()),
         trigger: Some(InstalledCheckTrigger {
             event: InstalledCheckEvent::ToolResult,
@@ -60,12 +143,20 @@ fn request() -> ReportRequest {
 }
 
 fn store() -> Arc<Store> {
-    Arc::new(Store::open_in_memory(Path::new("/tmp/check-facade-test")).unwrap())
+    let store = Arc::new(Store::open_in_memory(Path::new("/tmp/check-facade-test")).unwrap());
+    store
+        .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+        .unwrap();
+    store
 }
 
-fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
+fn activate(
+    store: &Arc<Store>,
+    definition: &InstalledCheckDefinition,
+) -> (Arc<StoreCheckStore>, EffectiveActivation) {
     let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key).unwrap();
-    let adapter = StoreCheckStore::new(store.clone(), "test".into(), scope.clone()).unwrap();
+    let adapter =
+        Arc::new(StoreCheckStore::new(store.clone(), "test".into(), scope.clone()).unwrap());
     let activation = EffectiveActivation {
         id: ActivationId {
             scope: scope.clone(),
@@ -76,7 +167,7 @@ fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
         definition_scope: DefinitionScope::Project,
         source_paths: vec![],
         project_root: Some(scope.session_cwd.into()),
-        compiled: Arc::new(compile("name: Report fixture\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap()),
+        compiled: Arc::new(compile(REPORT_CHECK).unwrap()),
         bootstrap_observation_position: ObservationPosition(0),
         bootstrap_publication: Default::default(),
     };
@@ -86,6 +177,73 @@ fn activate(store: &Arc<Store>, definition: &InstalledCheckDefinition) {
             &LifecycleTransition::Activated(activation.clone()),
             Some(&activation),
         )
+        .unwrap();
+    publish_runtime_definition(store, definition);
+    (adapter, activation)
+}
+
+#[test]
+fn definition_metadata_preserves_a_single_model_decision_name() {
+    let store = store();
+    let (_, activation) = activate(&store, &definition("/workspace/demo"));
+    let metadata = crate::installed_checks::tests::definition_metadata_for_activation(&activation);
+    assert!(!metadata.is_local);
+    assert_eq!(metadata.decision_name.as_deref(), Some("review"));
+}
+
+fn publish_runtime_definition(store: &Store, definition: &InstalledCheckDefinition) {
+    let mut connection = store.lock();
+    let mut runtime_definitions = connection
+        .prepare(
+            "SELECT check_id, activation_scope_key, generation, definition_revision, name, availability
+             FROM burn_check_runtime_definition",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            let availability: String = row.get(5)?;
+            Ok(antiburn_checks_store::RuntimeDefinition {
+                check_id: row.get(0)?,
+                activation_scope_key: row.get(1)?,
+                generation: row.get(2)?,
+                definition_revision: row.get(3)?,
+                name: row.get(4)?,
+                availability: match availability.as_str() {
+                    "paused" => antiburn_checks_store::DefinitionAvailability::Paused,
+                    "invalid" => antiburn_checks_store::DefinitionAvailability::Invalid,
+                    "unsupported" => antiburn_checks_store::DefinitionAvailability::Unsupported,
+                    _ => antiburn_checks_store::DefinitionAvailability::Available,
+                },
+            })
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    runtime_definitions.retain(|saved| {
+        saved.check_id != definition.check_id
+            || saved.activation_scope_key != definition.activation_scope_key
+    });
+    runtime_definitions.push(antiburn_checks_store::RuntimeDefinition {
+        check_id: definition.check_id.clone(),
+        activation_scope_key: definition.activation_scope_key.clone(),
+        generation: definition.generation,
+        definition_revision: definition.definition_revision.clone(),
+        name: definition.name.clone(),
+        availability: match &definition.availability {
+            InstalledCheckAvailability::Available => {
+                antiburn_checks_store::DefinitionAvailability::Available
+            }
+            InstalledCheckAvailability::Paused { .. } => {
+                antiburn_checks_store::DefinitionAvailability::Paused
+            }
+            InstalledCheckAvailability::Invalid { .. } => {
+                antiburn_checks_store::DefinitionAvailability::Invalid
+            }
+            InstalledCheckAvailability::Unsupported { .. } => {
+                antiburn_checks_store::DefinitionAvailability::Unsupported
+            }
+        },
+    });
+    antiburn_checks_store::replace_runtime_definitions(&mut connection, &runtime_definitions)
         .unwrap();
 }
 
@@ -116,6 +274,212 @@ fn session_in_project(store: &Store, id: &str, epoch: i64, project: &str) {
         .unwrap();
 }
 
+fn claude_cursor(id: &str) -> String {
+    use antiburn_local::analysis::file_live::read_native_file_page;
+    use antiburn_local::analysis::{RawSource, SessionInput, SourceFormat};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("session.jsonl");
+    let record = json!({
+        "type":"user", "uuid":"root", "parentUuid":null, "sessionId":id,
+        "version":"2.1.278", "entrypoint":"cli", "isSidechain":false,
+        "message":{"role":"user", "content":"Run the tests"}
+    });
+    std::fs::write(&path, format!("{record}\n")).unwrap();
+    let input = SessionInput {
+        agent: "claude".into(),
+        session_id: id.into(),
+        source: RawSource::File(path),
+        source_format: SourceFormat::ClaudeJsonl,
+        fork_parent_session_id: None,
+    };
+    let page = read_native_file_page(&input, None, &|| false).unwrap();
+    serde_json::to_string(&page.cursor).unwrap()
+}
+
+fn delivery_receipt(agent: &str, id: &str) -> serde_json::Value {
+    use antiburn_local::analysis::{RawSource, SessionInput, SourceFormat};
+    if agent == "claude-code" {
+        return serde_json::from_str(&claude_cursor(id)).unwrap();
+    }
+    if agent == "opencode" {
+        let journal = crate::insights_worker::journal::tests::SyntheticJournal::named(16, id);
+        let page = antiburn_local::analysis::read_opencode_live_tool_result_page(
+            &journal.path,
+            id,
+            None,
+            None,
+            &|| false,
+        )
+        .unwrap();
+        return serde_json::to_value(page.cursor).unwrap();
+    }
+    let (source_format, record) = match agent {
+        "codex" => (
+            SourceFormat::CodexRolloutJsonl,
+            json!({"type":"session_meta","payload":{"id":id,"cwd":"/workspace/demo","source":"cli"}}),
+        ),
+        "pi" => (
+            SourceFormat::PiV3Jsonl,
+            json!({"type":"session","version":3,"id":id,"cwd":"/workspace/demo"}),
+        ),
+        _ => panic!("unsupported native receipt test agent"),
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("session.jsonl");
+    std::fs::write(&path, format!("{record}\n")).unwrap();
+    let page = antiburn_local::analysis::file_live::read_native_file_page(
+        &SessionInput {
+            agent: agent.into(),
+            session_id: id.into(),
+            source: RawSource::File(path),
+            source_format,
+            fork_parent_session_id: None,
+        },
+        None,
+        &|| false,
+    )
+    .unwrap();
+    serde_json::to_value(page.cursor).unwrap()
+}
+
+fn receipt_compatible(store: &Store, agent: &str) -> bool {
+    let (table, compatible) = if agent == "opencode" {
+        (
+            "opencode_journal_delivery",
+            antiburn_checks_store::opencode_journal_receipt_compatible_sql(1),
+        )
+    } else {
+        (
+            "native_file_delivery",
+            antiburn_checks_store::native_file_receipt_compatible_sql(1),
+        )
+    };
+    store
+        .lock()
+        .query_row(
+            &format!(
+                "SELECT COALESCE(({compatible}), 0) FROM session s JOIN {table} d
+           USING(environment_key, agent, session_id)
+         WHERE s.environment_key = 'native' AND s.agent = ?2 AND s.session_id = 'main'"
+            ),
+            params![PARSER_REVISION, agent],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn seed_current_claude_origin(store: &Store, id: &str) -> i64 {
+    let cursor = claude_cursor(id);
+    let key = SessionKey::new("native", "claude-code", id);
+    let mut connection = store.lock();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute(
+            "UPDATE session SET source_kind = 'file', source_format = ?2
+             WHERE environment_key = 'native' AND agent = 'claude-code' AND session_id = ?1",
+            params![
+                id,
+                serde_json::to_string(&antiburn_local::analysis::SourceFormat::ClaudeJsonl)
+                    .unwrap()
+            ],
+        )
+        .unwrap();
+    transaction.execute(
+        "INSERT INTO native_file_delivery (environment_key, agent, session_id, incarnation,
+           source_label, cwd, parser_revision, cursor_json, observed_generation, pending, active_until_epoch)
+         SELECT environment_key, agent, session_id, incarnation, source_label, cwd, ?2, ?3,
+           source_generation, 0, 1000 FROM session
+          WHERE environment_key = 'native' AND agent = 'claude-code' AND session_id = ?1
+         ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
+           incarnation = excluded.incarnation, source_label = excluded.source_label,
+           cwd = excluded.cwd, parser_revision = excluded.parser_revision,
+           cursor_json = excluded.cursor_json, observed_generation = excluded.observed_generation,
+           pending = 0, blocked = 0, last_error = NULL",
+        params![id, PARSER_REVISION, cursor],
+    ).unwrap();
+    request_origin::ensure_boundary_in(&transaction, &key, 0, 1).unwrap();
+    let boundary: i64 = transaction
+        .query_row(
+            &format!(
+                "SELECT {} FROM session s WHERE s.environment_key = 'native'
+                 AND s.agent = 'claude-code' AND s.session_id = ?1",
+                request_origin::boundary_sql("s")
+            ),
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "INSERT INTO burn_check_session_attachment
+           (check_id, activation_scope_key, generation, branch_key, incarnation)
+         SELECT a.check_id, a.activation_scope_key, a.generation, ?2, s.incarnation
+           FROM burn_check_activation a JOIN session s
+             ON s.cwd = json_extract(a.activation_scope_key, '$.session_cwd')
+           WHERE s.environment_key = 'native' AND s.agent = 'claude-code' AND s.session_id = ?1
+          ON CONFLICT(check_id, activation_scope_key, generation, branch_key) DO NOTHING",
+            params![id, key.to_identity_json()],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    boundary
+}
+
+fn publication_page(
+    store: &Store,
+    activation: &ActivationId,
+) -> antiburn_checks::source::SourceBatch {
+    let (checkpoint, applied_sequence): (String, u64) = store
+        .lock()
+        .query_row(
+            "SELECT checkpoint_json, applied_sequence FROM burn_check_activation
+         WHERE check_id = ?1 AND activation_scope_key = ?2 AND generation = ?3",
+            params![
+                activation.definition_id,
+                serde_json::to_string(&activation.scope).unwrap(),
+                activation.generation.0
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let progress = antiburn_checks::check_store::SourceProgress::decode(&checkpoint).unwrap();
+    assert_eq!(progress.publication_cursor.0, applied_sequence);
+    antiburn_checks::source::PublishedEvidenceSource::new(
+        crate::published_evidence_reader::StorePublishedEvidenceReader::for_live_project(
+            store,
+            &activation.scope.environment,
+            &activation.scope.session_cwd,
+        )
+        .with_activation(activation),
+        40,
+    )
+    .unwrap()
+    .read_batch(progress.publication_cursor)
+    .unwrap()
+}
+
+fn apply_ready_publications(
+    store: &Store,
+    adapter: Arc<StoreCheckStore>,
+    activation: &EffectiveActivation,
+) {
+    let engine = antiburn_checks::engine::CheckEngine::new(adapter, Arc::new(local::NoModel));
+    loop {
+        let page = publication_page(store, &activation.id);
+        assert_eq!(
+            engine
+                .apply_source_page(activation, &page)
+                .unwrap()
+                .candidates,
+            0
+        );
+        if !page.has_more {
+            break;
+        }
+    }
+}
+
 fn accept(
     store: &Store,
     definition: &InstalledCheckDefinition,
@@ -141,33 +505,92 @@ fn accept_with_message(
     status: Option<StatusResult>,
     message: Option<&str>,
 ) {
-    let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key).unwrap();
-    session_in_project(store, branch, 100, &scope.session_cwd);
-    let id = format!("{}:{branch}:{position}", definition.activation_scope_key);
     let label = if status == Some(StatusResult::Success) {
         "clear"
     } else {
         "concern"
     };
-    let evaluated = EvaluatedCandidate {
-        choices: vec![
-            ChoiceResult::validate(
-                "review",
-                "verdict",
-                &["clear".into(), "concern".into()],
-                label,
-                BTreeMap::from([
-                    ("clear".into(), if label == "clear" { 0.99 } else { 0.01 }),
-                    (
-                        "concern".into(),
-                        if label == "concern" { 0.99 } else { 0.01 },
-                    ),
-                ]),
+    let compiled = compile(REPORT_CHECK).unwrap();
+    let declaration = &compiled.decisions[0];
+    let requirements = compiled.question_requirements();
+    let evaluated = EvaluatedAssessment::new(
+        &compiled.decisions,
+        &requirements,
+        vec![
+            DecisionResult::new(
+                declaration,
+                &requirements,
+                vec![
+                    NamedAnswer::new(
+                        "verdict",
+                        QuestionResult::Choice(
+                            ChoiceResult::new(
+                                &declaration.outputs[0].question,
+                                label,
+                                Some(BTreeMap::from([
+                                    ("clear".into(), if label == "clear" { 0.99 } else { 0.01 }),
+                                    (
+                                        "concern".into(),
+                                        if label == "concern" { 0.99 } else { 0.01 },
+                                    ),
+                                ])),
+                                None,
+                            )
+                            .unwrap(),
+                        ),
+                    )
+                    .unwrap(),
+                ],
+                1,
             )
             .unwrap(),
         ],
-        attempts: 1,
-    };
+    )
+    .unwrap();
+    accept_evaluated_with_message(
+        store, definition, branch, position, status, message, &evaluated,
+    );
+}
+
+fn accept_evaluated_with_message(
+    store: &Store,
+    definition: &InstalledCheckDefinition,
+    branch: &str,
+    position: i64,
+    status: Option<StatusResult>,
+    message: Option<&str>,
+    evaluated: &EvaluatedAssessment,
+) {
+    let scope: ActivationScope = serde_json::from_str(&definition.activation_scope_key).unwrap();
+    session_in_project(store, branch, 100, &scope.session_cwd);
+    seed_current_claude_origin(store, branch);
+    let selected_head: i64 = store
+        .lock()
+        .query_row(
+            "INSERT INTO native_tool_result_publication
+           (outcome, environment_key, agent, session_id, source_format, complete,
+            source_generation, claim_fence, project_cwd, session_incarnation)
+         SELECT 'coverage_complete', environment_key, agent, session_id, source_format, 1,
+           source_generation, 1, cwd, incarnation FROM session
+          WHERE environment_key = 'native' AND agent = 'claude-code' AND session_id = ?1
+         RETURNING publication_sequence",
+            [branch],
+            |row| row.get(0),
+        )
+        .unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_activation SET applied_sequence = ?3
+          WHERE check_id = ?1 AND activation_scope_key = ?2",
+            params![
+                definition.check_id,
+                definition.activation_scope_key,
+                selected_head
+            ],
+        )
+        .unwrap();
+    let id = format!("{}:{branch}:{position}", definition.activation_scope_key);
     let plan = ActionPlan {
         current_status: status,
         outcomes: vec![ActionOutcome {
@@ -204,8 +627,8 @@ fn accept_with_message(
         "INSERT INTO burn_check_candidate (candidate_id, check_id, activation_scope_key, generation, branch_key,
            session_key_json, trigger_position, selected_publication_head, dependencies_json, frozen_input_json,
            answer_json, input_fingerprint, state, claim_owner, claim_fence, created_at_epoch, updated_at_epoch)
-         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, 0, '{}', ?7, ?8, ?1, 'answered', 'test', 1, 100, 100)",
-        params![id, definition.check_id, definition.activation_scope_key, branch, serde_json::to_string(&("native", "claude-code", branch)).unwrap(), position, serde_json::to_string(&frozen).unwrap(), serde_json::to_string(&evaluated).unwrap()],
+         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?9, '{}', ?7, ?8, ?1, 'answered', 'test', 1, 100, 100)",
+        params![id, definition.check_id, definition.activation_scope_key, branch, serde_json::to_string(&("native", "claude-code", branch)).unwrap(), position, serde_json::to_string(&frozen).unwrap(), serde_json::to_string(&evaluated).unwrap(), selected_head],
     ).unwrap();
     assert_eq!(
         store
@@ -216,7 +639,7 @@ fn accept_with_message(
                     fence: 1
                 },
                 &format!("assessment-{position}"),
-                &serde_json::to_value(&evaluated).unwrap(),
+                &serde_json::to_value(evaluated).unwrap(),
                 &serde_json::to_value(&plan).unwrap(),
                 status.map(|value| match value {
                     StatusResult::Failure => "failure",
@@ -346,6 +769,7 @@ fn has_started_distinguishes_cancelled_queue_from_a_dispatched_attempt() {
     let definition = definition("/workspace/demo");
     activate(&store, &definition);
     queue(&store, &definition, "cancelled", 1);
+    seed_current_claude_origin(&store, "cancelled");
     store
         .lock()
         .execute("UPDATE burn_check_candidate SET state = 'cancelled'", [])
@@ -385,7 +809,7 @@ fn has_started_distinguishes_cancelled_queue_from_a_dispatched_attempt() {
 fn has_started_excludes_invalid_evidence_and_out_of_cohort_history() {
     for invalidation in [
         "UPDATE burn_check_assessment_history SET evidence_valid = 0",
-        "UPDATE session SET source_generation = source_generation + 1",
+        "UPDATE session SET incarnation = incarnation + 1",
         "UPDATE session SET updated_at_epoch = 200",
         "UPDATE session SET updated_at_epoch = 89",
         "UPDATE session SET cwd = '/workspace/other'",
@@ -432,9 +856,7 @@ fn rust_facade_matches_frontend_fixture_and_retains_the_actual_failure_write() {
         "Original source: requested task"
     );
     assert!(evidence.items.iter().all(|item| {
-        item.limitation
-            .as_deref()
-            .is_some_and(|text| text.contains("Exact assessed input was not saved"))
+        item.limitation.as_deref() == Some("Exact assessed input was not saved for this check. This is original source evidence; it does not show which values were sent to the model.")
     }));
 }
 
@@ -442,8 +864,10 @@ fn rust_facade_matches_frontend_fixture_and_retains_the_actual_failure_write() {
 fn ready_session_without_a_candidate_waits_for_results_without_checking() {
     let store = store();
     let definition = definition("/workspace/demo");
-    activate(&store, &definition);
+    let (adapter, activation) = activate(&store, &definition);
     session(&store, "active-session", 190);
+    seed_current_claude_origin(&store, "active-session");
+    apply_ready_publications(&store, adapter, &activation);
     let report = rows(&store, std::slice::from_ref(&definition));
     assert_eq!(report[0].checking_count, 0);
     assert!(!report[0].has_started);
@@ -453,6 +877,59 @@ fn ready_session_without_a_candidate_waits_for_results_without_checking() {
         (report[0].finding, report[0].clean, report[0].review_failed),
         (0, 0, 0)
     );
+}
+
+#[test]
+fn grouped_waiting_event_and_count_come_from_the_same_scope_in_both_orders() {
+    let store = store();
+    let mut calls = definition("/workspace/calls");
+    calls.trigger = Some(InstalledCheckTrigger {
+        event: InstalledCheckEvent::ToolCall,
+        minimum: 1,
+    });
+    let mut users = definition("/workspace/users");
+    users.trigger = Some(InstalledCheckTrigger {
+        event: InstalledCheckEvent::UserMessage,
+        minimum: 3,
+    });
+    for definition in [&calls, &users] {
+        let (adapter, activation) = activate(&store, definition);
+        let scope: ActivationScope =
+            serde_json::from_str(&definition.activation_scope_key).unwrap();
+        session_in_project(&store, &scope.session_cwd, 190, &scope.session_cwd);
+        seed_current_claude_origin(&store, &scope.session_cwd);
+        apply_ready_publications(&store, adapter, &activation);
+    }
+    for definitions in [
+        [calls.clone(), users.clone()],
+        [users.clone(), calls.clone()],
+    ] {
+        let report = rows(&store, &definitions);
+        assert_eq!(report.len(), 1);
+        let waiting = report[0].waiting_for_events.unwrap();
+        assert_eq!(
+            (waiting.event, waiting.count, waiting.catching_up),
+            (InstalledCheckEvent::ToolCall, 1, false)
+        );
+    }
+    store
+        .lock()
+        .execute(
+            "UPDATE native_file_delivery SET pending = 1 WHERE session_id = '/workspace/users'",
+            [],
+        )
+        .unwrap();
+    for definitions in [
+        [calls.clone(), users.clone()],
+        [users.clone(), calls.clone()],
+    ] {
+        let report = rows(&store, &definitions);
+        let waiting = report[0].waiting_for_events.unwrap();
+        assert_eq!(
+            (waiting.event, waiting.count, waiting.catching_up),
+            (InstalledCheckEvent::ToolCall, 1, true)
+        );
+    }
 }
 
 #[test]
@@ -628,12 +1105,39 @@ fn checking_uses_any_queued_or_in_flight_candidate_and_stops_at_terminal_states(
 }
 
 #[test]
-fn stale_session_evidence_waits_for_data_and_cannot_expose_retained_status_or_evidence() {
+fn native_appends_preserve_accepted_history_without_changing_the_source_incarnation() {
     let (store, definition) = populated();
     let target = rows(&store, std::slice::from_ref(&definition))[0].targets[0]
         .id
         .clone();
     store.lock().execute("UPDATE session SET source_generation = source_generation + 1 WHERE session_id = 'branch-a'", []).unwrap();
+
+    let report = rows(&store, std::slice::from_ref(&definition));
+    assert!(report[0].has_started);
+    assert_eq!((report[0].finding, report[0].clean), (1, 1));
+    assert_eq!(report[0].reviewed_without_status, 1);
+    assert_eq!(
+        read_evidence(&store, &[definition], &request(), &target)
+            .unwrap()
+            .status,
+        BurnCheckEvidenceStatus::Available
+    );
+}
+
+#[test]
+fn stale_native_receipt_waits_for_data_and_cannot_expose_retained_status_or_evidence() {
+    let (store, definition) = populated();
+    let target = rows(&store, std::slice::from_ref(&definition))[0].targets[0]
+        .id
+        .clone();
+    store
+        .lock()
+        .execute(
+            "UPDATE session SET source_generation = source_generation + 1,
+        incarnation = incarnation + 1 WHERE session_id = 'branch-a'",
+            [],
+        )
+        .unwrap();
     let report = rows(&store, std::slice::from_ref(&definition));
     assert_eq!((report[0].finding, report[0].clean), (0, 1));
     assert_eq!(report[0].checking_count, 0);
@@ -668,6 +1172,190 @@ fn disabled_activation_exposes_no_status_checking_or_waiting_counts_with_old_met
         (0, 0, 0, 0, 0)
     );
     assert!(row.targets.is_empty());
+}
+
+#[test]
+fn capability_pauses_keep_saved_results_and_evidence_without_showing_new_work() {
+    for availability in [
+        InstalledCheckAvailability::Unsupported {
+            reason: Some("The selected model does not support choice questions.".into()),
+        },
+        InstalledCheckAvailability::Paused { reason: None },
+    ] {
+        let (store, mut definition) = populated();
+        queue(&store, &definition, "branch-a", 4);
+        let before = rows(&store, std::slice::from_ref(&definition)).remove(0);
+        assert_eq!(
+            (before.finding, before.clean, before.checking_count),
+            (1, 1, 1)
+        );
+        let target = &before.targets[0];
+        let evidence = read_evidence(
+            &store,
+            std::slice::from_ref(&definition),
+            &request(),
+            &target.id,
+        )
+        .unwrap();
+        assert_eq!(evidence.status, BurnCheckEvidenceStatus::Available);
+        let writer = || {
+            store
+                .lock()
+                .query_row(
+                    "SELECT assessment_id, position, status, evidence_valid, updated_at_epoch
+             FROM burn_check_current_status WHERE branch_key = 'branch-a'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, bool>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let accepted = writer();
+        definition.availability = availability;
+        publish_runtime_definition(&store, &definition);
+
+        let changes = store.lock().total_changes();
+        assert!(saved_activation_current(&store.lock(), &definition).unwrap());
+        assert!(!current_activation(&store.lock(), &definition).unwrap());
+        let report = rows(&store, std::slice::from_ref(&definition)).remove(0);
+        assert_eq!(report.availability, definition.availability);
+        assert_eq!(
+            (report.finding, report.clean, report.unavailable),
+            (1, 1, 0)
+        );
+        assert!(report.has_started);
+        assert_eq!(
+            (
+                report.checking_count,
+                report.waiting_for_data_count,
+                report.waiting_for_results_count
+            ),
+            (0, 0, 0),
+        );
+        assert!(report.waiting_for_events.is_none());
+        assert_eq!(report.explanation, before.explanation);
+        assert_eq!(report.targets.len(), 1);
+        assert_eq!(report.targets[0].id, target.id);
+        assert_eq!(report.targets[0].observation, target.observation);
+        assert_eq!(
+            read_evidence(
+                &store,
+                std::slice::from_ref(&definition),
+                &request(),
+                &target.id
+            )
+            .unwrap(),
+            evidence
+        );
+        let mut stale_metadata = definition.clone();
+        stale_metadata.availability = InstalledCheckAvailability::Available;
+        assert!(!current_activation(&store.lock(), &stale_metadata).unwrap());
+        let stale_report = rows(&store, &[stale_metadata]).remove(0);
+        assert_eq!(
+            (
+                stale_report.finding,
+                stale_report.clean,
+                stale_report.checking_count
+            ),
+            (1, 1, 0)
+        );
+        assert!(stale_report.waiting_for_events.is_none());
+        assert_eq!(writer(), accepted);
+        assert_eq!(store.lock().total_changes(), changes);
+
+        definition.availability = InstalledCheckAvailability::Available;
+        publish_runtime_definition(&store, &definition);
+        let changes = store.lock().total_changes();
+        let resumed = rows(&store, std::slice::from_ref(&definition)).remove(0);
+        assert_eq!(
+            (resumed.finding, resumed.clean, resumed.checking_count),
+            (1, 1, 1)
+        );
+        assert_eq!(resumed.targets[0].id, target.id);
+        assert_eq!(writer(), accepted);
+        assert_eq!(store.lock().total_changes(), changes);
+    }
+}
+
+#[test]
+fn paused_history_requires_the_exact_current_catalog_activation_and_source() {
+    for mutation in [
+        "metadata-revision",
+        "metadata-generation",
+        "metadata-missing-generation",
+        "metadata-scope",
+        "metadata-check-id",
+        "metadata-invalid",
+        "new-catalog-revision",
+        "new-catalog-generation",
+        "UPDATE burn_check_runtime_definition SET definition_revision = 'changed'",
+        "UPDATE burn_check_runtime_definition SET generation = 2",
+        "UPDATE burn_check_runtime_definition SET activation_scope_key = json_set(activation_scope_key, '$.session_cwd', '/workspace/other')",
+        "UPDATE burn_check_runtime_definition SET check_id = 'removed-check'",
+        "UPDATE burn_check_runtime_definition SET availability = 'invalid'",
+        "DELETE FROM burn_check_runtime_definition",
+        "UPDATE burn_check_runtime_definition_state SET initialized = 0",
+        "UPDATE burn_check_activation SET definition_revision = 'changed'",
+        "UPDATE burn_check_activation SET generation = 2",
+        "UPDATE burn_check_activation SET enabled = 0",
+        "UPDATE native_file_delivery SET incarnation = incarnation + 1",
+    ] {
+        let (store, mut definition) = populated();
+        let target = rows(&store, std::slice::from_ref(&definition))[0].targets[0]
+            .id
+            .clone();
+        definition.availability = InstalledCheckAvailability::Unsupported { reason: None };
+        publish_runtime_definition(&store, &definition);
+        match mutation {
+            "metadata-revision" => definition.definition_revision = "changed".into(),
+            "metadata-generation" => definition.generation = Some(2),
+            "metadata-missing-generation" => definition.generation = None,
+            "metadata-scope" => {
+                definition.activation_scope_key =
+                    serde_json::to_string(&scope("/workspace/other")).unwrap()
+            }
+            "metadata-check-id" => definition.check_id = "removed-check".into(),
+            "metadata-invalid" => {
+                definition.availability = InstalledCheckAvailability::Invalid { reason: None }
+            }
+            "new-catalog-revision" => {
+                definition.definition_revision = "changed".into();
+                publish_runtime_definition(&store, &definition);
+            }
+            "new-catalog-generation" => {
+                definition.generation = Some(2);
+                publish_runtime_definition(&store, &definition);
+            }
+            sql => {
+                store.lock().execute(sql, []).unwrap();
+            }
+        }
+
+        let changes = store.lock().total_changes();
+        let report = rows(&store, std::slice::from_ref(&definition)).remove(0);
+        assert_eq!(
+            (report.finding, report.clean, report.checking_count),
+            (0, 0, 0),
+            "{mutation}"
+        );
+        assert!(!report.has_started, "{mutation}");
+        assert!(report.targets.is_empty(), "{mutation}");
+        assert_eq!(
+            read_evidence(&store, &[definition], &request(), &target)
+                .unwrap()
+                .status,
+            BurnCheckEvidenceStatus::Unavailable,
+            "{mutation}",
+        );
+        assert_eq!(store.lock().total_changes(), changes, "{mutation}");
+    }
 }
 
 #[test]
@@ -834,19 +1522,63 @@ fn set_latest_failure(
 #[test]
 fn typed_runtime_failures_group_sessions_without_exposing_internal_detail() {
     use antiburn_checks::engine::EvaluationFailureCode::*;
-    for (failure, code) in [
-        (AuthenticationRejected, "provider-authentication"),
-        (RateLimited, "provider-rate-limited"),
-        (ProviderOverloaded, "provider-overloaded"),
-        (ProviderUnavailable, "provider-unavailable"),
-        (DeliveryUnknown, "provider-delivery-unknown"),
-        (InvalidResponse, "provider-invalid-response"),
-        (InvalidDecision, "provider-invalid-response"),
-        (ContextRejected, "provider-context-rejected"),
-        (InvalidRequest, "provider-invalid-request"),
-        (Cancelled, "assessment-cancelled"),
-        (StorageFailure, "storage-failed"),
-        (ActionFailed, "action-failed"),
+    for (failure, code, title) in [
+        (
+            AuthenticationRejected,
+            "provider-authentication",
+            "Reconnect the check provider",
+        ),
+        (
+            RateLimited,
+            "provider-rate-limited",
+            "Provider rate limit reached",
+        ),
+        (
+            ProviderOverloaded,
+            "provider-overloaded",
+            "The check provider is busy",
+        ),
+        (
+            ProviderUnavailable,
+            "provider-unavailable",
+            "The check provider is unavailable",
+        ),
+        (
+            DeliveryUnknown,
+            "provider-delivery-unknown",
+            "The check did not finish",
+        ),
+        (
+            InvalidResponse,
+            "provider-invalid-response",
+            "The provider returned an invalid response",
+        ),
+        (
+            InvalidDecision,
+            "provider-invalid-response",
+            "The provider returned an invalid response",
+        ),
+        (
+            ContextRejected,
+            "provider-context-rejected",
+            "The provider rejected the input size",
+        ),
+        (
+            InvalidRequest,
+            "provider-invalid-request",
+            "Correct the decision request",
+        ),
+        (Cancelled, "assessment-cancelled", "The check stopped"),
+        (
+            StorageFailure,
+            "storage-failed",
+            "The check result could not be saved",
+        ),
+        (
+            ActionFailed,
+            "action-failed",
+            "The status action could not run",
+        ),
     ] {
         let store = store();
         let definition = definition("/workspace/demo");
@@ -863,6 +1595,21 @@ fn typed_runtime_failures_group_sessions_without_exposing_internal_detail() {
         let report = rows(&store, &[definition]);
         assert_eq!(report[0].diagnostics.len(), 1, "{failure:?}");
         assert_eq!(report[0].diagnostics[0].code, code);
+        assert_eq!(report[0].diagnostics[0].title, title);
+        assert!(!report[0].diagnostics[0].message.contains("assessment"));
+        assert!(!report[0].diagnostics[0].message.contains("assessing"));
+        if failure == DeliveryUnknown {
+            assert_eq!(
+                report[0].diagnostics[0].message,
+                "The connection ended before the provider confirmed a response. This can include a timeout. The request may have reached the provider, so it will not be resent automatically."
+            );
+        }
+        if failure == ActionFailed {
+            assert_eq!(
+                report[0].diagnostics[0].message,
+                "A status action was invalid or reached an evaluation limit. Check the action expression and result in the YAML file."
+            );
+        }
         assert_eq!(report[0].diagnostics[0].affected_session_count, 2);
         assert!(
             report[0].diagnostics[0]
@@ -949,6 +1696,10 @@ fn shortened_input_is_informational_without_copying_prepared_content() {
     let diagnostic = &report[0].diagnostics[0];
     assert_eq!(diagnostic.code, "input-shortened");
     assert_eq!(diagnostic.title, "Input shortened");
+    assert_eq!(
+        diagnostic.message,
+        "Fitting rules shortened this check's input. Session evidence is unchanged."
+    );
     assert_eq!(diagnostic.severity, InstalledCheckDiagnosticSeverity::Info);
     assert_eq!(diagnostic.affected_session_count, 1);
     assert_eq!(
@@ -1047,6 +1798,10 @@ fn fitted_evidence_uses_the_status_assessment_input_without_original_or_later_co
     assert_eq!(evidence.items[0].reference, "assessed-input");
     assert_eq!(evidence.items[0].source_label, "Assessed input");
     assert_eq!(
+        evidence.items[0].explanation,
+        "These are the decision input values used for this check."
+    );
+    assert_eq!(
         serde_json::from_str::<serde_json::Value>(&evidence.items[0].excerpt).unwrap(),
         input
     );
@@ -1066,6 +1821,127 @@ fn fitted_evidence_uses_the_status_assessment_input_without_original_or_later_co
     for original in ["test failed", "Run the tests", "LATER_INPUT_CANARY"] {
         assert!(!serialized.contains(original));
     }
+}
+
+#[test]
+fn evidence_and_failure_details_use_the_saved_connection_not_current_settings() {
+    use crate::jev::config::{
+        SystemOneConnection, SystemOneEndpoint, SystemOneProvider, SystemOneResponseMode,
+    };
+    use crate::jev::decision_evaluator::TypeSafeDecisionEvaluator;
+    use antiburn_checks::engine::DecisionEvaluator;
+
+    let (store, definition) = populated();
+    let connection = SystemOneConnection {
+        provider: SystemOneProvider::Cloudflare,
+        endpoint: SystemOneEndpoint::CloudflareAccount("syntheticaccount".into()),
+        model: "clef".into(),
+        model_revision: None,
+        response_mode: SystemOneResponseMode::CloudflareEnvelope,
+        credential: None,
+        revision: 7,
+        context_override: None,
+    };
+    let evaluator = TypeSafeDecisionEvaluator::from_selected_snapshot(
+        connection.clone(),
+        Some("SECRET_CANARY".into()),
+        connection.capabilities().unwrap(),
+    )
+    .unwrap();
+    let activation = EffectiveActivation {
+        id: ActivationId { scope: scope("/workspace/demo"), definition_id: definition.check_id.clone(), generation: Generation(1) },
+        revision: [1; 32],
+        definition_scope: DefinitionScope::Project,
+        source_paths: vec![],
+        project_root: None,
+        compiled: Arc::new(compile("name: Provenance\non:\n  tool_result:\ndecisions:\n  review:\n    input: {activity: ready}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {clear: Clear., concern: Concern.}\nactions:\n  - type: status\n    input: {result: failure}\n").unwrap()),
+        bootstrap_observation_position: ObservationPosition(0),
+        bootstrap_publication: Default::default(),
+    };
+    let prepared = evaluator
+        .prepare(
+            &activation,
+            vec![antiburn_checks::decision::DecisionInput {
+                decision: "review".into(),
+                input: json!({"activity":"saved input"}),
+            }],
+            Default::default(),
+        )
+        .unwrap();
+    let preparation =
+        serde_json::to_string(&antiburn_checks::fit::PreparationRecord::Ready(prepared)).unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_candidate SET preparation_json = ?1",
+            [&preparation],
+        )
+        .unwrap();
+    // This setting is unrelated to the connection that produced the saved answer.
+    store
+        .set_internal_value_checked(
+            "internal:smartChecksActiveConnectionV1",
+            &serde_json::to_string(&SystemOneConnection::jev_default()).unwrap(),
+        )
+        .unwrap();
+    let current = rows(&store, std::slice::from_ref(&definition));
+    let evidence = read_evidence(
+        &store,
+        std::slice::from_ref(&definition),
+        &request(),
+        &current[0].targets[0].id,
+    )
+    .unwrap();
+    let provenance = evidence
+        .items
+        .iter()
+        .find(|item| item.reference == "decision-connection")
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&provenance.excerpt).unwrap();
+    assert_eq!(
+        provenance.explanation,
+        "This saved connection identifies the requested model. Usage observations identify served models for each decision and attempt, not one release for the whole check. Missing observations and alias echoes leave the served release unknown. Current Settings can use a different connection."
+    );
+    assert_eq!(value["provider"], "Cloudflare");
+    assert_eq!(value["requestedModel"], "clef");
+    assert_eq!(
+        value["usageObservations"],
+        json!({"attempts":[], "truncated":false})
+    );
+    assert_eq!(value["connectionRevision"], 7);
+    let serialized = serde_json::to_string(&evidence).unwrap();
+    for private in ["SECRET_CANARY", "syntheticaccount", "api.cloudflare.com"] {
+        assert!(!serialized.contains(private));
+        assert!(!preparation.contains(private));
+    }
+
+    store.lock().execute("UPDATE burn_check_assessment_history SET outcome = 'execution_failed' WHERE trigger_position = 2", []).unwrap();
+    store
+        .lock()
+        .execute(
+            "UPDATE burn_check_candidate SET diagnostic_json = ?1 WHERE trigger_position = 2",
+            [json!({"code":"invalid_request", "detail":"safe"}).to_string()],
+        )
+        .unwrap();
+    let current = rows(&store, &[definition]);
+    let diagnostic = current[0]
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "provider-invalid-request")
+        .unwrap();
+    assert!(diagnostic.message.contains("model in Settings"));
+    assert!(
+        diagnostic
+            .details
+            .iter()
+            .any(|detail| detail.label == "Provider" && detail.value == "Cloudflare")
+    );
+    assert!(
+        diagnostic
+            .details
+            .iter()
+            .any(|detail| detail.label == "Model" && detail.value == "clef")
+    );
 }
 
 #[test]
@@ -1119,10 +1995,7 @@ fn rejected_preparation_cannot_fall_back_to_original_evidence_as_assessed_input(
 fn typed_fitting_reasons_show_safe_paths_and_estimates_without_parsing_failure_text() {
     use antiburn_checks::fit::NoFitReason;
     for (reason, title) in [
-        (
-            NoFitReason::NoRules,
-            "Allow input fitting or select less data",
-        ),
+        (NoFitReason::NoRules, "The check input is too large"),
         (NoFitReason::NoMatchingTargets, "No fitting targets matched"),
         (
             NoFitReason::TargetsAtMinimum,
@@ -1412,14 +2285,13 @@ fn a_current_scope_success_is_not_overridden_by_a_previous_project_failure() {
 
 #[test]
 fn trigger_counts_exclude_old_moved_stale_and_missing_checkpoint_sessions() {
-    use antiburn_checks::check_store::SourceProgress;
     use antiburn_checks::domain::{EvidenceVersion, NativeOrderKey};
     use antiburn_checks::selection::{BranchSelection, SelectedMessage};
     let store = store();
     let mut definition = definition("/workspace/demo");
     definition.trigger.as_mut().unwrap().minimum = 3;
-    activate(&store, &definition);
-    let mut progress = SourceProgress::default();
+    let (adapter, activation) = activate(&store, &definition);
+    let mut branches = BTreeMap::new();
     for (id, epoch, project, count) in [
         ("old-full-window", 89, "/workspace/demo", 5),
         ("future-full-window", 200, "/workspace/demo", 5),
@@ -1429,8 +2301,9 @@ fn trigger_counts_exclude_old_moved_stale_and_missing_checkpoint_sessions() {
         ("new-needs-two", 100, "/workspace/demo", 1),
     ] {
         session_in_project(&store, id, epoch, project);
+        seed_current_claude_origin(&store, id);
         let branch = BranchId(SessionKey::new("native", "claude-code", id).to_identity_json());
-        progress.selection.branches.insert(
+        branches.insert(
             branch,
             BranchSelection {
                 results: (0..count)
@@ -1446,9 +2319,13 @@ fn trigger_counts_exclude_old_moved_stale_and_missing_checkpoint_sessions() {
                     .collect(),
                 coverage_complete: true,
                 identity_limit_reached: false,
+                last_filter_diagnostic: None,
             },
         );
     }
+    apply_ready_publications(&store, adapter.clone(), &activation);
+    let mut progress = adapter.load_source_progress(&activation).unwrap();
+    progress.selection.branches = branches;
     store
         .lock()
         .execute(
@@ -1524,8 +2401,10 @@ fn missing_initial_receipt_reports_catchup_without_a_result_countdown() {
 fn publication_catchup_is_bound_to_activation_scope_and_current_incarnation() {
     let store = store();
     let definition = definition("/workspace/demo");
-    activate(&store, &definition);
+    let (adapter, activation) = activate(&store, &definition);
     session(&store, "starting", 100);
+    seed_current_claude_origin(&store, "starting");
+    apply_ready_publications(&store, adapter.clone(), &activation);
     let publish = |cwd: &str, incarnation: i64| {
         store
             .lock()
@@ -1533,9 +2412,14 @@ fn publication_catchup_is_bound_to_activation_scope_and_current_incarnation() {
                 "INSERT INTO native_tool_result_publication
                 (outcome, environment_key, agent, session_id, source_format, complete,
                  source_generation, claim_fence, project_cwd, session_incarnation)
-             VALUES ('coverage_complete', 'native', 'claude-code', 'starting', 'ClaudeJsonl',
-                1, 0, 1, ?1, ?2)",
-                params![cwd, incarnation],
+             VALUES ('coverage_complete', 'native', 'claude-code', 'starting', ?3,
+                 1, 0, 1, ?1, ?2)",
+                params![
+                    cwd,
+                    incarnation,
+                    serde_json::to_string(&antiburn_local::analysis::SourceFormat::ClaudeJsonl)
+                        .unwrap()
+                ],
             )
             .unwrap();
     };
@@ -1552,14 +2436,7 @@ fn publication_catchup_is_bound_to_activation_scope_and_current_incarnation() {
     assert_eq!(catching_up[0].waiting_for_results_count, 0);
     assert_eq!((catching_up[0].finding, catching_up[0].clean), (0, 0));
 
-    store
-        .lock()
-        .execute(
-            "UPDATE burn_check_activation SET applied_sequence =
-            (SELECT MAX(publication_sequence) FROM native_tool_result_publication)",
-            [],
-        )
-        .unwrap();
+    apply_ready_publications(&store, adapter, &activation);
     let ready = rows(&store, &[definition]);
     assert!(!ready[0].waiting_for_events.unwrap().catching_up);
     assert_eq!(ready[0].waiting_for_data_count, 0);
@@ -1589,7 +2466,7 @@ fn deterministic_request_failure_shows_the_typed_criterion_limit() {
         diagnostic
             .details
             .iter()
-            .any(|detail| detail.label == "Choice criteria"
+            .any(|detail| detail.label == "Question criteria"
                 && detail.value == "27 criteria; local limit 26 criteria")
     );
     assert!(diagnostic.message.contains("Nothing was sent"));
@@ -1605,13 +2482,15 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
     for agent in ["opencode", "claude-code", "codex", "pi"] {
         let store = store();
         let definition = definition("/workspace/demo");
-        activate(&store, &definition);
+        let (adapter, activation) = activate(&store, &definition);
         let journal = agent == "opencode";
         store.lock().execute(
             "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
-              cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation)
-             VALUES ('native', ?1, 'main', ?2, 'test', '/workspace/demo', 100, 100, '', '', 7)",
-            params![agent, if journal { "providerDb" } else { "file" }],
+              cwd, updated_at_epoch, started_at_epoch, first_seen_at, last_seen_at, incarnation, source_format)
+             VALUES ('native', ?1, 'main', ?2, ?3, '/workspace/demo', 100, 100, '', '', 7, ?4)",
+            params![agent, if journal { "providerDb" } else { "file" },
+                if journal { "opencode:main" } else { "test" },
+                journal.then(|| serde_json::to_string(&antiburn_local::analysis::SourceFormat::OpenCodeSqliteV1).unwrap())],
         ).unwrap();
         let mut request = request();
         request.computed_at_epoch = 280;
@@ -1663,9 +2542,13 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
                 &format!(
                     "INSERT INTO {table} (environment_key, agent, session_id, incarnation,
               source_label, cwd, parser_revision, pending, {extra})
-             VALUES ('native', ?1, 'main', 7, 'test', '/workspace/demo', ?2, 1, 1)"
+             VALUES ('native', ?1, 'main', 7, ?3, '/workspace/demo', ?2, 1, 1)"
                 ),
-                params![agent, PARSER_REVISION],
+                params![
+                    agent,
+                    PARSER_REVISION,
+                    if journal { "opencode:main" } else { "test" }
+                ],
             )
             .unwrap();
         assert_eq!(
@@ -1701,13 +2584,307 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
             .unwrap();
         assert!(
             report(&request).waiting_for_events.is_none(),
-            "{agent}: old parser needs fresh reset admission"
+            "{agent}: an unknown parser cannot promise more events"
         );
         request.computed_at_epoch = 280;
         assert_eq!(
             report(&request).waiting_for_data_count,
-            1,
-            "{agent}: active reset can recover"
+            0,
+            "{agent}: an unknown parser cannot reset an active source"
         );
+        request.computed_at_epoch = 281;
+        store
+            .lock()
+            .execute(
+                &format!("UPDATE {table} SET parser_revision = ?1, incarnation = 6, blocked = 1"),
+                [PARSER_REVISION],
+            )
+            .unwrap();
+        request.computed_at_epoch = 280;
+        assert_eq!(
+            report(&request).waiting_for_data_count,
+            1,
+            "{agent}: an active new incarnation can reset an old blocked NULL receipt"
+        );
+        request.computed_at_epoch = 281;
+        assert_eq!(
+            report(&request).waiting_for_data_count,
+            0,
+            "{agent}: pending work on the old incarnation cannot bypass reset activity"
+        );
+        store
+            .lock()
+            .execute(
+                &format!("UPDATE {table} SET incarnation = 7, blocked = 0"),
+                [],
+            )
+            .unwrap();
+        for revision in [62, 63, 64, 65, 66] {
+            store
+                .lock()
+                .execute(
+                    &format!("UPDATE {table} SET parser_revision = ?1"),
+                    [revision],
+                )
+                .unwrap();
+            assert_eq!(
+                report(&request).waiting_for_data_count,
+                1,
+                "{agent}: parser {revision} keeps admitted pending work"
+            );
+        }
+
+        if agent == "claude-code" {
+            seed_current_claude_origin(&store, "main");
+            apply_ready_publications(&store, adapter, &activation);
+        }
+        let receipt = delivery_receipt(agent, "main");
+        for revision in [63, 64, 65, 66, PARSER_REVISION] {
+            let mut compatible = receipt.clone();
+            if journal {
+                compatible["parser_revision"] = json!(revision);
+            }
+            store
+                .lock()
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET parser_revision = ?1, cursor_json = ?2,
+                 blocked = 0, pending = 1, last_error = NULL"
+                    ),
+                    params![revision, compatible.to_string()],
+                )
+                .unwrap();
+            assert!(
+                receipt_compatible(&store, agent),
+                "{agent}: parser {revision}"
+            );
+            let sessions = current_sessions(&store.lock(), &definition, &request).unwrap();
+            let current = sessions
+                .iter()
+                .find(|session| session.key.agent == agent)
+                .unwrap();
+            assert_eq!(
+                current.ready,
+                agent != "claude-code" || revision >= 65,
+                "{agent}: parser {revision} readiness keeps the Claude origin gate"
+            );
+            assert!(
+                current.data_can_arrive && current.catching_up,
+                "{agent}: parser {revision} keeps known pending work"
+            );
+            assert_eq!(report(&request).waiting_for_data_count, 1);
+        }
+
+        // This fixture checks SQL eligibility. The converter owns the pinned main bodies.
+        let mut main_receipt = receipt.clone();
+        if journal {
+            main_receipt["parser_revision"] = json!(64);
+            main_receipt["live"]["revision"] = json!(2);
+        } else {
+            main_receipt["revision"] = json!(1);
+        }
+        request.computed_at_epoch = 200;
+        store
+            .lock()
+            .execute(
+                &format!(
+                    "UPDATE {table} SET parser_revision = 64, cursor_json = ?1,
+                incarnation = 7, blocked = 0, pending = 1, last_error = NULL"
+                ),
+                [main_receipt.to_string()],
+            )
+            .unwrap();
+        assert!(receipt_compatible(&store, agent));
+        let progress = |request: &ReportRequest| {
+            current_sessions(&store.lock(), &definition, request)
+                .unwrap()
+                .into_iter()
+                .find(|session| session.key.agent == agent)
+                .map(|session| (session.ready, session.data_can_arrive, session.catching_up))
+        };
+        assert_eq!(
+            progress(&request),
+            Some((false, true, true)),
+            "{agent}: the pinned main converter permits pending work, not readiness"
+        );
+        assert_eq!(report(&request).waiting_for_data_count, 1);
+        store
+            .lock()
+            .execute(&format!("UPDATE {table} SET blocked = 1"), [])
+            .unwrap();
+        assert_eq!(
+            progress(&request),
+            Some((false, false, false)),
+            "{agent}: conversion eligibility cannot bypass a blocked source"
+        );
+        store
+            .lock()
+            .execute(
+                &format!(
+                    "UPDATE {table} SET blocked = 0, pending = 0, next_attempt_at_epoch = NULL,
+                observed_generation = (SELECT source_generation FROM session
+                  WHERE environment_key = 'native' AND agent = ?1 AND session_id = 'main')"
+                ),
+                [agent],
+            )
+            .unwrap();
+        assert_eq!(
+            progress(&request),
+            Some((false, false, false)),
+            "{agent}: recent activity alone does not schedule a retained main receipt"
+        );
+        store
+            .lock()
+            .execute(
+                &format!("UPDATE {table} SET next_attempt_at_epoch = 201"),
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            progress(&request),
+            Some((false, true, true)),
+            "{agent}: an existing retry permits conversion catch-up"
+        );
+        store
+            .lock()
+            .execute(
+                &format!(
+                    "UPDATE {table} SET incarnation = 6, blocked = 1, next_attempt_at_epoch = NULL"
+                ),
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            progress(&request),
+            Some((false, true, true)),
+            "{agent}: the existing active-incarnation reset still applies"
+        );
+        request.computed_at_epoch = 281;
+        assert_eq!(
+            progress(&request),
+            None,
+            "{agent}: an inactive reset cannot promise conversion work"
+        );
+        assert_eq!(report(&request).waiting_for_data_count, 0);
+        store
+            .lock()
+            .execute(
+                &format!("UPDATE {table} SET incarnation = 7, blocked = 0, pending = 1"),
+                [],
+            )
+            .unwrap();
+        request.computed_at_epoch = 200;
+        let mut wrong_pair = main_receipt.clone();
+        if journal {
+            wrong_pair["parser_revision"] = json!(65);
+        }
+        let mut wrong_identity = main_receipt.clone();
+        wrong_identity["session_id"] = json!("other");
+        let mut future_parser = receipt.clone();
+        if journal {
+            future_parser["parser_revision"] = json!(PARSER_REVISION + 1);
+        }
+        let mut incompatible_receipts = vec![
+            (65, wrong_pair),
+            (64, wrong_identity),
+            (PARSER_REVISION + 1, future_parser),
+            (
+                65,
+                json!({"revision":5,"parser_revision":65,"live":{"revision":5}}),
+            ),
+            (PARSER_REVISION, json!("not an object")),
+        ];
+        if journal {
+            let mut malformed_baseline = main_receipt.clone();
+            malformed_baseline["live"]["baseline"] = json!(-1);
+            incompatible_receipts.push((64, malformed_baseline));
+            incompatible_receipts.push((65, main_receipt));
+        }
+        for (revision, incompatible) in incompatible_receipts {
+            store
+                .lock()
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET parser_revision = ?1, cursor_json = ?2,
+                 blocked = 0, pending = 1, last_error = NULL"
+                    ),
+                    params![revision, incompatible.to_string()],
+                )
+                .unwrap();
+            assert!(
+                !receipt_compatible(&store, agent),
+                "{agent}: {incompatible}"
+            );
+            let sessions = current_sessions(&store.lock(), &definition, &request).unwrap();
+            let current = sessions
+                .iter()
+                .find(|session| session.key.agent == agent)
+                .unwrap();
+            assert!(
+                !current.ready && !current.data_can_arrive && !current.catching_up,
+                "{agent}: an incompatible receipt is not catch-up before the producer blocks it"
+            );
+            let blocked = report(&request);
+            assert_eq!(blocked.waiting_for_data_count, 0);
+            assert_eq!(blocked.waiting_for_results_count, 0);
+        }
+        store
+            .lock()
+            .execute(
+                &format!(
+                    "UPDATE {table} SET parser_revision = ?1, cursor_json = NULL, pending = 1"
+                ),
+                [PARSER_REVISION],
+            )
+            .unwrap();
+        let sessions = current_sessions(&store.lock(), &definition, &request).unwrap();
+        let fresh = sessions
+            .iter()
+            .find(|session| session.key.agent == agent)
+            .unwrap();
+        assert!(
+            !fresh.ready && fresh.data_can_arrive && fresh.catching_up,
+            "{agent}: a fresh NULL receipt permits pending work but does not prove readiness"
+        );
+        request.computed_at_epoch = 281;
+
+        accept(&store, &definition, "main", 1, Some(StatusResult::Success));
+        if agent != "claude-code" {
+            store
+                .lock()
+                .execute(
+                    "UPDATE session SET cwd = '/workspace/other' WHERE agent = 'claude-code'",
+                    [],
+                )
+                .unwrap();
+            store
+                .lock()
+                .execute(
+                    "UPDATE burn_check_candidate SET session_key_json = json_array('native', ?1, 'main')",
+                    [agent],
+                )
+                .unwrap();
+        }
+        for revision in [PARSER_REVISION, 66, 65, 63, 64, -1] {
+            let mut saved = receipt.clone();
+            if journal {
+                saved["parser_revision"] = json!(revision);
+            }
+            store
+                .lock()
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET parser_revision = ?1, cursor_json = ?2,
+                         pending = 0, last_error = NULL"
+                    ),
+                    params![revision, saved.to_string()],
+                )
+                .unwrap();
+            assert_eq!(
+                report(&request).clean,
+                u64::from(revision != -1 && (agent != "claude-code" || revision >= 65)),
+                "{agent}: parser {revision} controls saved clean-result readiness"
+            );
+        }
     }
 }

@@ -481,6 +481,38 @@ for (const surface of ["terminal", "desktop"] as const) {
   })
 }
 
+for (const columns of [24, 40, 59, 60, 61, 80, 120]) {
+  test(`Desktop meters fill flexible slots at ${columns} columns`, async ($, on) => {
+    fakeEngine(on)
+    await start($)
+    const band = await $.ui.mount({
+      plugin: PLUGIN,
+      surface: "desktop",
+      component: "AbovePrompt",
+      props: props(columns),
+    })
+    expect((await band.find({ key: "usage-band" }))?.props.width).toBe("100%")
+    const meters = await band.find({ key: "usage-meters" })
+    expect(meters?.props.width).toBe(0)
+    expect(meters?.props.flexGrow).toBe(1)
+    expect(meters?.props.minWidth).toBe(0)
+    expect(meters?.props.flexDirection).toBe(columns >= 60 ? "row" : "column")
+    for (const kind of ["five_hour", "seven_day"]) {
+      const slot = await band.find({ key: `meter-${kind}` })
+      expect(slot?.props.width).toBe(columns >= 60 ? 0 : "100%")
+      expect(slot?.props.flexGrow).toBe(1)
+      expect(slot?.props.minWidth).toBe(0)
+      const graphic = (await band.findAll({ type: "Svg" })).find((node) =>
+        String(node.props.alt).startsWith(kind === "five_hour" ? "5-hour:" : "Weekly:"),
+      )
+      expect(graphic?.props.width).toBe(4096)
+      expect(graphic?.props.height).toBe(18)
+      expect(String(graphic?.props.source)).toContain('width="100%"')
+      expect(String(graphic?.props.source)).not.toContain("viewBox=")
+    }
+  })
+}
+
 test("working and stacked terminal layouts retain both quota readings and reset activation", async ($, on) => {
   fakeEngine(on)
   await start($)
@@ -2266,4 +2298,144 @@ for (const lostAccess of ["unsupported", "missing", "error"] as const) {
     expect(reply).toContain("5-hour: 31%.")
     expect(fake.requests).toHaveLength(1)
   })
+}
+
+for (const tier of ["prepend", "append"] as const) {
+  for (const surface of ["terminal", "desktop"] as const) {
+    for (const scenario of [
+      "ready",
+      "constrained",
+      "spacious",
+      "survey",
+      "hidden",
+      "failure",
+    ] as const) {
+      test(
+        `unrelated ${tier} mod survives ${surface} quota ${scenario}`,
+        {
+          plugins: [
+            {
+              name: "unrelated-band",
+              tier,
+              register(on) {
+                on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {
+                  await $.ui.log("unrelated render")
+                  const downstream = await next(e)
+                  const { Box, Text } = $.ui.resolve(e)
+                  return h(
+                    Box,
+                    { key: "unrelated-composition", flexDirection: "column" },
+                    h(Text, { key: "unrelated-content" }, "Unrelated mod"),
+                    downstream,
+                  ) as RenderElement
+                })
+              },
+            },
+          ],
+        },
+        async ($, on) => {
+          const fake = fakeEngine(on)
+          await start($)
+          fake.clockFailure = scenario === "failure"
+          const rows =
+            scenario === "hidden"
+              ? 0
+              : scenario === "constrained"
+                ? 1
+                : scenario === "spacious"
+                  ? 8
+                  : 4
+          const band = await $.ui.mount({
+            plugin: PLUGIN,
+            surface,
+            component: "AbovePrompt",
+            props: props(80, rows, scenario === "survey"),
+          })
+          expect(await band.find({ text: "Unrelated mod" })).toBeDefined()
+          expect(await band.find({ text: "host drawing" })).toBeDefined()
+          expect(fake.renders).toBe(1)
+          expect(fake.logs.filter((line) => line === "unrelated render").length).toBe(1)
+          const visible = !["survey", "hidden", "failure"].includes(scenario)
+          expect((await band.find({ key: "usage-band" })) !== undefined).toBe(visible)
+          if (visible) {
+            const boxes = await band.findAll({ type: "Box" })
+            const own = boxes.findIndex((node) => node.key === "usage-spacing")
+            const other = boxes.findIndex((node) => node.key === "unrelated-composition")
+            expect(own >= 0 && other >= 0).toBe(true)
+            expect(own < other).toBe(tier === "append")
+            expect((await band.find({ key: "usage-spacing" }))?.props.marginTop).toBe(
+              rows < 8 ? 0 : surface === "desktop" ? 0.25 : 1,
+            )
+          }
+          await band.unmount()
+        },
+      )
+    }
+  }
+}
+
+for (const surface of ["terminal", "desktop"] as const) {
+  test(
+    `empty downstream UI retains ${surface} quota`,
+    {
+      plugins: [
+        {
+          name: "empty-band",
+          tier: "append",
+          register(on) {
+            on("ui.render", { component: "AbovePrompt" }, async ($, e) => {
+              await $.ui.log("empty render")
+              const { Box } = $.ui.resolve(e)
+              return h(Box, { key: "empty-downstream" }) as RenderElement
+            })
+          },
+        },
+      ],
+    },
+    async ($, on) => {
+      const fake = fakeEngine(on)
+      await start($)
+      const band = await $.ui.mount({
+        plugin: PLUGIN,
+        surface,
+        component: "AbovePrompt",
+        props: props(),
+      })
+      expect(await band.find({ key: "usage-band" })).toBeDefined()
+      expect(fake.renders).toBe(0)
+      expect(fake.logs.filter((line) => line === "empty render").length).toBe(1)
+    },
+  )
+
+  test(
+    `failed downstream mod forwards once on ${surface}`,
+    {
+      plugins: [
+        {
+          name: "failed-band",
+          tier: "append",
+          register(on) {
+            on("ui.render", { component: "AbovePrompt" }, async ($) => {
+              await $.ui.log("failed render")
+              throw new Error("unrelated render failed")
+            })
+          },
+        },
+      ],
+    },
+    async ($, on) => {
+      const fake = fakeEngine(on)
+      await start($)
+      const band = await $.ui.mount({
+        plugin: PLUGIN,
+        surface,
+        component: "AbovePrompt",
+        props: props(),
+      })
+      expect(await band.find({ text: "host drawing" })).toBeDefined()
+      expect(await band.find({ key: "usage-band" })).toBeDefined()
+      expect(fake.renders).toBe(1)
+      expect(fake.logs.filter((line) => line === "failed render").length).toBe(1)
+    },
+  )
 }

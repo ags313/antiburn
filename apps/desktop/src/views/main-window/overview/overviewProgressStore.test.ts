@@ -104,11 +104,9 @@ it("keeps installed results, work, errors, and waiting states in the Overview pr
     INITIAL_LAST_PASS,
   )
   expect(progress.categories).toHaveLength(2)
-  expect(checkResultStatus(progress.categories[0]!).text).toBe(
-    "Passed · Could not check · Checking",
-  )
-  expect(progress.categories[1]).toMatchObject({ status: "passing", checking: true, clean: 0 })
-  expect(checkResultStatus(progress.categories[1]!).text).toBe("Passed · Checking")
+  expect(checkResultStatus(progress.categories[0]!).text).toBe("Passed · Checking")
+  expect(progress.categories[1]).toMatchObject({ status: "checking", checking: true, clean: 0 })
+  expect(checkResultStatus(progress.categories[1]!).text).toBe("Not assessed · Checking")
 })
 
 describe("first-run result evidence", () => {
