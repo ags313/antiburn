@@ -232,8 +232,21 @@ pub fn remove(
         .iter()
         .filter(|entry| matches(entry, profile, &source))
         .collect::<Vec<_>>();
+    if matching.is_empty() {
+        inspect_change(&receipt.installed, &before, profile, &source, false)?;
+        receipt.removed = true;
+        return transaction::save_receipt(receipt_path, receipt);
+    }
     if matching.len() != 1 || !matching[0].is_string() {
         return Err("owned_entry_changed");
+    }
+    if receipt.installed != before {
+        // A retry uses these bytes to verify an interrupted removal.
+        receipt.installed = before.clone();
+        transaction::save_receipt(receipt_path, receipt)?;
+    }
+    if transaction::read(&receipt.target)?.as_deref() != Some(before.as_slice()) {
+        return Err("concurrent_config_change");
     }
     command(runner, host, env, "remove", &source)?;
     let after = transaction::read(&receipt.target)?.ok_or("native_manager_readback_failed")?;
@@ -325,5 +338,171 @@ mod tests {
             Err("owned_entry_changed")
         );
         assert_eq!(std::fs::read(target).unwrap(), bytes);
+    }
+
+    struct RemoveThenFail {
+        target: PathBuf,
+        after: Vec<u8>,
+    }
+
+    impl Runner for RemoveThenFail {
+        fn run(
+            &self,
+            _: &Path,
+            args: &[String],
+            _: &BTreeMap<String, String>,
+            _: Duration,
+        ) -> std::result::Result<String, ProcessError> {
+            assert_eq!(args[0], "remove");
+            std::fs::write(&self.target, &self.after)
+                .expect("write the interrupted Pi removal result");
+            Err(ProcessError::Failed)
+        }
+    }
+
+    #[test]
+    fn interrupted_removal_retries_without_a_second_native_command() {
+        let temp = tempfile::tempdir().expect("create the interrupted Pi removal fixture");
+        let root = temp
+            .path()
+            .canonicalize()
+            .expect("resolve the interrupted Pi removal fixture");
+        let owned = root.join("owned");
+        std::fs::create_dir(&owned).expect("create the interrupted-removal package directory");
+        let profile = Profile {
+            vendor: Vendor::Pi,
+            root: root.clone(),
+        };
+        let target = root.join("settings.json");
+        let installed = serde_json::to_vec(&serde_json::json!({
+            "packages": ["npm:keep", owned], "unknown": 1,
+        }))
+        .expect("encode the installed Pi package fixture");
+        let mut receipt = Receipt::prepare(
+            target.clone(),
+            Some(br#"{"packages":["npm:keep"],"unknown":1}"#.to_vec()),
+            installed,
+            Vec::new(),
+            "fixture".into(),
+        )
+        .expect("prepare the interrupted Pi removal receipt");
+        receipt.manager_source = Some(owned.clone());
+        receipt.published = true;
+        let receipt_path = root.join("receipt.json");
+        transaction::save_receipt(&receipt_path, &receipt)
+            .expect("save the interrupted Pi removal receipt");
+        let current = serde_json::to_vec(&serde_json::json!({
+            "packages": ["npm:keep", owned], "unknown": 2,
+        }))
+        .expect("encode the user-changed Pi config fixture");
+        std::fs::write(&target, &current).expect("write the user-changed Pi config fixture");
+        let after = br#"{"packages":["npm:keep"],"unknown":2}"#.to_vec();
+        assert_eq!(
+            remove(
+                &profile,
+                Path::new("/unused"),
+                &mut receipt,
+                &receipt_path,
+                &BTreeMap::new(),
+                &RemoveThenFail {
+                    target: target.clone(),
+                    after: after.clone()
+                },
+            ),
+            Err("native_manager_requires_review")
+        );
+        let mut pending = transaction::load_receipt(&receipt_path)
+            .expect("load the interrupted Pi removal receipt")
+            .expect("find the pending Pi removal receipt");
+        assert!(!pending.removed);
+        assert_eq!(pending.installed, current);
+        remove(
+            &profile,
+            Path::new("/unused"),
+            &mut pending,
+            &receipt_path,
+            &BTreeMap::new(),
+            &NoCommands,
+        )
+        .expect("finish the interrupted Pi removal without another command");
+        assert_eq!(
+            std::fs::read(target).expect("read the recovered Pi config"),
+            after
+        );
+        assert!(
+            transaction::load_receipt(&receipt_path)
+                .expect("load the completed Pi removal receipt")
+                .expect("find the completed Pi removal receipt")
+                .removed
+        );
+        assert_eq!(
+            inspect(&profile, &receipt_path).expect("inspect the completed Pi removal"),
+            IntegrationPhase::Disabled
+        );
+    }
+
+    #[test]
+    fn absent_package_recovery_refuses_changed_config_and_package_entries() {
+        let temp = tempfile::tempdir().expect("create the changed Pi recovery fixture");
+        let root = temp
+            .path()
+            .canonicalize()
+            .expect("resolve the changed Pi recovery fixture");
+        let owned = root.join("owned");
+        std::fs::create_dir(&owned).expect("create the changed-recovery package directory");
+        let profile = Profile {
+            vendor: Vendor::Pi,
+            root: root.clone(),
+        };
+        let target = root.join("settings.json");
+        let installed = serde_json::to_vec(&serde_json::json!({
+            "packages": ["npm:keep", owned], "unknown": 1,
+        }))
+        .expect("encode the pre-removal Pi config fixture");
+        let mut receipt = Receipt::prepare(
+            target.clone(),
+            Some(b"{}".to_vec()),
+            installed,
+            Vec::new(),
+            "fixture".into(),
+        )
+        .expect("prepare the changed Pi recovery receipt");
+        receipt.manager_source = Some(owned.clone());
+        receipt.published = true;
+        let receipt_path = root.join("receipt.json");
+        transaction::save_receipt(&receipt_path, &receipt)
+            .expect("save the changed Pi recovery receipt");
+        let saved =
+            std::fs::read(&receipt_path).expect("read the receipt before changed-config recovery");
+        for changed in [
+            serde_json::json!({"packages":["npm:keep"], "unknown": 2}),
+            serde_json::json!({"packages":["npm:different"], "unknown": 1}),
+            serde_json::json!({"packages":["npm:keep", {"source": owned, "extensions":[]}], "unknown":1}),
+            serde_json::json!({"packages":["npm:keep", "/user/package"], "unknown":1}),
+        ] {
+            let bytes =
+                serde_json::to_vec(&changed).expect("encode the unsafe Pi recovery config fixture");
+            std::fs::write(&target, &bytes).expect("write the unsafe Pi recovery config fixture");
+            assert!(
+                remove(
+                    &profile,
+                    Path::new("/unused"),
+                    &mut receipt,
+                    &receipt_path,
+                    &BTreeMap::new(),
+                    &NoCommands,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                std::fs::read(&target).expect("read the unchanged unsafe Pi recovery config"),
+                bytes
+            );
+            assert_eq!(
+                std::fs::read(&receipt_path).expect("read the receipt after refused Pi recovery"),
+                saved
+            );
+            assert!(!receipt.removed);
+        }
     }
 }

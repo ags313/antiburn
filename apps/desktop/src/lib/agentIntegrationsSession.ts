@@ -6,96 +6,101 @@ import {
   type IntegrationStatus,
   type IntegrationVendor,
 } from "./agentIntegrationsIpc"
+import { createExternalStore } from "./externalStore"
 
-type Snapshot = { statuses: IntegrationStatus[]; busy: boolean; error: string | null }
+type OperationState = { busy: boolean; error: string | null }
+type Snapshot = OperationState & { statuses: IntegrationStatus[] }
 
 export class AgentIntegrationsSession {
-  private listeners = new Set<() => void>()
+  private operation = 0
+  private subscribers = 0
+  private readonly state = createExternalStore<OperationState>({
+    initial: { busy: false, error: null },
+  })
+  private readonly statuses = createExternalStore<IntegrationStatus[]>({
+    initial: [],
+    load: () => this.request(getAgentIntegrations),
+    subscribe: (set) => {
+      this.operation += 1
+      this.state.set({ busy: true, error: null })
+      return onAgentIntegrationsChanged(set)
+    },
+  })
   private snapshot: Snapshot = { statuses: [], busy: false, error: null }
-  private started = false
-  private generation = 0
-  private stopListening: (() => void) | null = null
-  private refreshPending = false
 
-  getSnapshot = (): Snapshot => this.snapshot
+  getSnapshot = (): Snapshot => {
+    const statuses = this.statuses.getSnapshot()
+    const state = this.state.getSnapshot()
+    if (
+      this.snapshot.statuses !== statuses ||
+      this.snapshot.busy !== state.busy ||
+      this.snapshot.error !== state.error
+    )
+      this.snapshot = { statuses, ...state }
+    return this.snapshot
+  }
 
   subscribe = (listener: () => void): (() => void) => {
-    this.listeners.add(listener)
-    if (!this.started) {
-      this.started = true
-      const generation = ++this.generation
-      void this.start(generation)
-    }
+    this.subscribers += 1
+    const stopState = this.state.subscribe(listener)
+    const stopStatuses = this.statuses.subscribe(listener)
+    let subscribed = true
     return () => {
-      this.listeners.delete(listener)
-      if (this.listeners.size === 0) {
-        this.started = false
-        this.generation += 1
-        this.stopListening?.()
-        this.stopListening = null
-      }
+      if (!subscribed) return
+      subscribed = false
+      this.subscribers -= 1
+      if (this.subscribers === 0) this.operation += 1
+      stopStatuses()
+      stopState()
     }
   }
 
   reportNavigationError = (): void =>
-    this.publish({
-      ...this.snapshot,
+    this.state.set({
+      ...this.state.getSnapshot(),
       error: "Could not open CLI settings. Try again from Settings.",
     })
 
   repair = (vendor: IntegrationVendor): Promise<void> =>
-    this.run(() => repairAgentIntegration(vendor))
+    this.run(() => repairAgentIntegration(vendor), true)
   remove = (vendor: IntegrationVendor): Promise<void> =>
-    this.run(() => removeAgentIntegration(vendor))
-  refresh = async (): Promise<void> => {
-    if (this.snapshot.busy) {
-      this.refreshPending = true
-      return
-    }
-    await this.run(getAgentIntegrations)
-  }
+    this.run(() => removeAgentIntegration(vendor), true)
+  refresh = (): Promise<void> => this.run(getAgentIntegrations)
 
-  private async start(generation: number): Promise<void> {
-    try {
-      const stop = await onAgentIntegrationsChanged(() => {
-        if (generation === this.generation) void this.refresh()
-      })
-      if (generation !== this.generation) {
-        stop()
-        return
+  private async run(
+    action: () => Promise<IntegrationStatus[]>,
+    reconcileOnError = false,
+  ): Promise<void> {
+    if (this.state.getSnapshot().busy) return
+    const operation = this.operation + 1
+    await this.request(async () => {
+      try {
+        await this.statuses.refresh(action)
+      } catch (error) {
+        if (reconcileOnError && operation === this.operation)
+          await this.statuses.refresh(getAgentIntegrations).catch(() => undefined)
+        throw error
       }
-      this.stopListening = stop
-    } catch {
-      // The status request remains available when event registration fails.
-    }
-    if (generation === this.generation) await this.refresh()
+    }).catch(() => undefined)
   }
 
-  private async run(action: () => Promise<IntegrationStatus[]>): Promise<void> {
-    if (this.snapshot.busy) return
-    const generation = this.generation
-    this.publish({ ...this.snapshot, busy: true, error: null })
-    let next: Snapshot
+  private async request<T>(action: () => Promise<T>): Promise<T> {
+    const operation = ++this.operation
+    this.state.set({ busy: true, error: null })
     try {
-      const statuses = await action()
-      next = { statuses, busy: false, error: null }
-    } catch {
-      next = {
-        ...this.snapshot,
-        busy: false,
-        error: "Could not update agent integrations. Try again.",
+      return await action()
+    } catch (error) {
+      if (operation === this.operation) {
+        this.state.set({
+          busy: true,
+          error: "Could not update agent integrations. Try again.",
+        })
       }
+      throw error
+    } finally {
+      if (operation === this.operation)
+        this.state.set({ ...this.state.getSnapshot(), busy: false })
     }
-    this.publish(generation === this.generation ? next : { ...this.snapshot, busy: false })
-    if (this.refreshPending) {
-      this.refreshPending = false
-      if (this.started) await this.refresh()
-    }
-  }
-
-  private publish(snapshot: Snapshot): void {
-    this.snapshot = snapshot
-    for (const listener of this.listeners) listener()
   }
 }
 

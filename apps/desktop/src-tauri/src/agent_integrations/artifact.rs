@@ -4,7 +4,24 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::Vendor;
 use super::transaction::{self, Result, digest};
+
+pub(super) fn vendor_directory(vendor: Vendor) -> &'static str {
+    match vendor {
+        Vendor::Claude => "claude",
+        Vendor::Codex => "codex",
+        Vendor::Cursor => "cursor",
+        Vendor::OpenCode => "opencode",
+        Vendor::Pi => "pi",
+    }
+}
+
+fn connection_paths() -> impl Iterator<Item = PathBuf> {
+    Vendor::ALL
+        .into_iter()
+        .map(|vendor| PathBuf::from(vendor_directory(vendor)).join("lib/connection.json"))
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,8 +103,8 @@ impl Artifact {
                 Some(_) => return Err("owned_artifact_changed"),
             }
         }
-        for vendor in ["claude", "codex", "cursor", "opencode", "pi"] {
-            let path = pending.join(vendor).join("lib/connection.json");
+        for relative in connection_paths() {
+            let path = pending.join(relative);
             match transaction::read(&path)? {
                 None => transaction::publish(&path, None, &encoded)?,
                 Some(current) if current == encoded => (),
@@ -105,9 +122,7 @@ impl Artifact {
             .iter()
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
-        for vendor in ["claude", "codex", "cursor", "opencode", "pi"] {
-            expected.push(PathBuf::from(vendor).join("lib/connection.json"));
-        }
+        expected.extend(connection_paths());
         let mut actual = Vec::new();
         inventory(destination, Path::new(""), &mut actual, &mut 128, 0)?;
         actual.sort();
@@ -120,10 +135,8 @@ impl Artifact {
                 return Err("owned_artifact_changed");
             }
         }
-        for vendor in ["claude", "codex", "cursor", "opencode", "pi"] {
-            if transaction::read(&destination.join(vendor).join("lib/connection.json"))?.as_deref()
-                != Some(connection)
-            {
+        for path in connection_paths() {
+            if transaction::read(&destination.join(path))?.as_deref() != Some(connection) {
                 return Err("owned_artifact_changed");
             }
         }
@@ -232,11 +245,11 @@ mod tests {
         transaction::private_directory(&state).unwrap();
         let artifact = Artifact {
             hash: digest(b"fixture"),
-            files: ["claude", "codex", "cursor", "opencode", "pi"]
+            files: Vendor::ALL
                 .into_iter()
                 .map(|vendor| {
                     (
-                        PathBuf::from(vendor).join("lib/core.mjs"),
+                        PathBuf::from(vendor_directory(vendor)).join("lib/core.mjs"),
                         b"export {}".to_vec(),
                     )
                 })
@@ -246,6 +259,14 @@ mod tests {
         let destination = artifact.stage(&state, &connection).unwrap();
         assert_eq!(artifact.stage(&state, &connection).unwrap(), destination);
         let encoded = serde_json::to_vec(&connection).unwrap();
+        assert_eq!(connection_paths().count(), Vendor::ALL.len());
+        for path in connection_paths() {
+            assert_eq!(
+                fs::read(destination.join(path))
+                    .expect("read the staged vendor connection fixture"),
+                encoded
+            );
+        }
         let pending = state.join(format!(
             ".{}-{}.pending",
             &artifact.hash[..16],

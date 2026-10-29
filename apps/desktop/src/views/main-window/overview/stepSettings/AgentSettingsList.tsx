@@ -33,13 +33,11 @@ export interface AgentSettingsRow {
 export function AgentSettingsList({
   rows,
   busy,
-  shared,
   onOpenCli,
   onEnabledChange,
 }: {
   rows: AgentSettingsRow[]
   busy: boolean
-  shared: boolean
   onOpenCli: () => void
   onEnabledChange: (slug: string, enabled: boolean) => void
 }) {
@@ -53,7 +51,6 @@ export function AgentSettingsList({
           expanded={expanded?.slug === row.slug}
           tab={expanded?.slug === row.slug ? expanded.tab : undefined}
           busy={busy}
-          shared={shared}
           onOpenCli={onOpenCli}
           onToggle={() =>
             setExpanded(
@@ -73,7 +70,6 @@ function AgentRow({
   expanded,
   tab,
   busy,
-  shared,
   onOpenCli,
   onToggle,
   onTab,
@@ -83,7 +79,6 @@ function AgentRow({
   expanded: boolean
   tab: AgentTab | undefined
   busy: boolean
-  shared: boolean
   onOpenCli: () => void
   onToggle: () => void
   onTab: (tab: AgentTab) => void
@@ -335,7 +330,6 @@ function AgentRow({
                     status={row.connection}
                     name={name}
                     busy={busy}
-                    shared={shared}
                     onOpenCli={onOpenCli}
                     onFocusIntegration={() => integrationTab.current?.focus()}
                   />

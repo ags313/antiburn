@@ -2,7 +2,8 @@ mod probe;
 
 use crate::analytics::{self, event::CliOperation};
 pub use antiburn_cli_runtime::{CliInstallState, CliRuntime};
-use antiburn_cli_runtime::{Installation, file_name};
+use antiburn_cli_runtime::{Installation, RuntimeDigestCache, file_name};
+use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 
 fn installation(app: &tauri::AppHandle) -> Result<Installation, String> {
@@ -37,7 +38,16 @@ pub fn resolve_cli(app: &tauri::AppHandle) -> Result<CliRuntime, String> {
     installation(app)?.resolve().map_err(|e| e.to_string())
 }
 
+pub fn inspect_cli(app: &tauri::AppHandle) -> Result<CliRuntime, String> {
+    let cache = app.state::<Mutex<RuntimeDigestCache>>();
+    let mut cache = cache.lock().map_err(|e| e.to_string())?;
+    installation(app)?
+        .resolve_cached(&mut cache)
+        .map_err(|e| e.to_string())
+}
+
 pub fn start(app: &tauri::AppHandle) {
+    app.manage(Mutex::new(RuntimeDigestCache::default()));
     // Source and debug builds stage the runtime only through explicit repair.
     if !cfg!(feature = "distribution") || cfg!(debug_assertions) {
         return;

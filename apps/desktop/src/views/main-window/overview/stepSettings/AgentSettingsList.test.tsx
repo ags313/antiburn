@@ -52,7 +52,6 @@ function setup(overrides: Partial<Parameters<typeof AgentSettingsList>[0]> = {})
     <AgentSettingsList
       rows={rows}
       busy={false}
-      shared={false}
       onOpenCli={vi.fn()}
       onEnabledChange={change}
       {...overrides}
@@ -314,7 +313,6 @@ describe("integration badge semantics", () => {
         status={{ ...status, phase: "unavailable", reason: "managed_cli_unavailable" }}
         name="Codex"
         busy={false}
-        shared={false}
         onOpenCli={vi.fn()}
         onFocusIntegration={vi.fn()}
       />,

@@ -579,6 +579,66 @@ fn disabled_policies_duplicates_and_malformed_configs_are_unchanged() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn registered_claude_hooks_report_disabled_after_either_policy_changes() {
+    for policy in ["disableAllHooks", "allowManagedHooksOnly"] {
+        let fixture = Fixture::new();
+        let profile = fixture.profile(Vendor::Claude);
+        let target = profile.root.join("settings.json");
+        let original = format!(r#"{{"{policy}":false}}"#);
+        fs::write(&target, original).expect("write the initial Claude policy fixture");
+        let installation = fixture.installation();
+        installation
+            .reconcile_config(
+                &profile,
+                Some(&node()),
+                Path::new("/artifact"),
+                "one",
+                cli(),
+            )
+            .expect("register the Claude hooks before disabling policy");
+        let disabled = fs::read_to_string(&target)
+            .expect("read the registered Claude hooks fixture")
+            .replace(
+                &format!(r#""{policy}":false"#),
+                &format!(r#""{policy}":true"#),
+            );
+        fs::write(&target, &disabled).expect("enable the disabling Claude policy fixture");
+        let receipt_path = fixture.state.join("claude-receipt.json");
+        let receipt =
+            fs::read(&receipt_path).expect("read the receipt before disabled-policy inspection");
+        assert_eq!(
+            installation
+                .inspect_profile(&profile)
+                .expect("inspect the disabled Claude policy"),
+            IntegrationPhase::Disabled
+        );
+        for binding in ["one", "two"] {
+            assert_eq!(
+                installation
+                    .reconcile_config(
+                        &profile,
+                        Some(&node()),
+                        Path::new("/artifact"),
+                        binding,
+                        cli(),
+                    )
+                    .expect("reconcile the disabled Claude policy without writing"),
+                IntegrationPhase::Disabled
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(target).expect("read the unchanged disabled Claude config"),
+            disabled
+        );
+        assert_eq!(
+            fs::read(receipt_path).expect("read the unchanged disabled Claude receipt"),
+            receipt
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn prepared_but_unpublished_transaction_requires_repair_and_keeps_original() {
     let fixture = Fixture::new();
     let profile = fixture.profile(Vendor::Codex);

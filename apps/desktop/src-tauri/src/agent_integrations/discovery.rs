@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::provider_usage::live::sources::cli_locator::{is_executable, version_bin_dirs};
+
 use super::Vendor;
 use super::process::{PROBE_TIMEOUT, Runner};
 
@@ -99,45 +101,11 @@ pub fn search_directories(home: &Path, env: &BTreeMap<String, String>) -> Vec<Pa
         home.join(".local/share/mise/installs/node"),
         home.join(".asdf/installs/nodejs"),
     ] {
-        if let Ok(entries) = std::fs::read_dir(root) {
-            let mut versions = entries
-                .take(16)
-                .filter_map(std::result::Result::ok)
-                .filter(|entry| {
-                    entry.file_name().to_str().is_some_and(|name| {
-                        name.len() < 32
-                            && name
-                                .bytes()
-                                .all(|byte| byte.is_ascii_digit() || b"v.-".contains(&byte))
-                    })
-                })
-                .map(|entry| entry.path().join("bin"))
-                .collect::<Vec<_>>();
-            versions.sort();
-            versions.reverse();
-            directories.extend(versions.into_iter().take(8));
-        }
+        directories.extend(version_bin_dirs(&root, 8));
     }
     let mut seen = BTreeSet::new();
     directories.retain(|p| seen.insert(p.clone()));
     directories
-}
-
-fn executable(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return false;
-        }
-    }
-    true
 }
 
 pub fn find_node(directories: &[PathBuf], runner: &impl Runner) -> Option<Runtime> {
@@ -147,7 +115,7 @@ pub fn find_node(directories: &[PathBuf], runner: &impl Runner) -> Option<Runtim
             break;
         }
         let candidate = directory.join(if cfg!(windows) { "node.exe" } else { "node" });
-        if !candidate.is_absolute() || !executable(&candidate) {
+        if !candidate.is_absolute() || !is_executable(&candidate) {
             continue;
         }
         let Ok(path) = candidate.canonicalize() else {
@@ -173,7 +141,7 @@ pub fn find_node(directories: &[PathBuf], runner: &impl Runner) -> Option<Runtim
         let Ok(path) = probe.executable.canonicalize() else {
             continue;
         };
-        if compatible_node(&probe.version) && path.is_absolute() && executable(&path) {
+        if compatible_node(&probe.version) && path.is_absolute() && is_executable(&path) {
             return Some(Runtime {
                 executable: path,
                 version: probe.version,
@@ -207,13 +175,132 @@ pub fn find_host(vendor: Vendor, directories: &[PathBuf]) -> Option<PathBuf> {
         .iter()
         .take(80)
         .map(|directory| directory.join(name))
-        .find(|path| path.is_absolute() && executable(path))
+        .find(|path| path.is_absolute() && is_executable(path))
     // Keep the vendor launcher so its own runtime setup remains intact.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn touch_executable(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn version_managers_select_newest_versions_after_filtering_all_entries() {
+        let home = tempfile::tempdir().unwrap();
+        for (manager, prefix) in [
+            (".nvm/versions/node", "v"),
+            (".local/share/mise/installs/node", ""),
+            (".asdf/installs/nodejs", ""),
+        ] {
+            let root = home.path().join(manager);
+            for index in 0..24 {
+                std::fs::create_dir_all(root.join(format!("alias-{index}"))).unwrap();
+                std::fs::create_dir_all(root.join(format!("{prefix}9.0.{index}/bin"))).unwrap();
+            }
+            for version in ["22.0.0", "22.1.0"] {
+                std::fs::create_dir_all(root.join(format!("{prefix}{version}/bin"))).unwrap();
+            }
+        }
+
+        let directories = search_directories(home.path(), &BTreeMap::new());
+        assert_eq!(
+            directories,
+            search_directories(home.path(), &BTreeMap::new())
+        );
+        for (manager, prefix) in [
+            (".nvm/versions/node", "v"),
+            (".local/share/mise/installs/node", ""),
+            (".asdf/installs/nodejs", ""),
+        ] {
+            let root = home.path().join(manager);
+            let versions = directories
+                .iter()
+                .filter(|path| path.starts_with(&root) && !path.ends_with("lts/bin"))
+                .collect::<Vec<_>>();
+            assert_eq!(versions.len(), 8);
+            assert_eq!(versions[0], &root.join(format!("{prefix}22.1.0/bin")));
+            assert_eq!(versions[1], &root.join(format!("{prefix}22.0.0/bin")));
+            assert_eq!(versions[2], &root.join(format!("{prefix}9.0.23/bin")));
+        }
+    }
+
+    #[test]
+    fn a_compatible_node_is_found_after_more_than_16_older_installs() {
+        struct ProbeRunner;
+        impl Runner for ProbeRunner {
+            fn run(
+                &self,
+                executable: &Path,
+                _: &[String],
+                _: &BTreeMap<String, String>,
+                _: Duration,
+            ) -> Result<String, super::super::process::ProcessError> {
+                let version = executable
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                Ok(serde_json::json!({"version": version, "executable": executable}).to_string())
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".nvm/versions/node");
+        let binary = if cfg!(windows) { "node.exe" } else { "node" };
+        for index in 0..24 {
+            touch_executable(&root.join(format!("v9.0.{index}/bin/{binary}")));
+        }
+        let compatible = root.join("v22.0.0/bin").join(binary);
+        touch_executable(&compatible);
+        let directories = search_directories(home.path(), &BTreeMap::new())
+            .into_iter()
+            .filter(|path| path.starts_with(&root))
+            .collect::<Vec<_>>();
+
+        let runtime = find_node(&directories, &ProbeRunner).unwrap();
+        assert_eq!(runtime.version, "v22.0.0");
+        assert_eq!(runtime.executable, compatible.canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_discovery_uses_the_shared_executable_rules_and_preserves_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let non_executable = root.path().join("stray");
+        std::fs::create_dir(&non_executable).unwrap();
+        std::fs::write(non_executable.join("claude"), b"not executable").unwrap();
+        let directory = root.path().join("directory");
+        std::fs::create_dir_all(directory.join("claude")).unwrap();
+        let installed = root.path().join("installed");
+        touch_executable(&installed.join("native"));
+        symlink(installed.join("native"), installed.join("claude")).unwrap();
+
+        assert!(!is_executable(&non_executable.join("claude")));
+        assert!(!is_executable(&directory.join("claude")));
+        assert!(is_executable(&installed.join("claude")));
+        assert_eq!(
+            find_host(
+                Vendor::Claude,
+                &[non_executable, directory, installed.clone()]
+            ),
+            Some(installed.join("claude"))
+        );
+    }
 
     #[test]
     fn node_requires_a_stable_numeric_release_at_least_22() {
@@ -234,20 +321,22 @@ mod tests {
 
     #[test]
     fn saved_profile_wins_over_changed_gui_environment() {
+        let home = tempfile::tempdir().unwrap();
+        let other = home.path().join("profiles/other");
         let saved = Profile {
             vendor: Vendor::Codex,
-            root: "/profiles/selected".into(),
+            root: home.path().join("profiles/selected"),
         };
-        let env = BTreeMap::from([("CODEX_HOME".into(), "/profiles/other".into())]);
+        let env = BTreeMap::from([("CODEX_HOME".into(), other.to_str().unwrap().into())]);
         assert_eq!(
-            profile(Vendor::Codex, Path::new("/home/test"), &env, Some(&saved)).unwrap(),
+            profile(Vendor::Codex, home.path(), &env, Some(&saved)).unwrap(),
             saved
         );
         assert_eq!(
-            profile(Vendor::Codex, Path::new("/home/test"), &env, None)
+            profile(Vendor::Codex, home.path(), &env, None)
                 .unwrap()
                 .root,
-            Path::new("/profiles/other")
+            other
         );
     }
 

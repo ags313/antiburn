@@ -40,10 +40,14 @@ export async function removeAgentIntegration(
   return invoke("remove_agent_integration", { vendor })
 }
 
-export async function onAgentIntegrationsChanged(callback: () => void): Promise<() => void> {
+export async function onAgentIntegrationsChanged(
+  callback: (statuses: IntegrationStatus[]) => void,
+): Promise<() => void> {
   if (!isTauri())
     return () => {
       // Browser previews have no native event subscription to release.
     }
-  return listen("agent-integrations:changed", callback)
+  return listen<IntegrationStatus[]>("agent-integrations:changed", (event) =>
+    callback(event.payload),
+  )
 }

@@ -113,14 +113,12 @@ export function AgentConnectionDetails({
   status,
   name,
   busy,
-  shared,
   onOpenCli,
   onFocusIntegration,
 }: {
   status: IntegrationStatus
   name: string
   busy: boolean
-  shared: boolean
   onOpenCli: () => void
   onFocusIntegration: () => void
 }) {
@@ -206,96 +204,94 @@ export function AgentConnectionDetails({
       aria-label={`${name} Antiburn integration`}
       aria-busy={busy}
     >
-      {!shared && (
-        <div className="space-y-2">
-          <p
-            className={`font-semibold! ${tone === "attention" ? "agent-settings-badge-attention" : tone === "success" ? "agent-settings-badge-success" : "text-label"}`}
-          >
-            {integrationTitle(status)}
+      <div className="space-y-2">
+        <p
+          className={`font-semibold! ${tone === "attention" ? "agent-settings-badge-attention" : tone === "success" ? "agent-settings-badge-success" : "text-label"}`}
+        >
+          {integrationTitle(status)}
+        </p>
+        {needsApproval ? (
+          <ol className="list-decimal space-y-1 pl-5 text-label-secondary">
+            <li>Open {host}.</li>
+            <li>Approve Antiburn when prompted.</li>
+            <li>Restart or reload {host}.</li>
+          </ol>
+        ) : !connected ? (
+          <p className="text-pretty text-label-secondary">
+            {integrationDescription(status, host)}
           </p>
-          {needsApproval ? (
-            <ol className="list-decimal space-y-1 pl-5 text-label-secondary">
-              <li>Open {host}.</li>
-              <li>Approve Antiburn when prompted.</li>
-              <li>Restart or reload {host}.</li>
-            </ol>
-          ) : !connected ? (
-            <p className="text-pretty text-label-secondary">
-              {integrationDescription(status, host)}
-            </p>
-          ) : null}
-          {status.reason === "managed_cli_unavailable" && (
-            <PushButton onClick={onOpenCli}>Open CLI settings</PushButton>
-          )}
-          {(canRefresh || canRepair) && (
-            <div
-              role="group"
-              aria-label={`${name} integration maintenance`}
-              className="flex flex-wrap items-center gap-x-2 gap-y-6 pt-1"
-            >
-              {canRefresh && (
-                <button
-                  type="button"
-                  aria-label={`Refresh ${name} integration status`}
-                  aria-busy={refreshing}
-                  className="agent-integration-maintenance ui-push-button gap-1.5 whitespace-nowrap aria-disabled:opacity-50"
-                  aria-disabled={busy}
-                  onClick={(event) => {
-                    if (!busy)
-                      void runAction(
-                        () => agentIntegrationsSession.refresh(),
-                        event.currentTarget,
-                        "refresh",
-                      )
-                  }}
-                >
-                  <RefreshCw
-                    size={12}
-                    aria-hidden="true"
-                    className={refreshing ? "motion-safe:animate-spin" : undefined}
-                  />
-                  Refresh status
-                </button>
-              )}
-              {canRepair && (
-                <button
-                  type="button"
-                  aria-label={`Repair ${name} integration`}
-                  aria-busy={repairing}
-                  className="agent-integration-repair agent-integration-maintenance ui-push-button gap-1.5 whitespace-nowrap aria-disabled:opacity-50"
-                  aria-disabled={busy}
-                  onClick={(event) => {
-                    if (!busy)
-                      void runAction(
-                        () => agentIntegrationsSession.repair(status.vendor),
-                        event.currentTarget,
-                        "repair",
-                      )
-                  }}
-                >
-                  <RepairIcon
-                    size={12}
-                    aria-hidden="true"
-                    className={repairing ? "shrink-0 motion-safe:animate-spin" : "shrink-0"}
-                  />
-                  <span>{repairing ? "Repairing…" : "Repair setup"}</span>
-                </button>
-              )}
-            </div>
-          )}
-          <p
-            role="status"
-            aria-atomic="true"
-            className="min-h-lh type-caption text-label-secondary"
+        ) : null}
+        {status.reason === "managed_cli_unavailable" && (
+          <PushButton onClick={onOpenCli}>Open CLI settings</PushButton>
+        )}
+        {(canRefresh || canRepair) && (
+          <div
+            role="group"
+            aria-label={`${name} integration maintenance`}
+            className="flex flex-wrap items-center gap-x-2 gap-y-6 pt-1"
           >
-            {refreshing
-              ? "Checking integration status…"
-              : repairing
-                ? "Repairing integration setup…"
-                : feedbackMessage}
-          </p>
-        </div>
-      )}
+            {canRefresh && (
+              <button
+                type="button"
+                aria-label={`Refresh ${name} integration status`}
+                aria-busy={refreshing}
+                className="agent-integration-maintenance ui-push-button gap-1.5 whitespace-nowrap aria-disabled:opacity-50"
+                aria-disabled={busy}
+                onClick={(event) => {
+                  if (!busy)
+                    void runAction(
+                      () => agentIntegrationsSession.refresh(),
+                      event.currentTarget,
+                      "refresh",
+                    )
+                }}
+              >
+                <RefreshCw
+                  size={12}
+                  aria-hidden="true"
+                  className={refreshing ? "motion-safe:animate-spin" : undefined}
+                />
+                Refresh status
+              </button>
+            )}
+            {canRepair && (
+              <button
+                type="button"
+                aria-label={`Repair ${name} integration`}
+                aria-busy={repairing}
+                className="agent-integration-repair agent-integration-maintenance ui-push-button gap-1.5 whitespace-nowrap aria-disabled:opacity-50"
+                aria-disabled={busy}
+                onClick={(event) => {
+                  if (!busy)
+                    void runAction(
+                      () => agentIntegrationsSession.repair(status.vendor),
+                      event.currentTarget,
+                      "repair",
+                    )
+                }}
+              >
+                <RepairIcon
+                  size={12}
+                  aria-hidden="true"
+                  className={repairing ? "shrink-0 motion-safe:animate-spin" : "shrink-0"}
+                />
+                <span>{repairing ? "Repairing…" : "Repair setup"}</span>
+              </button>
+            )}
+          </div>
+        )}
+        <p
+          role="status"
+          aria-atomic="true"
+          className="min-h-lh type-caption text-label-secondary"
+        >
+          {refreshing
+            ? "Checking integration status…"
+            : repairing
+              ? "Repairing integration setup…"
+              : feedbackMessage}
+        </p>
+      </div>
       <details className="group border-t border-separator">
         <summary className="agent-integration-maintenance flex cursor-default list-none items-center gap-1.5 rounded-control text-label-secondary hover:text-label [&::-webkit-details-marker]:hidden">
           <ChevronRight size={12} className="group-open:rotate-90" aria-hidden="true" />

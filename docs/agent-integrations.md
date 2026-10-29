@@ -14,6 +14,11 @@ as `ANTIBURN_EXECUTABLE`; each JavaScript runtime also supplies that override in
 the CLI child's environment. Pi and OpenCode use the same per-call binding
 without changing the host process environment.
 
+Repeated status reads on macOS APFS reuse the binary digest only while its path,
+file identity, size, modification time, and change time match. Each read still
+checks the receipt and ownership policy. Other filesystems and platforms keep
+full binary verification. Setup and Repair always verify the binary in full.
+
 Managed integrations use the receipt-validated absolute CLI path without a terminal
 export. Fresh installations do not publish a terminal command; receipt-owned legacy
 exports are retired. Unmanaged plugin discovery accepts both `antiburn-cli` and the
@@ -24,7 +29,8 @@ no terminal shortcut, and an injected absolute `ANTIBURN_EXECUTABLE`, including
 acknowledgement. This does not establish native host acceptance. Source and debug
 builds do not install agent integrations. Managed integrations keep working
 without a terminal shortcut. If the internal executable becomes unavailable,
-callbacks fail quietly. Each integration has a separate Remove control.
+callbacks fail quietly. Settings offers status refresh and repair, but no integration
+removal control.
 
 ## Routes and runtime boundaries
 
@@ -57,6 +63,14 @@ The host's own version probe can create vendor state. Native acceptance must
 verify those probes under the selected profile before any route is enabled.
 All development probes, including `--help` and `--version`, must use disposable
 HOME and agent-specific profile directories.
+
+On Unix, a version probe can resolve an existing Volta layout-v4 command and its
+pinned Node without running the shim. This uses the metadata shape in
+[Volta 2.0.2](https://github.com/volta-cli/volta/blob/e83f04ccd79be994c0e65c0bb56838fbcda6fcf9/crates/volta-core/src/tool/package/metadata.rs)
+and its [installed paths](https://github.com/volta-cli/volta/blob/e83f04ccd79be994c0e65c0bb56838fbcda6fcf9/crates/volta-layout/src/v4.rs).
+The probe does not run Volta hooks or download tools. Missing tools, unknown
+metadata, or paths outside the installed image require review. This does not
+establish native delivery support or support for other runtime managers.
 
 ## Ownership and recovery
 
@@ -104,8 +118,8 @@ changed, and unavailable states. Registration does not claim activation. This
 implementation does not emit `active`: host context delivery needs separate
 native evidence. Status refresh is read-only; repair and removal are explicit
 Agents-view IPC actions. CLI Repair emits its resulting state so integration
-reconciliation can resume. Settings queues status reads while another operation
-is busy and discards responses from an earlier subscription. Paths and raw
+reconciliation can resume. Settings applies returned snapshots and change events
+without another full read. It discards responses from an earlier subscription. Paths and raw
 backend errors are not rendered in the Settings descriptions. Installation
 analytics are intentionally deferred while
 all native routes remain gated; this leaves an acknowledged measurement gap.
@@ -187,5 +201,9 @@ a connection does not remove the shared runtime.
 
 Refresh connections inspects current profile/configuration and receipt ownership
 without staging artifacts, changing vendor configuration, or repairing receipts.
+Closed routes do not run host or Node probes. An accepted route uses disposable
+HOME, profile, and XDG directories for its host version probe. The probe runs
+outside projects, with `/` as its working directory. Host probes share a
+four-second budget. Inspection does not probe Node.
 Interrupted installation needs explicit repair. Development builds keep setup
 unavailable. Unsupported native routes remain gated.

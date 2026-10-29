@@ -204,12 +204,11 @@ test('desktop assembly rejects a missing or repeated managed marker before publi
   try {
     await mkdir(join(root, 'scripts'))
     await mkdir(join(root, 'packages/antiburn-plugin-core'), { recursive: true })
-    await writeFile(
-      join(root, 'scripts/assemble-agent-integrations.mjs'),
-      await readFile(
-        new URL('../../../scripts/assemble-agent-integrations.mjs', import.meta.url),
-      ),
-    )
+    for (const name of ['assemble-agent-integrations.mjs', 'artifact-files.mjs'])
+      await writeFile(
+        join(root, 'scripts', name),
+        await readFile(new URL(`../../../scripts/${name}`, import.meta.url)),
+      )
     for (const name of [
       'core.mjs',
       'discovery.mjs',

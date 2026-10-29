@@ -142,7 +142,6 @@ export function AgentsStepSettings({
               enabled: !disabledAgents.includes(slug),
             }))}
             busy={connections.busy}
-            shared={false}
             onOpenCli={onOpenCli ?? (() => undefined)}
             onEnabledChange={setAgentEnabled}
           />

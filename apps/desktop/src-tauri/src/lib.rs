@@ -413,14 +413,16 @@ pub fn run() {
         };
         app.manage(live_usage);
         cli_install::start(app.handle());
-        agent_integrations::desktop::start(app.handle(), |app| {
-            cli_install::resolve_cli(app).map(|runtime| {
-                agent_integrations::lifecycle::CliConnection {
-                    executable: runtime.executable,
-                    version: runtime.version,
-                    sha256: runtime.sha256,
-                    delivery_protocols: runtime.delivery_protocols,
-                }
+        agent_integrations::desktop::start(app.handle(), |app, validation| {
+            let runtime = match validation {
+                agent_integrations::desktop::CliValidation::Fresh => cli_install::resolve_cli(app),
+                agent_integrations::desktop::CliValidation::Cached => cli_install::inspect_cli(app),
+            };
+            runtime.map(|runtime| agent_integrations::lifecycle::CliConnection {
+                executable: runtime.executable,
+                version: runtime.version,
+                sha256: runtime.sha256,
+                delivery_protocols: runtime.delivery_protocols,
             })
         });
         // Only file metadata, but keep it off the launch path.

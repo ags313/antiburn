@@ -1,167 +1,52 @@
 //! Lossless JSONC insertion and exact owned-delta removal.
 
-use std::collections::BTreeSet;
-use std::ops::Range;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone)]
-struct Node {
-    range: Range<usize>,
-    object: Vec<(String, Node)>,
-    array: Vec<Node>,
-    kind: u8,
-}
-
-struct Parser<'a> {
-    bytes: &'a [u8],
-    index: usize,
-}
+use crate::agent_config::ConfigUnavailableReason;
+use crate::agent_config::filesystem::MAX_CONFIG_BYTES;
+use crate::agent_config::json::Document;
 
 pub type Result<T> = std::result::Result<T, &'static str>;
 
-impl Parser<'_> {
-    fn space(&mut self) -> Result<()> {
-        loop {
-            while self
-                .bytes
-                .get(self.index)
-                .is_some_and(u8::is_ascii_whitespace)
-            {
-                self.index += 1;
-            }
-            if self.bytes.get(self.index..self.index + 2) == Some(b"//") {
-                self.index += 2;
-                while self.bytes.get(self.index).is_some_and(|b| *b != b'\n') {
-                    self.index += 1;
-                }
-            } else if self.bytes.get(self.index..self.index + 2) == Some(b"/*") {
-                self.index += 2;
-                loop {
-                    if self.bytes.get(self.index..self.index + 2) == Some(b"*/") {
-                        self.index += 2;
-                        break;
-                    }
-                    if self.index >= self.bytes.len() {
-                        return Err("malformed_jsonc");
-                    }
-                    self.index += 1;
-                }
-            } else {
-                return Ok(());
-            }
-        }
-    }
-
-    fn string(&mut self) -> Result<String> {
-        let start = self.index;
-        if self.bytes.get(self.index) != Some(&b'"') {
-            return Err("malformed_jsonc");
-        }
-        self.index += 1;
-        while let Some(byte) = self.bytes.get(self.index) {
-            self.index += 1;
-            if *byte == b'\\' {
-                self.index += 1;
-            } else if *byte == b'"' {
-                return serde_json::from_slice(&self.bytes[start..self.index])
-                    .map_err(|_| "malformed_jsonc");
-            }
-        }
-        Err("malformed_jsonc")
-    }
-
-    fn node(&mut self, depth: usize) -> Result<Node> {
-        if depth > 32 {
-            return Err("json_depth_limit");
-        }
-        self.space()?;
-        let start = self.index;
-        let kind = *self.bytes.get(start).ok_or("malformed_jsonc")?;
-        let mut object = Vec::new();
-        let mut array = Vec::new();
-        if matches!(kind, b'{' | b'[') {
-            self.index += 1;
-            let end = if kind == b'{' { b'}' } else { b']' };
-            let mut keys = BTreeSet::new();
-            loop {
-                self.space()?;
-                if self.bytes.get(self.index) == Some(&end) {
-                    self.index += 1;
-                    break;
-                }
-                if kind == b'{' {
-                    let key = self.string()?;
-                    if !keys.insert(key.clone()) {
-                        return Err("duplicate_json_key");
-                    }
-                    self.space()?;
-                    if self.bytes.get(self.index) != Some(&b':') {
-                        return Err("malformed_jsonc");
-                    }
-                    self.index += 1;
-                    object.push((key, self.node(depth + 1)?));
-                } else {
-                    array.push(self.node(depth + 1)?);
-                }
-                self.space()?;
-                match self.bytes.get(self.index) {
-                    Some(b',') => self.index += 1,
-                    Some(byte) if *byte == end => {
-                        self.index += 1;
-                        break;
-                    }
-                    _ => return Err("malformed_jsonc"),
-                }
-            }
-        } else if kind == b'"' {
-            self.string()?;
-        } else {
-            while self
-                .bytes
-                .get(self.index)
-                .is_some_and(|b| !b.is_ascii_whitespace() && !b",]}/".contains(b))
-            {
-                self.index += 1;
-            }
-            if self.index == start {
-                return Err("malformed_jsonc");
-            }
-            serde_json::from_slice::<Value>(&self.bytes[start..self.index])
-                .map_err(|_| "malformed_jsonc")?;
-        }
-        Ok(Node {
-            range: start..self.index,
-            object,
-            array,
-            kind,
-        })
+fn json_error(reason: ConfigUnavailableReason) -> &'static str {
+    match reason {
+        ConfigUnavailableReason::DuplicateDefinition => "duplicate_json_key",
+        _ => "malformed_jsonc",
     }
 }
 
-fn parse(bytes: &[u8]) -> Result<Node> {
-    if bytes.len() > 256 * 1024 {
+fn parse(bytes: &[u8]) -> Result<Document> {
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
         return Err("config_too_large");
     }
     std::str::from_utf8(bytes).map_err(|_| "malformed_jsonc")?;
-    let mut parser = Parser { bytes, index: 0 };
-    let node = parser.node(0)?;
-    parser.space()?;
-    if parser.index != bytes.len() || node.kind != b'{' {
+    let document = Document::parse(bytes).map_err(json_error)?;
+    if !document.value().is_object() {
         return Err("malformed_jsonc");
     }
-    Ok(node)
+    check_depth(document.value(), 0)?;
+    Ok(document)
 }
 
-fn member<'a>(node: &'a Node, path: &[String]) -> Option<&'a Node> {
-    if path.is_empty() {
-        return Some(node);
+fn check_depth(value: &Value, depth: usize) -> Result<()> {
+    if depth > 32 {
+        return Err("json_depth_limit");
     }
-    node.object
-        .iter()
-        .find(|(key, _)| key == &path[0])
-        .and_then(|(_, child)| member(child, &path[1..]))
+    match value {
+        Value::Object(object) => {
+            for child in object.values() {
+                check_depth(child, depth + 1)?;
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                check_depth(child, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,23 +63,23 @@ pub fn append(bytes: &[u8], path: &[String], value: Value) -> Result<(Vec<u8>, D
     if path.is_empty() || path.len() > 4 {
         return Err("invalid_config_path");
     }
-    let mut parent = &root;
+    let mut parent = root.value();
     let mut prefix = Vec::new();
     for (index, key) in path.iter().enumerate() {
-        if parent.kind != b'{' {
-            return Err("config_schema_conflict");
-        }
-        if let Some((_, child)) = parent.object.iter().find(|(name, _)| name == key) {
+        let object = parent.as_object().ok_or("config_schema_conflict")?;
+        if let Some(child) = object.get(key) {
             if index + 1 == path.len() {
-                if child.kind != b'[' {
-                    return Err("config_schema_conflict");
-                }
+                let array = child.as_array().ok_or("config_schema_conflict")?;
                 let encoded =
                     serde_json::to_string(&value).map_err(|_| "config_schema_conflict")?;
                 // Insert before the first item so all original comments and commas remain.
-                let inserted =
-                    format!("{encoded}{}", if child.array.is_empty() { "" } else { "," });
-                let position = child.range.start + 1;
+                let inserted = format!("{encoded}{}", if array.is_empty() { "" } else { "," });
+                let position = root
+                    .range(path)
+                    .map_err(json_error)?
+                    .ok_or("config_schema_conflict")?
+                    .start
+                    + 1;
                 let mut result = bytes.to_vec();
                 result.splice(position..position, inserted.bytes());
                 parse(&result)?;
@@ -215,13 +100,16 @@ pub fn append(bytes: &[u8], path: &[String], value: Value) -> Result<(Vec<u8>, D
             let encoded_key = serde_json::to_string(key).map_err(|_| "invalid_config_path")?;
             let inserted = format!(
                 "{encoded_key}:{nested}{}",
-                if parent.object.is_empty() { "" } else { "," }
+                if object.is_empty() { "" } else { "," }
             );
             let mut result = bytes.to_vec();
-            result.splice(
-                parent.range.start + 1..parent.range.start + 1,
-                inserted.bytes(),
-            );
+            let position = root
+                .range(&prefix)
+                .map_err(json_error)?
+                .ok_or("config_schema_conflict")?
+                .start
+                + 1;
+            result.splice(position..position, inserted.bytes());
             parse(&result)?;
             return Ok((
                 result,
@@ -239,21 +127,21 @@ pub fn append(bytes: &[u8], path: &[String], value: Value) -> Result<(Vec<u8>, D
 /// Remove only the unchanged bytes at the recorded parent boundary.
 pub fn remove(bytes: &[u8], delta: &Delta) -> Result<Vec<u8>> {
     let root = parse(bytes)?;
-    let parent = member(&root, &delta.parent).ok_or("owned_entry_removed")?;
-    let start = parent.range.start + 1;
+    root.value_at(&delta.parent).ok_or("owned_entry_removed")?;
+    let parent = root
+        .range(&delta.parent)
+        .map_err(json_error)?
+        .ok_or("owned_entry_removed")?;
+    let start = parent.start + 1;
     let inserted = delta.inserted.as_bytes();
     if bytes.get(start..start + inserted.len()) != Some(inserted) {
         return Err("owned_entry_changed");
     }
     let mut output = bytes.to_vec();
     if !delta.inserted.ends_with(',') {
-        let mut parser = Parser {
-            bytes,
-            index: start + inserted.len(),
-        };
-        parser.space()?;
-        if bytes.get(parser.index) == Some(&b',') {
-            output.remove(parser.index);
+        let next = root.next_token(start + inserted.len());
+        if bytes.get(next) == Some(&b',') {
+            output.remove(next);
         }
     }
     output.drain(start..start + inserted.len());
@@ -267,69 +155,54 @@ pub fn validate(bytes: &[u8]) -> Result<()> {
 
 pub fn boolean(bytes: &[u8], path: &[String]) -> Result<Option<bool>> {
     let root = parse(bytes)?;
-    let Some(node) = member(&root, path) else {
+    let Some(value) = root.value_at(path) else {
         return Ok(None);
     };
-    match &bytes[node.range.clone()] {
-        b"true" => Ok(Some(true)),
-        b"false" => Ok(Some(false)),
-        _ => Err("config_schema_conflict"),
-    }
+    value.as_bool().map(Some).ok_or("config_schema_conflict")
 }
 
 pub fn strings(bytes: &[u8], path: &[String]) -> Result<Vec<String>> {
     let root = parse(bytes)?;
-    let Some(node) = member(&root, path) else {
+    let Some(value) = root.value_at(path) else {
         return Ok(Vec::new());
     };
-    if node.kind != b'[' {
-        return Err("config_schema_conflict");
-    }
-    node.array
+    value
+        .as_array()
+        .ok_or("config_schema_conflict")?
         .iter()
-        .map(|node| {
-            serde_json::from_slice(&bytes[node.range.clone()]).map_err(|_| "config_schema_conflict")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or("config_schema_conflict")
         })
         .collect()
 }
 
-fn to_value(node: &Node, bytes: &[u8]) -> Result<Value> {
-    match node.kind {
-        b'{' => node
-            .object
-            .iter()
-            .map(|(key, child)| Ok((key.clone(), to_value(child, bytes)?)))
-            .collect::<Result<serde_json::Map<_, _>>>()
-            .map(Value::Object),
-        b'[' => node
-            .array
-            .iter()
-            .map(|child| to_value(child, bytes))
-            .collect::<Result<Vec<_>>>()
-            .map(Value::Array),
-        _ => serde_json::from_slice(&bytes[node.range.clone()]).map_err(|_| "malformed_jsonc"),
-    }
-}
-
 pub fn value(bytes: &[u8], path: &[String]) -> Result<Option<Value>> {
     let root = parse(bytes)?;
-    member(&root, path)
-        .map(|node| to_value(node, bytes))
-        .transpose()
+    Ok(root.value_at(path).cloned())
 }
 
 pub fn insert_member(bytes: &[u8], key: &str, value: Value) -> Result<(Vec<u8>, Delta)> {
     let root = parse(bytes)?;
-    if root.object.iter().any(|(name, _)| name == key) {
+    let object = root.value().as_object().ok_or("config_schema_conflict")?;
+    if object.contains_key(key) {
         return Err("config_schema_conflict");
     }
     let inserted = format!(
         "{}:{value}{}",
         serde_json::to_string(key).map_err(|_| "invalid_config_path")?,
-        if root.object.is_empty() { "" } else { "," }
+        if object.is_empty() { "" } else { "," }
     );
     let mut output = bytes.to_vec();
-    output.splice(root.range.start + 1..root.range.start + 1, inserted.bytes());
+    let position = root
+        .range(&[])
+        .map_err(json_error)?
+        .ok_or("config_schema_conflict")?
+        .start
+        + 1;
+    output.splice(position..position, inserted.bytes());
     parse(&output)?;
     Ok((
         output,
@@ -359,9 +232,16 @@ mod tests {
                 &path,
                 serde_json::json!({"hooks": [{"command":"test"}]}),
             )
-            .unwrap();
-            assert_eq!(remove(&output, &delta).unwrap(), original.as_bytes());
-            assert!(String::from_utf8(output).unwrap().contains("test"));
+            .expect("insert the hook into each valid JSONC fixture");
+            assert_eq!(
+                remove(&output, &delta).expect("remove the hook without changing the fixture"),
+                original.as_bytes()
+            );
+            assert!(
+                String::from_utf8(output)
+                    .expect("decode the inserted-hook fixture as UTF-8")
+                    .contains("test")
+            );
         }
     }
 
@@ -372,10 +252,16 @@ mod tests {
             &["hooks".into(), "test".into()],
             serde_json::json!({"command":"owned"}),
         )
-        .unwrap();
-        let updated = String::from_utf8(output).unwrap().replace("true", "false");
+        .expect("insert the owned hook beside an unrelated setting");
+        let updated = String::from_utf8(output)
+            .expect("decode the fixture before editing the unrelated setting")
+            .replace("true", "false");
         assert_eq!(
-            String::from_utf8(remove(updated.as_bytes(), &delta).unwrap()).unwrap(),
+            String::from_utf8(
+                remove(updated.as_bytes(), &delta)
+                    .expect("remove the owned hook after the unrelated setting changes")
+            )
+            .expect("decode the fixture after removing the owned hook"),
             r#"{"hooks":{"test":[]},"unrelated":false}"#
         );
         assert!(remove(updated.replace("owned", "changed").as_bytes(), &delta).is_err());
@@ -388,21 +274,32 @@ mod tests {
             &["hooks".into(), "test".into()],
             serde_json::json!({"command":"owned"}),
         )
-        .unwrap();
-        let array = String::from_utf8(array).unwrap().replace(
-            "]}",
-            " /* keep before */ , // keep after\n{\"command\":\"user\"}]}",
-        );
+        .expect("insert the first owned hook into the empty array");
+        let array = String::from_utf8(array)
+            .expect("decode the array fixture before adding a user hook")
+            .replace(
+                "]}",
+                " /* keep before */ , // keep after\n{\"command\":\"user\"}]}",
+            );
         assert_eq!(
-            String::from_utf8(remove(array.as_bytes(), &delta).unwrap()).unwrap(),
+            String::from_utf8(
+                remove(array.as_bytes(), &delta)
+                    .expect("remove the owned hook while keeping the later user hook")
+            )
+            .expect("decode the array fixture after removing the owned hook"),
             "{\"hooks\":{\"test\":[ /* keep before */  // keep after\n{\"command\":\"user\"}]}}"
         );
-        let (object, delta) = insert_member(b"{}", "owned", Value::Bool(true)).unwrap();
+        let (object, delta) = insert_member(b"{}", "owned", Value::Bool(true))
+            .expect("insert the first owned member into the empty object");
         let object = String::from_utf8(object)
-            .unwrap()
+            .expect("decode the object fixture before adding a user member")
             .replace("}", " /* keep before */ , // keep after\n\"user\":true}");
         assert_eq!(
-            String::from_utf8(remove(object.as_bytes(), &delta).unwrap()).unwrap(),
+            String::from_utf8(
+                remove(object.as_bytes(), &delta)
+                    .expect("remove the owned member while keeping the later user member")
+            )
+            .expect("decode the object fixture after removing the owned member"),
             "{ /* keep before */  // keep after\n\"user\":true}"
         );
     }
@@ -425,5 +322,76 @@ mod tests {
                 "{bytes}"
             );
         }
+    }
+
+    #[test]
+    fn validation_and_append_reject_commas_without_entries() {
+        for bytes in [
+            "{,}",
+            "[,]",
+            r#"{"other":[,]}"#,
+            r#"{"other":{,}}"#,
+            "{ /* before */ , /* after */ }",
+            "[ // before\r\n, // after\r\n]",
+            r#"{"other":[ /* before */ , /* after */ ]}"#,
+            "{\"other\":{ // before\n, // after\n}}",
+        ] {
+            assert_eq!(
+                validate(bytes.as_bytes()),
+                Err("malformed_jsonc"),
+                "{bytes}"
+            );
+            assert_eq!(
+                append(
+                    bytes.as_bytes(),
+                    &["hooks".into(), "test".into()],
+                    Value::Null
+                )
+                .map(|_| ()),
+                Err("malformed_jsonc"),
+                "{bytes}"
+            );
+        }
+    }
+
+    #[test]
+    fn removal_keeps_comments_when_a_sole_entry_gets_a_trailing_comma() {
+        let (output, delta) = insert_member(b"{}", "owned", Value::Bool(true))
+            .expect("insert the sole owned member before adding a trailing comma");
+        let updated = String::from_utf8(output)
+            .expect("decode the object fixture before adding a trailing comma")
+            .replace('}', " /* keep , */ , // keep after\r\n}");
+        assert_eq!(
+            remove(updated.as_bytes(), &delta)
+                .expect("remove the sole owned member and keep the trailing comments"),
+            b"{ /* keep , */  // keep after\r\n}"
+        );
+        let (output, delta) = append(
+            br#"{"hooks":[]}"#,
+            &["hooks".into()],
+            Value::String("owned".into()),
+        )
+        .expect("insert the sole owned array item before adding a trailing comma");
+        let updated = String::from_utf8(output)
+            .expect("decode the array fixture before adding a trailing comma")
+            .replace(']', " /* keep , */ ,]");
+        assert_eq!(
+            remove(updated.as_bytes(), &delta)
+                .expect("remove the sole owned array item and keep the trailing comment"),
+            br#"{"hooks":[ /* keep , */ ]}"#
+        );
+    }
+
+    #[test]
+    fn integration_depth_and_size_limits_stay_in_force() {
+        let within_depth = format!("{}true{}", "{\"nested\":".repeat(32), "}".repeat(32));
+        validate(within_depth.as_bytes()).expect("accept the fixture at the 32-level depth limit");
+        let too_deep = format!("{}true{}", "{\"nested\":".repeat(33), "}".repeat(33));
+        assert_eq!(validate(too_deep.as_bytes()), Err("json_depth_limit"));
+        let mut bytes = b"{}".to_vec();
+        bytes.resize(MAX_CONFIG_BYTES as usize, b' ');
+        validate(&bytes).expect("accept the fixture at the configuration byte limit");
+        bytes.push(b' ');
+        assert_eq!(validate(&bytes), Err("config_too_large"));
     }
 }

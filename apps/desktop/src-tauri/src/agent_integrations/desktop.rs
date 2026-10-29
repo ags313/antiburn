@@ -9,7 +9,13 @@ use super::lifecycle::{CliConnection, Installation, status};
 use super::process::NativeRunner;
 use super::{IntegrationPhase, IntegrationStatus, Vendor};
 
-type Resolver = dyn Fn(&tauri::AppHandle) -> Result<CliConnection, String> + Send + Sync;
+pub enum CliValidation {
+    Fresh,
+    Cached,
+}
+
+type Resolver =
+    dyn Fn(&tauri::AppHandle, CliValidation) -> Result<CliConnection, String> + Send + Sync;
 
 struct Controller {
     statuses: Mutex<Vec<IntegrationStatus>>,
@@ -40,7 +46,10 @@ fn enabled() -> bool {
 /// Start after the managed CLI owner begins its startup reconciliation.
 pub fn start(
     app: &tauri::AppHandle,
-    resolver: impl Fn(&tauri::AppHandle) -> Result<CliConnection, String> + Send + Sync + 'static,
+    resolver: impl Fn(&tauri::AppHandle, CliValidation) -> Result<CliConnection, String>
+    + Send
+    + Sync
+    + 'static,
 ) {
     app.manage(Controller {
         statuses: Mutex::new(unavailable(if enabled() {
@@ -74,7 +83,7 @@ fn request_reconcile(app: &tauri::AppHandle) {
             controller.pending.store(false, Ordering::Release);
             let started = Instant::now();
             let cli = loop {
-                if let Ok(cli) = (controller.resolver)(&app) {
+                if let Ok(cli) = (controller.resolver)(&app, CliValidation::Fresh) {
                     break Some(cli);
                 }
                 if started.elapsed() >= Duration::from_secs(5) {
@@ -85,10 +94,10 @@ fn request_reconcile(app: &tauri::AppHandle) {
             let statuses = reconcile(&app, cli.as_ref(), None)
                 .unwrap_or_else(|_| unavailable("installation_unavailable"));
             if let Ok(mut snapshot) = controller.statuses.lock() {
-                *snapshot = statuses;
+                *snapshot = statuses.clone();
             }
+            let _ = app.emit_to("settings", "agent-integrations:changed", &statuses);
             drop(running);
-            let _ = app.emit_to("settings", "agent-integrations:changed", ());
             if !controller.pending.load(Ordering::Acquire)
                 || controller.running.swap(true, Ordering::AcqRel)
             {
@@ -99,8 +108,15 @@ fn request_reconcile(app: &tauri::AppHandle) {
 }
 
 fn environment() -> BTreeMap<String, String> {
+    capture_environment(|key| std::env::var(key).ok())
+}
+
+pub(super) fn capture_environment(
+    mut read: impl FnMut(&str) -> Option<String>,
+) -> BTreeMap<String, String> {
     [
         "PATH",
+        "VOLTA_HOME",
         "CODEX_HOME",
         "CLAUDE_CONFIG_DIR",
         "PI_CODING_AGENT_DIR",
@@ -114,7 +130,7 @@ fn environment() -> BTreeMap<String, String> {
         "XDG_STATE_HOME",
     ]
     .into_iter()
-    .filter_map(|key| std::env::var(key).ok().map(|value| (key.into(), value)))
+    .filter_map(|key| read(key).map(|value| (key.into(), value)))
     .collect()
 }
 
@@ -178,7 +194,7 @@ pub async fn get_agent_integrations(
                 .map_err(|_| "Integration status is unavailable.".to_owned());
         }
         let running = RunningGuard(&controller.running);
-        let cli = (controller.resolver)(&app).ok();
+        let cli = (controller.resolver)(&app, CliValidation::Cached).ok();
         let result = reconcile(&app, cli.as_ref(), Some(Action::Inspect));
         if let Ok(statuses) = &result
             && let Ok(mut snapshot) = controller.statuses.lock()
@@ -207,15 +223,15 @@ async fn change(app: tauri::AppHandle, action: Action) -> Result<Vec<Integration
             return Err("Integration setup is already running.".into());
         }
         let running = RunningGuard(&controller.running);
-        let cli = (controller.resolver)(&app).ok();
+        let cli = (controller.resolver)(&app, CliValidation::Fresh).ok();
         let result = reconcile(&app, cli.as_ref(), Some(action));
-        if let Ok(statuses) = &result
-            && let Ok(mut snapshot) = controller.statuses.lock()
-        {
-            *snapshot = statuses.clone();
+        if let Ok(statuses) = &result {
+            if let Ok(mut snapshot) = controller.statuses.lock() {
+                *snapshot = statuses.clone();
+            }
+            let _ = app.emit_to("settings", "agent-integrations:changed", statuses);
         }
         drop(running);
-        let _ = app.emit_to("settings", "agent-integrations:changed", ());
         if controller.pending.load(Ordering::Acquire) {
             request_reconcile(&app);
         }
@@ -245,6 +261,14 @@ pub async fn remove_agent_integration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_capture_keeps_a_custom_volta_root_for_metadata_lookup() {
+        let root = std::env::temp_dir().join("synthetic-volta");
+        let root = root.to_string_lossy().into_owned();
+        let env = capture_environment(|key| (key == "VOLTA_HOME").then(|| root.clone()));
+        assert_eq!(env, BTreeMap::from([("VOLTA_HOME".into(), root)]));
+    }
 
     #[test]
     fn running_flag_is_released_when_a_task_panics() {

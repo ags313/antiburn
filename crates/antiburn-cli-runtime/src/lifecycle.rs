@@ -30,6 +30,78 @@ pub struct CliRuntime {
     pub delivery_protocols: Vec<String>,
 }
 
+/// Retain one verified binary digest for repeated status reads.
+#[derive(Default)]
+pub struct RuntimeDigestCache {
+    #[cfg(target_os = "macos")]
+    entry: Option<(PathBuf, BinaryIdentity, String)>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+struct BinaryIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(target_os = "macos")]
+fn binary_identity(path: &Path) -> Result<Option<BinaryIdentity>> {
+    use std::ffi::{CStr, CString};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let native_path = CString::new(path.as_os_str().as_bytes())?;
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    ensure!(
+        unsafe { libc::statfs(native_path.as_ptr(), filesystem.as_mut_ptr()) } == 0,
+        "CLI filesystem metadata is unavailable"
+    );
+    let filesystem = unsafe { filesystem.assume_init() };
+    if unsafe { CStr::from_ptr(filesystem.f_fstypename.as_ptr()) }.to_bytes() != b"apfs" {
+        return Ok(None);
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(metadata.is_file(), "Expected a regular CLI file");
+    Ok(Some(BinaryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        length: metadata.len(),
+        modified: (metadata.mtime(), metadata.mtime_nsec()),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    }))
+}
+
+impl RuntimeDigestCache {
+    fn hash(&mut self, path: &Path) -> Result<String> {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(before) = binary_identity(path)? else {
+                self.entry = None;
+                return hash(path);
+            };
+            if let Some((cached_path, identity, digest)) = &self.entry
+                && cached_path == path
+                && *identity == before
+            {
+                return Ok(digest.clone());
+            }
+            self.entry = None;
+            let digest = hash(path)?;
+            ensure!(
+                binary_identity(path)?.as_ref() == Some(&before),
+                "CLI runtime changed during validation"
+            );
+            self.entry = Some((path.to_path_buf(), before, digest.clone()));
+            Ok(digest)
+        }
+        // Other filesystems need reliable change-time checks before they can reuse a digest.
+        #[cfg(not(target_os = "macos"))]
+        hash(path)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CliInstallState {
@@ -467,7 +539,11 @@ impl Installation {
         Ok(())
     }
 
-    fn runtime(&self, r: &Receipt) -> Result<CliRuntime> {
+    fn runtime_with_cache(
+        &self,
+        r: &Receipt,
+        cache: &mut RuntimeDigestCache,
+    ) -> Result<CliRuntime> {
         let m = [&r.active, &r.pending, &r.previous]
             .into_iter()
             .flatten()
@@ -482,7 +558,7 @@ impl Installation {
         #[cfg(windows)]
         check_owner(&self.stable(), &fs::symlink_metadata(self.stable())?)?;
         ensure!(
-            hash(&self.immutable(m))? == m.sha256,
+            cache.hash(&self.immutable(m))? == m.sha256,
             "CLI runtime digest does not match its receipt"
         );
         #[cfg(unix)]
@@ -501,9 +577,19 @@ impl Installation {
         })
     }
 
+    fn runtime(&self, r: &Receipt) -> Result<CliRuntime> {
+        self.runtime_with_cache(r, &mut RuntimeDigestCache::default())
+    }
+
     pub fn resolve(&self) -> Result<CliRuntime> {
         let _lock = self.lock()?;
         self.runtime(&self.receipt()?)
+    }
+
+    /// Recheck ownership and receipts, but reuse an unchanged binary's verified digest.
+    pub fn resolve_cached(&self, cache: &mut RuntimeDigestCache) -> Result<CliRuntime> {
+        let _lock = self.lock()?;
+        self.runtime_with_cache(&self.receipt()?, cache)
     }
 
     pub fn runtime_for_test(&self) -> Result<(File, CliRuntime)> {
@@ -708,6 +794,103 @@ mod tests {
         fs::remove_dir_all(&f.i.payload).unwrap();
         assert_eq!(f.i.resolve().unwrap().executable, first.executable);
         assert!(!first.executable.starts_with(&f.i.payload));
+    }
+
+    #[test]
+    fn cached_resolution_rechecks_the_receipt_and_follows_upgrades() {
+        let f = Fixture::new();
+        f.i.reconcile().unwrap();
+        let mut cache = RuntimeDigestCache::default();
+        let first = f.i.resolve_cached(&mut cache).unwrap();
+        assert_eq!(f.i.resolve_cached(&mut cache).unwrap().sha256, first.sha256);
+        f.payload(b"synthetic native CLI two");
+        f.i.reconcile().unwrap();
+        let second = f.i.resolve_cached(&mut cache).unwrap();
+        assert_ne!(second.sha256, first.sha256);
+        fs::write(f.i.root.join("receipt.json"), b"{}").unwrap();
+        assert!(f.i.resolve_cached(&mut cache).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn digest_cache_reuses_only_the_same_unchanged_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::write(&first, b"synthetic binary").unwrap();
+        fs::write(&second, b"synthetic binary").unwrap();
+        let mut cache = RuntimeDigestCache::default();
+        let actual = cache.hash(&first).unwrap();
+        if binary_identity(&first).unwrap().is_none() {
+            assert!(cache.entry.is_none());
+            return;
+        }
+        cache.entry.as_mut().unwrap().2 = "cached digest".into();
+        assert_eq!(cache.hash(&first).unwrap(), "cached digest");
+        assert_eq!(cache.hash(&second).unwrap(), actual);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_resolution_rejects_same_size_edits_with_restored_modification_time() {
+        let f = Fixture::new();
+        f.i.reconcile().unwrap();
+        let mut cache = RuntimeDigestCache::default();
+        f.i.resolve_cached(&mut cache).unwrap();
+        let manifest = f.i.receipt().unwrap().active.unwrap();
+        let path = f.i.immutable(&manifest);
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, b"synthetic native CLI bad").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(
+            f.i.resolve_cached(&mut cache)
+                .unwrap_err()
+                .to_string()
+                .contains("digest")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_resolution_rechecks_file_and_directory_policy() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        f.i.reconcile().unwrap();
+        let mut cache = RuntimeDigestCache::default();
+        f.i.resolve_cached(&mut cache).unwrap();
+        let manifest = f.i.receipt().unwrap().active.unwrap();
+        let path = f.i.immutable(&manifest);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(f.i.resolve_cached(&mut cache).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        f.i.resolve_cached(&mut cache).unwrap();
+        let bin = f.i.root.join("bin");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(f.i.resolve_cached(&mut cache).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_resolution_rejects_a_replaced_binary_or_symlink() {
+        let f = Fixture::new();
+        f.i.reconcile().unwrap();
+        let mut cache = RuntimeDigestCache::default();
+        f.i.resolve_cached(&mut cache).unwrap();
+        let manifest = f.i.receipt().unwrap().active.unwrap();
+        let path = f.i.immutable(&manifest);
+        let original = path.with_extension("original");
+        fs::rename(&path, &original).unwrap();
+        fs::copy(f.i.payload.join(file_name()), &path).unwrap();
+        fs::set_permissions(&path, fs::metadata(&original).unwrap().permissions()).unwrap();
+        f.i.resolve_cached(&mut cache).unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&original, &path).unwrap();
+        assert!(f.i.resolve_cached(&mut cache).is_err());
     }
 
     #[test]

@@ -1,49 +1,14 @@
-import { createHash } from 'node:crypto'
-import {
-  lstat,
-  mkdir,
-  mkdtemp,
-  readFile,
-  readdir,
-  rename,
-  rm,
-  writeFile,
-} from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { hash, rejectSymlinkParents, verifyArtifactFiles } from './artifact-files.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 export const defaultOutput = join(
   root,
   'apps/desktop/src-tauri/resources/agent-integrations/payload',
 )
-const hash = (value) => createHash('sha256').update(value).digest('hex')
 const json = (value) => JSON.stringify(value, null, 2) + '\n'
-
-async function safeParents(path) {
-  for (let current = resolve(path); ;) {
-    try {
-      if ((await lstat(current)).isSymbolicLink()) throw new Error('Artifact symlink refused')
-    } catch (error) {
-      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error
-    }
-    const parent = dirname(current)
-    if (parent === current) return
-    current = parent
-  }
-}
-
-async function inventory(root, prefix = '') {
-  const result = []
-  for (const entry of await readdir(join(root, prefix), { withFileTypes: true })) {
-    const name = prefix ? `${prefix}/${entry.name}` : entry.name
-    if (entry.isSymbolicLink()) throw new Error('Artifact symlink refused')
-    if (entry.isDirectory()) result.push(...(await inventory(root, name)))
-    else if (entry.isFile()) result.push(name)
-    else throw new Error('Unsupported artifact file')
-  }
-  return result.sort()
-}
 
 async function verifyExisting(output) {
   const manifest = JSON.parse(await readFile(join(output, 'manifest.json'), 'utf8'))
@@ -54,19 +19,17 @@ async function verifyExisting(output) {
     manifest.files.length > 64
   )
     throw new Error('Unowned output refused')
-  const actual = (await inventory(output)).filter((name) => name !== 'manifest.json')
-  if (JSON.stringify(actual) !== JSON.stringify(manifest.files.map(({ path }) => path).sort()))
-    throw new Error('Artifact inventory mismatch')
-  for (const entry of manifest.files)
-    if (hash(await readFile(join(output, entry.path))) !== entry.sha256)
-      throw new Error('Artifact hash mismatch')
+  const files = manifest.files.toSorted((a, b) =>
+    a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
+  )
+  await verifyArtifactFiles(output, files, ['manifest.json'])
 }
 
 /** Build the desktop-only runtime payload. Public plugins keep their own builder. */
 export async function assembleAgentIntegrations(output = defaultOutput) {
   output = resolve(output)
   if (output === root || output === dirname(root)) throw new Error('Unsafe output')
-  await safeParents(output)
+  await rejectSymlinkParents(output)
   const files = new Map()
   const read = (name) => readFile(join(root, name), 'utf8')
   const add = (name, contents) => files.set(name, contents)
@@ -147,7 +110,7 @@ export async function assembleAgentIntegrations(output = defaultOutput) {
       await writeFile(join(stage, name), content, { flag: 'wx' })
     }
     await verifyExisting(stage)
-    await safeParents(output)
+    await rejectSymlinkParents(output)
     if (exists) {
       await verifyExisting(output)
       const backup = `${stage}-previous`

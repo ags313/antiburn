@@ -7,10 +7,15 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::agent_config::ConfigUnavailableReason;
+use crate::agent_config::filesystem::{
+    MAX_CONFIG_BYTES, check_regular_file, file_identity, read_bounded,
+};
+
 use super::document::{self, Delta};
 
 pub type Result<T> = std::result::Result<T, &'static str>;
-pub const MAX_BYTES: u64 = 256 * 1024;
+pub const MAX_BYTES: u64 = MAX_CONFIG_BYTES;
 
 pub fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -47,9 +52,7 @@ pub fn read(path: &Path) -> Result<Option<Vec<u8>>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err("config_unreadable"),
     };
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_BYTES {
-        return Err("unsafe_config");
-    }
+    check_regular_file(&metadata).map_err(|_| "unsafe_config")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -76,27 +79,23 @@ pub fn read(path: &Path) -> Result<Option<Vec<u8>>> {
     }
     let mut file = options.open(path).map_err(|_| "config_unreadable")?;
     let opened = file.metadata().map_err(|_| "config_unreadable")?;
+    if file_identity(&opened) != file_identity(&metadata) || !opened.is_file() {
+        return Err("concurrent_config_change");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if opened.dev() != metadata.dev()
-            || opened.ino() != metadata.ino()
-            || opened.uid() != unsafe { libc::geteuid() }
+        if opened.uid() != unsafe { libc::geteuid() }
             || opened.nlink() != 1
             || opened.mode() & 0o022 != 0
-            || !opened.is_file()
         {
             return Err("concurrent_config_change");
         }
     }
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
-        .take(MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "config_unreadable")?;
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err("config_too_large");
-    }
+    let bytes = read_bounded(&mut file).map_err(|reason| match reason {
+        ConfigUnavailableReason::FileTooLarge => "config_too_large",
+        _ => "config_unreadable",
+    })?;
     Ok(Some(bytes))
 }
 
@@ -114,7 +113,9 @@ fn private_file(path: &Path) -> Result<File> {
 pub fn private_directory(path: &Path) -> Result<()> {
     if !path.exists() {
         checked_directory(path.parent().ok_or("unsafe_path")?)?;
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -267,12 +268,11 @@ pub fn load_receipt(path: &Path) -> Result<Option<Receipt>> {
     }
     let file = options.open(path).map_err(|_| "state_unavailable")?;
     let opened = file.metadata().map_err(|_| "state_invalid")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-            return Err("state_changed");
-        }
+    if !opened.is_file() {
+        return Err("state_invalid");
+    }
+    if file_identity(&opened) != file_identity(&metadata) {
+        return Err("state_changed");
     }
     let mut bytes = Vec::new();
     file.take(2 * 1024 * 1024 + 1)
@@ -614,6 +614,61 @@ mod tests {
         assert!(read(&link).is_err());
         fs::hard_link(&target, root.join("hardlink")).unwrap();
         assert!(read(&target).is_err());
+        assert_eq!(
+            crate::agent_config::filesystem::read_checked(&target, &root)
+                .unwrap()
+                .bytes,
+            b"{}"
+        );
+    }
+
+    #[test]
+    fn readers_share_regular_file_and_size_checks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let target = root.join("config.json");
+        fs::write(&target, b"{}").unwrap();
+        assert_eq!(
+            read(&target).unwrap().unwrap(),
+            crate::agent_config::filesystem::read_checked(&target, &root)
+                .unwrap()
+                .bytes
+        );
+        let file = fs::OpenOptions::new().write(true).open(&target).unwrap();
+        file.set_len(MAX_BYTES).unwrap();
+        assert_eq!(read(&target).unwrap().unwrap().len() as u64, MAX_BYTES);
+        file.set_len(MAX_BYTES + 1).unwrap();
+        assert_eq!(read(&target), Err("unsafe_config"));
+        assert!(matches!(
+            crate::agent_config::filesystem::read_checked(&target, &root),
+            Err(ConfigUnavailableReason::FileTooLarge)
+        ));
+        let directory = root.join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(read(&directory), Err("unsafe_config"));
+        assert!(matches!(
+            crate::agent_config::filesystem::read_checked(&directory, &root),
+            Err(ConfigUnavailableReason::NonRegularFile)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn integration_reader_keeps_its_stricter_permission_policy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let target = root.join("config.json");
+        fs::write(&target, b"{}").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o660)).unwrap();
+        assert_eq!(read(&target), Err("unsafe_owner_or_permissions"));
+        assert_eq!(
+            crate::agent_config::filesystem::read_checked(&target, &root)
+                .unwrap()
+                .bytes,
+            b"{}"
+        );
     }
 
     #[cfg(target_os = "macos")]

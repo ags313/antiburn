@@ -289,6 +289,38 @@ describe("AgentsStepSettings coding agents", () => {
 })
 
 describe("AgentsStepSettings session locations", () => {
+  it("detects an empty agent root after Sessions Rescan and return to Agents", async () => {
+    foundByAgent = [{ agent: "codex", sessions: 0, done: true }]
+    mockCommands({
+      get_agent_integrations: [],
+      agent_session_locations: [
+        { agent: "codex", locations: [{ path: "~/.codex/sessions", found: false }] },
+      ],
+    })
+    const { rerender } = render(<AgentsStepSettings manageConnections />)
+    await waitFor(() => expect(screen.getByText("Searched 1 location")).toBeInTheDocument())
+    expect(screen.getByRole("switch", { name: "Show Codex sessions" })).toBeDisabled()
+
+    const { ScanningSection } = await import("./SessionSourcesSections")
+    rerender(<ScanningSection discoveryPaused={false} />)
+    mockCommands({
+      get_agent_integrations: [],
+      scan_now: scanStatus(),
+      agent_session_locations: [
+        { agent: "codex", locations: [{ path: "~/.codex/sessions", found: true }] },
+      ],
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Rescan" }))
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("scan_now"))
+    rerender(<AgentsStepSettings manageConnections />)
+    await waitFor(() =>
+      expect(screen.getByRole("switch", { name: "Show Codex sessions" })).toBeEnabled(),
+    )
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "agent_session_locations"),
+    ).toHaveLength(2)
+  })
+
   it("shows how many locations it searched and lists them on demand", async () => {
     mockCommands({
       agent_session_locations: [
