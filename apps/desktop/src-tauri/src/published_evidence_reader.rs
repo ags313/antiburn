@@ -374,6 +374,18 @@ impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
     fn read_batch(&self, request: PublicationRead) -> Result<PublishedEvidenceBatch, SourceError> {
         let started = std::time::Instant::now();
         let after = i64::try_from(request.after.0).map_err(|error| self.decode_error(error))?;
+        // Read the bound first so an empty page cannot skip a later publication.
+        let global_high_water = self
+            .project
+            .map(|_| {
+                self.store.lock().query_row(
+                    "SELECT COALESCE(MAX(publication_sequence), 0) FROM native_tool_result_publication",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .map_err(|error| self.reader_error(error))
+            })
+            .transpose()?;
         let read = |after, limit| match self.project {
             Some((environment, project)) => {
                 self.store.native_evidence_publications_for_project_after(
@@ -401,6 +413,9 @@ impl PublishedEvidenceReader for StorePublishedEvidenceReader<'_> {
                 u64::try_from(publication.publication_sequence)
                     .map_err(|error| self.decode_error(error))?,
             ),
+            None if !waiting_for_attachment => {
+                PublicationCursor(request.after.0.max(global_high_water.unwrap_or(0)))
+            }
             None => request.after,
         };
         let next_sequence = i64::try_from(next.0).map_err(|error| self.decode_error(error))?;

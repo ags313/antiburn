@@ -776,6 +776,72 @@ fn transcript(session_id: &str, count: usize) -> String {
 }
 
 #[tokio::test]
+async fn quiet_project_catchup_persists_empty_page_progress_and_resumes_matching_work() {
+    let fixture = Fixture::new();
+    fixture.publish("main", 3);
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    host.catch_up().unwrap();
+    let scope = host.projects.keys().next().unwrap().clone();
+    let active = host.projects[&scope].active[0].clone();
+    let before = host.projects[&scope]
+        .store
+        .load_source_progress(&active)
+        .unwrap();
+    let other_project = fixture.directory.path().join("other-project");
+    fixture.publish_in_cwd("native", "other", 2, &other_project);
+    let source = PublishedEvidenceSource::new(
+        StorePublishedEvidenceReader::for_live_project(
+            &fixture.store,
+            &scope.environment,
+            &scope.session_cwd,
+        )
+        .with_activation(&active.id),
+        SOURCE_PAGE_SIZE,
+    )
+    .unwrap();
+    let page = source.read_batch(before.publication_cursor).unwrap();
+    assert!(page.events.is_empty());
+    assert!(page.next > before.publication_cursor);
+    assert!(!page.has_more);
+
+    assert_eq!(host.catch_up().unwrap(), (false, false));
+    let mut expected = before;
+    expected.publication_cursor = page.next;
+    assert_eq!(
+        host.projects[&scope]
+            .store
+            .load_source_progress(&active)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(host.catch_up().unwrap(), (false, false));
+    drop(host);
+
+    let mut restarted = fixture.host();
+    restarted.reconcile(&Admission::Ready).unwrap();
+    assert_eq!(
+        restarted.projects[&scope]
+            .store
+            .load_source_progress(&active)
+            .unwrap(),
+        expected
+    );
+    fixture.publish("main", 4);
+    assert_eq!(restarted.catch_up().unwrap(), (true, false));
+    let progress = restarted.projects[&scope]
+        .store
+        .load_source_progress(&active)
+        .unwrap();
+    assert!(progress.publication_cursor > expected.publication_cursor);
+    assert_eq!(
+        progress.observation_position.0,
+        expected.observation_position.0 + 1
+    );
+    assert!(fixture.evaluator.inputs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn actual_yaml_parser_publication_engine_and_report_assess_startup_once_and_resume() {
     let fixture = Fixture::new();
     fixture.publish("main", 3);

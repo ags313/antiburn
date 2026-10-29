@@ -639,7 +639,7 @@ fn first_terminal_lookup_seeks_exact_identity_and_binding_without_scanning_sessi
 }
 
 #[test]
-fn empty_project_page_keeps_request_cursor_and_reads_later_matching_publications() {
+fn empty_project_page_advances_past_unrelated_publications_and_reads_later_matches() {
     let store = store();
     {
         let connection = store.lock();
@@ -664,7 +664,7 @@ fn empty_project_page_keeps_request_cursor_and_reads_later_matching_publications
         })
         .unwrap();
     assert!(empty.events.is_empty());
-    assert_eq!(empty.next, PublicationCursor(0));
+    assert_eq!(empty.next, PublicationCursor(2));
     assert!(!empty.has_more);
 
     let repeated_empty = reader
@@ -675,6 +675,21 @@ fn empty_project_page_keeps_request_cursor_and_reads_later_matching_publications
         .unwrap();
     assert_eq!(repeated_empty.next, empty.next);
     assert!(!repeated_empty.has_more);
+
+    let source = PublishedEvidenceSource::new(
+        StorePublishedEvidenceReader::for_project(&store, "native", "/synthetic"),
+        1,
+    )
+    .unwrap();
+    let normalized = source.read_batch(PublicationCursor(0)).unwrap();
+    assert!(normalized.events.is_empty());
+    assert_eq!(normalized.next, empty.next);
+    assert!(!normalized.has_more);
+
+    let ahead = source.read_batch(PublicationCursor(10)).unwrap();
+    assert!(ahead.events.is_empty());
+    assert_eq!(ahead.next, PublicationCursor(10));
+    assert!(!ahead.has_more);
 
     let (unrelated, matching) = {
         let connection = store.lock();

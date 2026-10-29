@@ -431,6 +431,16 @@ fn typed_v2_with_v1_label_waits_only_for_an_exact_capture_and_then_an_attachment
                     [i64::from(capture == "stale")],
                 ).unwrap();
             }
+            if capture == "exact" {
+                insert_update(
+                    &connection,
+                    "unrelated-tail",
+                    true,
+                    Some(7),
+                    Some("/other-project"),
+                    SourceFormat::PiV3Jsonl,
+                );
+            }
         }
         let sequence =
             store.native_evidence_publications_after(0, 10).unwrap()[0].publication_sequence;
@@ -475,7 +485,7 @@ fn typed_v2_with_v1_label_waits_only_for_an_exact_capture_and_then_an_attachment
         assert!(!attached.has_more);
         let empty = source.read_batch(attached.next).unwrap();
         assert!(empty.events.is_empty());
-        assert_eq!(empty.next, attached.next);
+        assert_eq!(empty.next, PublicationCursor(sequence as u64 + 1));
         assert!(!empty.has_more);
     }
 }

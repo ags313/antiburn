@@ -1052,7 +1052,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                 }
             };
             more |= page.has_more;
-            if !page.events.is_empty() {
+            if !page.events.is_empty() || page.next > progress.publication_cursor {
                 let upserts = page
                     .events
                     .iter()
@@ -1112,7 +1112,7 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
                         },
                     );
                 }
-                changed = true;
+                changed |= !page.events.is_empty();
             }
             for session in project.store.startup_sessions(activation, active_since())? {
                 let _phase = diagnostics::SlowPhase::start("attach_session");

@@ -224,7 +224,7 @@ pub enum PublishedEvidenceChange {
 pub struct PublishedEvidenceBatch {
     /// Events in strictly increasing durable publication order.
     pub events: Vec<PublishedEvidenceEvent>,
-    /// Cursor after the last returned event, or the request cursor when empty.
+    /// Cursor of the last event. Empty pages can advance past filtered publications.
     pub next: PublicationCursor,
     /// Whether more committed events remain after this page.
     pub has_more: bool,
@@ -344,7 +344,7 @@ impl<R: PublishedEvidenceReader> PublishedEvidenceSource<R> {
             previous = event.cursor;
             events.push(normalize(event)?);
         }
-        if batch.next != previous || batch.next < after {
+        if batch.next < previous || (!events.is_empty() && batch.next != previous) {
             return Err(SourceError::InvalidNextCursor {
                 expected: previous,
                 received: batch.next,

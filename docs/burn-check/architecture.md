@@ -130,6 +130,13 @@ terminal result can trigger once. A correction keeps its logical result identity
 and first-terminal position, but changes its evidence version. Duplicate delivery
 is not a new attempt. Timestamps cannot replace proven source order.
 
+An empty project page can advance delivery past unrelated publications. The reader
+captures the global high-water mark before its project query, so a later
+publication cannot be skipped. A publication that waits for a session attachment
+still holds the cursor. The store verifies that the skipped range has no matching
+project publications before it saves progress. This does not change observation
+order or create candidates.
+
 New public messages, calls, and cycles keep separate namespaced identities and
 first-eligible publication boundaries. Corrections retain their original logical
 order and event context. Calls and results cannot deduplicate each other. A mixed

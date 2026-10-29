@@ -336,22 +336,47 @@ fn partial_context_is_preserved_with_explicit_quality_fields() {
 }
 
 #[test]
+fn empty_pages_can_advance_past_filtered_publications_but_cannot_rewind() {
+    for next in [3, 8] {
+        let source = PublishedEvidenceSource::new(
+            MemoryReader(PublishedEvidenceBatch {
+                events: vec![],
+                next: PublicationCursor(next),
+                has_more: false,
+            }),
+            1,
+        )
+        .unwrap();
+        let batch = source.read_batch(PublicationCursor(3)).unwrap();
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.next, PublicationCursor(next));
+        assert!(!batch.has_more);
+        assert!(matches!(
+            source.read_batch(PublicationCursor(next + 1)),
+            Err(SourceError::InvalidNextCursor { .. })
+        ));
+    }
+}
+
+#[test]
 fn rejects_cursor_gaps_and_bad_page_progress() {
-    let reader = MemoryReader(PublishedEvidenceBatch {
-        events: vec![event(
-            5,
-            PublishedEvidenceChange::Gap {
-                reason: "gap".into(),
-            },
-        )],
-        next: PublicationCursor(4),
-        has_more: false,
-    });
-    let source = PublishedEvidenceSource::new(reader, 1).unwrap();
-    assert!(matches!(
-        source.read_batch(PublicationCursor(3)),
-        Err(SourceError::InvalidNextCursor { .. })
-    ));
+    for next in [4, 6] {
+        let reader = MemoryReader(PublishedEvidenceBatch {
+            events: vec![event(
+                5,
+                PublishedEvidenceChange::Gap {
+                    reason: "gap".into(),
+                },
+            )],
+            next: PublicationCursor(next),
+            has_more: false,
+        });
+        let source = PublishedEvidenceSource::new(reader, 1).unwrap();
+        assert!(matches!(
+            source.read_batch(PublicationCursor(3)),
+            Err(SourceError::InvalidNextCursor { .. })
+        ));
+    }
 }
 
 #[test]

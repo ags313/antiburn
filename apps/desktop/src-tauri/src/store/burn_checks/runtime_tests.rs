@@ -42,6 +42,8 @@ mod gaps;
 mod local;
 #[path = "runtime_preparation_tests.rs"]
 mod preparation;
+#[path = "runtime_progress_tests.rs"]
+mod progress;
 #[path = "runtime_recovery_validation_tests.rs"]
 mod recovery_validation;
 #[path = "runtime_registry_tests.rs"]

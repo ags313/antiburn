@@ -1310,7 +1310,7 @@ fn validate_source_page(progress: &SourceProgress, page: &SourceBatch) -> Result
         }
         previous = cursor;
     }
-    if page.next != previous {
+    if page.next < previous || (!page.events.is_empty() && page.next != previous) {
         return Err(StoreError {
             message: "source page cursor does not match its final event".to_owned(),
         });

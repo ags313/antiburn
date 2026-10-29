@@ -85,8 +85,7 @@ impl Store {
                 .is_none_or(|sequence| *sequence > cursor)
                 && publication_sequences
                     .last()
-                    .is_none_or(|sequence| *sequence == through_sequence)
-                && (!publication_sequences.is_empty() || through_sequence == cursor),
+                    .is_none_or(|sequence| *sequence == through_sequence),
             "publication cursor range does not match the page"
         );
         let persisted_sequences = {
@@ -126,6 +125,16 @@ impl Store {
         });
         if !replay && persisted_sequences != publication_sequences {
             return Ok(false);
+        }
+        if !replay && publication_sequences.is_empty() && through_sequence > cursor {
+            let high_water: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(publication_sequence), 0) FROM native_tool_result_publication",
+                [],
+                |row| row.get(0),
+            )?;
+            if through_sequence > high_water {
+                return Ok(false);
+            }
         }
         let mut page_sessions = HashMap::with_capacity(publication_sequences.len());
         for sequence in publication_sequences {
