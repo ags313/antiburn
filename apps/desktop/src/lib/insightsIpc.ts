@@ -641,17 +641,19 @@ export async function applyPreparedBurnCheckOperation(
   })
 }
 
-/** Returns a bounded prompt and starts or reuses its verification watch. */
+/** Builds a current prompt for one stable target identity. */
 export async function copyPromptFixBurnCheckTarget(
-  actionId: string,
+  detector: BurnCheckDetectorId,
+  findingId: string,
 ): Promise<CopyPromptFixBurnCheckTargetOutcome | null> {
   if (!hasShell()) return null
   return invoke<CopyPromptFixBurnCheckTargetOutcome>("copy_prompt_fix_burn_check_target", {
-    actionId,
+    detector,
+    findingId,
   })
 }
 
-/** Returns a generic bounded prompt only for a failed check with no exact target. */
+/** Builds a current bounded prompt for one check. */
 export async function copyPromptFixBurnCheck(
   detector: BurnCheckDetectorId,
 ): Promise<CopyPromptFixBurnCheckOutcome | null> {
@@ -661,11 +663,13 @@ export async function copyPromptFixBurnCheck(
 
 /** Prepares one bounded prompt for all selected exact targets in a check. */
 export async function copyPromptFixBurnCheckTargets(
-  actionIds: string[],
+  detector: BurnCheckDetectorId,
+  findingIds: string[],
 ): Promise<CopyPromptFixBurnCheckOutcome | null> {
   if (!hasShell()) return null
   return invoke<CopyPromptFixBurnCheckOutcome>("copy_prompt_fix_burn_check_targets", {
-    actionIds,
+    detector,
+    findingIds,
   })
 }
 

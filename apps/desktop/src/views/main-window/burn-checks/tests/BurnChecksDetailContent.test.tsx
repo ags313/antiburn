@@ -49,9 +49,9 @@ beforeEach(() => installBurnChecksCommandMocks(commands))
 afterEach(() => restoreBurnChecksTestWindow())
 
 describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
-  it.each(["batch", "target"] as const)("keeps %s prompt analytics generic", async (kind) => {
+  it.each(["check", "target"] as const)("keeps %s prompt analytics generic", async (kind) => {
     render(
-      kind === "batch" ? (
+      kind === "check" ? (
         <CheckPromptAction detector="oldModelUsage" targets={[target]} refresh={vi.fn()} />
       ) : (
         <BurnCheckTargetActions target={target} refresh={vi.fn()} />
@@ -115,8 +115,8 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
     expect(snooze.compareDocumentPosition(fix) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
     expect(fix.compareDocumentPosition(action) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
     fireEvent.click(action)
-    await waitFor(() => expect(commands.copyBatch).toHaveBeenCalledWith(["action-fresh"]))
-    expect(commands.writeClipboardText).toHaveBeenCalledWith("Batch backend prompt")
+    await waitFor(() => expect(commands.copyFallback).toHaveBeenCalledWith("oldModelUsage"))
+    expect(commands.writeClipboardText).toHaveBeenCalledWith("Inspect representative evidence.")
     expect(screen.getByRole("region", { name: "Burn check details" })).toHaveTextContent(
       "1 failed · 2 passed",
     )
@@ -157,19 +157,18 @@ describe("BurnChecksView detail content", { timeout: 15_000 }, () => {
     expect(watermarks?.querySelector('[data-agent-icon="codex"]')).toBeInTheDocument()
   })
 
-  it("includes all listed targets in a large check prompt", async () => {
+  it("requests the current whole-check prompt instead of rendered target handles", async () => {
     const targets = Array.from({ length: 13 }, (_, index) => ({
       ...target,
       findingId: `finding-${index}`,
       actionId: `action-${index}`,
     }))
     render(<CheckPromptAction detector="oldModelUsage" targets={targets} refresh={vi.fn()} />)
-    fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
-    await waitFor(() =>
-      expect(commands.copyBatch).toHaveBeenCalledWith(
-        Array.from({ length: 13 }, (_, index) => `action-${index}`),
-      ),
-    )
+
+    fireEvent.click(await screen.findByRole("button", { name: "Copy fix prompt" }))
+
+    await waitFor(() => expect(commands.copyFallback).toHaveBeenCalledWith("oldModelUsage"))
+    expect(commands.copyBatch).not.toHaveBeenCalled()
   })
 
   it("shows session cards with authoritative impact and project identity", async () => {

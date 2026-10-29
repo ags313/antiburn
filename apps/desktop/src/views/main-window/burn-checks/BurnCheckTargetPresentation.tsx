@@ -52,7 +52,7 @@ export function targetTitle(target: BurnCheckTargetPayload): string {
 export function watchStatus(target: BurnCheckTargetPayload): string | null {
   const watch = target.watch
   if (watch?.lifecycle === "waitingForPromptUse") {
-    return "The prompt is ready. The check can confirm a change after you use it in a later session."
+    return null
   }
   const verification = watch?.verification
   if (!verification) return null
@@ -72,7 +72,7 @@ export function watchStatus(target: BurnCheckTargetPayload): string | null {
     case "recoveryNeeded":
       return null
     case "verificationUnavailable":
-      return "The check could not confirm this change in a later session."
+      return "The check cannot verify this change automatically."
   }
 }
 

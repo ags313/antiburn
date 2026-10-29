@@ -113,7 +113,8 @@ fn every_detector_has_an_actionable_bounded_fallback_prompt() {
     for detector in DetectorId::ALL {
         let prompt = fallback_remediation_prompt(detector).unwrap();
         assert!(prompt.as_str().len() <= MAX_PROMPT_BYTES);
-        assert!(prompt.as_str().contains("Failed check\n"));
+        assert!(prompt.as_str().contains("Check to inspect\n"));
+        assert!(!prompt.as_str().contains("Failed check\n"));
         assert!(prompt.as_str().contains("Goal\n"));
         assert!(prompt.as_str().contains("What to inspect\n"));
         assert!(prompt.as_str().contains("Before you apply a change\n"));

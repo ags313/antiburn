@@ -266,8 +266,12 @@ for an eligible optional built-in tool. Findings that share one global target
 across projects are grouped, and every project context is revalidated. Model and
 reasoning targets remain pinned to publication attribution. Claude fast mode
 writes `false`. Before replacing an existing config file, Auto Fix leaves its
-exact prior content in a sibling `.bak` file. Copy provides a bounded fallback
-when an exact prompt is not available. See the
+exact prior content in a sibling `.bak` file. Each explicit Copy prepares fresh
+text from current data, including retries after clipboard failure. It provides
+a bounded inspection fallback for incomplete selections or oversized combined
+text. Existing watches and
+full watch capacity do not block valid text; Copy does not rearm attempts or
+prove verification or savings. See the
 [remediation guide](../../docs/remediation.md) for supported agents, safety
 checks, recovery, bounds, and privacy.
 

@@ -178,11 +178,17 @@ optional built-in tool. Claude project scope requires the exact bare tool name
 in `permissions.allow`. Model and reasoning edits remain pinned to their saved
 attribution, and Claude fast mode writes `false`. A controller-reported runtime
 or managed override can prevent an immediate behavior change; the review shows
-this warning. Check-level Copy can provide bounded generic text only when it can
-select at least one current target. Every returned prompt has a durable attempt
-reference. Native Windows can read supported setting attribution but
-cannot apply a change. Pi and Oh My Pi session discovery remains unavailable on
-native Windows. WSL is separate and cannot edit native host config. See the
+this warning. Each explicit Copy prepares fresh prompt text, including retries
+after clipboard failure. Check-level Copy queries current targets. Incomplete
+queries and missing selected identities can
+receive bounded inspection text without a current finding claim. Matched
+unsupported targets remain unavailable. Existing watch
+state and full watch capacity do not block valid prompt text. Copy preserves
+existing attempts and adds references only for selected waiting attempts. It does
+not prove verification or savings. Native Windows can read supported setting
+attribution but cannot apply a change. Pi and Oh My Pi session discovery remains
+unavailable on native Windows. WSL is separate and cannot edit native host config.
+See the
 [implementation guide](remediation.md) for precedence, verification, savings,
 privacy, and exact unavailable cases.
 

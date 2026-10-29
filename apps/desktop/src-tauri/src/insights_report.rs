@@ -2727,7 +2727,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap()
                 .prompt_group_id
-                .is_some()
+                .is_none()
         );
         let count: i64 = store
             .lock()
@@ -2769,7 +2769,7 @@ pub(crate) mod tests {
             .prompt;
 
         assert!(prompt.contains("Unused targets"));
-        assert_eq!(prompt.matches("Remediation reference: ABR-").count(), 1);
+        assert_eq!(prompt.matches("Remediation reference: ABR-").count(), 2);
         for resource in resources {
             assert!(prompt.contains(resource), "{prompt}");
         }
@@ -2793,7 +2793,7 @@ pub(crate) mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0], groups[1]);
+        assert!(groups.iter().all(Option::is_none));
         assert_eq!(
             controller.copy_prompt_fix_burn_check_targets(&store, &[]),
             Err(crate::remediation::ControllerError::CheckPromptUnavailable)
@@ -2801,7 +2801,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn resource_prompt_has_a_durable_group_marker_without_verification_claims() {
+    fn resource_prompt_has_an_exact_attempt_marker_without_verification_claims() {
         let data_dir = TempDir::new().unwrap();
         let store = Store::open(data_dir.path()).unwrap();
         publish_mcp_findings(&store, "baseline", 120, &["server-a"]);
@@ -3012,7 +3012,7 @@ pub(crate) mod tests {
         assert!(turn_probes > 0);
 
         let controller = crate::remediation::RemediationController::new(data_dir.path().to_owned());
-        let fallback = controller
+        let prompt = controller
             .copy_prompt_fix_burn_check(
                 &store,
                 DetectorId::UnusedMcpServers,
@@ -3022,9 +3022,9 @@ pub(crate) mod tests {
                 },
             )
             .unwrap();
-        assert!(fallback.prompt.contains("Failed check\nUnused MCP servers"));
+        assert!(prompt.prompt.contains("Resource: \"server-a\""));
         assert!(
-            !fallback
+            !prompt
                 .prompt
                 .contains("/home/avery/.claude/older-finding.jsonl")
         );
@@ -3066,7 +3066,7 @@ pub(crate) mod tests {
         let prompt = controller
             .copy_prompt_fix_burn_check(&store, DetectorId::UnusedMcpServers, context)
             .unwrap();
-        assert!(prompt.prompt.contains("Failed check\nUnused MCP servers"));
+        assert!(prompt.prompt.contains("server-a"));
     }
 
     #[test]

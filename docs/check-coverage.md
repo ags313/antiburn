@@ -1464,9 +1464,26 @@ reachability. Use
 the first-tier product and source-format remediation matrices for reachable
 prompts; a helper `Yes` cannot supply a new finding.
 The check-level Copy action can return bounded generic text for one or more
-selectable current targets. It returns no prompt when no target is selectable.
-Every returned prompt has one durable `ABR-` reference and each selected target
-has a durable action attempt.
+selectable current targets. A complete query with no selectable target returns no
+prompt.
+An empty truncated query can return inspection-only text without a current
+finding claim.
+Each explicit click queries current targets and prepares fresh text, including
+retries after clipboard failure. Target-level Copy resolves the current target
+by stable finding ID. A missing selected identity can return inspection-only text
+without old target facts or watch enrollment. This does not establish finding or
+source support. Existing remediation state does not block generation.
+Fallback text retains all source, agent, check, and protected-tool limits; it
+does not establish new prompt support or exact advice without current evidence.
+
+Prompt enrollment leaves existing exact active action attempts unchanged.
+Missing eligible attempts enroll as one batch only if all fit the capacity
+bound, without pruning history. Full capacity still permits valid prompt text.
+Each selected waiting attempt returned by enrollment gets one exact opaque
+`ABR-` marker, up to 100. Other states and unenrolled targets need no new
+reference. The 64 KiB prompt bound includes every marker. Incomplete selections
+or oversized aggregate text can use a bounded inspection fallback. A matched
+ineligible target remains unavailable.
 
 | Agent and source                                                                                          | D   | T   | S   | M   | B   | K   | O   | F   | C   |
 | --------------------------------------------------------------------------------------------------------- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -1630,9 +1647,12 @@ attributed to the same publication-time effective physical target, scope,
 provider, and API can change the result. Other checks store
 `verificationUnavailable`; generic absence cannot verify them. Positive-only
 sources cannot verify absence, and missing later evidence remains `watching`.
-An exact copied prompt remains outside verification until its opaque `ABR-`
-reference appears in a later captured user message. The marker publication sets
-the boundary and cannot prove the same attempt.
+A newly enrolled prompt attempt remains outside verification until its exact
+opaque `ABR-` reference appears in a later captured user message. Existing
+prompt-group markers remain valid for activation. The marker publication sets
+the boundary and cannot prove the same attempt. Repeated Copy does not rearm
+attempts or change snapshots, boundaries, or savings. Copy alone proves neither
+verification nor savings; resource verification remains unavailable.
 
 Cursor can use its explicit synthesized source-header model, but does not borrow
 the previous message's model. This preserves existing basic support without

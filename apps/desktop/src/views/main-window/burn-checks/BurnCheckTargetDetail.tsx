@@ -277,7 +277,9 @@ export function BurnCheckTargetDetail({
         {costLine && (
           <p className="mt-1 type-callout tabular-nums text-label-secondary">{costLine}</p>
         )}
-        {!reportRow && <BurnCheckTargetActions target={target} refresh={refresh} />}
+        {!reportRow && (
+          <BurnCheckTargetActions target={target} refresh={refresh} active={evidenceActive} />
+        )}
         {status && (
           <p role="status" className="mt-2 type-callout text-label-secondary">
             {status}
