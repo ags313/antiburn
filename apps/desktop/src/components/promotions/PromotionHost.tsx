@@ -1,4 +1,4 @@
-import { useSyncExternalStore, type RefObject } from "react"
+import { useCallback, useSyncExternalStore, type RefObject } from "react"
 import type { PromotionSession } from "../../lib/promotions/PromotionSession"
 import { useGlobalKeydown } from "../../lib/useGlobalKeydown"
 import { PromotionPanel } from "./PromotionPanel"
@@ -16,6 +16,10 @@ function subscribeModal(listener: () => void): () => void {
     attributeFilter: ["open", "aria-modal"],
   })
   return () => observer.disconnect()
+}
+
+function getReturnFocusTarget(target: RefObject<HTMLElement | null> | undefined) {
+  return target?.current ?? document.activeElement
 }
 
 export function PromotionHost({
@@ -55,27 +59,30 @@ function VisiblePromotion({
       session.close()
     }
   })
-  const attachPanel = (node: HTMLElement) => {
-    if (snapshot.screen !== "catalog") session.presented()
-    const stopReveal = session.takeReveal() ? revealPromotion(node) : () => undefined
-    const previous = returnFocusTo?.current ?? document.activeElement
-    if (snapshot.focusPanel) node.focus({ preventScroll: true })
-    return () => {
-      stopReveal()
-      const ownedFocus = node.contains(document.activeElement)
-      queueMicrotask(() => {
-        if (
-          ownedFocus &&
-          !node.isConnected &&
-          !hasModal() &&
-          previous instanceof HTMLElement &&
-          previous.isConnected
-        ) {
-          previous.focus({ preventScroll: true })
-        }
-      })
-    }
-  }
+  const attachPanel = useCallback(
+    (node: HTMLElement) => {
+      if (snapshot.screen !== "catalog") session.presented()
+      const stopReveal = session.takeReveal() ? revealPromotion(node) : () => undefined
+      const previous = getReturnFocusTarget(returnFocusTo)
+      if (snapshot.focusPanel) node.focus({ preventScroll: true })
+      return () => {
+        stopReveal()
+        const ownedFocus = node.contains(document.activeElement)
+        queueMicrotask(() => {
+          if (
+            ownedFocus &&
+            !node.isConnected &&
+            !hasModal() &&
+            previous instanceof HTMLElement &&
+            previous.isConnected
+          ) {
+            previous.focus({ preventScroll: true })
+          }
+        })
+      }
+    },
+    [session, returnFocusTo, snapshot.screen, snapshot.focusPanel],
+  )
   if (modal) return null
   return (
     <div className="promotion-host">
