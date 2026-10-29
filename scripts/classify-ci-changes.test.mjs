@@ -1085,10 +1085,10 @@ test("routes the session check reader and CLI to their dependent workspaces", ()
   assert.equal(desktopWorkspaces(cli), "");
 });
 
-test("runtime policy changes check the library, CLI, and desktop", () => {
+test("runtime policy changes check the library and desktop", () => {
   const runtime = plan("ready", [
-    "crates/antiburn-cli-runtime/src/terminal.rs",
+    "crates/antiburn-cli-runtime/src/lifecycle.rs",
   ]);
-  assert.equal(runtime.engine_workspaces, "cli-runtime,cli");
+  assert.equal(runtime.engine_workspaces, "cli-runtime");
   assert.equal(desktopWorkspaces(runtime), "shell");
 });

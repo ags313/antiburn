@@ -118,7 +118,7 @@ export const WORKSPACES = [
     id: "cli",
     directory: "apps/cli",
     group: "engine",
-    dependsOn: ["engine", "checks-store", "cli-runtime"],
+    dependsOn: ["engine", "checks-store"],
   },
 ];
 

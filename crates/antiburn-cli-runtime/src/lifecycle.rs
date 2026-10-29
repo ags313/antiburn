@@ -1,6 +1,3 @@
-mod terminal;
-pub use terminal::TerminalState;
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -345,15 +342,6 @@ fn retry_startup(
 }
 
 impl Installation {
-    pub fn for_terminal(root: PathBuf) -> Self {
-        Self {
-            terminal: root.join("legacy").join(file_name()),
-            payload: root.join("unused-payload"),
-            root,
-            target: crate::TARGET.into(),
-        }
-    }
-
     fn stable(&self) -> PathBuf {
         self.root.join("bin").join(file_name())
     }
@@ -607,8 +595,7 @@ impl Installation {
                 let _ = fs::remove_dir(parent(&path)?);
             }
         }
-        self.retire_terminal(&mut r)?;
-        self.reconcile_terminal()
+        self.retire_terminal(&mut r)
     }
 
     fn retire_terminal(&self, r: &mut Receipt) -> Result<()> {

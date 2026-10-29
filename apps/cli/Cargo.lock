@@ -81,7 +81,6 @@ name = "antiburn-cli"
 version = "0.1.0"
 dependencies = [
  "antiburn-checks-store",
- "antiburn-cli-runtime",
  "antiburn-local",
  "clap",
  "dirs",
@@ -93,19 +92,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "antiburn-cli-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "getrandom",
- "libc",
- "serde",
- "serde_json",
- "sha2",
- "windows-sys",
 ]
 
 [[package]]

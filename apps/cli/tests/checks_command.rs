@@ -31,6 +31,27 @@ fn public_command_help_and_version_use_antiburn_name() {
 }
 
 #[test]
+fn terminal_setup_commands_are_unavailable() {
+    let temp = tempdir().unwrap();
+    for operation in ["install", "status", "uninstall"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_antiburn"))
+            .args(["terminal", operation])
+            .env("HOME", temp.path())
+            .env("USERPROFILE", temp.path())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("unrecognized subcommand 'terminal'")
+        );
+    }
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn checks_command_reads_the_selected_database() {
     let temp = tempdir().unwrap();
     let data_root = platform_data_root(temp.path());
