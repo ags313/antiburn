@@ -205,8 +205,9 @@ describe("installed check status precedence", () => {
           {
             code: "opencode-v2-capture-gap",
             severity: "error",
-            title: "OpenCode live checks are unavailable",
-            message: "Keep OpenCode and antiburn running, then rescan sessions.",
+            title: "OpenCode live checks are not running",
+            message:
+              "Live activity is not available for this session. Keep OpenCode open, then rescan sessions. Live checks cannot recover missed activity. Saved results cover only their recorded input.",
             source: null,
             details: [],
             affectedSessionCount: 1,

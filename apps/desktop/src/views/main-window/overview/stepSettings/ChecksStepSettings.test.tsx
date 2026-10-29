@@ -250,7 +250,9 @@ it("loads fresh folders on each visit and opens only the new issued reference", 
   const open = await screen.findByRole("button", { name: /^Open in .*This device/ })
   expect(screen.queryByRole("button", { name: /refresh folders/i })).not.toBeInTheDocument()
   fireEvent.click(open)
-  await screen.findByText("Could not open this check folder. Reopen Checks to try again.")
+  await screen.findByText(
+    "Could not open this check folder. Reopen Settings → Checks to try again.",
+  )
   firstVisit.unmount()
   const freshRead = deferred<CheckDirectory[]>()
   getDirectories.mockReturnValueOnce(freshRead.promise)
@@ -261,7 +263,7 @@ it("loads fresh folders on each visit and opens only the new issued reference", 
   await act(async () => freshRead.reject(new Error("private read failure")))
   expect(screen.queryByText("2 check files")).not.toBeInTheDocument()
   expect(screen.getByRole("alert")).toHaveTextContent(
-    "Could not load check folders. Reopen Checks to try again.",
+    "Could not load check folders. Reopen Settings → Checks to try again.",
   )
   expect(
     screen.queryByRole("button", { name: /refresh|retry loading check folders/i }),
@@ -305,7 +307,9 @@ it.each([
 it("keeps folder failures visible while closed and reloads only after reopening Checks", async () => {
   getDirectories.mockRejectedValueOnce(new Error("private read error"))
   const firstVisit = render(<ChecksStepSettings />)
-  await screen.findByText("Could not load check folders. Reopen Checks to try again.")
+  await screen.findByText(
+    "Could not load check folders. Reopen Settings → Checks to try again.",
+  )
   expect(screen.getByRole("button", { name: "Check files" })).toHaveAttribute(
     "aria-expanded",
     "false",

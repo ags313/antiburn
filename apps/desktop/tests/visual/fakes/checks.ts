@@ -132,15 +132,15 @@ function installedChecks(): InstalledCheckReportPayload[] {
   const sourceIssue: InstalledCheckDiagnosticPayload = {
     code: "opencode-v2-capture-gap",
     severity: "error",
-    title: "OpenCode live checks are unavailable",
-    message: "Keep OpenCode and antiburn running, then rescan sessions.",
+    title: "OpenCode live checks are not running",
+    message:
+      "Live activity is not available for this session. Keep OpenCode open, then rescan sessions. Live checks cannot recover missed activity. Saved results cover only their recorded input.",
     source: null,
     details: [
       { label: "Diagnostic code", value: "opencode-v2-capture-gap" },
       {
         label: "Reason",
-        value:
-          "Live capture is not active for this session. Live checks cannot replay earlier events. Earlier checks cover only their saved input.",
+        value: "The connection for live OpenCode activity is not active.",
       },
       {
         label: "Stored analysis",

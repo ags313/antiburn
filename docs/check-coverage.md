@@ -152,11 +152,23 @@ uniform native evidence across every generating request, including private-only
 requests. A user-only cancellation has no generating model. Source timestamps
 do not replace native order. See [cycle limits](session-coverage.md#response-cycle-evidence-limits).
 
+Codex exec item results keep their native IDs. An exact same-turn wrapper output
+closes the outer call without publishing a second result. Missing or malformed
+wrapper output still withholds the cycle. Recognized inert top-level metadata
+can invalidate a cycle without making later request history partial; unhandled
+evidence fields still leave a history gap.
+
 V2 cycle context retains the known session request prefix separately from
 `turn.messages`. A later cycle can keep earlier retained requests without making
 them cycle members. Lost or bounded partial prefixes remain partial; a later
 valid request does not restore completeness. The accepted source and producer
 bounds still apply.
+
+V2 public steps, their calls, and retained assistant messages share frozen
+request prefixes instead of charging the same allocation more than once against
+the retained-state limit. Emitted contexts remain owned and bounded. Actual state
+or output overflow still leaves a capture gap and does not authorize later live
+evidence.
 
 Capture continuity is separate from each tool result's request-history
 completeness. A complete cycle prefix can coexist with a partial tool member
@@ -325,10 +337,13 @@ Native V1-only, V2-only, and mixed discovery retains recent session-header sourc
 an optional bounded message/part activity scan. Complete scans also find older
 message-only updates. A limited scan keeps the header sources and their activity
 times. It can omit old message-only sessions while that limit persists; it does
-not guarantee eventual discovery. Required metadata, cancellation, and other read
-failures still use the hard source gates. Discovery shares a total budget of five
-million SQLite VM instructions and one second. Optional activity scans leave one
-million instructions and 200 ms for required work within that budget.
+not guarantee eventual discovery. In mixed databases, a malformed header row in
+one family does not hide usable sources from the other. Migrated V1 copies remain
+excluded if V2 header decoding fails. A row error without usable sibling sources,
+or a schema, query, cancellation, or budget failure, still fails discovery. These
+rules do not add parsed evidence or check eligibility. Discovery shares a total
+budget of five million SQLite VM instructions and one second. Optional activity
+scans leave one million instructions and 200 ms for required work within that budget.
 
 Native OpenCode provider-DB metadata can enter discovery before full strict
 hashing finishes. A session-scoped bounded admission revision binds the source
@@ -401,9 +416,9 @@ capture sequence. Unbound removals report coverage gaps; page absence never
 removes evidence. Strict historical replay still does not support whole-message
 deletion.
 
-The source parser is revision 66, analyzer is 25, evidence schema is 22, file
+The source parser is revision 67, analyzer is 25, evidence schema is 22, file
 cursor is 5, resume snapshot is 25, and V1 live journal is 5. Compatible
-parser-63, parser-64, and parser-65 cursor/state-5 receipts retain committed
+parser-63, parser-64, parser-65, and parser-66 cursor/state-5 receipts retain committed
 progress. Named parser-62/file-V4 and V1 journal-V4 conversions retain
 old result progress, result identities, joins, and result seed semantics. They
 establish a separate future-only public baseline without replaying old results.
@@ -417,7 +432,7 @@ unknown delivery still cannot trigger a resend. Startup selection cannot seed
 old request context merely because its selector cursor is newer.
 Transient read errors do not erase proved request origin or revoke otherwise
 current frozen work. Existing source-evidence and idle-continuity gates still apply.
-Batch resume snapshots require parser 66. Parser numbers alone do not establish
+Batch resume snapshots require parser 67. Parser numbers alone do not establish
 layout compatibility: parser 64 from the producer commit below used file cursor 1
 and V1 live state 2, not the accepted cursor/state-5 layouts. Named converters
 accept only the exact parser/layout pairs from producer commit
@@ -430,10 +445,14 @@ conversion candidates, not ready sources. Readiness requires a committed
 layout-5 page and the existing origin, health, and ownership gates. Conversion
 does not rewind, reseed, reset paid attempts, or rewrite accepted history and
 usage. Malformed and unsupported pairs remain blocked.
-An exact proven branch parser-65/cursor-5 receipt keeps its request-origin boundary
+An exact proven branch parser-65 or parser-66 cursor-5 receipt keeps its request-origin boundary
 and validated context without another reset. Unknown revisions fail closed
 without rewind or automatic resend. See
 [saved-state conversion](session-coverage.md#saved-state-revisions-and-conversion).
+
+Parser-66 journal cold retries keep their original parser-number hash binding
+until the pinned page commits. Upgrade does not replay the window or reset paid
+attempts.
 
 For these definitions, `user_message` means accepted content in the user slot,
 including extension/API input. It does not require literal-human origin.

@@ -2,9 +2,14 @@ import { beforeEach, expect, it, vi } from "vitest"
 import {
   connectionDraftChanged,
   defaultConnection,
+  type PendingProviderOperation,
   type ProviderSettings,
 } from "../../lib/smartCheckProviders"
-import { ProviderSettingsSession, providerErrorMessage } from "./ProviderSettingsSession"
+import {
+  ProviderSettingsSession,
+  pendingOperationMessage,
+  providerErrorMessage,
+} from "./ProviderSettingsSession"
 import { providerSettingsFixture } from "./tests/providerSettingsFixture"
 
 const invoke = vi.hoisted(() => vi.fn())
@@ -161,6 +166,27 @@ it("does not expose unapproved credential errors or diagnostic payloads", () => 
     expect(providerErrorMessage(error, "safe fallback")).toBe("safe fallback")
   }
 })
+
+it.each([
+  { kind: "save", action: "save" },
+  { kind: "switch", action: "selection" },
+  { kind: "remove", action: "removal" },
+] as const)(
+  "explains an unfinished connection $action and how to finish it",
+  ({ kind, action }) => {
+    const operation: PendingProviderOperation = {
+      id: "pending-operation",
+      kind,
+      connectionId: "jev",
+      requestId: kind === "save" ? "save-request" : null,
+    }
+    for (const editorOpen of [false, true]) {
+      expect(pendingOperationMessage(operation, editorOpen)).toBe(
+        `The connection ${action} is not finished. Choose Retry to resolve it. This may restore the previous settings. Closing ${editorOpen ? "this dialog" : "Settings"} does not cancel it.`,
+      )
+    }
+  },
+)
 
 it.each([unsupportedModelMessage, new Error(unsupportedModelMessage)])(
   "keeps the unsupported-model error when testing an Ollama connection: %s",

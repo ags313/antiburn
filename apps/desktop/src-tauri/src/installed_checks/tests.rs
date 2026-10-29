@@ -27,6 +27,7 @@ use crate::store::{
 
 mod analytics;
 mod cursor_desktop;
+mod idle_recovery;
 mod journal_delivery;
 mod opencode_v2_fairness;
 mod opencode_v2_source_gates;

@@ -72,10 +72,10 @@ export function checksPresentation(
     burnChecks: noActiveChecks
       ? {
           ...burnChecks,
-          headline: noEnabledChecks ? "No checks enabled" : "No active checks",
+          headline: noEnabledChecks ? "No checks enabled" : "All checks are snoozed",
           accessibleDescription: noEnabledChecks
             ? "No Burn Checks enabled."
-            : "No active Burn Checks.",
+            : "All checks are snoozed.",
         }
       : burnChecks,
     estimate: {
@@ -95,7 +95,12 @@ export function checksHeroPresentation(
     return { result: "No checks enabled", summary: null, state: "pending", tone: "text-label" }
   }
   if (presentation.noActiveChecks) {
-    return { result: "No active checks", summary: null, state: "pending", tone: "text-label" }
+    return {
+      result: "All checks are snoozed",
+      summary: null,
+      state: "pending",
+      tone: "text-label",
+    }
   }
   const failureCount = presentation.failures.length
   if (failureCount > 0) {
@@ -127,7 +132,7 @@ export function checksHeroPresentation(
   )
   const completePass = passed.length > 0
   return {
-    result: completePass ? "No issues found" : "No checks assessed",
+    result: completePass ? "No issues in available results" : "No checks assessed",
     summary: completePass
       ? `${passed.length} ${pluralize(passed.length, "check", "checks")} passed`
       : null,

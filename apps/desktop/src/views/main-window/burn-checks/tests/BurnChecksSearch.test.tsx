@@ -158,7 +158,7 @@ describe("BurnChecksView search", { timeout: 15_000 }, () => {
       "aria-expanded",
       "true",
     )
-    expect(screen.getByText("This check has not checked any sessions yet.")).toBeVisible()
+    expect(screen.getByText("This check has no result in the current report.")).toBeVisible()
     expect(screen.getByRole("button", { name: /Excess cache rehydration/ })).toHaveFocus()
     view.rerender(
       <BurnChecksView
@@ -175,7 +175,7 @@ describe("BurnChecksView search", { timeout: 15_000 }, () => {
       "aria-pressed",
       "true",
     )
-    expect(screen.getByText("This check has not checked any sessions yet.")).toBeVisible()
+    expect(screen.getByText("This check has no result in the current report.")).toBeVisible()
   })
 
   it("allows ordinary selection after searching for an absent check", async () => {
@@ -189,10 +189,10 @@ describe("BurnChecksView search", { timeout: 15_000 }, () => {
     view.rerender(
       <BurnChecksView active session={session} focusedCheck="cacheChurn" focusRevision={1} />,
     )
-    expect(screen.getByText("This check has not checked any sessions yet.")).toBeVisible()
+    expect(screen.getByText("This check has no result in the current report.")).toBeVisible()
     fireEvent.click(screen.getByRole("button", { name: /Old model usage/ }))
     expect(
-      screen.queryByText("This check has not checked any sessions yet."),
+      screen.queryByText("This check has no result in the current report."),
     ).not.toBeInTheDocument()
     expect(screen.getByRole("heading", { name: "Old model usage" })).toBeVisible()
   })
@@ -221,7 +221,7 @@ describe("BurnChecksView search", { timeout: 15_000 }, () => {
     expect(row).toHaveAttribute("aria-pressed", "true")
     expect(row).toHaveFocus()
     expect(
-      screen.queryByText("This check has not checked any sessions yet."),
+      screen.queryByText("This check has no result in the current report."),
     ).not.toBeInTheDocument()
   })
 
@@ -238,6 +238,7 @@ describe("BurnChecksView search", { timeout: 15_000 }, () => {
       />,
     )
     expect(screen.getByRole("heading", { name: "failed-retry-loop" })).toBeVisible()
+    expect(screen.getByText("This check has no result in the current report.")).toBeVisible()
     vi.mocked(adapter.getReport).mockResolvedValueOnce({
       ...report,
       installedChecks: [installedCheckFixture],
@@ -251,7 +252,7 @@ describe("BurnChecksView search", { timeout: 15_000 }, () => {
     await act(async () => session.refresh())
     expect(screen.queryByRole("heading", { name: "failed-retry-loop" })).not.toBeInTheDocument()
     expect(
-      screen.queryByText("This check has not checked any sessions yet."),
+      screen.queryByText("This check has no result in the current report."),
     ).not.toBeInTheDocument()
     expect(screen.getByRole("heading", { name: "Old model usage" })).toBeVisible()
     expect(screen.getByRole("button", { name: /Old model usage, / })).toHaveFocus()

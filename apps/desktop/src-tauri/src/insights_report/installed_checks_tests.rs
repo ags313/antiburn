@@ -1601,7 +1601,7 @@ fn typed_runtime_failures_group_sessions_without_exposing_internal_detail() {
         if failure == DeliveryUnknown {
             assert_eq!(
                 report[0].diagnostics[0].message,
-                "The connection ended before the provider confirmed a response. This can include a timeout. The request may have reached the provider, so antiburn will not resend it automatically."
+                "The connection ended before the provider confirmed a response. This can include a timeout. The request may have reached the provider, so it will not be resent automatically."
             );
         }
         if failure == ActionFailed {
@@ -2619,7 +2619,7 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
                 [],
             )
             .unwrap();
-        for revision in [62, 63, 64, 65] {
+        for revision in [62, 63, 64, 65, 66] {
             store
                 .lock()
                 .execute(
@@ -2639,7 +2639,7 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
             apply_ready_publications(&store, adapter, &activation);
         }
         let receipt = delivery_receipt(agent, "main");
-        for revision in [63, 64, 65, PARSER_REVISION] {
+        for revision in [63, 64, 65, 66, PARSER_REVISION] {
             let mut compatible = receipt.clone();
             if journal {
                 compatible["parser_revision"] = json!(revision);
@@ -2865,7 +2865,7 @@ fn native_progress_matches_reset_activity_and_admitted_pending_delivery() {
                 )
                 .unwrap();
         }
-        for revision in [PARSER_REVISION, 65, 63, 64, -1] {
+        for revision in [PARSER_REVISION, 66, 65, 63, 64, -1] {
             let mut saved = receipt.clone();
             if journal {
                 saved["parser_revision"] = json!(revision);

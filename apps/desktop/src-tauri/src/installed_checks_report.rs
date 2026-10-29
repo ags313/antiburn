@@ -635,7 +635,7 @@ fn runtime_diagnostics(
             DeliveryUnknown => (
                 "provider-delivery-unknown",
                 "The check did not finish",
-                "The connection ended before the provider confirmed a response. This can include a timeout. The request may have reached the provider, so antiburn will not resend it automatically.",
+                "The connection ended before the provider confirmed a response. This can include a timeout. The request may have reached the provider, so it will not be resent automatically.",
             ),
             InvalidResponse | InvalidDecision => (
                 "provider-invalid-response",
@@ -768,7 +768,7 @@ fn runtime_diagnostics(
                         InvalidRequest => Some((
                             "provider-invalid-request",
                             "Correct the decision request",
-                            "The decision does not match the supported model request format. Check the field and local limit shown in Details. Nothing was sent to the provider.",
+                            "The decision does not match the supported model request format. Check the field and local limit shown in Technical details. Nothing was sent to the provider.",
                         )),
                         ProviderUnavailable => Some((
                             "provider-unavailable",
@@ -1016,7 +1016,7 @@ fn source_ready_at_sql(parser: usize, analyzer: usize, evidence: usize, now: &st
 
 pub(crate) fn source_can_arrive_sql(parser: usize, active_since: usize) -> String {
     // Match delivery reset admission. A compatible pending claim can outlive activity.
-    let fresh_revision = format!("d.parser_revision IN (?{parser}, 62, 63, 64, 65)");
+    let fresh_revision = format!("d.parser_revision IN (?{parser}, 62, 63, 64, 65, 66)");
     let route = |table: &str, reset: &str, compatible: &str| {
         let scheduled = "d.blocked = 0 AND (d.last_error IS NULL OR d.last_error NOT IN ('native-unsafe-identity', 'native-unsafe-order', 'native-unsafe-ownership'))
               AND (d.pending = 1 OR d.next_attempt_at_epoch IS NOT NULL
@@ -1655,23 +1655,23 @@ fn opencode_v2_diagnostic(status: OpenCodeV2SourceStatus) -> Option<InstalledChe
             "opencode-v2-source-mismatch",
             "Check the OpenCode source",
             "Open this project in OpenCode, then rescan sessions.",
-            "antiburn could not verify that the local service uses this session's database.",
+            "Cannot confirm that the local service uses this session's database.",
         ),
         VersionUnsupported => (
             "opencode-v2-version-unsupported",
-            "Update OpenCode or antiburn",
-            "This OpenCode source is not supported. Update OpenCode or antiburn.",
+            "Check for updates",
+            "This OpenCode source is not supported. Update OpenCode or this app.",
             "The service, database, or event version is not supported.",
         ),
         CaptureGap => (
             "opencode-v2-capture-gap",
-            "OpenCode live checks are unavailable",
-            "Keep OpenCode and antiburn running, then rescan sessions.",
-            "Live capture is not active for this session. Live checks cannot replay earlier events. Earlier checks cover only their saved input.",
+            "OpenCode live checks are not running",
+            "Live activity is not available for this session. Keep OpenCode open, then rescan sessions. Live checks cannot recover missed activity. Saved results cover only their recorded input.",
+            "The connection for live OpenCode activity is not active.",
         ),
         SourceLimit => (
             "opencode-v2-source-limit",
-            "Reduce OpenCode capture size",
+            "OpenCode live checks reached a local limit",
             "Close unused sessions or start a smaller session, then rescan sessions.",
             "Live capture reached a local source limit.",
         ),
@@ -1768,8 +1768,8 @@ fn read_row(
                         .is_some();
                     let (title, message) = if unsafe_admission {
                         (
-                            "Session records are unsafe",
-                            "antiburn cannot prove record identity, order, or session ownership. Start a new supported agent session to run checks on new work.",
+                            "Session records could not be verified",
+                            "Cannot confirm the identity or order of these records, or which session they belong to. Start a new supported agent session to check new activity.",
                         )
                     } else if session.journal_owned {
                         (
@@ -1779,7 +1779,7 @@ fn read_row(
                     } else {
                         (
                             "Session source is unavailable",
-                            "antiburn cannot read supported evidence from this session. Check source access in Settings → Sources and refresh the session index.",
+                            "Cannot read supported evidence from this session. Check source access in Settings → Sources and refresh the session index.",
                         )
                     };
                     diagnostics.add(
@@ -2081,7 +2081,7 @@ fn filter_diagnostic(
         FilterReason::Incomplete => (
             "filter-evidence-incomplete",
             "Recorded paths are incomplete",
-            "The known paths cannot establish this filter. An ignore filter needs complete paths to rule out a veto. Review the check's path filters and supported sources.",
+            "The recorded path list is incomplete, so an excluded path may be missing. Review the check's path filters and supported sources.",
         ),
         FilterReason::Invalid => (
             "filter-evidence-invalid",

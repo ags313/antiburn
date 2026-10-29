@@ -60,7 +60,7 @@ it("clears known rows and errors before a revisit loads or fails", async () => {
   await vi.waitFor(() => expect(session.getSnapshot().loading).toBe(false))
   expect(session.getSnapshot().directories).toBeNull()
   expect(session.getSnapshot().error).toBe(
-    "Could not load check folders. Reopen Checks to try again.",
+    "Could not load check folders. Reopen Settings → Checks to try again.",
   )
   cleanup()
   const stopRecovered = session.subscribe(() => undefined)
@@ -153,7 +153,7 @@ it.each(["success", "failure"])(
     await freshOpen
     expect(session.getSnapshot().opening.size).toBe(0)
     expect(session.getSnapshot().openErrors.get("issued")).toBe(
-      "Could not open this check folder. Reopen Checks to try again.",
+      "Could not open this check folder. Reopen Settings → Checks to try again.",
     )
     cleanup()
   },

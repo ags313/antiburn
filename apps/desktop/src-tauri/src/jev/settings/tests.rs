@@ -1291,6 +1291,7 @@ fn legacy_removal_preflights_every_revision_before_marking_or_pausing() {
         let before_runtime = worker.execution_snapshot().unwrap();
         let pending_before = [
             store.internal_value(CREDENTIAL_CHANGE_PENDING_KEY),
+            store.internal_value(super::LEGACY_REMOVAL_PENDING_KEY),
             store.internal_value(CONNECTION_PENDING_KEY),
             store.internal_value(super::CONNECTION_REMOVAL_KEY),
         ];
@@ -1309,6 +1310,7 @@ fn legacy_removal_preflights_every_revision_before_marking_or_pausing() {
         assert_eq!(
             [
                 store.internal_value(CREDENTIAL_CHANGE_PENDING_KEY),
+                store.internal_value(super::LEGACY_REMOVAL_PENDING_KEY),
                 store.internal_value(CONNECTION_PENDING_KEY),
                 store.internal_value(super::CONNECTION_REMOVAL_KEY),
             ],
@@ -1365,6 +1367,277 @@ fn legacy_removal_commits_its_preflight_revisions_once() {
         Some("false")
     );
     assert!(vault.value.borrow().is_none());
+}
+
+#[test]
+fn legacy_removal_marker_failure_keeps_both_markers_and_runtime_unchanged() {
+    let store =
+        Store::open_in_memory(Path::new("synthetic-legacy-removal-marker-failure")).unwrap();
+    let worker = WorkerHandle::default();
+    let vault = OfflineVault::default();
+    super::save_legacy_key(&store, &worker, Some("synthetic-secret".into()), &vault).unwrap();
+    let before = worker.execution_snapshot().unwrap();
+    let profiles_before = store.internal_value(CONNECTION_PROFILES_KEY);
+    let removal_before = store.internal_value(super::LEGACY_REMOVAL_PENDING_KEY);
+    store.lock().execute_batch("CREATE TEMP TRIGGER fail_legacy_marker BEFORE UPDATE ON setting WHEN NEW.key = 'internal:typesafeCredentialChangePendingV1' BEGIN SELECT RAISE(ABORT, 'synthetic marker failure'); END;").unwrap();
+    assert!(super::begin_legacy_removal(&store, &worker).is_err());
+    assert_eq!(
+        store
+            .internal_value(CREDENTIAL_CHANGE_PENDING_KEY)
+            .as_deref(),
+        Some("false")
+    );
+    assert_eq!(
+        store.internal_value(super::LEGACY_REMOVAL_PENDING_KEY),
+        removal_before
+    );
+    assert_eq!(
+        store.internal_value(CONNECTION_PROFILES_KEY),
+        profiles_before
+    );
+    assert!(super::yaml_discovery_enabled(&store));
+    assert_eq!(
+        worker.execution_snapshot().unwrap().generation,
+        before.generation
+    );
+    assert_eq!(
+        worker.execution_snapshot().unwrap().credential,
+        before.credential
+    );
+    assert_eq!(
+        vault.read(None).unwrap().as_deref(),
+        Some("synthetic-secret")
+    );
+}
+
+#[test]
+fn inactive_legacy_removal_failure_preserves_active_work_and_startup_restore() {
+    for keyless in [false, true] {
+        for fail_delete in [false, true] {
+            let (store, worker, vault) = saved_custom(true);
+            let mut saved = super::profiles(&store).unwrap();
+            if keyless {
+                saved.profiles.get_mut("proxy").unwrap().credential = None;
+                worker
+                    .set_system_one_connection(saved.profiles["proxy"].clone(), None)
+                    .unwrap();
+            }
+            let legacy = super::SystemOneConnection::jev_default();
+            let legacy_revision = legacy.revision;
+            saved.profiles.insert("legacy".into(), legacy);
+            super::save_profiles(&store, &saved).unwrap();
+            store.set_internal_value(super::AUTOMATIC_LIMITS_MIGRATION_KEY, "1");
+            vault.write(None, "shared-key").unwrap();
+            store.set_internal_value(SAVED_KEY_KEY, "true");
+            insert_unfinished_assessment(&store, "pending");
+            let before = worker.execution_snapshot().unwrap();
+            let profiles_before = store.internal_value(CONNECTION_PROFILES_KEY);
+            if fail_delete {
+                vault.fail_delete.set(true);
+            } else {
+                fail_profile_writes(&store);
+            }
+            let prepared = super::begin_legacy_removal(&store, &worker).unwrap();
+            assert!(super::finish_legacy_removal(&store, &vault, &prepared).is_err());
+            assert!(super::legacy_removal_pending(&store));
+            assert_eq!(
+                store
+                    .internal_value(super::LEGACY_REMOVAL_PENDING_KEY)
+                    .as_deref(),
+                Some("true")
+            );
+            assert_eq!(
+                store
+                    .internal_value(CREDENTIAL_CHANGE_PENDING_KEY)
+                    .as_deref(),
+                Some("false")
+            );
+            assert_eq!(
+                store.internal_value(CONNECTION_PROFILES_KEY),
+                profiles_before
+            );
+            assert_eq!(vault.read(None).unwrap().as_deref(), Some("shared-key"));
+            assert!(super::yaml_discovery_enabled(&store));
+            assert_eq!(unfinished_assessment_state(&store), "pending");
+            let current = worker.execution_snapshot().unwrap();
+            assert_eq!(current.generation, before.generation);
+            assert_eq!(current.connection, before.connection);
+            assert_eq!(current.credential, before.credential);
+            let restored = WorkerHandle::default();
+            super::restore_saved_key_with_vault(
+                &store,
+                &restored,
+                || panic!("An unrelated connection must not read the legacy credential"),
+                &vault,
+            )
+            .unwrap();
+            assert!(restored.is_available());
+            assert_eq!(
+                restored.execution_snapshot().unwrap().connection,
+                before.connection
+            );
+            assert_eq!(
+                restored.execution_snapshot().unwrap().credential,
+                before.credential
+            );
+            assert!(super::legacy_removal_pending(&store));
+            if !fail_delete {
+                store
+                    .lock()
+                    .execute_batch("DROP TRIGGER fail_profiles")
+                    .unwrap();
+            }
+            let retry = super::begin_legacy_removal(&store, &worker).unwrap();
+            super::finish_legacy_removal(&store, &vault, &retry).unwrap();
+            assert!(!super::legacy_removal_pending(&store));
+            assert_eq!(
+                super::profiles(&store).unwrap().profiles["legacy"].revision,
+                legacy_revision + 1
+            );
+            assert_eq!(
+                worker.execution_snapshot().unwrap().generation,
+                before.generation
+            );
+            assert!(vault.read(None).unwrap().is_none());
+            assert_eq!(unfinished_assessment_state(&store), "pending");
+        }
+    }
+}
+
+#[test]
+fn inactive_legacy_removal_retry_clears_its_restart_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    let worker = WorkerHandle::default();
+    let vault = OfflineVault::default();
+    super::save_legacy_key(&store, &worker, Some("shared-key".into()), &vault).unwrap();
+    let mut saved = super::profiles(&store).unwrap();
+    let selected = custom_connection();
+    saved.profiles.insert("proxy".into(), selected.clone());
+    saved.active_id = Some("proxy".into());
+    super::save_profiles(&store, &saved).unwrap();
+    worker
+        .set_system_one_connection(selected.clone(), None)
+        .unwrap();
+    fail_profile_writes(&store);
+    assert!(
+        super::save_legacy_key(&store, &worker, Some("replacement-key".into()), &vault).is_err()
+    );
+    assert!(!worker.is_available());
+    assert!(super::legacy_removal_pending(&store));
+    drop(store);
+    drop(worker);
+
+    let reopened = Store::open(directory.path()).unwrap();
+    let restarted = WorkerHandle::default();
+    let startup_errors = super::StartupErrors::new();
+    let result = super::restore_saved_key_with_origin(
+        &reopened,
+        &restarted,
+        || panic!("Pending recovery must not read a legacy credential"),
+        &vault,
+    );
+    assert!(matches!(
+        result,
+        Err(super::StartupRestoreFailure::LegacyCredentialChange(_))
+    ));
+    startup_errors.record_restore_result(&reopened, result);
+    let startup_error = startup_errors.message();
+    assert!(startup_error.is_some());
+    assert!(startup_errors.unbound.lock().unwrap().is_none());
+
+    vault.fail_delete.set(true);
+    let prepared = super::begin_legacy_removal(&reopened, &restarted).unwrap();
+    let result = super::finish_legacy_removal(&reopened, &vault, &prepared);
+    assert!(result.is_err());
+    startup_errors.record_legacy_removal_result(false, result);
+    assert_eq!(startup_errors.message(), startup_error);
+    super::restore_saved_key_with_vault(
+        &reopened,
+        &restarted,
+        || panic!("An unrelated connection must not read a legacy credential"),
+        &vault,
+    )
+    .unwrap();
+    assert!(restarted.is_available());
+
+    let retry = super::begin_legacy_removal(&reopened, &restarted).unwrap();
+    let result = super::finish_legacy_removal(&reopened, &vault, &retry);
+    assert!(result.is_ok());
+    startup_errors.record_legacy_removal_result(false, result);
+    assert!(!super::legacy_removal_pending(&reopened));
+    assert!(startup_errors.message().is_none());
+    assert_eq!(restarted.execution_snapshot().unwrap().connection, selected);
+    assert!(
+        super::read_check_availability(
+            &reopened,
+            restarted.is_available(),
+            saved_key_marker(&reopened),
+            startup_errors.message()
+        )
+        .unwrap()
+        .error
+        .is_none()
+    );
+}
+
+#[test]
+fn legacy_removal_preserves_unrelated_startup_errors() {
+    for active_uses_legacy_key in [false, true] {
+        for origin in [
+            None,
+            Some(super::StartupRecoveryOrigin::SelectedConnection),
+            Some(super::StartupRecoveryOrigin::Operation(
+                "unrelated-operation".into(),
+            )),
+        ] {
+            let startup_errors = super::StartupErrors::new();
+            let message = "Synthetic unrelated startup error.";
+            match origin {
+                None => startup_errors.set_unbound(Some(message)),
+                Some(origin) => {
+                    *startup_errors.recovery.lock().unwrap() =
+                        Some(super::StartupRecoveryError { origin, message })
+                }
+            }
+            startup_errors.record_legacy_removal_result(
+                active_uses_legacy_key,
+                Err("Synthetic removal failure."),
+            );
+            assert_eq!(startup_errors.message(), Some(message));
+            startup_errors.record_legacy_removal_result(active_uses_legacy_key, Ok(()));
+            assert_eq!(startup_errors.message(), Some(message));
+        }
+    }
+}
+
+#[test]
+fn legacy_removal_clears_the_selected_legacy_credential_error() {
+    let store = Store::open_in_memory(Path::new("synthetic-legacy-startup-error-removal")).unwrap();
+    let worker = WorkerHandle::default();
+    let vault = OfflineVault::default();
+    super::save_legacy_key(&store, &worker, Some("shared-key".into()), &vault).unwrap();
+    vault.fail_read.set(true);
+    let startup_errors = super::StartupErrors::new();
+    let result = super::restore_saved_key_with_origin(
+        &store,
+        &worker,
+        || super::read_key_with_vault(&vault),
+        &vault,
+    );
+    assert!(matches!(
+        result,
+        Err(super::StartupRestoreFailure::SelectedLegacyCredential(_))
+    ));
+    startup_errors.record_restore_result(&store, result);
+    assert!(startup_errors.message().is_some());
+    let prepared = super::begin_legacy_removal(&store, &worker).unwrap();
+    let result = super::finish_legacy_removal(&store, &vault, &prepared);
+    assert!(result.is_ok());
+    startup_errors.record_legacy_removal_result(true, result);
+    assert!(startup_errors.message().is_none());
+    assert!(!super::legacy_removal_pending(&store));
+    assert!(!worker.is_available());
 }
 
 #[test]

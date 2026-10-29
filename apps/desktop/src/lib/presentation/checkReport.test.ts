@@ -56,6 +56,7 @@ describe("Checks presentation", () => {
     )
     expect(presentation.wins).toHaveLength(1)
     expect(presentation.activeUnavailable).toHaveLength(1)
+    expect(checksHeroPresentation(presentation).result).toBe("No issues in available results")
     expect(checksHeroPresentation(presentation).summary).toBe("1 check passed")
     expect(presentation.burnChecks.counts).toEqual({ failed: 0, passed: 1, unassessed: 1 })
   })
@@ -95,7 +96,7 @@ describe("Checks presentation", () => {
     )
 
     expect(checksHeroPresentation(presentation)).toEqual({
-      result: "No issues found",
+      result: "No issues in available results",
       summary: "2 checks passed",
       state: "passed",
       tone: "text-label",
@@ -236,6 +237,28 @@ describe("Checks presentation", () => {
     expect(checksHeroPresentation(checksPresentation(report([]))).result).toBe(
       "No checks enabled",
     )
+    expect(checksPresentation(report([])).burnChecks).toMatchObject({
+      headline: "No checks enabled",
+      accessibleDescription: "No Burn Checks enabled.",
+    })
+  })
+
+  it("names snoozed checks without suggesting a connection problem", () => {
+    const check = category()
+    const presentation = checksPresentation(report([check]), false, new Set([check.id]))
+
+    expect(presentation.noActiveChecks).toBe(true)
+    expect(presentation.noEnabledChecks).toBe(false)
+    expect(presentation.burnChecks).toMatchObject({
+      headline: "All checks are snoozed",
+      accessibleDescription: "All checks are snoozed.",
+    })
+    expect(checksHeroPresentation(presentation)).toEqual({
+      result: "All checks are snoozed",
+      summary: null,
+      state: "pending",
+      tone: "text-label",
+    })
   })
 
   it("keeps the running presentation while evidence is unsettled", () => {

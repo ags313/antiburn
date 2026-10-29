@@ -225,6 +225,25 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
 
     afterEach(() => vi.restoreAllMocks())
 
+    it("directs users to Snoozed when every check is snoozed", async () => {
+      mockSnoozes(
+        report.categories.map((check) => ({
+          detector: check.id,
+          scope: "check" as const,
+          until: null,
+        })),
+      )
+      setup(null, false, aggregate, { ...report, evidenceSettled: true })
+
+      expect(
+        await screen.findByText(
+          "All checks are snoozed. Open Snoozed and unsnooze a check to include it in the summary.",
+        ),
+      ).toBeVisible()
+      expect(screen.getByRole("button", { name: "Snoozed 3" })).toBeVisible()
+      expect(screen.queryByText(/Check their settings and provider connection/)).toBeNull()
+    })
+
     it.each([false, true])(
       "search targets an awaiting check once with snoozed=%s",
       async (snoozed) => {
@@ -245,7 +264,7 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
         expect(rows[0]).toHaveAttribute("aria-pressed", "true")
         expect(rows[0]).toHaveFocus()
         expect(
-          screen.queryByText("This check has not checked any sessions yet."),
+          screen.queryByText("This check has no result in the current report."),
         ).not.toBeInTheDocument()
         if (snoozed)
           expect(screen.getByRole("button", { name: "Snoozed 1" })).toHaveAttribute(
@@ -279,7 +298,7 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
         screen.queryByRole("button", { name: /Old model usage, Not assessed/ }),
       ).not.toBeInTheDocument()
       expect(
-        screen.queryByText("This check has not checked any sessions yet."),
+        screen.queryByText("This check has no result in the current report."),
       ).not.toBeInTheDocument()
     })
 
@@ -387,7 +406,7 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
       expect(screen.queryByRole("button", { name: /Unused skills/ })).not.toBeInTheDocument()
       expect(screen.queryByRole("heading", { name: "Failed checks 1" })).not.toBeInTheDocument()
       expect(screen.queryByRole("region", { name: "Savings" })).not.toBeInTheDocument()
-      expect(screen.queryByText("No active checks.")).not.toBeInTheDocument()
+      expect(screen.queryByText("All checks are snoozed")).not.toBeInTheDocument()
     })
 
     it("moves focus to the Snoozed trigger before hiding a focused row", async () => {
@@ -607,7 +626,10 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
       categories: [report.categories[2]!],
     })
     expect(await screen.findByRole("button", { name: "Not assessed (1)" })).toBeVisible()
-    expect(screen.queryByText("No active checks.")).not.toBeInTheDocument()
+    expect(
+      screen.getByText("Open Not assessed to see checks without a current result."),
+    ).toBeVisible()
+    expect(screen.queryByText("All checks are snoozed")).not.toBeInTheDocument()
     expect(screen.queryByText("Checks have not been assessed.")).not.toBeInTheDocument()
     view.unmount()
     setup(null, false, aggregate, { ...report, evidenceSettled: true, categories: [] })
@@ -627,7 +649,7 @@ describe("BurnChecksView grouping", { timeout: 15_000 }, () => {
     expect(
       document.querySelector(".burn-checks-collection-content > [role='status']"),
     ).not.toBeInTheDocument()
-    expect(screen.queryByText("No active checks.")).not.toBeInTheDocument()
+    expect(screen.queryByText("All checks are snoozed")).not.toBeInTheDocument()
   })
 
   it("groups wide check rows and exposes the selected outcome state", async () => {

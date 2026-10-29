@@ -227,6 +227,263 @@ fn cycle_count(events: &[NativeEvidenceEvent]) -> usize {
         .count()
 }
 
+fn codex_exec_records() -> Vec<Value> {
+    let mut records = rows(CODEX);
+    let completed = rows(include_str!(
+        "fixtures/codex_characterization/paginated_completed.jsonl"
+    ));
+    let operations = [5, 7, 8, 9].map(|index| {
+        let mut record = completed[index].clone();
+        if record["type"] == "event_msg" {
+            record["payload"]["thread_id"] = json!("facts");
+        }
+        record
+    });
+    records.splice(6..8, operations);
+    records
+}
+
+#[test]
+fn codex_replaced_exec_output_closes_only_its_outer_call_without_duplicate_results() {
+    for single_operation in [true, false] {
+        let mut records = codex_exec_records();
+        let expected = if single_operation {
+            records[6]["payload"]["input"] =
+                json!("text(await tools.exec_command({cmd:\"python3 -m unittest -v\"}));");
+            records[9]["payload"]["output"] = json!("Script completed.");
+            records.remove(8);
+            vec!["test-1"]
+        } else {
+            vec!["test-1", "read-1"]
+        };
+        let source = encode(&records);
+        for events in [full_events("codex", &source), file_events("codex", &source)] {
+            assert_eq!(cycle_count(&events), 1);
+            let mut call_ids = Vec::new();
+            let mut result_ids = Vec::new();
+            for event in &events {
+                match &event.fact {
+                    NativeEvidenceFact::Message(NativeMessageObservation::Public(value))
+                        if matches!(value.payload, PublicMessagePayload::ToolCall { .. }) =>
+                    {
+                        call_ids.push(value.call_id.as_deref().unwrap());
+                    }
+                    NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(value)) => {
+                        result_ids.push(value.call_id.as_deref().unwrap());
+                    }
+                    NativeEvidenceFact::ResponseCycle(cycle) => {
+                        let ids: Vec<_> = cycle
+                            .messages
+                            .iter()
+                            .filter_map(|message| match message {
+                                NativeMessageObservation::ToolResult(result) => {
+                                    result.call_id.as_deref()
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(ids, expected);
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(call_ids, ["outer-call-1"]);
+            assert_eq!(result_ids, expected);
+        }
+        assert_live_splits("codex", &source);
+    }
+}
+
+#[test]
+fn codex_replaced_exec_needs_its_exact_complete_wrapper_output_to_close() {
+    for case in [
+        "missing",
+        "wrong-id",
+        "wrong-turn",
+        "incomplete",
+        "pending-other-call",
+    ] {
+        let mut records = codex_exec_records();
+        match case {
+            "missing" => {
+                records.remove(9);
+            }
+            "wrong-id" => records[9]["payload"]["call_id"] = json!("another-call"),
+            "wrong-turn" => records[9]["payload"]["turn_id"] = json!("another-turn"),
+            "incomplete" => records[9]["payload"]["output"] = json!([{"type":"image"}]),
+            "pending-other-call" => {
+                let mut call = rows(CODEX)[6].clone();
+                call["payload"]["call_id"] = json!("pending-call");
+                records.insert(7, call);
+            }
+            _ => unreachable!(),
+        }
+        let source = encode(&records);
+        for events in [full_events("codex", &source), file_events("codex", &source)] {
+            assert_eq!(cycle_count(&events), 0, "{case}");
+        }
+        assert_live_splits("codex", &source);
+    }
+}
+
+#[test]
+fn codex_replaced_exec_outputs_require_valid_timestamps_in_full_and_live_reads() {
+    for case in ["missing", "invalid"] {
+        let mut records = codex_exec_records();
+        if case == "missing" {
+            records[9].as_object_mut().unwrap().remove("timestamp");
+        } else {
+            records[9]["timestamp"] = json!("not-a-timestamp");
+        }
+        let source = encode(&records);
+        for (reader, events) in [
+            ("full", full_events("codex", &source)),
+            ("live", file_events("codex", &source)),
+        ] {
+            assert_eq!(cycle_count(&events), 0, "{reader}, {case}");
+        }
+        assert_live_splits("codex", &source);
+    }
+}
+
+#[test]
+fn codex_replaced_exec_output_call_id_alias_matches_full_and_live_reads() {
+    let mut records = codex_exec_records();
+    let payload = records[9]["payload"].as_object_mut().unwrap();
+    let call = payload.remove("call_id").unwrap();
+    payload.insert("callId".into(), call);
+    let source = encode(&records);
+    for (reader, events) in [
+        ("full", full_events("codex", &source)),
+        ("live", file_events("codex", &source)),
+    ] {
+        assert_eq!(cycle_count(&events), 1, "{reader}");
+        let results: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.fact {
+                NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(result)) => {
+                    result.call_id.as_deref()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results, ["test-1", "read-1"], "{reader}");
+    }
+    assert_live_splits("codex", &source);
+}
+
+#[test]
+fn codex_replacement_filter_collisions_cannot_close_an_ordinary_call() {
+    let mut records = rows(CODEX);
+    let mut ordinary = records[6].clone();
+    ordinary["payload"]["call_id"] = json!("ordinary-call");
+    let mut operations = vec![ordinary];
+    for id in [
+        "exec-proof-55240",
+        "exec-proof-87869",
+        "exec-proof-104981",
+        "exec-proof-131544",
+        "exec-proof-132961",
+        "exec-proof-259736",
+        "exec-proof-267599",
+        "exec-proof-327225",
+    ] {
+        let mut call = records[6].clone();
+        call["payload"]["call_id"] = json!(id);
+        call["payload"]["name"] = json!("exec");
+        call["payload"]["input"] = json!("text(1);");
+        let mut output = records[7].clone();
+        output["payload"]["call_id"] = json!(id);
+        operations.extend([call, output]);
+    }
+    let mut output = records[7].clone();
+    output["payload"]["call_id"] = json!("ordinary-call");
+    operations.push(output);
+    records.splice(6..8, operations);
+    let source = encode(&records);
+    let full = full_events("codex", &source);
+    assert_eq!(cycle_count(&full), 1);
+    assert!(full.iter().any(|event| matches!(
+        &event.fact,
+        NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(result))
+            if result.call_id.as_deref() == Some("ordinary-call")
+    )));
+    let live = file_events("codex", &source);
+    assert_eq!(cycle_count(&live), 0);
+    assert_live_splits("codex", &source);
+}
+
+#[test]
+fn codex_recognized_inert_metadata_keeps_later_full_and_live_history_complete() {
+    let mut records = rows(CODEX);
+    records.insert(
+        4,
+        json!({"timestamp":"2026-10-07T10:00:03Z","ordinal":0,"type":"inter_agent_communication_metadata","payload":{"trigger_turn":true}}),
+    );
+    let source = encode(&records);
+    for events in [full_events("codex", &source), file_events("codex", &source)] {
+        assert_eq!(cycle_count(&events), 0);
+        let mut messages = 0;
+        for event in events {
+            let complete = match event.fact {
+                NativeEvidenceFact::Message(NativeMessageObservation::User(value)) => {
+                    value.context.complete_through_event
+                }
+                NativeEvidenceFact::Message(NativeMessageObservation::Public(value)) => {
+                    value.context.unwrap().complete_through_event
+                }
+                NativeEvidenceFact::Message(NativeMessageObservation::ToolResult(value)) => {
+                    value.context.unwrap().complete_through_event
+                }
+                _ => continue,
+            };
+            messages += 1;
+            assert!(complete);
+        }
+        assert_eq!(messages, 4);
+    }
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("session.jsonl");
+    std::fs::write(&path, &source).unwrap();
+    let page =
+        read_native_file_page(&input("codex", RawSource::File(path)), None, &|| false).unwrap();
+    assert!(page.history_complete);
+    assert_live_splits("codex", &source);
+}
+
+#[test]
+fn codex_recognized_records_with_unhandled_evidence_still_mark_history_partial() {
+    for kind in ["inter_agent_communication_metadata", "world_state"] {
+        let mut records = rows(CODEX);
+        records.insert(
+            4,
+            json!({"timestamp":"2026-10-07T10:00:03Z","ordinal":0,"type":kind,"payload":{"trigger_turn":true,"usage":{"output_tokens":1}}}),
+        );
+        let source = encode(&records);
+        for (reader, events) in [
+            ("full", full_events("codex", &source)),
+            ("live", file_events("codex", &source)),
+        ] {
+            assert_eq!(cycle_count(&events), 0, "{reader}, {kind}");
+            assert!(
+                events.iter().any(|event| matches!(
+                    &event.fact,
+                    NativeEvidenceFact::Message(NativeMessageObservation::Public(value))
+                        if value.context.as_ref().is_some_and(|context| !context.complete_through_event)
+                )),
+                "{reader}, {kind}"
+            );
+        }
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("session.jsonl");
+        std::fs::write(&path, &source).unwrap();
+        let page =
+            read_native_file_page(&input("codex", RawSource::File(path)), None, &|| false).unwrap();
+        assert!(!page.history_complete, "{kind}");
+        assert_live_splits("codex", &source);
+    }
+}
+
 fn lifecycle_payloads() -> Vec<Value> {
     vec![
         json!({"type":"web_search_begin","call_id":"search-1"}),

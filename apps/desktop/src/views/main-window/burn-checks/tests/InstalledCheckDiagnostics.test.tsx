@@ -82,7 +82,7 @@ describe("installed check diagnostics", () => {
     expect(panel.queryByText("3 affected sessions")).toBeNull()
     expect(panel.getByText(/retries.yaml · Line 18, column 5/)).toBeVisible()
     expect(panel.getByRole("button", { name: "Open check file" })).toBeEnabled()
-    expect(screen.queryByText("This check has not checked any sessions yet.")).toBeNull()
+    expect(screen.queryByText("This check has no result in the current report.")).toBeNull()
     expect(screen.queryByText("raw diagnostic must not become UI copy")).toBeNull()
     expect(screen.queryByRole("region", { name: "Failed sessions" })).toBeNull()
     expect(screen.queryByRole("button", { name: /Copy|Open session/ })).toBeNull()
@@ -408,8 +408,9 @@ describe("installed check diagnostics", () => {
       const error = {
         ...diagnostic,
         code: "opencode-v2-capture-gap",
-        title: "OpenCode live checks are unavailable",
-        message: "Keep OpenCode and antiburn running, then rescan sessions.",
+        title: "OpenCode live checks are not running",
+        message:
+          "Live activity is not available for this session. Keep OpenCode open, then rescan sessions. Live checks cannot recover missed activity. Saved results cover only their recorded input.",
         source: null,
         details: [{ label: "Diagnostic code", value: "opencode-v2-capture-gap" }],
       }
@@ -432,6 +433,9 @@ describe("installed check diagnostics", () => {
       expect(screen.getByRole("region", { name: "Failed checks 1" })).toContainElement(row)
       const panel = screen.getByRole("region", { name: error.title })
       expect(within(panel).getByText(error.message)).toBeVisible()
+      expect(
+        within(panel).getByText(/Live checks cannot recover missed activity\./),
+      ).toBeVisible()
       expect(screen.getAllByText(error.message)).toHaveLength(1)
       expect(screen.queryByText(/OpenCode V2/)).toBeNull()
       expect(screen.getByText("Review the recorded work.")).toBeVisible()

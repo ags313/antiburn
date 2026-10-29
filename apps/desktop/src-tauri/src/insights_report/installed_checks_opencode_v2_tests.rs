@@ -486,6 +486,16 @@ fn v2_first_attach_and_recovered_capture_keep_typed_gaps_without_an_alert() {
     let stopped = rows(&store, std::slice::from_ref(&definition));
     assert_eq!(stopped[0].diagnostics.len(), 1);
     assert_eq!(stopped[0].diagnostics[0].code, "opencode-v2-capture-gap");
+    let diagnostic = &stopped[0].diagnostics[0];
+    assert_eq!(diagnostic.title, "OpenCode live checks are not running");
+    for text in [
+        "Live activity is not available for this session.",
+        "Keep OpenCode open, then rescan sessions.",
+        "Live checks cannot recover missed activity.",
+        "Saved results cover only their recorded input.",
+    ] {
+        assert!(diagnostic.message.contains(text), "{text}");
+    }
     assert_eq!(
         stopped[0].diagnostics[0].severity,
         InstalledCheckDiagnosticSeverity::Error

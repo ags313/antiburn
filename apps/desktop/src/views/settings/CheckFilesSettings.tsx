@@ -43,7 +43,9 @@ export function CheckFilesSettings({
           state.error ? (
             <span role="alert">{state.error}</span>
           ) : state.openErrors.size > 0 ? (
-            <span role="alert">Could not open a check folder. Reopen Checks to try again.</span>
+            <span role="alert">
+              Could not open a check folder. Reopen Settings → Checks to try again.
+            </span>
           ) : undefined
         }
       >

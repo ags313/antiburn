@@ -26,7 +26,7 @@ const eventCases: Array<{
     singular: "session-start observation",
     plural: "session-start observations",
     limit:
-      "Session-start observations mark when antiburn attaches to a session, not when the agent starts or resumes.",
+      "Session-start observations mark when monitoring begins, not when the agent starts or resumes.",
   },
   {
     event: "sessionIdle",

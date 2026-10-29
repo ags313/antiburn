@@ -21,7 +21,7 @@ export function installedCheckEventLabel(event: InstalledCheckEvent, count: numb
 export function installedCheckEventLimit(event: InstalledCheckEvent): string | null {
   switch (event) {
     case "sessionStart":
-      return "Session-start observations mark when antiburn attaches to a session, not when the agent starts or resumes."
+      return "Session-start observations mark when monitoring begins, not when the agent starts or resumes."
     case "sessionIdle":
       return "Idle observations record at least 120 seconds without observed activity. They do not prove that the agent finished."
     case "sessionEvent":

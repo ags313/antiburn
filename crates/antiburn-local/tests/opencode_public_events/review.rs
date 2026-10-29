@@ -65,6 +65,11 @@ fn parser_65_saved_live_cursor_keeps_progress_public_baseline_and_frozen_context
     compatible_live_cursor_keeps_progress_public_baseline_and_frozen_context(65);
 }
 
+#[test]
+fn parser_66_saved_live_cursor_keeps_progress_public_baseline_and_frozen_context() {
+    compatible_live_cursor_keeps_progress_public_baseline_and_frozen_context(66);
+}
+
 fn compatible_live_cursor_keeps_progress_public_baseline_and_frozen_context(parser_revision: i64) {
     use antiburn_local::analysis::{
         PARSER_REVISION, ToolResultStatus, opencode_journal_has_new_events,
@@ -189,7 +194,7 @@ fn compatible_parser_revisions_require_the_current_journal_layout() {
     let (_directory, path, connection) = journal();
     v1_messages(&connection);
     let initial = read(&path, "root", None, None, &|| false).unwrap();
-    for parser_revision in [63, 64, 65, PARSER_REVISION] {
+    for parser_revision in [63, 64, 65, 66, PARSER_REVISION] {
         for live_revision in [2, 4, 6] {
             let mut incompatible = serde_json::to_value(&initial.cursor).unwrap();
             incompatible["parser_revision"] = json!(parser_revision);
@@ -213,6 +218,41 @@ fn compatible_parser_revisions_require_the_current_journal_layout() {
 }
 
 #[test]
+fn parser_66_cold_retry_keeps_its_original_digest_and_frontier() {
+    use sha2::{Digest, Sha256};
+
+    let (_directory, path, connection) = journal();
+    v1_messages(&connection);
+    let initial = read(&path, "root", None, None, &|| false).unwrap();
+    let mut old = serde_json::to_value(&initial.cursor).unwrap();
+    old["parser_revision"] = json!(66);
+    let cursor: OpenCodeJournalCursor = serde_json::from_value(old).unwrap();
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(&initial.cold_retry_json().unwrap().unwrap()).unwrap();
+    let digest: [u8; 32] = Sha256::digest(
+        serde_json::to_vec(&(
+            &cursor,
+            &initial.evidence,
+            initial.history_complete,
+            &receipt["cold_replay"]["assistant_projections"],
+        ))
+        .unwrap(),
+    )
+    .into();
+    receipt["parser_revision"] = json!(66);
+    receipt["cold_replay"]["output_sha256"] = json!(digest);
+    let cursor: OpenCodeJournalCursor = serde_json::from_value(receipt.clone()).unwrap();
+    let retry = read(&path, "root", Some(&cursor), None, &|| false).unwrap();
+    assert_eq!(retry.cursor, initial.cursor);
+    assert_eq!(retry.evidence, initial.evidence);
+    assert_eq!(retry.results, initial.results);
+
+    receipt["cold_replay"]["output_sha256"][0] = json!(digest[0] ^ 1);
+    let invalid = serde_json::from_value(receipt).unwrap();
+    assert!(read(&path, "root", Some(&invalid), None, &|| false).is_err());
+}
+
+#[test]
 fn parser_63_strict_cursor_continues_after_its_existing_frontier() {
     compatible_strict_cursor_continues_after_its_existing_frontier(63);
 }
@@ -225,6 +265,11 @@ fn parser_64_strict_cursor_continues_after_its_existing_frontier() {
 #[test]
 fn parser_65_strict_cursor_continues_after_its_existing_frontier() {
     compatible_strict_cursor_continues_after_its_existing_frontier(65);
+}
+
+#[test]
+fn parser_66_strict_cursor_continues_after_its_existing_frontier() {
+    compatible_strict_cursor_continues_after_its_existing_frontier(66);
 }
 
 fn compatible_strict_cursor_continues_after_its_existing_frontier(parser_revision: i64) {

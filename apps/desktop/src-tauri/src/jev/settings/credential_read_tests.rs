@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::Path;
 
@@ -321,6 +321,430 @@ fn legacy_startup_classifies_invalid_stored_text_without_a_system_vault() {
     let vault = ScriptedVault::default();
     vault.push(None, Err(keyring::Error::NoEntry));
     assert_eq!(native::read_key_with_vault(&vault).unwrap(), None);
+}
+
+struct LegacyVault {
+    entry: keyring::Entry,
+    utf16_password: bool,
+    fail_password_read: Cell<bool>,
+    fail_write: Cell<bool>,
+    fail_restore: Cell<bool>,
+    writes: Cell<usize>,
+}
+
+impl CredentialVault for LegacyVault {
+    type Error = keyring::Error;
+
+    fn read(&self, id: Option<&str>) -> ReadResult {
+        assert!(id.is_none());
+        if self.fail_password_read.replace(false) {
+            return Err(platform_error());
+        }
+        if !self.utf16_password {
+            return self.entry.get_password().map(Some);
+        }
+        let raw = self.entry.get_secret()?;
+        if !raw.len().is_multiple_of(2) {
+            return Err(keyring::Error::BadEncoding(raw));
+        }
+        let units = raw
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(&units)
+            .map(Some)
+            .map_err(|_| keyring::Error::BadEncoding(raw))
+    }
+
+    fn write(&self, id: Option<&str>, value: &str) -> Result<(), Self::Error> {
+        assert!(id.is_none());
+        self.writes.set(self.writes.get() + 1);
+        if self.utf16_password {
+            let raw = value
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            self.entry.set_secret(&raw)?;
+        } else {
+            self.entry.set_password(value)?;
+        }
+        if self.fail_write.replace(false) {
+            return Err(platform_error());
+        }
+        Ok(())
+    }
+
+    fn delete(&self, id: Option<&str>) -> Result<(), Self::Error> {
+        assert!(id.is_none());
+        self.entry.delete_credential()
+    }
+
+    fn read_legacy_snapshot(&self) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.entry.get_secret().map(Some)
+    }
+
+    fn restore_legacy_snapshot(&self, value: &[u8]) -> Result<(), &'static str> {
+        if self.fail_restore.replace(false) {
+            return Err("Synthetic byte restore failure.");
+        }
+        self.entry
+            .set_secret(value)
+            .map_err(|error| Self::write_failure(&error))
+    }
+
+    fn is_missing(error: &Self::Error) -> bool {
+        native::SystemCredentialVault::is_missing(error)
+    }
+
+    fn is_bad_encoding(error: &Self::Error) -> bool {
+        native::SystemCredentialVault::is_bad_encoding(error)
+    }
+
+    fn read_failure(error: &Self::Error) -> Failure {
+        native::SystemCredentialVault::read_failure(error)
+    }
+
+    fn write_failure(error: &Self::Error) -> &'static str {
+        native::SystemCredentialVault::write_failure(error)
+    }
+}
+
+const UNDECODABLE_CREDENTIAL: &[u8] = b"synthetic-credential\xff";
+
+fn legacy_vault(utf16_password: bool) -> LegacyVault {
+    LegacyVault {
+        entry: keyring::Entry::new_with_credential(Box::new(
+            keyring::mock::MockCredential::default(),
+        )),
+        utf16_password,
+        fail_password_read: Cell::new(false),
+        fail_write: Cell::new(false),
+        fail_restore: Cell::new(false),
+        writes: Cell::new(0),
+    }
+}
+
+fn legacy_setup() -> (Store, WorkerHandle, LegacyVault) {
+    let store = Store::open_in_memory(Path::new("synthetic-legacy-byte-recovery")).unwrap();
+    let worker = WorkerHandle::default();
+    let vault = legacy_vault(false);
+    native::save_legacy_key(&store, &worker, Some("initial-key".into()), &vault).unwrap();
+    vault.entry.set_secret(UNDECODABLE_CREDENTIAL).unwrap();
+    assert!(matches!(
+        vault.entry.get_password(),
+        Err(keyring::Error::BadEncoding(_))
+    ));
+    (store, worker, vault)
+}
+
+#[test]
+fn legacy_windows_password_reuse_and_same_key_save_keep_decoded_key_and_revision() {
+    for key in ["synthetic-ascii-key", "synthetic-\u{100}-\u{1f600}"] {
+        let store = Store::open_in_memory(Path::new("synthetic-legacy-windows-password")).unwrap();
+        let worker = WorkerHandle::default();
+        let vault = legacy_vault(true);
+        native::save_legacy_key(&store, &worker, Some(key.into()), &vault).unwrap();
+        let raw = key
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(vault.entry.get_secret().unwrap(), raw);
+        let revision = native::active_connection(&store).unwrap().revision;
+        let writes = vault.writes.get();
+        for replacement in [None, Some(key.to_owned())] {
+            native::save_legacy_key(&store, &worker, replacement, &vault).unwrap();
+            assert_eq!(
+                worker.execution_snapshot().unwrap().credential.as_deref(),
+                Some(key)
+            );
+            assert_eq!(
+                native::active_connection(&store).unwrap().revision,
+                revision
+            );
+            assert_eq!(vault.writes.get(), writes);
+            assert_eq!(vault.entry.get_secret().unwrap(), raw);
+        }
+    }
+}
+
+#[test]
+fn legacy_windows_replacement_rollback_restores_exact_utf16le_bytes() {
+    let store = Store::open_in_memory(Path::new("synthetic-legacy-windows-rollback")).unwrap();
+    let worker = WorkerHandle::default();
+    let vault = legacy_vault(true);
+    native::save_legacy_key(&store, &worker, Some("original-key".into()), &vault).unwrap();
+    let raw = vault.entry.get_secret().unwrap();
+    let revision = native::active_connection(&store).unwrap().revision;
+    super::fail_profile_writes(&store);
+    assert!(
+        native::save_legacy_key(&store, &worker, Some("replacement-key".into()), &vault).is_err()
+    );
+    assert_eq!(vault.entry.get_secret().unwrap(), raw);
+    assert_eq!(vault.read(None).unwrap().as_deref(), Some("original-key"));
+    assert_eq!(
+        native::active_connection(&store).unwrap().revision,
+        revision
+    );
+    assert!(native::legacy_removal_pending(&store));
+    assert!(!worker.is_available());
+    store
+        .lock()
+        .execute_batch("DROP TRIGGER fail_profiles")
+        .unwrap();
+    native::save_legacy_key(&store, &worker, Some("replacement-key".into()), &vault).unwrap();
+    assert_eq!(
+        worker.execution_snapshot().unwrap().credential.as_deref(),
+        Some("replacement-key")
+    );
+    assert_eq!(
+        native::active_connection(&store).unwrap().revision,
+        revision + 1
+    );
+}
+
+#[test]
+fn legacy_windows_undecodable_password_allows_explicit_replacement_or_removal() {
+    for replace in [false, true] {
+        let store = Store::open_in_memory(Path::new("synthetic-legacy-windows-recovery")).unwrap();
+        let worker = WorkerHandle::default();
+        let vault = legacy_vault(true);
+        native::save_legacy_key(&store, &worker, Some("original-key".into()), &vault).unwrap();
+        vault.entry.set_secret(&[0x00, 0xd8]).unwrap();
+        assert!(matches!(
+            vault.read(None),
+            Err(keyring::Error::BadEncoding(_))
+        ));
+        assert_eq!(
+            native::save_legacy_key(&store, &worker, None, &vault).unwrap_err(),
+            Category::Malformed.message()
+        );
+        recover_legacy_credential(&store, &worker, &vault, replace).unwrap();
+        assert!(!native::legacy_removal_pending(&store));
+        if replace {
+            assert_eq!(
+                vault.read(None).unwrap().as_deref(),
+                Some("replacement-key")
+            );
+            assert_eq!(
+                worker.execution_snapshot().unwrap().credential.as_deref(),
+                Some("replacement-key")
+            );
+        } else {
+            assert!(matches!(
+                vault.entry.get_secret(),
+                Err(keyring::Error::NoEntry)
+            ));
+            assert!(!worker.is_available());
+        }
+    }
+}
+
+fn recover_legacy_credential(
+    store: &Store,
+    worker: &WorkerHandle,
+    vault: &LegacyVault,
+    replace: bool,
+) -> Result<(), &'static str> {
+    if replace {
+        native::save_legacy_key(store, worker, Some("replacement-key".into()), vault)
+    } else {
+        let prepared = native::begin_legacy_removal(store, worker)?;
+        native::finish_legacy_removal(store, vault, &prepared)
+    }
+}
+
+#[test]
+fn legacy_recovery_can_replace_or_remove_undecodable_credentials() {
+    for replace in [false, true] {
+        let (store, worker, vault) = legacy_setup();
+        let revision = native::active_connection(&store).unwrap().revision;
+        assert_eq!(
+            native::read_key_with_vault(&vault).unwrap_err(),
+            Category::Malformed.message()
+        );
+        recover_legacy_credential(&store, &worker, &vault, replace).unwrap();
+        assert_eq!(
+            native::active_connection(&store).unwrap().revision,
+            revision + 1
+        );
+        assert!(!native::legacy_removal_pending(&store));
+        assert_eq!(native::saved_key_marker(&store), replace);
+        assert_eq!(worker.is_available(), replace);
+        if replace {
+            assert_eq!(vault.entry.get_password().unwrap(), "replacement-key");
+            assert_eq!(
+                worker.execution_snapshot().unwrap().credential.as_deref(),
+                Some("replacement-key")
+            );
+        } else {
+            assert!(matches!(
+                vault.entry.get_secret(),
+                Err(keyring::Error::NoEntry)
+            ));
+            assert!(!native::yaml_discovery_enabled(&store));
+        }
+    }
+}
+
+#[test]
+fn legacy_recovery_metadata_failure_restores_exact_credential_bytes() {
+    for replace in [false, true] {
+        let (store, worker, vault) = legacy_setup();
+        let before = store.internal_value(native::CONNECTION_PROFILES_KEY);
+        let revision = native::active_connection(&store).unwrap().revision;
+        super::fail_profile_writes(&store);
+        assert!(recover_legacy_credential(&store, &worker, &vault, replace).is_err());
+        assert_eq!(vault.entry.get_secret().unwrap(), UNDECODABLE_CREDENTIAL);
+        assert_eq!(
+            store.internal_value(native::CONNECTION_PROFILES_KEY),
+            before
+        );
+        assert!(native::legacy_removal_pending(&store));
+        assert!(!worker.is_available());
+        assert!(
+            native::restore_saved_key_with_vault(
+                &store,
+                &worker,
+                || panic!("Pending recovery must not read a credential"),
+                &vault
+            )
+            .is_err()
+        );
+        store
+            .lock()
+            .execute_batch("DROP TRIGGER fail_profiles")
+            .unwrap();
+        recover_legacy_credential(&store, &worker, &vault, replace).unwrap();
+        assert_eq!(
+            native::active_connection(&store).unwrap().revision,
+            revision + 1
+        );
+        assert!(!native::legacy_removal_pending(&store));
+    }
+}
+
+#[test]
+fn legacy_recovery_failed_byte_rollback_keeps_the_retry_gate() {
+    for replace in [false, true] {
+        let (store, worker, vault) = legacy_setup();
+        let before = store.internal_value(native::CONNECTION_PROFILES_KEY);
+        super::fail_profile_writes(&store);
+        vault.fail_restore.set(true);
+        assert!(
+            recover_legacy_credential(&store, &worker, &vault, replace)
+                .unwrap_err()
+                .contains("restore the API key")
+        );
+        assert_eq!(
+            store.internal_value(native::CONNECTION_PROFILES_KEY),
+            before
+        );
+        assert!(native::legacy_removal_pending(&store));
+        assert!(!worker.is_available());
+        store
+            .lock()
+            .execute_batch("DROP TRIGGER fail_profiles")
+            .unwrap();
+        recover_legacy_credential(&store, &worker, &vault, replace).unwrap();
+        assert!(!native::legacy_removal_pending(&store));
+    }
+}
+
+#[test]
+fn legacy_replacement_write_failure_restores_undecodable_bytes() {
+    let (store, worker, vault) = legacy_setup();
+    let before = store.internal_value(native::CONNECTION_PROFILES_KEY);
+    vault.fail_write.set(true);
+    assert!(recover_legacy_credential(&store, &worker, &vault, true).is_err());
+    assert_eq!(vault.entry.get_secret().unwrap(), UNDECODABLE_CREDENTIAL);
+    assert_eq!(
+        store.internal_value(native::CONNECTION_PROFILES_KEY),
+        before
+    );
+    assert!(native::legacy_removal_pending(&store));
+    assert!(!worker.is_available());
+}
+
+#[test]
+fn legacy_snapshot_access_failure_keeps_the_credential_and_reports_safe_fields() {
+    for replace in [false, true] {
+        let (store, worker, vault) = legacy_setup();
+        let before = store.internal_value(native::CONNECTION_PROFILES_KEY);
+        let generation = worker.execution_snapshot().unwrap().generation;
+        vault
+            .entry
+            .get_credential()
+            .downcast_ref::<keyring::mock::MockCredential>()
+            .unwrap()
+            .set_error(platform_error());
+        let capture = LogCapture::default();
+        let result = tracing::subscriber::with_default(capture.clone(), || {
+            recover_legacy_credential(&store, &worker, &vault, replace)
+        });
+        assert_eq!(result.unwrap_err(), Category::Platform.message());
+        assert_eq!(vault.entry.get_secret().unwrap(), UNDECODABLE_CREDENTIAL);
+        assert_eq!(
+            store.internal_value(native::CONNECTION_PROFILES_KEY),
+            before
+        );
+        if replace {
+            assert_eq!(worker.execution_snapshot().unwrap().generation, generation);
+            assert!(!native::legacy_removal_pending(&store));
+        } else {
+            assert!(!worker.is_available());
+            assert!(native::legacy_removal_pending(&store));
+        }
+        let diagnostics = capture.events("system_one_credential_read_failed");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].fields["stage"],
+            if replace {
+                "\"legacy_update\""
+            } else {
+                "\"credential_removal\""
+            }
+        );
+        assert_eq!(diagnostics[0].fields["category"], "\"platform\"");
+        assert!(!capture.text().contains("secret-sentinel"));
+        assert!(!capture.text().contains("synthetic-credential"));
+    }
+}
+
+#[test]
+fn legacy_replacement_does_not_bypass_a_password_read_access_failure() {
+    let (store, worker, vault) = legacy_setup();
+    let profiles = store.internal_value(native::CONNECTION_PROFILES_KEY);
+    let generation = worker.execution_snapshot().unwrap().generation;
+    vault.fail_password_read.set(true);
+    assert_eq!(
+        recover_legacy_credential(&store, &worker, &vault, true).unwrap_err(),
+        Category::Platform.message()
+    );
+    assert_eq!(vault.entry.get_secret().unwrap(), UNDECODABLE_CREDENTIAL);
+    assert_eq!(
+        store.internal_value(native::CONNECTION_PROFILES_KEY),
+        profiles
+    );
+    assert_eq!(worker.execution_snapshot().unwrap().generation, generation);
+    assert!(!native::legacy_removal_pending(&store));
+}
+
+#[test]
+fn legacy_key_reuse_rejects_undecodable_bytes_without_mutation() {
+    let (store, worker, vault) = legacy_setup();
+    let before = store.internal_value(native::CONNECTION_PROFILES_KEY);
+    let generation = worker.execution_snapshot().unwrap().generation;
+    assert_eq!(
+        native::save_legacy_key(&store, &worker, None, &vault).unwrap_err(),
+        Category::Malformed.message()
+    );
+    assert_eq!(vault.entry.get_secret().unwrap(), UNDECODABLE_CREDENTIAL);
+    assert_eq!(
+        store.internal_value(native::CONNECTION_PROFILES_KEY),
+        before
+    );
+    assert_eq!(worker.execution_snapshot().unwrap().generation, generation);
+    assert!(!native::legacy_removal_pending(&store));
 }
 
 #[test]

@@ -101,7 +101,17 @@ fn results_after_old_assistant_header(source: &mut SyntheticJournal) {
 
 #[test]
 fn cold_journal_retry_keeps_original_ownership_after_projection_delete_and_restart() {
+    cold_journal_retry_keeps_original_ownership_at_parser_revision(PARSER_REVISION);
+}
+
+#[test]
+fn parser_66_cold_journal_retry_keeps_partial_publication_after_restart() {
+    cold_journal_retry_keeps_original_ownership_at_parser_revision(66);
+}
+
+fn cold_journal_retry_keeps_original_ownership_at_parser_revision(parser_revision: i64) {
     use antiburn_local::analysis::ToolResultChange;
+    use sha2::{Digest, Sha256};
 
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path()).unwrap();
@@ -138,8 +148,30 @@ fn cold_journal_retry_keeps_original_ownership_after_projection_delete_and_resta
         )
         .unwrap();
     assert!(saved.len() <= 1024 * 1024);
-    let value: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&saved).unwrap();
     assert!(value["cold_replay"]["assistant_projections"]["assistant"].is_object());
+    let mut old = serde_json::to_value(&initial.cursor).unwrap();
+    old["parser_revision"] = json!(parser_revision);
+    let cursor: OpenCodeJournalCursor = serde_json::from_value(old).unwrap();
+    let digest: [u8; 32] = Sha256::digest(
+        serde_json::to_vec(&(
+            &cursor,
+            &initial.evidence,
+            initial.history_complete,
+            &value["cold_replay"]["assistant_projections"],
+        ))
+        .unwrap(),
+    )
+    .into();
+    value["parser_revision"] = json!(parser_revision);
+    value["cold_replay"]["output_sha256"] = json!(digest);
+    store
+        .lock()
+        .execute(
+            "UPDATE opencode_journal_delivery SET parser_revision = ?1, cursor_json = ?2",
+            params![parser_revision, value.to_string()],
+        )
+        .unwrap();
     drop(store);
 
     source.event("message.removed.1", json!({"messageID":"assistant"}));

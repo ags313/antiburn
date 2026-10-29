@@ -66,7 +66,7 @@ fn marker(store: &crate::store::Store, key: &SessionKey) -> i64 {
 }
 
 #[test]
-fn origin_proof_accepts_only_parser_65_or_current_with_cursor_5() {
+fn origin_proof_accepts_only_parser_65_66_or_current_with_cursor_5() {
     use antiburn_local::analysis::PARSER_REVISION;
 
     let (_directory, store, key) = fixture();
@@ -80,6 +80,9 @@ fn origin_proof_accepts_only_parser_65_or_current_with_cursor_5() {
         (65, 1, false),
         (65, 4, false),
         (65, 5, true),
+        (66, 1, false),
+        (66, 4, false),
+        (66, 5, true),
         (PARSER_REVISION, 1, false),
         (PARSER_REVISION, 4, false),
         (PARSER_REVISION, 5, true),

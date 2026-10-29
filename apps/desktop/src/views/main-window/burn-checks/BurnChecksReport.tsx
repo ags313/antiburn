@@ -155,7 +155,7 @@ function CheckDetailBody({ check, session, state, evidenceActive }: CheckDetailC
   if (check.lifecycle == null) {
     return (
       <p className="type-callout text-label-secondary">
-        This check has not checked any sessions yet.
+        This check has no result in the current report.
       </p>
     )
   }
@@ -1026,7 +1026,8 @@ export function BurnChecksReport({
               )}
               {presentation.noActiveChecks && !presentation.noEnabledChecks && (
                 <p className="type-body text-label-secondary">
-                  No checks can run right now. Check their settings and provider connection.
+                  All checks are snoozed. Open Snoozed and unsnooze a check to include it in the
+                  summary.
                 </p>
               )}
             </div>
@@ -1060,7 +1061,7 @@ export function BurnChecksReport({
           ) : selectedVisibleId == null ? (
             <p className="burn-checks-detail-content type-body text-label-secondary">
               {unassessed.length > 0
-                ? "Open Not assessed to see which checks have not checked any sessions."
+                ? "Open Not assessed to see checks without a current result."
                 : "Select a check to see its result and explanation."}
             </p>
           ) : (
@@ -1113,7 +1114,7 @@ function UnavailableSearchCheck({
     >
       <h2 className="type-title-3 text-label">{label}</h2>
       <p className="mt-2 type-callout text-label-secondary">
-        This check has not checked any sessions yet.
+        This check has no result in the current report.
       </p>
     </section>
   )

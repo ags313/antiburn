@@ -314,19 +314,19 @@ pub(super) fn definition_diagnostic(
         ),
         ConfigMissingField => (
             "Add the required field",
-            "The check is missing a required field. Add the field shown in Details and save the file.",
+            "The check is missing a required field. Add the field shown in Technical details and save the file.",
         ),
         ConfigUnknownField => (
             "Remove the unsupported field",
-            "This version does not recognize the field shown in Details. Remove it or use a supported field.",
+            "This version does not recognize the field shown in Technical details. Remove it or use a supported field.",
         ),
         ConfigInvalidType => (
             "Correct the field type",
-            "The field shown in Details has the wrong type. Use the object, array, text, number, or boolean required by the check format.",
+            "The field shown in Technical details has the wrong type. Use the object, array, text, number, or boolean required by the check format.",
         ),
         ConfigInvalidValue => (
             "Correct the field value",
-            "The field shown in Details has an invalid value. Check its allowed values and relationships.",
+            "The field shown in Technical details has an invalid value. Check its allowed values and relationships.",
         ),
         CompileUnsupportedFeature => (
             "Use a supported check feature",
@@ -334,7 +334,7 @@ pub(super) fn definition_diagnostic(
         ),
         CompileInvalidExpression => (
             "Fix the expression",
-            "The expression does not use supported syntax. Check the expression in the field shown in Details.",
+            "The expression does not use supported syntax. Check the expression in the field shown in Technical details.",
         ),
         CompileUnknownReference => (
             "Correct the expression reference",
@@ -366,7 +366,7 @@ pub(super) fn definition_diagnostic(
         ),
         DiscoveryReadFailed => (
             "Check file access",
-            "antiburn cannot read this check file. Check its permissions, use UTF-8 text, and keep the file within 256 KiB.",
+            "Cannot read this check file. Check its permissions, use UTF-8 text, and keep the file within 256 KiB.",
         ),
         DiscoveryPaused => (
             "Check is paused",
@@ -415,7 +415,7 @@ pub(super) fn definition_diagnostic(
         (
             "fit-config-invalid",
             "Correct the input fitting rules",
-            "Use recent for arrays and truncate for text. Select valid input paths and remove overlapping rules. Check the field shown in Details.",
+            "Use recent for arrays and truncate for text. Select valid input paths and remove overlapping rules. Check the field shown in Technical details.",
         )
     } else {
         (diagnostic.code.as_str(), title, message)

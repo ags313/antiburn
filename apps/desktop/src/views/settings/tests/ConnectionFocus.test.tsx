@@ -177,7 +177,7 @@ it("defers search through busy Save and keeps pending recovery and later secrets
   fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }))
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
   await waitFor(() => expect(screen.getByRole("button", { name: "Model usage" })).toHaveFocus())
-  expect(screen.getByRole("button", { name: "Retry connection operation" })).toBeEnabled()
+  expect(screen.getByRole("button", { name: "Retry connection change" })).toBeEnabled()
   const reopened = await editWorkConnection(null)
   expect(reopened.credential).toHaveValue("later-secret")
   expect(saved.pendingOperation?.requestId).toBe(requestId)
@@ -300,8 +300,7 @@ it.each(["success", "pending failure"])(
       expect(screen.getByRole("listitem", { name: "Jev 2" })).toHaveAccessibleDescription(
         "Selected",
       )
-    else
-      expect(screen.getByRole("button", { name: "Retry connection operation" })).toBeEnabled()
+    else expect(screen.getByRole("button", { name: "Retry connection change" })).toBeEnabled()
     await nextFrame()
     expect(files).toHaveFocus()
   },
@@ -350,7 +349,7 @@ it.each(["success", "failure", "pending failure"])(
     if (outcome === "success")
       expect(screen.queryByRole("listitem", { name: "Jev 2" })).not.toBeInTheDocument()
     else if (outcome === "pending failure")
-      expect(screen.getByRole("button", { name: "Retry connection operation" })).toBeEnabled()
+      expect(screen.getByRole("button", { name: "Retry connection change" })).toBeEnabled()
     else expect(screen.getByRole("alert")).toBeVisible()
     await nextFrame()
     expect(files).toHaveFocus()
@@ -375,7 +374,7 @@ it.each(["completed", "failure"])(
       expect(command).toBe("retry_system_one_connection_operation")
       return operation.promise
     })
-    fireEvent.click(screen.getByRole("button", { name: "Retry connection operation" }))
+    fireEvent.click(screen.getByRole("button", { name: "Retry connection change" }))
     files.focus()
     await act(async () => {
       if (outcome === "completed") {
@@ -390,10 +389,9 @@ it.each(["completed", "failure"])(
     })
     if (outcome === "completed")
       expect(
-        screen.queryByRole("button", { name: "Retry connection operation" }),
+        screen.queryByRole("button", { name: "Retry connection change" }),
       ).not.toBeInTheDocument()
-    else
-      expect(screen.getByRole("button", { name: "Retry connection operation" })).toBeEnabled()
+    else expect(screen.getByRole("button", { name: "Retry connection change" })).toBeEnabled()
     await nextFrame()
     expect(files).toHaveFocus()
   },

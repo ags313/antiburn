@@ -143,7 +143,7 @@ impl OpenCodeToolResultPage {
         );
         let mut cursor = self.cursor.clone();
         cursor.cold_replay = Some(ColdReplay {
-            output_sha256: self.cold_output_digest()?,
+            output_sha256: self.cold_output_digest(PARSER_REVISION)?,
             assistant_projections: self.assistant_projections.clone(),
         });
         let encoded = serde_json::to_string(&cursor)?;
@@ -154,9 +154,11 @@ impl OpenCodeToolResultPage {
         Ok(Some(encoded))
     }
 
-    fn cold_output_digest(&self) -> anyhow::Result<[u8; 32]> {
+    fn cold_output_digest(&self, parser_revision: i64) -> anyhow::Result<[u8; 32]> {
+        let mut cursor = self.cursor.clone();
+        cursor.parser_revision = parser_revision;
         Ok(Sha256::digest(serde_json::to_vec(&(
-            &self.cursor,
+            &cursor,
             &self.evidence,
             self.history_complete,
             &self.assistant_projections,
@@ -879,7 +881,7 @@ fn live_boundary(
 }
 
 fn compatible_parser_revision(revision: i64) -> bool {
-    revision == PARSER_REVISION || matches!(revision, 63..=65)
+    revision == PARSER_REVISION || matches!(revision, 63..=66)
 }
 
 #[cfg(test)]
@@ -917,7 +919,7 @@ mod compatibility_tests {
             root: true,
             all_events_visible: true,
         };
-        for parser_revision in [63, 64, 65, PARSER_REVISION] {
+        for parser_revision in [63, 64, 65, 66, PARSER_REVISION] {
             let cursor = OpenCodeJournalCursor {
                 session_id: "root".into(),
                 owner_id: None,
@@ -967,7 +969,7 @@ fn validate_live(
                     && live.public == PublicState::default()))
             && cursor.through_sequence <= metadata.latest
             && cursor.cold_replay.as_ref().is_none_or(|replay| {
-                cursor.parser_revision == PARSER_REVISION
+                matches!(cursor.parser_revision, 66 | PARSER_REVISION)
                     && live.revision == LIVE_STATE_REVISION
                     && live.baseline <= cursor.through_sequence
                     && live.public_baseline == Some(cursor.through_sequence)
@@ -1299,8 +1301,9 @@ fn read_live(
         assistant_projections: assistant_projections.values,
     };
     if let Some(replay) = cold_replay {
+        let parser_revision = after.expect("a cold replay has a cursor").parser_revision;
         ensure!(
-            page.cold_output_digest()? == replay.output_sha256,
+            page.cold_output_digest(parser_revision)? == replay.output_sha256,
             OpenCodeJournalReadError::SourceChanged
         );
     }

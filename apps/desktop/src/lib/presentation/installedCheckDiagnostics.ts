@@ -42,7 +42,8 @@ export function installedCheckDiagnosticDetails(
     let value = detail.value.trim()
     if (detail.label === "Reason" && diagnostic.code === "opencode-v2-capture-gap") {
       // The first sentence gives the cause. Later sentences describe saved history.
-      value = value.split(/(?<=[.!?])\s+/u)[0] ?? value
+      const sentenceEnd = value.search(/[.!?]\s/u)
+      if (sentenceEnd >= 0) value = value.slice(0, sentenceEnd + 1)
     }
     if (!value || (kind !== "code" && primary.includes(` ${normalizedProse(value)} `))) continue
     const presented = { label: detail.label, value, code: kind === "code" }

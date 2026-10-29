@@ -147,7 +147,7 @@ export function pendingOperationMessage(
 ): string {
   const action =
     operation.kind === "save" ? "save" : operation.kind === "switch" ? "selection" : "removal"
-  return `A connection ${action} is still pending. Retry to finish recovery. Closing ${editorOpen ? "this dialog" : "Settings"} does not cancel the operation.`
+  return `The connection ${action} is not finished. Choose Retry to resolve it. This may restore the previous settings. Closing ${editorOpen ? "this dialog" : "Settings"} does not cancel it.`
 }
 
 const providerFieldTargets: Array<{

@@ -192,6 +192,147 @@ fn mixed_v1_ids_keep_the_existing_permissive_metadata_boundary() {
 }
 
 #[test]
+fn mixed_v1_header_error_keeps_v2_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("opencode.db");
+    let connection = database(&path, 0, 0);
+    add_mixed_headers(&connection);
+    connection
+        .execute(
+            "UPDATE session SET time_updated = 'invalid' WHERE id = 'ses_v1'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        sources(&discover(directory.path())),
+        BTreeMap::from([(
+            "ses_current".to_owned(),
+            (SourceFormat::OpenCodeSqliteV2, 1_700_000_000)
+        )]),
+    );
+}
+
+#[test]
+fn mixed_v2_header_error_keeps_unmigrated_v1_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("opencode.db");
+    let connection = database(&path, 0, 0);
+    add_mixed_headers(&connection);
+    connection
+        .execute("UPDATE session_v2 SET time_updated = 'invalid'", [])
+        .unwrap();
+    let mut expected = expected_headers();
+    expected.remove("ses_current");
+    assert_eq!(sources(&discover(directory.path())), expected);
+}
+
+#[test]
+fn oversized_header_ids_do_not_return_sibling_sources() {
+    for (table, id) in [("session", "ses_v1"), ("session_v2", "ses_current")] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opencode.db");
+        let connection = database(&path, 0, 0);
+        add_mixed_headers(&connection);
+        let oversized_id = "ses_".to_owned() + &"x".repeat(10 * 1024 * 1024);
+        connection
+            .execute(
+                &format!("UPDATE {table} SET id = ?1 WHERE id = ?2"),
+                params![oversized_id, id],
+            )
+            .unwrap();
+        assert!(matches!(
+            query_recent_db_session_sources(directory.path(), 1_699_999_999),
+            DbSourceRead::Failed("query")
+        ));
+    }
+}
+
+#[test]
+fn header_errors_without_usable_sibling_sources_still_fail() {
+    for (malformed_v1, malformed_v2, only_family) in [
+        (true, false, true),
+        (false, true, true),
+        (true, true, false),
+        (true, false, false),
+        (false, true, false),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("opencode.db");
+        let connection = database(&path, 0, 0);
+        add_mixed_headers(&connection);
+        if malformed_v1 {
+            connection
+                .execute("UPDATE session SET time_updated = 'invalid'", [])
+                .unwrap();
+        } else {
+            connection.execute("DELETE FROM session", []).unwrap();
+        }
+        if malformed_v2 {
+            connection
+                .execute("UPDATE session_v2 SET time_updated = 'invalid'", [])
+                .unwrap();
+        } else {
+            connection.execute("DELETE FROM session_v2", []).unwrap();
+        }
+        if only_family {
+            connection
+                .execute_batch(if malformed_v1 {
+                    "DROP TABLE session_message; DROP TABLE session_v2;"
+                } else {
+                    "DROP TABLE part; DROP TABLE message; DROP TABLE session;"
+                })
+                .unwrap();
+        }
+        assert!(matches!(
+            query_recent_db_session_sources(directory.path(), 1_699_999_999),
+            DbSourceRead::Failed("row")
+        ));
+    }
+}
+
+#[test]
+fn header_cancellation_and_authorization_errors_still_fail() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    for table in ["session", "session_v2"] {
+        for cancel in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("opencode.db");
+            let connection = database(&path, 0, 0);
+            add_mixed_headers(&connection);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let budget = QueryBudget::new(&connection, cancelled.clone());
+            connection.authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    AuthAction::Read {
+                        table_name,
+                        column_name: "time_updated"
+                    } if table_name == table
+                ) {
+                    if cancel {
+                        cancelled.store(true, Ordering::Release);
+                        return Authorization::Allow;
+                    }
+                    return Authorization::Deny;
+                }
+                Authorization::Allow
+            }));
+            let result = query_recent_db_session_sources_connection(
+                &connection,
+                &path,
+                1_699_999_999,
+                &budget,
+            );
+            assert!(matches!(
+                result,
+                DbSourceRead::Failed(stage) if stage == if cancel { "cancelled" } else { "query" }
+            ));
+        }
+    }
+}
+
+#[test]
 fn cancellation_and_authorization_errors_do_not_return_header_fallback() {
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 

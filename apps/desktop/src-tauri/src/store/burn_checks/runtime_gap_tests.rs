@@ -63,7 +63,7 @@ fn saved_results(store: &Store) -> (String, String, String, String) {
 }
 
 #[test]
-fn parser_66_reconciliation_keeps_parser_65_results_unknown_delivery_and_usage() {
+fn parser_67_reconciliation_keeps_parser_66_results_unknown_delivery_and_usage() {
     let directory = tempfile::tempdir().unwrap();
     let (store, adapter, active) =
         fixture_with_store(Arc::new(Store::open(directory.path()).unwrap()));
@@ -123,7 +123,7 @@ fn parser_66_reconciliation_keeps_parser_65_results_unknown_delivery_and_usage()
         .execute(
             "INSERT INTO session_evidence (environment_key, agent, session_id, status,
              analyzed_generation, parser_revision, analyzer_revision, evidence_schema_revision)
-         SELECT environment_key, agent, session_id, 'ready', source_generation, 65, ?1, ?2
+         SELECT environment_key, agent, session_id, 'ready', source_generation, 66, ?1, ?2
            FROM session",
             params![
                 antiburn_local::analysis::ANALYZER_REVISION,
@@ -151,7 +151,7 @@ fn parser_66_reconciliation_keeps_parser_65_results_unknown_delivery_and_usage()
     };
     let before_attempts = attempts(&store);
     let revisions = crate::analysis::projection_revisions();
-    assert_eq!(revisions.parser_revision, 66);
+    assert_eq!(revisions.parser_revision, 67);
     assert_eq!(
         store
             .reconcile_evidence_revisions(&["fixture"], revisions)
@@ -169,7 +169,7 @@ fn parser_66_reconciliation_keeps_parser_65_results_unknown_delivery_and_usage()
     let adapter = Arc::new(
         StoreCheckStore::new(
             store.clone(),
-            "parser-66-restart".into(),
+            "parser-67-restart".into(),
             active.id.scope.clone(),
         )
         .unwrap(),

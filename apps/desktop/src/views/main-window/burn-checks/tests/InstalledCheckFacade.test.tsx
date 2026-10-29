@@ -201,7 +201,7 @@ describe("installed checks in the existing UI", () => {
       expect(detail.querySelector("header")).toHaveTextContent("Not assessed")
       expect(
         within(detail).getByRole("heading", {
-          name: availability === "invalid" ? "Check needs fixing" : "Checks are paused",
+          name: availability === "invalid" ? "Check needs fixing" : "This check is paused",
         }),
       ).toBeVisible()
       expect(within(detail).queryByText("Review the recorded work.")).not.toBeInTheDocument()
@@ -314,12 +314,12 @@ describe("installed checks in the existing UI", () => {
           name: "Failed retry loop, Not assessed",
         }),
       )
-      const fallback = screen.queryByText("This check has not checked any sessions yet.")
+      const fallback = screen.queryByText("This check has no result in the current report.")
       if (reviewedWithoutStatus === 0) {
         expect(fallback).toBeVisible()
       } else {
         expect(fallback).not.toBeInTheDocument()
-        expect(screen.getByText("No check results in the current window.")).toBeVisible()
+        expect(screen.getByText("No check results in the last 30 days.")).toBeVisible()
       }
     },
   )
@@ -378,7 +378,7 @@ describe("installed checks in the existing UI", () => {
         "Failed retry loop: Not assessed · Checking",
       )
       expect(
-        screen.queryByText("This check has not checked any sessions yet."),
+        screen.queryByText("This check has no result in the current report."),
       ).not.toBeInTheDocument()
       expect(screen.queryByText(/Scanning sessions/)).not.toBeInTheDocument()
       vi.mocked(adapter.getReport).mockResolvedValue({
@@ -438,7 +438,7 @@ describe("installed checks in the existing UI", () => {
     expect(detail.querySelector("header")).toHaveTextContent("Not assessed")
     expect(within(detail).getByText("A recent check could not finish.")).toBeVisible()
     expect(
-      screen.queryByText("This check has not checked any sessions yet."),
+      screen.queryByText("This check has no result in the current report."),
     ).not.toBeInTheDocument()
 
     vi.mocked(adapter.getReport).mockResolvedValue({
@@ -467,7 +467,7 @@ describe("installed checks in the existing UI", () => {
     expect(detail.querySelector("header")).toHaveTextContent("Not assessed")
     expect(within(detail).getByText("The check finished without a new result.")).toBeVisible()
     expect(
-      screen.queryByText("This check has not checked any sessions yet."),
+      screen.queryByText("This check has no result in the current report."),
     ).not.toBeInTheDocument()
   })
 
@@ -510,7 +510,7 @@ describe("installed checks in the existing UI", () => {
       expect(detail.querySelector("header")).toHaveTextContent(text)
       expect(screen.getByRole("status")).toHaveTextContent(`Failed retry loop: ${text}`)
       expect(
-        screen.queryByText("This check has not checked any sessions yet."),
+        screen.queryByText("This check has no result in the current report."),
       ).not.toBeInTheDocument()
       expect(
         within(detail).getByText(
@@ -570,7 +570,7 @@ describe("installed checks in the existing UI", () => {
       within(waiting).queryByText(/action results|session data|No status change/),
     ).not.toBeInTheDocument()
     expect(
-      screen.queryByText("This check has not checked any sessions yet."),
+      screen.queryByText("This check has no result in the current report."),
     ).not.toBeInTheDocument()
     expect(screen.getByRole("region", { name: "Not assessed (1)" })).toContainElement(waiting)
     expect(screen.queryByRole("region", { name: "Checking 1" })).not.toBeInTheDocument()
@@ -598,7 +598,7 @@ describe("installed checks in the existing UI", () => {
     ).toBeVisible()
     expect(screen.queryByText("Needs 3 more tool results.")).not.toBeInTheDocument()
     expect(
-      screen.queryByText("This check has not checked any sessions yet."),
+      screen.queryByText("This check has no result in the current report."),
     ).not.toBeInTheDocument()
 
     vi.mocked(adapter.getReport).mockResolvedValue({

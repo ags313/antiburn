@@ -31,21 +31,27 @@ pub(super) fn query(
 ) -> Result<Vec<SessionLog>, &'static str> {
     budget.check()?;
     let mut families = Vec::new();
-    if schema.has_v2() {
-        families.push(Family::read_headers(
-            connection,
-            "session_v2",
-            cutoff,
-            false,
-        )?);
-    }
-    if schema.has_v1() {
-        families.push(Family::read_headers(
-            connection,
-            "session",
-            cutoff,
-            schema.has_v2(),
-        )?);
+    let mut header_failure = None;
+    for (supported, table, exclude_migrated) in [
+        (schema.has_v2(), "session_v2", false),
+        (schema.has_v1(), "session", schema.has_v2()),
+    ] {
+        if !supported {
+            continue;
+        }
+        match Family::read_headers(connection, table, cutoff, exclude_migrated) {
+            Ok(family) => families.push(family),
+            Err("row") => {
+                budget.check()?;
+                tracing::warn!(
+                    event = "opencode_sqlite_session_headers_failed",
+                    table,
+                    stage = "row"
+                );
+                header_failure = Some("row");
+            }
+            Err(stage) => return Err(stage),
+        }
     }
     for family in &mut families {
         family.roots = family
@@ -110,6 +116,11 @@ pub(super) fn query(
                 })
         })
         .collect();
+    if logs.is_empty()
+        && let Some(stage) = header_failure
+    {
+        return Err(stage);
+    }
     logs.sort_by(|a, b| {
         b.updated_at
             .cmp(&a.updated_at)
@@ -175,15 +186,12 @@ impl Family {
                 family.exclusion,
             ))
             .map_err(|_| "query")?;
-        let headers = statement
-            .query_map(
-                params![cutoff.saturating_mul(1000), family.result_limit()],
-                |row| Ok((candidate(row)?, row.get::<_, bool>(2)?)),
-            )
-            .map_err(|_| "query")?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|_| "row")?;
-        for (candidate, root) in headers {
+        let mut rows = statement
+            .query(params![cutoff.saturating_mul(1000), family.result_limit()])
+            .map_err(|_| "query")?;
+        while let Some(row) = rows.next().map_err(|_| "query")? {
+            let candidate = candidate(row).map_err(|_| "row")?;
+            let root = row.get::<_, bool>(2).map_err(|_| "row")?;
             let Some((id, activity)) = candidate else {
                 continue;
             };

@@ -44,7 +44,7 @@ const CANDIDATES: &str = "WITH candidates AS (
       FROM session s LEFT JOIN native_file_delivery d USING(environment_key, agent, session_id)
      WHERE s.environment_key = 'native' AND s.wsl_distro IS NULL
         AND s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'
-        AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62, 63, 64, 65))
+        AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62, 63, 64, 65, 66))
         AND s.cwd IS NOT NULL AND s.cwd <> ''
         AND EXISTS(SELECT 1 FROM burn_check_activation a
           WHERE a.enabled = 1 AND json_extract(a.activation_scope_key, '$.environment') = s.environment_key
@@ -86,7 +86,7 @@ impl NativeFileClaim {
             (Some(64), Some(1)) => NativeFileCursor::convert_main_64_json(encoded.as_bytes())?,
             (Some(62), Some(4)) => NativeFileCursor::convert_v4_json(encoded.as_bytes())?,
             (Some(revision), Some(5))
-                if revision == PARSER_REVISION || matches!(revision, 63..=65) =>
+                if revision == PARSER_REVISION || matches!(revision, 63..=66) =>
             {
                 let cursor: NativeFileCursor = serde_json::from_value(value)?;
                 if revision < 65
@@ -179,7 +179,11 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
-        let cursor_reset = if reset { "cursor_json = NULL," } else { "" };
+        let state_reset = if reset {
+            "cursor_json = NULL, last_error = NULL,"
+        } else {
+            ""
+        };
         tx.execute(
             &format!("INSERT INTO native_file_delivery (environment_key, agent, session_id, incarnation,
                 source_label, cwd, parser_revision, claim_fence,
@@ -189,7 +193,7 @@ impl Store {
              ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
                 incarnation = excluded.incarnation, source_label = excluded.source_label,
                 cwd = excluded.cwd,
-                {cursor_reset} pending = 1, blocked = 0,
+                {state_reset} pending = 1, blocked = 0,
                 claim_fence = excluded.claim_fence, lease_expires_at_epoch = excluded.lease_expires_at_epoch,
                 last_attempt_at_epoch = excluded.last_attempt_at_epoch, retry_count = excluded.retry_count,
                  last_attempt_order = excluded.last_attempt_order,
@@ -244,7 +248,8 @@ impl Store {
             claim.fence,
         )?;
         let origin_upgrade = claude
-            && (origin_boundary || !matches!(claim.parser_revision, Some(65 | PARSER_REVISION)));
+            && (origin_boundary
+                || !matches!(claim.parser_revision, Some(65 | 66 | PARSER_REVISION)));
         let mut unsafe_reason = if claim.reset {
             None
         } else {
@@ -452,7 +457,7 @@ fn current_generation(
            AND d.claim_fence = ?4 AND d.cursor_json IS ?5 AND d.lease_expires_at_epoch > ?6
            AND d.incarnation = ?7 AND s.incarnation = ?7 AND d.source_label = ?8
            AND s.source_label = ?8 AND s.source_kind = 'file' AND s.wsl_distro IS NULL
-            AND d.cwd = ?9 AND s.cwd = ?9 AND d.parser_revision IN (?10, 62, 63, 64, 65)
+            AND d.cwd = ?9 AND s.cwd = ?9 AND d.parser_revision IN (?10, 62, 63, 64, 65, 66)
            AND NOT EXISTS(SELECT 1 FROM session_relation r
              WHERE r.environment_key = s.environment_key AND r.agent = s.agent
                AND ((r.session_id = s.session_id AND r.kind = 'forkParent')

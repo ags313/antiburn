@@ -1,6 +1,9 @@
 //! Public message boundaries from the pinned V2 execution events.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use serde_json::Value;
 
@@ -23,7 +26,7 @@ const MAX_CYCLE_BYTES: usize = 4 * 1024 * 1024;
 pub(super) struct PublicState {
     baseline: Option<u64>,
     steps: BTreeMap<String, PublicStep>,
-    calls: BTreeMap<(String, String), PublicMessageObservation>,
+    calls: BTreeMap<(String, String), RetainedMessage>,
     cycle: Option<Cycle>,
     unavailable: bool,
     output_omitted: bool,
@@ -34,10 +37,45 @@ pub(super) struct PublicState {
 struct PublicStep {
     requester: NativeRequestAttribution,
     context: NativeEventContext,
+    prefix: Arc<UserPrefix>,
     text: BTreeMap<u32, Option<String>>,
     settled: bool,
     invalid: bool,
-    published: Option<PublicMessageObservation>,
+    published: Option<RetainedMessage>,
+}
+
+#[derive(Debug)]
+struct UserPrefix {
+    messages: Vec<UserMessage>,
+    bytes: usize,
+}
+
+impl UserPrefix {
+    fn new(messages: Vec<UserMessage>) -> Self {
+        let bytes = encoded_bytes(&messages);
+        Self { messages, bytes }
+    }
+}
+
+// Retained contexts keep user messages here. Output observations own their messages.
+#[derive(Debug, Clone)]
+struct RetainedMessage {
+    message: PublicMessageObservation,
+    prefix: Arc<UserPrefix>,
+}
+
+impl RetainedMessage {
+    fn materialize(&self) -> PublicMessageObservation {
+        let mut message = self.message.clone();
+        if let Some(context) = &mut message.context {
+            context.user_messages = self.prefix.messages.clone();
+        }
+        message
+    }
+
+    fn retained_bytes(&self, prefixes: &mut BTreeSet<*const UserPrefix>) -> usize {
+        encoded_bytes(&self.message) + prefix_bytes(&self.prefix, prefixes)
+    }
 }
 
 #[derive(Debug)]
@@ -136,26 +174,33 @@ impl PublicState {
     }
 
     pub(super) fn retained_bytes(&self) -> usize {
+        let mut prefixes = BTreeSet::new();
         let steps = self
             .steps
             .iter()
             .map(|(id, step)| {
                 id.len()
                     + encoded_bytes(&step.context)
+                    + prefix_bytes(&step.prefix, &mut prefixes)
                     + step.requester.retained_bytes()
                     + step
                         .text
                         .values()
                         .map(|text| 32 + text.as_ref().map_or(0, String::len))
                         .sum::<usize>()
-                    + step.published.as_ref().map_or(0, encoded_bytes)
+                    + step
+                        .published
+                        .as_ref()
+                        .map_or(0, |message| message.retained_bytes(&mut prefixes))
             })
             .sum::<usize>();
         steps
             + self
                 .calls
                 .iter()
-                .map(|((message, call), value)| message.len() + call.len() + encoded_bytes(value))
+                .map(|((message, call), value)| {
+                    message.len() + call.len() + value.retained_bytes(&mut prefixes)
+                })
                 .sum::<usize>()
             + self.cycle.as_ref().map_or(0, |cycle| {
                 cycle.bytes
@@ -308,10 +353,10 @@ impl PublicState {
                     let prior = self.steps.remove(id);
                     let mut published = prior.and_then(|step| step.published);
                     if let Some(previous) = &mut published {
-                        previous.eligible = false;
-                        previous.position = position(sequence);
-                        previous.revision = sequence;
-                        messages.push(NativeMessageObservation::Public(previous.clone()));
+                        previous.message.eligible = false;
+                        previous.message.position = position(sequence);
+                        previous.message.revision = sequence;
+                        messages.push(NativeMessageObservation::Public(previous.materialize()));
                     }
                     if self.steps.len() >= MAX_RETAINED_CALLS {
                         self.evict_settled_step();
@@ -328,12 +373,13 @@ impl PublicState {
                                 settled: false,
                                 invalid: false,
                                 published,
+                                prefix: Arc::new(UserPrefix::new(prefix)),
                                 context: NativeEventContext {
                                     first_eligible_position: position(sequence),
                                     main_session: safe,
                                     complete_through_event: context
                                         .is_some_and(|context| context.gaps.is_empty()),
-                                    user_messages: prefix,
+                                    user_messages: Vec::new(),
                                 },
                             },
                         );
@@ -378,11 +424,12 @@ impl PublicState {
                             if step.settled && value.as_deref() != Some(text) {
                                 step.invalid = true;
                                 if let Some(previous) = &mut step.published {
-                                    previous.eligible = false;
-                                    previous.position = position(sequence);
-                                    previous.revision = sequence;
-                                    messages
-                                        .push(NativeMessageObservation::Public(previous.clone()));
+                                    previous.message.eligible = false;
+                                    previous.message.position = position(sequence);
+                                    previous.message.revision = sequence;
+                                    messages.push(NativeMessageObservation::Public(
+                                        previous.materialize(),
+                                    ));
                                 }
                             }
                             *value = Some(text.to_owned());
@@ -420,31 +467,35 @@ impl PublicState {
                                     None,
                                     step.requester.clone(),
                                 );
-                                let mut observation = PublicMessageObservation {
-                                    source_format: SourceFormat::OpenCodeSqliteV2,
-                                    session_id: session.to_owned(),
-                                    record_id: message.to_owned(),
-                                    part_id: None,
-                                    call_id: Some(call_id.to_owned()),
-                                    position: position(sequence),
-                                    revision: sequence,
-                                    change: ToolResultChange::Update,
-                                    eligible: safe,
-                                    completeness: completeness(session, safe),
-                                    context: Some(step.context.clone()),
-                                    payload: PublicMessagePayload::ToolCall {
-                                        tool_name: name.clone(),
-                                        input: Some(NativeToolInput::Json(input.clone())),
-                                        facts: Some(facts),
-                                        provider_executed: call.provider_executed,
+                                let mut observation = RetainedMessage {
+                                    prefix: step.prefix.clone(),
+                                    message: PublicMessageObservation {
+                                        source_format: SourceFormat::OpenCodeSqliteV2,
+                                        session_id: session.to_owned(),
+                                        record_id: message.to_owned(),
+                                        part_id: None,
+                                        call_id: Some(call_id.to_owned()),
+                                        position: position(sequence),
+                                        revision: sequence,
+                                        change: ToolResultChange::Update,
+                                        eligible: safe,
+                                        completeness: completeness(session, safe),
+                                        context: Some(step.context.clone()),
+                                        payload: PublicMessagePayload::ToolCall {
+                                            tool_name: name.clone(),
+                                            input: Some(NativeToolInput::Json(input.clone())),
+                                            facts: Some(facts),
+                                            provider_executed: call.provider_executed,
+                                        },
                                     },
                                 };
                                 let unchanged = self.calls.get(&key).is_some_and(|previous| {
-                                    previous.payload == observation.payload
+                                    previous.message.payload == observation.message.payload
                                 });
                                 if let Some(previous) = self.calls.get(&key) {
-                                    observation.context = previous.context.clone();
-                                } else if let Some(context) = &mut observation.context {
+                                    observation.message.context = previous.message.context.clone();
+                                    observation.prefix = previous.prefix.clone();
+                                } else if let Some(context) = &mut observation.message.context {
                                     context.first_eligible_position = position(sequence);
                                 }
                                 if !unchanged
@@ -452,7 +503,9 @@ impl PublicState {
                                         || self.calls.contains_key(&key))
                                 {
                                     self.calls.insert(key.clone(), observation.clone());
-                                    messages.push(NativeMessageObservation::Public(observation));
+                                    messages.push(NativeMessageObservation::Public(
+                                        observation.materialize(),
+                                    ));
                                     if let Some(cycle) = &mut self.cycle {
                                         cycle.invalid |= !cycle.owned_steps.contains(message);
                                         cycle.calls.insert(key);
@@ -495,35 +548,42 @@ impl PublicState {
                             let mut context = step
                                 .published
                                 .as_ref()
-                                .and_then(|previous| previous.context.clone())
+                                .and_then(|previous| previous.message.context.clone())
                                 .unwrap_or_else(|| step.context.clone());
                             if step.published.is_none() {
                                 context.first_eligible_position = position(sequence);
                             }
-                            let observation = PublicMessageObservation {
-                                source_format: SourceFormat::OpenCodeSqliteV2,
-                                session_id: session.to_owned(),
-                                record_id: id.to_owned(),
-                                part_id: None,
-                                call_id: None,
-                                position: position(sequence),
-                                revision: sequence,
-                                change: ToolResultChange::Update,
-                                eligible: safe,
-                                completeness: completeness(session, safe),
-                                context: Some(context),
-                                payload: PublicMessagePayload::AssistantText {
-                                    parts,
-                                    generator: step.requester.clone(),
+                            let observation = RetainedMessage {
+                                prefix: step.published.as_ref().map_or_else(
+                                    || step.prefix.clone(),
+                                    |previous| previous.prefix.clone(),
+                                ),
+                                message: PublicMessageObservation {
+                                    source_format: SourceFormat::OpenCodeSqliteV2,
+                                    session_id: session.to_owned(),
+                                    record_id: id.to_owned(),
+                                    part_id: None,
+                                    call_id: None,
+                                    position: position(sequence),
+                                    revision: sequence,
+                                    change: ToolResultChange::Update,
+                                    eligible: safe,
+                                    completeness: completeness(session, safe),
+                                    context: Some(context),
+                                    payload: PublicMessagePayload::AssistantText {
+                                        parts,
+                                        generator: step.requester.clone(),
+                                    },
                                 },
                             };
                             step.published = Some(observation.clone());
-                            messages.push(NativeMessageObservation::Public(observation));
+                            messages
+                                .push(NativeMessageObservation::Public(observation.materialize()));
                         } else if let Some(previous) = &mut step.published {
-                            previous.position = position(sequence);
-                            previous.revision = sequence;
-                            previous.eligible = false;
-                            messages.push(NativeMessageObservation::Public(previous.clone()));
+                            previous.message.position = position(sequence);
+                            previous.message.revision = sequence;
+                            previous.message.eligible = false;
+                            messages.push(NativeMessageObservation::Public(previous.materialize()));
                         }
                         if let Some(cycle) = &mut self.cycle {
                             cycle.invalid |= !cycle.steps.remove(id);
@@ -551,16 +611,16 @@ impl PublicState {
                     facts,
                     provider_executed,
                     ..
-                } = &mut call.payload
+                } = &mut call.message.payload
                 && *provider_executed != observation.provider_executed
             {
                 *provider_executed = observation.provider_executed;
                 *facts = observation.facts.clone();
-                call.position = position(sequence);
-                call.revision = sequence;
-                call.eligible &= safe;
-                call.completeness = completeness(session, safe);
-                messages.push(NativeMessageObservation::Public(call.clone()));
+                call.message.position = position(sequence);
+                call.message.revision = sequence;
+                call.message.eligible &= safe;
+                call.message.completeness = completeness(session, safe);
+                messages.push(NativeMessageObservation::Public(call.materialize()));
             }
             self.calls.remove(&key);
             if let Some(cycle) = &mut self.cycle {
@@ -713,6 +773,14 @@ impl PublicState {
 
 fn encoded_bytes(value: &impl serde::Serialize) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+fn prefix_bytes(prefix: &Arc<UserPrefix>, prefixes: &mut BTreeSet<*const UserPrefix>) -> usize {
+    if prefixes.insert(Arc::as_ptr(prefix)) {
+        prefix.bytes
+    } else {
+        0
+    }
 }
 
 fn position(sequence: u64) -> ToolResultPosition {

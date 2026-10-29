@@ -189,7 +189,7 @@ it.each([false, true])(
     expect(screen.queryByRole("heading", { name: "Assessed input" })).not.toBeInTheDocument()
     expect(screen.queryByRole("heading", { name: "failed-retry-loop" })).not.toBeInTheDocument()
     expect(
-      screen.queryByText("This check has not checked any sessions yet."),
+      screen.queryByText("This check has no result in the current report."),
     ).not.toBeInTheDocument()
     expect(screen.getByText("Select a check to see its result and explanation.")).toBeVisible()
     expect(
@@ -313,7 +313,7 @@ it.each([false, true])(
     ).not.toBeInTheDocument()
     expect(screen.queryByRole("heading", { name: "failed-retry-loop" })).not.toBeInTheDocument()
     expect(
-      screen.queryByText("This check has not checked any sessions yet."),
+      screen.queryByText("This check has no result in the current report."),
     ).not.toBeInTheDocument()
     expect(screen.getByText("Select a check to see its result and explanation.")).toBeVisible()
   },

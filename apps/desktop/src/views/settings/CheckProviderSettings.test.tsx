@@ -576,13 +576,13 @@ it("keeps pending removal Retry reachable and focused after deletion and remount
     throw new Error("Could not finish credential cleanup. Use Retry in Settings → Checks.")
   })
   fireEvent.click(screen.getByRole("menuitem", { name: "Remove" }))
-  const retry = await screen.findByRole("button", { name: "Retry connection operation" })
+  const retry = await screen.findByRole("button", { name: "Retry connection change" })
   await waitFor(() => expect(retry).toHaveFocus())
   expect(screen.queryByRole("button", { name: "More actions for Jev" })).not.toBeInTheDocument()
   expect(screen.getByRole("button", { name: "Add connection" })).toBeDisabled()
   first.unmount()
   render(<CheckProviderSettings />)
-  const remounted = await screen.findByRole("button", { name: "Retry connection operation" })
+  const remounted = await screen.findByRole("button", { name: "Retry connection change" })
   invoke.mockImplementationOnce(async (_command, args) => {
     expect(args).toEqual({ operationId: "remove-token" })
     saved = { ...saved, pendingOperation: null }
@@ -591,7 +591,7 @@ it("keeps pending removal Retry reachable and focused after deletion and remount
   fireEvent.click(remounted)
   await waitFor(() =>
     expect(
-      screen.queryByRole("button", { name: "Retry connection operation" }),
+      screen.queryByRole("button", { name: "Retry connection change" }),
     ).not.toBeInTheDocument(),
   )
   await waitFor(() =>
@@ -624,15 +624,13 @@ it.each(["Cancel", "Escape"])(
       )
     })
     fireEvent.click(within(dialog).getByRole("button", { name: "Add connection" }))
-    await screen.findByRole("button", { name: "Retry connection operation" })
+    await screen.findByRole("button", { name: "Retry connection change" })
     if (action === "Cancel") fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
     else fireEvent(dialog, new Event("cancel", { cancelable: true }))
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
-    const retry = screen.getByRole("button", { name: "Retry connection operation" })
+    const retry = screen.getByRole("button", { name: "Retry connection change" })
     await waitFor(() => expect(retry).toHaveFocus())
-    expect(screen.getAllByRole("button", { name: "Retry connection operation" })).toHaveLength(
-      1,
-    )
+    expect(screen.getAllByRole("button", { name: "Retry connection change" })).toHaveLength(1)
     expect(opener).toBeDisabled()
     expect(saved.pendingOperation?.id).toBe("pending-add")
     expect(saved.profiles).toEqual({})
@@ -684,7 +682,7 @@ it.each([
     fireEvent.click(
       kind === "switch" ? opener : screen.getByRole("menuitem", { name: "Remove" }),
     )
-    const retry = await screen.findByRole("button", { name: "Retry connection operation" })
+    const retry = await screen.findByRole("button", { name: "Retry connection change" })
     await waitFor(() => expect(retry).toHaveFocus())
     expect(opener).toBeInTheDocument()
     if (kind === "switch") expect(opener).toBeDisabled()
@@ -744,12 +742,12 @@ it("closes a pending editor without discarding the secret and completes only its
     )
   })
   fireEvent.click(screen.getByRole("button", { name: "Save" }))
-  await screen.findByRole("button", { name: "Retry connection operation" })
+  await screen.findByRole("button", { name: "Retry connection change" })
   expect(screen.getByRole("button", { name: "Save" })).toBeDisabled()
   expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled()
   fireEvent.click(screen.getByRole("button", { name: "Cancel" }))
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
-  expect(screen.getByRole("button", { name: "Retry connection operation" })).toBeVisible()
+  expect(screen.getByRole("button", { name: "Retry connection change" })).toBeVisible()
   expect(confirmDiscard).not.toHaveBeenCalled()
   await edit()
   expect(screen.getByLabelText("Jev API key")).toHaveValue("keep-secret")
@@ -757,7 +755,7 @@ it("closes a pending editor without discarding the secret and completes only its
     saved = { ...saved, pendingOperation: null }
     return { settings: saved, outcome: "completed" }
   })
-  fireEvent.click(screen.getByRole("button", { name: "Retry connection operation" }))
+  fireEvent.click(screen.getByRole("button", { name: "Retry connection change" }))
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
   await edit()
   expect(screen.queryByLabelText("Jev API key")).not.toBeInTheDocument()

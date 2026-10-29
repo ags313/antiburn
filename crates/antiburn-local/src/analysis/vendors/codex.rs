@@ -407,6 +407,9 @@ impl CodexSessionReader {
                             &mut capture,
                         );
                     }
+                    if state.completed.replaces_exec_content(&value) {
+                        public.close_replaced_output(&value);
+                    }
                     public.end(
                         &value,
                         record_index,
@@ -571,7 +574,7 @@ impl CodexStreamState {
         record_index: u64,
         sink: &mut dyn RecordSink,
     ) {
-        if record_to_event(&value).is_some_and(|event| event.ts_ms.is_none()) {
+        if !has_required_timestamp(&value) {
             self.scope.invalidate();
             sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
             return;
@@ -2335,6 +2338,10 @@ fn codex_fork_owned_offset(content: &str) -> (Option<usize>, bool) {
 /// echoes of `response_item` turns). `task_complete` also returns `None` here,
 /// but [`task_complete_observation`] reads its `error` object separately, for
 /// the `QuotaIncident` or `ProviderIncident` observation.
+fn has_required_timestamp(record: &Value) -> bool {
+    record_to_event(record).is_none_or(|event| event.ts_ms.is_some())
+}
+
 fn record_to_event(record: &Value) -> Option<NormalizedEvent> {
     let obj = record.as_object()?;
     let ts = obj.get("timestamp").and_then(parse_ts);
@@ -3605,7 +3612,8 @@ mod tests {
         // This range reads no new source keys or inertness rules for those facts.
         // MCP names reuse namespace/name and preserve the pinned trailing delimiter.
         // Read categories use typed extents. Neither change adds source keys.
-        const EXPECTED_FINGERPRINT: u64 = 5_249_953_243_403_150_501;
+        // Full and live readers share the event timestamp check. It reads no new keys.
+        const EXPECTED_FINGERPRINT: u64 = 4_904_148_983_723_535_706;
         let source = include_str!("codex.rs").replace("\r\n", "\n");
         let start = source.find("fn observe_model_and_effort").unwrap();
         let end = source.find("\n#[cfg(test)]\nmod tests").unwrap();

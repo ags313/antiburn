@@ -127,26 +127,35 @@ for (const theme of ["light", "dark"] as const) {
 
       await failed.click()
       const alert = details.getByRole("region", {
-        name: "OpenCode live checks are unavailable",
+        name: "OpenCode live checks are not running",
       })
       await expect(alert).toBeVisible()
       await expect(status.getByRole("heading", { name: "Checking", exact: true })).toBeVisible()
       await expect(status.getByText("Saved check results: 1 failed.")).toBeVisible()
       await expect(
-        details.getByRole("region", { name: "OpenCode live checks are unavailable" }),
+        details.getByRole("region", { name: "OpenCode live checks are not running" }),
       ).toHaveCount(1)
       await expect(
         details.getByText("The same failed command ran again without a change."),
       ).toBeVisible()
-      await expect(details.getByText(/OpenCode V2|Missing information|missed/i)).toHaveCount(0)
+      await expect(details.getByText(/OpenCode V2|Missing information/i)).toHaveCount(0)
+      await expect(
+        alert.getByText(
+          "Live activity is not available for this session. Keep OpenCode open, then rescan sessions. Live checks cannot recover missed activity. Saved results cover only their recorded input.",
+          { exact: true },
+        ),
+      ).toBeVisible()
       const technical = alert.locator("summary", { hasText: "Technical details" })
       await expect(technical.locator("..")).not.toHaveAttribute("open", "")
       await technical.focus()
       await technical.press("Enter")
       await expect(alert.getByText("opencode-v2-capture-gap", { exact: true })).toBeVisible()
-      const cause = alert.getByText("Live capture is not active for this session.", {
-        exact: true,
-      })
+      const cause = alert.getByText(
+        "The connection for live OpenCode activity is not active.",
+        {
+          exact: true,
+        },
+      )
       await expect(cause).toBeVisible()
       await expect(cause).not.toHaveCSS("font-family", /monospace/)
       await expect(

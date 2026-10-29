@@ -175,9 +175,7 @@ describe("BurnChecksView actions", { timeout: 15_000 }, () => {
     fireEvent.click(await screen.findByRole("button", { name: "Fix" }))
     const dialog = await screen.findByRole("dialog", { name: "Confirm change" })
     fireEvent.click(within(dialog).getByRole("button", { name: "Apply change" }))
-    await screen.findByText(
-      "The change was made, but a later session could not confirm the result.",
-    )
+    await screen.findByText("Change applied. Automatic verification is unavailable.")
     vi.mocked(adapter.getTargets).mockResolvedValueOnce({
       targets: [
         {
@@ -201,47 +199,62 @@ describe("BurnChecksView actions", { timeout: 15_000 }, () => {
     expect(screen.getByText("The check cannot verify this change automatically.")).toBeVisible()
   })
 
-  it("reviews and applies all selected automatic fixes", async () => {
-    const targets = Array.from({ length: 3 }, (_, index) => ({
-      ...target,
-      findingId: `finding-${index}`,
-      actionId: `action-${index}`,
-      display: {
-        ...target.display,
-        resourceIdentity: `model-${index}`,
-        currentValue: `model-${index}`,
-      },
-    }))
-    render(
-      <BurnCheckDetail
-        detector="oldModelUsage"
-        targets={targets}
-        samples={[]}
-        failedSessionCount={3}
-        refresh={vi.fn()}
-      />,
-    )
+  it.each([false, true])(
+    "reviews and applies selected fixes with verification unavailable=%s",
+    async (verificationUnavailable) => {
+      if (verificationUnavailable) {
+        commands.apply.mockResolvedValue({
+          outcome: "appliedVerificationUnavailable",
+          watchId: "watch-unverified",
+        })
+      }
+      const targets = Array.from({ length: 3 }, (_, index) => ({
+        ...target,
+        findingId: `finding-${index}`,
+        actionId: `action-${index}`,
+        display: {
+          ...target.display,
+          resourceIdentity: `model-${index}`,
+          currentValue: `model-${index}`,
+        },
+      }))
+      render(
+        <BurnCheckDetail
+          detector="oldModelUsage"
+          targets={targets}
+          samples={[]}
+          failedSessionCount={3}
+          refresh={vi.fn()}
+        />,
+      )
 
-    const fix = screen.getByRole("button", { name: "Fix" })
-    const prompt = screen.getByRole("button", { name: "Copy fix prompt" })
-    expect(fix.parentElement).not.toHaveClass("mt-3")
-    expect(fix.parentElement?.parentElement).toBe(prompt.parentElement?.parentElement)
-    fireEvent.click(fix)
-    let dialog = await screen.findByRole("dialog", { name: "Choose changes" })
-    expect(within(dialog).getByRole("button", { name: "Check 0 changes" })).toBeDisabled()
-    fireEvent.click(within(dialog).getByRole("button", { name: "Select all" }))
-    fireEvent.click(within(dialog).getByRole("button", { name: "Check 3 changes" }))
+      const fix = screen.getByRole("button", { name: "Fix" })
+      const prompt = screen.getByRole("button", { name: "Copy fix prompt" })
+      expect(fix.parentElement).not.toHaveClass("mt-3")
+      expect(fix.parentElement?.parentElement).toBe(prompt.parentElement?.parentElement)
+      fireEvent.click(fix)
+      let dialog = await screen.findByRole("dialog", { name: "Choose changes" })
+      expect(within(dialog).getByRole("button", { name: "Check 0 changes" })).toBeDisabled()
+      fireEvent.click(within(dialog).getByRole("button", { name: "Select all" }))
+      fireEvent.click(within(dialog).getByRole("button", { name: "Check 3 changes" }))
 
-    dialog = await screen.findByRole("dialog", { name: "Check 3 changes" })
-    expect(within(dialog).getByText("model-0")).toBeVisible()
-    expect(within(dialog).getByText("model-1")).toBeVisible()
-    expect(within(dialog).getByText("model-2")).toBeVisible()
-    fireEvent.click(within(dialog).getByRole("button", { name: "Apply 3 changes" }))
+      dialog = await screen.findByRole("dialog", { name: "Check 3 changes" })
+      expect(within(dialog).getByText("model-0")).toBeVisible()
+      expect(within(dialog).getByText("model-1")).toBeVisible()
+      expect(within(dialog).getByText("model-2")).toBeVisible()
+      fireEvent.click(within(dialog).getByRole("button", { name: "Apply 3 changes" }))
 
-    dialog = await screen.findByRole("dialog", { name: "Changes applied" })
-    expect(within(dialog).getByRole("status")).toHaveTextContent("3 changes applied")
-    expect(commands.apply).toHaveBeenCalledTimes(3)
-  })
+      dialog = await screen.findByRole("dialog", { name: "Changes applied" })
+      expect(within(dialog).getByRole("status")).toHaveTextContent("3 changes applied")
+      if (verificationUnavailable) {
+        expect(within(dialog).getByRole("status")).toHaveTextContent(
+          "Some applied changes cannot be verified automatically.",
+        )
+        expect(within(dialog).queryByText(/A later session could not confirm/)).toBeNull()
+      }
+      expect(commands.apply).toHaveBeenCalledTimes(3)
+    },
+  )
 
   it("keeps long config values readable in the batch review", async () => {
     const currentValue = "copy-value-with-a-long-config-selector-".repeat(8)

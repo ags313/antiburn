@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::store::native_tool_results::ToolResultPublicationOutcome;
+use crate::store::native_tool_results::admission;
 use crate::store::native_tool_results::main_64_preservation_tests as preservation;
 use crate::store::native_tool_results::publications::PublicationGapKind;
 
@@ -231,7 +232,7 @@ fn main_64_codex_and_pi_partial_publication_restart_keep_converted_read_state() 
         store.lock().execute("UPDATE native_file_delivery SET parser_revision=64,cursor_json=?1,
             observed_generation=?2,pending=1,claim_fence=NULL,lease_expires_at_epoch=NULL,next_attempt_at_epoch=101",
             params![saved["cursor"].to_string(), claim.generation]).unwrap();
-        let call = prefix
+        let mut call = prefix
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .rfind(|record| {
@@ -242,13 +243,18 @@ fn main_64_codex_and_pi_partial_publication_restart_keep_converted_read_state() 
                 }
             })
             .unwrap();
-        let completion: Value = serde_json::from_str(&format!(
-            "{}{}",
-            prefix.lines().last().unwrap(),
-            saved["source_suffix"].as_str().unwrap()
-        ))
-        .unwrap();
-        append(&input, saved["source_suffix"].as_str().unwrap());
+        let mut suffix = saved["source_suffix"].as_str().unwrap().to_owned();
+        if agent == "codex" {
+            call["timestamp"] = json!("2026-01-01T00:00:05Z");
+            // Add the required timestamp without changing the saved partial row.
+            suffix = format!(
+                "{},\"timestamp\":\"2026-01-01T00:00:05Z\"}}\n",
+                suffix.strip_suffix("}\n").unwrap()
+            );
+        }
+        let completion: Value =
+            serde_json::from_str(&format!("{}{}", prefix.lines().last().unwrap(), suffix)).unwrap();
+        append(&input, &suffix);
         for index in 2..82 {
             let mut call = call.clone();
             let mut result = completion.clone();
@@ -546,6 +552,139 @@ fn next_page(store: &Store, input: &SessionInput, now: i64) -> (NativeFileClaim,
     (claim, page)
 }
 
+fn unsafe_file_fixture(reason: &str) -> (tempfile::TempDir, Store, SessionInput) {
+    let (directory, store, input) = fixture_for_source(
+        concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"scope-test\",\"timestamp\":100}\n",
+            "{\"type\":\"message\",\"id\":\"user-one\",\"parentId\":null,\"timestamp\":101,",
+            "\"message\":{\"role\":\"user\",\"content\":\"Synthetic task\"}}\n",
+        ),
+        SessionKey::new("native", "pi", "scope-test"),
+        SourceFormat::PiV3Jsonl,
+    );
+    let (claim, page) = next_page(&store, &input, 100);
+    assert!(page.history_complete);
+    store
+        .publish_native_file_page(&claim, &page, &[], 100)
+        .unwrap();
+    {
+        let mut connection = store.lock();
+        let tx = connection.transaction().unwrap();
+        admission::invalidate_in(&tx, &claim.key, reason).unwrap();
+        tx.commit().unwrap();
+    }
+    let (claim, page) = next_page(&store, &input, 101);
+    store
+        .publish_native_file_page(&claim, &page, &[], 101)
+        .unwrap();
+    (directory, store, input)
+}
+
+#[test]
+fn reset_file_claim_clears_old_unsafe_state_before_a_failed_or_cancelled_read() {
+    for reason in [
+        "native-unsafe-identity",
+        "native-unsafe-order",
+        "native-unsafe-ownership",
+    ] {
+        for failure in [
+            NativeFileReadError::ReadFailed,
+            NativeFileReadError::Cancelled,
+        ] {
+            let (_directory, store, input) = unsafe_file_fixture(reason);
+            store
+                .lock()
+                .execute(
+                    "UPDATE session SET incarnation = incarnation + 1, source_generation = source_generation + 1",
+                    [],
+                )
+                .unwrap();
+            let claim = store.claim_next_native_file(102, 60).unwrap().unwrap();
+            assert!(claim.reset && claim.cursor_json.is_none());
+            let last_error: Option<String> = store
+                .lock()
+                .query_row("SELECT last_error FROM native_file_delivery", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert!(store.fail_native_file(&claim, failure, 102, 103).unwrap());
+            let (retry, page) = next_page(&store, &input, 103);
+            assert!(!retry.reset && retry.cursor_json.is_none());
+            assert!(page.history_complete && page.admission_failure.is_none());
+            assert!(
+                store
+                    .publish_native_file_page(&retry, &page, &[], 103)
+                    .unwrap()
+            );
+            let connection = store.lock();
+            assert!(
+                admission::source_reason_in(&connection, &retry.key)
+                    .unwrap()
+                    .is_none(),
+                "{reason}, {failure:?}",
+            );
+            assert_eq!(last_error, None, "{reason}, {failure:?}");
+            let coverage: (String, bool, Option<String>) = connection
+                .query_row(
+                    "SELECT outcome, complete, gap_reason FROM native_tool_result_publication
+                 WHERE session_incarnation = ?1 AND outcome IN ('coverage_gap', 'coverage_complete')
+                 ORDER BY publication_sequence DESC LIMIT 1",
+                    [retry.incarnation],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(coverage, ("coverage_complete".into(), true, None));
+            let unsafe_gaps: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM native_tool_result_publication
+                 WHERE session_incarnation = ?1 AND gap_reason LIKE 'native-unsafe-%'",
+                    [retry.incarnation],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unsafe_gaps, 0);
+        }
+    }
+}
+
+#[test]
+fn same_file_incarnation_keeps_unsafe_state_after_failed_or_cancelled_reads() {
+    for reason in [
+        "native-unsafe-identity",
+        "native-unsafe-order",
+        "native-unsafe-ownership",
+    ] {
+        for failure in [
+            NativeFileReadError::ReadFailed,
+            NativeFileReadError::Cancelled,
+        ] {
+            let (_directory, store, input) = unsafe_file_fixture(reason);
+            let claim = store.claim_next_native_file(102, 60).unwrap().unwrap();
+            assert!(!claim.reset && claim.cursor_json.is_some());
+            assert!(store.fail_native_file(&claim, failure, 102, 103).unwrap());
+            assert_eq!(
+                admission::source_reason_in(&store.lock(), &claim.key)
+                    .unwrap()
+                    .as_deref(),
+                Some(reason),
+                "{failure:?}",
+            );
+            let (retry, page) = next_page(&store, &input, 103);
+            assert!(!retry.reset && page.history_complete);
+            store
+                .publish_native_file_page(&retry, &page, &[], 103)
+                .unwrap();
+            assert_eq!(
+                admission::source_reason_in(&store.lock(), &retry.key)
+                    .unwrap()
+                    .as_deref(),
+                Some(reason),
+                "{failure:?}",
+            );
+        }
+    }
+}
+
 fn prior_receipt(store: &Store, parser_revision: i64, now: i64) {
     store
         .lock()
@@ -559,7 +698,7 @@ fn prior_receipt(store: &Store, parser_revision: i64, now: i64) {
 
 #[test]
 fn compatible_parser_receipts_keep_partial_records_baselines_and_completed_results() {
-    for parser_revision in [63, 64, 65] {
+    for parser_revision in [63, 64, 65, 66] {
         let lines: Vec<_> = CLAUDE_RESULTS.split_inclusive('\n').collect();
         let pending = lines[4];
         let split = pending.len() / 2;
@@ -592,7 +731,7 @@ fn compatible_parser_receipts_keep_partial_records_baselines_and_completed_resul
         );
         assert!(idle.pending_tail);
         assert!(idle.results.is_empty() && idle.evidence.events.is_empty());
-        if parser_revision == 65 {
+        if matches!(parser_revision, 65 | 66) {
             assert_eq!(serde_json::to_string(&idle.cursor).unwrap(), saved);
             assert_eq!(
                 store
@@ -603,7 +742,7 @@ fn compatible_parser_receipts_keep_partial_records_baselines_and_completed_resul
                         |row| row.get::<_, i64>(0)
                     )
                     .unwrap(),
-                65
+                parser_revision
             );
         }
         store
@@ -617,7 +756,10 @@ fn compatible_parser_receipts_keep_partial_records_baselines_and_completed_resul
         let after = store.native_tool_result_publications_after(0, 100).unwrap();
         assert!(after.starts_with(&publications));
         let coverage = &after[publications.len()..];
-        assert_eq!(coverage.len(), usize::from(parser_revision == 65));
+        assert_eq!(
+            coverage.len(),
+            usize::from(matches!(parser_revision, 65 | 66))
+        );
         for publication in coverage {
             assert_eq!(
                 publication.outcome,
@@ -676,7 +818,7 @@ fn compatible_parser_receipts_keep_partial_records_baselines_and_completed_resul
 
 #[test]
 fn compatible_parser_receipts_keep_pending_output_without_reading_or_replaying_completed_results() {
-    for parser_revision in [64, 65] {
+    for parser_revision in [64, 65, 66] {
         let lines: Vec<_> = CLAUDE_RESULTS.lines().collect();
         let mut call: Value = serde_json::from_str(lines[1]).unwrap();
         call["message"]["content"] = json!(
@@ -885,11 +1027,15 @@ fn native_cursor_loader_requires_exact_parser_and_cursor_revision_pairs() {
         (64, 5, true),
         (65, 4, false),
         (65, 5, true),
+        (66, 1, false),
+        (66, 4, false),
+        (66, 5, true),
         (PARSER_REVISION, 1, false),
         (PARSER_REVISION, 4, false),
         (PARSER_REVISION, 5, true),
         (64, 6, false),
         (65, 6, false),
+        (66, 6, false),
         (PARSER_REVISION, 6, false),
     ] {
         let (_directory, store, input) = fixture(CLAUDE_RESULTS);
@@ -926,7 +1072,7 @@ fn native_cursor_loader_requires_exact_parser_and_cursor_revision_pairs() {
             assert_eq!(loaded.baseline_offset(), first.baseline_offset);
             assert_eq!(
                 serde_json::to_string(&loaded).unwrap().contains(CANARY),
-                parser == 65 || parser == PARSER_REVISION
+                matches!(parser, 65 | 66 | PARSER_REVISION)
             );
         } else {
             store

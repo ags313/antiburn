@@ -601,7 +601,7 @@ public kinds use a separate future-only baseline and first-eligible publication.
 The named file-cursor-4 and journal-4 converters preserve committed progress,
 pending result joins, source bindings, and the original result baseline when
 upgrading to revision 5. They set a new-event frontier without replaying old
-result identities. Parser 66 accepts parser-63, parser-64, and parser-65
+result identities. Parser 67 accepts parser-63, parser-64, parser-65, and parser-66
 cursor/state-5 receipts, and the named parser-62/cursor/state-4 predecessors
 through their exact converters. Separate converters accept parser-64
 file cursor 1 and V1 live state 2 only from producer commit
@@ -621,6 +621,10 @@ or reseeding. Unknown revisions fail closed. The historical
 parser-65 Claude request-origin boundary remains unchanged. Core checkpoint
 version 1 and existing result encodings remain unchanged. Missing new
 first-eligible fields do not authorize historical new-kind events.
+
+Parser-66 journal cold retries retain their original parser-number hash binding
+until their pinned page commits. Advancing to parser 67 does not change the
+retained source window or create a new provider attempt.
 
 Each journal page commits current rows, immutable outbox events, cursor,
 baseline, diagnostics, and continuation together under the current lease/claim,

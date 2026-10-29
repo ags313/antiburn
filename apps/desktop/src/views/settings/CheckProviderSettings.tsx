@@ -292,7 +292,7 @@ function PendingOperationNotice({
         {pendingOperationMessage(operation, Boolean(state.editor))}
       </p>
       <PushButton id={retryId} disabled={state.busy || state.loading} onClick={onRetry}>
-        {state.action === "retry" ? "Retrying…" : "Retry connection operation"}
+        {state.action === "retry" ? "Retrying…" : "Retry connection change"}
       </PushButton>
     </div>
   )

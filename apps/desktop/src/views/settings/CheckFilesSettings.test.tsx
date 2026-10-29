@@ -88,7 +88,7 @@ it("loads fresh rows on remount and never shows previous rows or errors", async 
   expect(screen.queryByText("2 check files")).not.toBeInTheDocument()
   await act(async () => fresh.reject(new Error("private read error")))
   expect(screen.getByRole("alert")).toHaveTextContent(
-    "Could not load check folders. Reopen Checks to try again.",
+    "Could not load check folders. Reopen Settings → Checks to try again.",
   )
   expect(screen.queryByRole("status")).not.toBeInTheDocument()
   expect(screen.queryByText("2 check files")).not.toBeInTheDocument()
@@ -126,7 +126,7 @@ it.each(["before", "after"])(
     if (timing === "after") fireEvent.click(disclosure)
     expect(disclosure).toHaveAttribute("aria-expanded", "false")
     expect(screen.getByRole("alert")).toHaveTextContent(
-      "Could not open a check folder. Reopen Checks to try again.",
+      "Could not open a check folder. Reopen Settings → Checks to try again.",
     )
     expect(screen.queryByText(/private failure|Refresh folders/i)).not.toBeInTheDocument()
   },

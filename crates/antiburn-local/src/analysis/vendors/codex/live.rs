@@ -57,6 +57,10 @@ impl State {
             );
             self.observe_inner(value.clone(), index, &mut capture);
         }
+        if self.replaces_exec_content(&value) {
+            public.close_replaced_output(&value);
+        }
+        self.parser.completed.retire_live_replacement(&value);
         public.end(
             &value,
             index,
@@ -72,6 +76,11 @@ impl State {
     }
 
     fn observe_inner(&mut self, value: Value, index: u64, sink: &mut dyn RecordSink) {
+        if !has_required_timestamp(&value) {
+            self.parser.scope.invalidate();
+            sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
+            return;
+        }
         self.parser.observe_native_request(&value, self.root);
         if value["type"] == "session_meta" {
             // The first physical header also initializes the parser on full-window startup.
@@ -130,12 +139,18 @@ impl State {
                     | "web_search_output"
             )
         );
-        if self.paginated
-            && is_call
-            && matches!(
-                payload["name"].as_str(),
-                Some("exec" | "exec_command" | "apply_patch")
-            )
+        let replaced = self.replaces_exec_content(&value);
+        let uncertain_replacement = is_output
+            && !replaced
+            && completed::replaces_exec_content(&value, self.paginated, |id| {
+                self.replaced_calls.contains(id)
+            });
+        if uncertain_replacement {
+            // A filter match cannot prove that this output replaces an exec call.
+            sink.tool_result_gap();
+        }
+        if is_call
+            && replaced
             && let Some(id) = call_id
         {
             self.replaced_calls.insert(id);
@@ -143,8 +158,7 @@ impl State {
         let retired = call_id.is_some_and(|id| {
             self.retired_calls.contains(id) && !self.parser.native_calls.contains_key(id)
         });
-        let replaced = self.paginated && call_id.is_some_and(|id| self.replaced_calls.contains(id));
-        if !(is_call && retired || is_output && replaced) {
+        if !(is_call && retired || is_output && (replaced || uncertain_replacement)) {
             self.parser.capture_native_tool_result(&value, index, sink);
         }
         self.parser.native_calls.retain(|_, call| call.is_some());
@@ -219,6 +233,10 @@ impl State {
                 sink.record(NormalizedRecord::ToolResult(Box::new(result)));
             }
         }
+    }
+
+    fn replaces_exec_content(&self, record: &Value) -> bool {
+        self.parser.completed.replaces_exec_content(record)
     }
 
     pub fn main_session(&self) -> bool {

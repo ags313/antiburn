@@ -612,6 +612,195 @@ fn steps_and_pending_calls_share_each_user_payload_once() {
 }
 
 #[test]
+fn public_steps_and_calls_share_nine_full_request_prefixes() {
+    use crate::analysis::{NativeEvidenceFact, NativeMessageObservation, PublicMessagePayload};
+
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    let mut sequence = 0;
+    for index in 0..9 {
+        request(
+            &mut joiner,
+            &mut sequence,
+            &format!("user-{index}"),
+            &"x".repeat(MAX_STRING_BYTES),
+        );
+    }
+    joiner.set_live_baseline(sequence);
+    observe(
+        &mut joiner,
+        &mut sequence,
+        "session.step.started",
+        json!({"assistantMessageID": "step"}),
+    );
+    start_call(&mut joiner, &mut sequence, "step", "call");
+    assert!(joiner.gaps().is_empty(), "{:?}", joiner.gaps());
+    let first_call_position = ToolResultPosition::OpenCodeV2Event {
+        sequence,
+        item_index: 0,
+    };
+    let call = joiner.evidence.iter().find_map(|event| match &event.fact {
+        NativeEvidenceFact::Message(NativeMessageObservation::Public(message))
+            if matches!(message.payload, PublicMessagePayload::ToolCall { .. }) =>
+        {
+            assert!(event.live_eligible);
+            Some(message)
+        }
+        _ => None,
+    });
+    let context = call.unwrap().context.as_ref().unwrap();
+    assert_eq!(context.first_eligible_position, first_call_position);
+    assert_eq!(context.user_messages.len(), 9);
+    assert!(context.complete_through_event);
+    assert!(
+        context
+            .user_messages
+            .iter()
+            .all(|message| message.parts[0].text.len() == MAX_STRING_BYTES)
+    );
+    assert_accounting(&joiner);
+
+    request(&mut joiner, &mut sequence, "later-user", "later request");
+    observe(
+        &mut joiner,
+        &mut sequence,
+        "session.tool.called",
+        json!({
+            "assistantMessageID": "step", "id": "call",
+            "input": {"path": "changed.rs"}, "executed": false
+        }),
+    );
+    let correction = joiner.evidence.iter().find_map(|event| match &event.fact {
+        NativeEvidenceFact::Message(NativeMessageObservation::Public(message)) => Some(message),
+        _ => None,
+    });
+    let context = correction.unwrap().context.as_ref().unwrap();
+    assert_eq!(context.first_eligible_position, first_call_position);
+    assert_eq!(context.user_messages.len(), 9);
+
+    let result = finish_call(&mut joiner, &mut sequence, "step", "call");
+    assert_eq!(result.user_messages.len(), 9);
+    assert!(result.gaps.is_empty());
+    assert_eq!(
+        result.into_observation(true, true).completeness,
+        ToolResultCompleteness::Complete
+    );
+    for (kind, data) in [
+        (
+            "session.text.started",
+            json!({"assistantMessageID": "step", "ordinal": 0}),
+        ),
+        (
+            "session.text.ended",
+            json!({"assistantMessageID": "step", "ordinal": 0, "text": "Done"}),
+        ),
+        (
+            "session.step.ended",
+            json!({"assistantMessageID": "step", "finish": "stop"}),
+        ),
+    ] {
+        observe(&mut joiner, &mut sequence, kind, data);
+    }
+    let assistant = joiner.evidence.iter().find_map(|event| match &event.fact {
+        NativeEvidenceFact::Message(NativeMessageObservation::Public(message)) => Some(message),
+        _ => None,
+    });
+    assert_eq!(
+        assistant
+            .unwrap()
+            .context
+            .as_ref()
+            .unwrap()
+            .user_messages
+            .len(),
+        9
+    );
+    assert!(joiner.gaps().is_empty());
+    assert!(joiner.retained_payload_bytes() <= MAX_RETAINED_PAYLOAD_BYTES);
+    assert_accounting(&joiner);
+}
+
+#[test]
+fn public_state_overflow_keeps_a_gap_on_later_evidence() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    let mut sequence = 0;
+    request(&mut joiner, &mut sequence, "user", "request");
+    joiner.set_live_baseline(sequence);
+    observe(
+        &mut joiner,
+        &mut sequence,
+        "session.step.started",
+        json!({"assistantMessageID": "step"}),
+    );
+    for ordinal in 0..17 {
+        observe(
+            &mut joiner,
+            &mut sequence,
+            "session.text.started",
+            json!({"assistantMessageID": "step", "ordinal": ordinal}),
+        );
+        observe(
+            &mut joiner,
+            &mut sequence,
+            "session.text.ended",
+            json!({
+                "assistantMessageID": "step", "ordinal": ordinal,
+                "text": "x".repeat(MAX_STRING_BYTES)
+            }),
+        );
+        if joiner.gaps().contains(&Gap::CapacityExceeded) {
+            break;
+        }
+    }
+    assert!(joiner.gaps().contains(&Gap::CapacityExceeded));
+    assert!(joiner.retained_payload_bytes() <= MAX_RETAINED_PAYLOAD_BYTES);
+    assert_accounting(&joiner);
+
+    start_call(&mut joiner, &mut sequence, "step", "call");
+    let result = finish_call(&mut joiner, &mut sequence, "step", "call");
+    assert!(result.gaps.contains(&Gap::CapacityExceeded));
+    assert!(joiner.evidence.iter().all(|event| !event.live_eligible));
+    assert_eq!(
+        result.into_observation(true, true).completeness,
+        ToolResultCompleteness::Incomplete
+    );
+    assert_accounting(&joiner);
+}
+
+#[test]
+fn public_output_overflow_still_omits_oversized_request_evidence() {
+    let mut joiner = OpenCodeV2EventJoiner::new();
+    let mut sequence = 0;
+    for index in 0..14 {
+        request(
+            &mut joiner,
+            &mut sequence,
+            &format!("user-{index}"),
+            &"x".repeat(MAX_STRING_BYTES),
+        );
+    }
+    assert!(joiner.gaps().is_empty());
+    request(
+        &mut joiner,
+        &mut sequence,
+        "user-14",
+        &"x".repeat(MAX_STRING_BYTES),
+    );
+    assert!(joiner.evidence.is_empty());
+    assert!(joiner.gaps().contains(&Gap::CapacityExceeded));
+    assert!(joiner.retained_payload_bytes() <= MAX_RETAINED_PAYLOAD_BYTES);
+    assert_accounting(&joiner);
+
+    sequence += 1;
+    let batch = joiner.observe_evidence(&event(
+        sequence,
+        "session.step.started",
+        json!({"assistantMessageID": "step"}),
+    ));
+    assert!(!batch.history_complete);
+    assert!(batch.events.iter().all(|event| !event.live_eligible));
+}
+
+#[test]
 fn old_history_counts_until_its_last_step_and_call_release_it() {
     let mut joiner = OpenCodeV2EventJoiner::new();
     let mut sequence = 0;

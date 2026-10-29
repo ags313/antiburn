@@ -556,7 +556,7 @@ test("a pending save keeps its draft until an explicit owned Retry completes", a
     "get_system_one_settings",
   ])
   await expect(dialog.getByRole("button", { name: "Save", exact: true })).toBeDisabled()
-  await dialog.getByRole("button", { name: "Retry connection operation", exact: true }).click()
+  await dialog.getByRole("button", { name: "Retry connection change", exact: true }).click()
   await expect(dialog).toHaveCount(0)
   expect(await providerCalls(page)).toEqual([
     ...baseline,
@@ -608,7 +608,7 @@ test("busy Save blocks dismissal, then failed Save can close while Retry stays r
   await expect(dialog).toBeVisible()
   await page.evaluate(() => window.__ANTIBURN_VISUAL_RELEASE_PROVIDER_OPERATION__?.())
   await expect(
-    dialog.getByRole("button", { name: "Retry connection operation", exact: true }),
+    dialog.getByRole("button", { name: "Retry connection change", exact: true }),
   ).toBeVisible()
   await expect(dialog.getByLabel("Jev API key", { exact: true })).toHaveValue(
     "synthetic-replacement",
@@ -616,14 +616,14 @@ test("busy Save blocks dismissal, then failed Save can close while Retry stays r
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click()
   await expect(dialog).toHaveCount(0)
   await expect(
-    pane.getByRole("button", { name: "Retry connection operation", exact: true }),
+    pane.getByRole("button", { name: "Retry connection change", exact: true }),
   ).toBeVisible()
   expect(await providerCalls(page)).toEqual([
     ...baseline,
     "save_system_one_connection",
     "get_system_one_settings",
   ])
-  await pane.getByRole("button", { name: "Retry connection operation", exact: true }).click()
+  await pane.getByRole("button", { name: "Retry connection change", exact: true }).click()
   await expect(pane.getByRole("button", { name: "Add connection", exact: true })).toBeFocused()
 })
 
@@ -656,7 +656,7 @@ test("incoming outside search waits for the native connection modal and keeps Sa
   expect(await dialog.evaluate((node) => node.matches(":modal"))).toBe(true)
   await page.evaluate(() => window.__ANTIBURN_VISUAL_RELEASE_PROVIDER_OPERATION__?.())
   await expect(
-    dialog.getByRole("button", { name: "Retry connection operation", exact: true }),
+    dialog.getByRole("button", { name: "Retry connection change", exact: true }),
   ).toBeEnabled()
   await expect(key).toHaveValue("synthetic-search-secret")
   await key.fill("synthetic-later-search-secret")
@@ -666,7 +666,7 @@ test("incoming outside search waits for the native connection modal and keeps Sa
   await expect(usage).toBeFocused()
   await expect(usage).toHaveAttribute("aria-expanded", "true")
   await expect(
-    pane.getByRole("button", { name: "Retry connection operation", exact: true }),
+    pane.getByRole("button", { name: "Retry connection change", exact: true }),
   ).toBeEnabled()
   const files = pane.getByRole("button", { name: "Check files", exact: true })
   await files.focus()
@@ -728,13 +728,13 @@ for (const action of ["Cancel", "Escape"] as const) {
     await dialog.getByLabel("Jev API key", { exact: true }).fill("synthetic-add-secret")
     await dialog.getByRole("button", { name: "Add connection", exact: true }).click()
     await expect(
-      dialog.getByRole("button", { name: "Retry connection operation", exact: true }),
+      dialog.getByRole("button", { name: "Retry connection change", exact: true }),
     ).toBeVisible()
     if (action === "Cancel")
       await dialog.getByRole("button", { name: "Cancel", exact: true }).click()
     else await page.keyboard.press("Escape")
     await expect(dialog).toHaveCount(0)
-    const retry = pane.getByRole("button", { name: "Retry connection operation", exact: true })
+    const retry = pane.getByRole("button", { name: "Retry connection change", exact: true })
     await expect(retry).toHaveCount(1)
     await expect(retry).toBeFocused()
     await expect(opener).toBeDisabled()
@@ -788,7 +788,7 @@ for (const scenario of [
         : pane.getByRole("button", { name: `More actions for ${scenario.label}`, exact: true })
     if (scenario.kind === "Use") await opener.click()
     else await connectionAction(page, scenario.label, "Remove")
-    const retry = pane.getByRole("button", { name: "Retry connection operation", exact: true })
+    const retry = pane.getByRole("button", { name: "Retry connection change", exact: true })
     await expect(retry).toHaveCount(1)
     await expect(retry).toBeFocused()
     await expect(opener).toBeVisible()
@@ -818,7 +818,7 @@ test("pending removal survives its deleted row and reload, then Retry restores s
   let pane = await openChecks(page)
   const baseline = await readOnlyBaseline(page)
   await connectionAction(page, "Jev", "Remove")
-  const retry = pane.getByRole("button", { name: "Retry connection operation", exact: true })
+  const retry = pane.getByRole("button", { name: "Retry connection change", exact: true })
   await expect(retry).toBeFocused()
   await expect(pane.getByRole("listitem")).toHaveCount(0)
   await expect(pane.getByRole("button", { name: "Add connection", exact: true })).toBeDisabled()
@@ -840,12 +840,12 @@ test("pending removal survives its deleted row and reload, then Retry restores s
   await page.reload()
   pane = await openChecks(page)
   await expect(
-    pane.getByRole("button", { name: "Retry connection operation", exact: true }),
+    pane.getByRole("button", { name: "Retry connection change", exact: true }),
   ).toBeVisible()
   const reloadedBaseline = await readOnlyBaseline(page, false)
-  await pane.getByRole("button", { name: "Retry connection operation", exact: true }).click()
+  await pane.getByRole("button", { name: "Retry connection change", exact: true }).click()
   await expect(
-    pane.getByRole("button", { name: "Retry connection operation", exact: true }),
+    pane.getByRole("button", { name: "Retry connection change", exact: true }),
   ).toHaveCount(0)
   await expect(pane.getByRole("button", { name: "Add connection", exact: true })).toBeFocused()
   expect(await providerCalls(page)).toEqual([
@@ -979,7 +979,9 @@ test("folder errors remain visible while closed and search only reveals the disc
   await openChecks(page)
   const baseline = await readOnlyBaseline(page)
   const files = page.getByRole("button", { name: "Check files", exact: true })
-  await expect(files).toContainText("Could not load check folders. Reopen Checks to try again.")
+  await expect(files).toContainText(
+    "Could not load check folders. Reopen Settings → Checks to try again.",
+  )
   await expect(files).toHaveAttribute("aria-expanded", "false")
   await page.evaluate(() =>
     window.__ANTIBURN_VISUAL_EMIT__?.("settings:pane", "checks#checkDirectories"),

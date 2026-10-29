@@ -19,6 +19,7 @@ const YAML_DISCOVERY_ENABLED_KEY: &str = "internal:yamlBurnChecksDiscoveryEnable
 const SAVED_KEY_KEY: &str = "internal:typesafeKeySavedV1";
 const AUTH_REJECTED_KEY: &str = "internal:typesafeAuthRejectedV1";
 const CREDENTIAL_CHANGE_PENDING_KEY: &str = "internal:typesafeCredentialChangePendingV1";
+const LEGACY_REMOVAL_PENDING_KEY: &str = "internal:typesafeCredentialRemovalPendingV1";
 const ACTIVE_CONNECTION_KEY: &str = "internal:smartChecksActiveConnectionV1";
 const CONNECTION_PROFILES_KEY: &str = "internal:smartChecksConnectionsV1";
 const PROVIDER_MIGRATION_KEY: &str = "internal:smartChecksProviderMigrationV1";
@@ -45,18 +46,25 @@ struct StartupRecoveryError {
 enum StartupRecoveryOrigin {
     Operation(String),
     SelectedConnection,
+    LegacyCredentialChange,
+    SelectedLegacyCredential,
 }
 
 #[derive(Debug)]
 enum StartupRestoreFailure {
     Unbound(&'static str),
     SelectedConnection(&'static str),
+    LegacyCredentialChange(&'static str),
+    SelectedLegacyCredential(&'static str),
 }
 
 impl StartupRestoreFailure {
     fn message(&self) -> &'static str {
         match self {
-            Self::Unbound(message) | Self::SelectedConnection(message) => message,
+            Self::Unbound(message)
+            | Self::SelectedConnection(message)
+            | Self::LegacyCredentialChange(message)
+            | Self::SelectedLegacyCredential(message) => message,
         }
     }
 }
@@ -95,13 +103,21 @@ impl StartupErrors {
 
     fn record_restore_result(&self, store: &Store, result: Result<(), StartupRestoreFailure>) {
         let failure = result.err();
-        let origin = failure.as_ref().and_then(|failure| {
-            operation::active_pending_operation_id(store)
+        let origin = failure.as_ref().and_then(|failure| match failure {
+            StartupRestoreFailure::LegacyCredentialChange(_) => {
+                Some(StartupRecoveryOrigin::LegacyCredentialChange)
+            }
+            _ => operation::active_pending_operation_id(store)
                 .map(StartupRecoveryOrigin::Operation)
-                .or_else(|| {
-                    matches!(failure, StartupRestoreFailure::SelectedConnection(_))
-                        .then_some(StartupRecoveryOrigin::SelectedConnection)
-                })
+                .or(match failure {
+                    StartupRestoreFailure::SelectedConnection(_) => {
+                        Some(StartupRecoveryOrigin::SelectedConnection)
+                    }
+                    StartupRestoreFailure::SelectedLegacyCredential(_) => {
+                        Some(StartupRecoveryOrigin::SelectedLegacyCredential)
+                    }
+                    _ => None,
+                }),
         });
         let mut unbound = self
             .unbound
@@ -130,9 +146,37 @@ impl StartupErrors {
             .unwrap_or_else(|error| error.into_inner());
         if recovery.as_ref().is_some_and(|error| match &error.origin {
             StartupRecoveryOrigin::Operation(id) => id == operation_id,
-            StartupRecoveryOrigin::SelectedConnection => committed,
+            StartupRecoveryOrigin::SelectedConnection
+            | StartupRecoveryOrigin::SelectedLegacyCredential => committed,
+            StartupRecoveryOrigin::LegacyCredentialChange => false,
         }) {
             *recovery = None;
+        }
+    }
+
+    fn record_legacy_removal_result(
+        &self,
+        active_uses_legacy_key: bool,
+        result: Result<(), &'static str>,
+    ) {
+        let mut recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let legacy_error = recovery.as_ref().is_some_and(|error| match &error.origin {
+            StartupRecoveryOrigin::LegacyCredentialChange => true,
+            StartupRecoveryOrigin::SelectedLegacyCredential => active_uses_legacy_key,
+            _ => false,
+        });
+        match result {
+            Ok(()) if legacy_error => *recovery = None,
+            Err(_) if active_uses_legacy_key && (recovery.is_none() || legacy_error) => {
+                *recovery = Some(StartupRecoveryError {
+                    origin: StartupRecoveryOrigin::LegacyCredentialChange,
+                    message: "Could not remove the API key from credential storage.",
+                });
+            }
+            _ => {}
         }
     }
 
@@ -226,7 +270,19 @@ trait CredentialVault {
     fn read(&self, id: Option<&str>) -> Result<Option<String>, Self::Error>;
     fn write(&self, id: Option<&str>, value: &str) -> Result<(), Self::Error>;
     fn delete(&self, id: Option<&str>) -> Result<(), Self::Error>;
+    fn read_legacy_snapshot(&self) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.read(None).map(|value| value.map(String::into_bytes))
+    }
+    fn restore_legacy_snapshot(&self, value: &[u8]) -> Result<(), &'static str> {
+        let value = std::str::from_utf8(value)
+            .map_err(|_| "The saved credential has an invalid format.")?;
+        self.write(None, value)
+            .map_err(|error| Self::write_failure(&error))
+    }
     fn is_missing(error: &Self::Error) -> bool;
+    fn is_bad_encoding(_error: &Self::Error) -> bool {
+        false
+    }
     fn read_failure(_error: &Self::Error) -> CredentialReadFailure {
         CredentialReadFailure::new(CredentialReadCategory::Unavailable)
     }
@@ -266,8 +322,22 @@ impl CredentialVault for SystemCredentialVault {
         entry.delete_credential()
     }
 
+    fn read_legacy_snapshot(&self) -> Result<Option<Vec<u8>>, Self::Error> {
+        entry()?.get_secret().map(Some)
+    }
+
+    fn restore_legacy_snapshot(&self, value: &[u8]) -> Result<(), &'static str> {
+        entry()
+            .and_then(|entry| entry.set_secret(value))
+            .map_err(|error| Self::write_failure(&error))
+    }
+
     fn is_missing(error: &Self::Error) -> bool {
         matches!(error, keyring::Error::NoEntry)
+    }
+
+    fn is_bad_encoding(error: &Self::Error) -> bool {
+        matches!(error, keyring::Error::BadEncoding(_))
     }
 
     fn read_failure(error: &Self::Error) -> CredentialReadFailure {
@@ -295,6 +365,17 @@ fn read_credential<V: CredentialVault>(
     stage: CredentialReadStage,
 ) -> Result<Option<String>, &'static str> {
     match vault.read(id) {
+        Ok(value) => Ok(value),
+        Err(error) if V::is_missing(&error) => Ok(None),
+        Err(error) => Err(V::read_failure(&error).report(stage)),
+    }
+}
+
+fn read_legacy_snapshot<V: CredentialVault>(
+    vault: &V,
+    stage: CredentialReadStage,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    match vault.read_legacy_snapshot() {
         Ok(value) => Ok(value),
         Err(error) if V::is_missing(&error) => Ok(None),
         Err(error) => Err(V::read_failure(&error).report(stage)),
@@ -342,11 +423,7 @@ fn read_key_with_vault(vault: &impl CredentialVault) -> Result<Option<String>, &
 }
 
 fn saved_key_marker(store: &Store) -> bool {
-    store.internal_value(SAVED_KEY_KEY).as_deref() == Some("true")
-        || store
-            .internal_value(CREDENTIAL_CHANGE_PENDING_KEY)
-            .as_deref()
-            == Some("true")
+    store.internal_value(SAVED_KEY_KEY).as_deref() == Some("true") || legacy_removal_pending(store)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -493,6 +570,7 @@ fn legacy_removal_pending(store: &Store) -> bool {
         .internal_value(CREDENTIAL_CHANGE_PENDING_KEY)
         .as_deref()
         == Some("true")
+        || store.internal_value(LEGACY_REMOVAL_PENDING_KEY).as_deref() == Some("true")
 }
 
 fn begin_legacy_removal(
@@ -509,7 +587,17 @@ fn begin_legacy_removal(
             matches!(active.credential, Some(CredentialReference::LegacyTypeSafe))
         });
     store
-        .set_internal_value_checked(CREDENTIAL_CHANGE_PENDING_KEY, "true")
+        .set_internal_values_checked(&[
+            (LEGACY_REMOVAL_PENDING_KEY, "true"),
+            (
+                CREDENTIAL_CHANGE_PENDING_KEY,
+                if active_uses_legacy_key {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+        ])
         .map_err(|_| "Could not protect the credential removal state.")?;
     if active_uses_legacy_key {
         pause_model_checks(store, worker)?;
@@ -524,19 +612,19 @@ fn finish_legacy_removal<V: CredentialVault>(
 ) -> Result<(), &'static str> {
     let encoded =
         serde_json::to_string(saved).map_err(|_| "Could not save the credential removal state.")?;
-    let previous = read_credential(vault, None, CredentialReadStage::CredentialRemoval)?
-        .filter(|secret| !secret.trim().is_empty());
+    let previous = read_legacy_snapshot(vault, CredentialReadStage::CredentialRemoval)?;
     delete_credential(vault, None)?;
     if store
         .set_internal_values_checked(&[
             (CONNECTION_PROFILES_KEY, &encoded),
             (SAVED_KEY_KEY, "false"),
             (CREDENTIAL_CHANGE_PENDING_KEY, "false"),
+            (LEGACY_REMOVAL_PENDING_KEY, "false"),
         ])
         .is_err()
     {
         if let Some(secret) = previous
-            && write_credential(vault, None, &secret).is_err()
+            && vault.restore_legacy_snapshot(&secret).is_err()
         {
             return Err(
                 "Could not restore the API key. Retry credential removal in Settings → Checks.",
@@ -776,9 +864,9 @@ fn restore_saved_key_with_origin(
         .as_deref()
         == Some("true")
     {
-        return Err(
-            "TypeSafe credential removal is incomplete. Retry it in Settings → Checks.".into(),
-        );
+        return Err(StartupRestoreFailure::LegacyCredentialChange(
+            "TypeSafe credential removal is incomplete. Retry it in Settings → Checks.",
+        ));
     }
     let recovered_connection = match lifecycle::recover_connection_change(store, worker, vault) {
         Ok(connection) => {
@@ -805,7 +893,6 @@ fn restore_saved_key_with_origin(
         return Ok(());
     }
     restore_selected_connection(store, worker, connection, read, vault)
-        .map_err(StartupRestoreFailure::SelectedConnection)
 }
 
 fn restore_selected_connection(
@@ -814,48 +901,69 @@ fn restore_selected_connection(
     connection: SystemOneConnection,
     read: impl FnOnce() -> Result<Option<String>, &'static str>,
     vault: &impl CredentialVault,
-) -> Result<(), &'static str> {
-    connection
-        .validate()
-        .map_err(|_| "Saved Smart Burn Checks provider settings are invalid.")?;
+) -> Result<(), StartupRestoreFailure> {
+    connection.validate().map_err(|_| {
+        StartupRestoreFailure::SelectedConnection(
+            "Saved Smart Burn Checks provider settings are invalid.",
+        )
+    })?;
     let checks_enabled = yaml_discovery_enabled(store);
     if !checks_enabled {
         return worker
             .install_system_one_connection(connection, None, false)
-            .map_err(|_| "Saved Smart Burn Checks provider settings are invalid.");
+            .map_err(|_| {
+                StartupRestoreFailure::SelectedConnection(
+                    "Saved Smart Burn Checks provider settings are invalid.",
+                )
+            });
     }
     let authentication_rejected =
         store.internal_value(AUTH_REJECTED_KEY).as_deref() == Some("true");
     if authentication_rejected {
         return worker
             .install_system_one_connection(connection, None, false)
-            .map_err(|_| "Saved Smart Burn Checks provider settings are invalid.");
+            .map_err(|_| {
+                StartupRestoreFailure::SelectedConnection(
+                    "Saved Smart Burn Checks provider settings are invalid.",
+                )
+            });
     }
     if matches!(
         connection.credential,
         Some(CredentialReference::LegacyTypeSafe)
     ) {
         let key = if saved_key_marker(store) {
-            read()?
+            read().map_err(StartupRestoreFailure::SelectedLegacyCredential)?
         } else {
             None
         };
         if saved_key_marker(store) && key.is_none() {
-            return Err("The saved TypeSafe API key is missing. Replace it in Settings → Checks.");
+            return Err(StartupRestoreFailure::SelectedLegacyCredential(
+                "The saved TypeSafe API key is missing. Replace it in Settings → Checks.",
+            ));
         }
         worker
             .install_system_one_connection(connection, key, true)
-            .map_err(|_| "Saved Smart Burn Checks provider settings are invalid.")?;
+            .map_err(|_| {
+                StartupRestoreFailure::SelectedConnection(
+                    "Saved Smart Burn Checks provider settings are invalid.",
+                )
+            })?;
     } else {
-        let credential = resolve_credential(&connection, None, vault)?;
+        let credential = resolve_credential(&connection, None, vault)
+            .map_err(StartupRestoreFailure::SelectedConnection)?;
         if connection_requires_credential(&connection) && credential.is_none() {
-            return Err(
+            return Err(StartupRestoreFailure::SelectedConnection(
                 "The active model provider credential is missing. Update it in Settings → Checks.",
-            );
+            ));
         }
         worker
             .set_system_one_connection(connection, credential)
-            .map_err(|_| "Saved Smart Burn Checks provider settings are invalid.")?;
+            .map_err(|_| {
+                StartupRestoreFailure::SelectedConnection(
+                    "Saved Smart Burn Checks provider settings are invalid.",
+                )
+            })?;
     }
     Ok(())
 }
@@ -1543,11 +1651,11 @@ fn resume_after_key_save(was_enabled: bool, replacing: bool, was_configured: boo
     was_enabled || (replacing && !was_configured)
 }
 
-fn save_legacy_key(
+fn save_legacy_key<V: CredentialVault>(
     store: &Store,
     worker: &WorkerHandle,
     key: Option<String>,
-    vault: &impl CredentialVault,
+    vault: &V,
 ) -> Result<(), &'static str> {
     if key.is_some()
         && store.internal_value(CONNECTION_PROFILES_KEY).is_none()
@@ -1567,8 +1675,13 @@ fn save_legacy_key(
         replacing,
         saved_key_marker(store),
     );
-    let previous = read_credential(vault, None, CredentialReadStage::LegacyUpdate)?
-        .filter(|secret| !secret.trim().is_empty());
+    let previous_snapshot = read_legacy_snapshot(vault, CredentialReadStage::LegacyUpdate)?;
+    let previous = match vault.read(None) {
+        Ok(value) => value,
+        Err(error) if V::is_missing(&error) || (replacing && V::is_bad_encoding(&error)) => None,
+        Err(error) => return Err(V::read_failure(&error).report(CredentialReadStage::LegacyUpdate)),
+    }
+    .filter(|secret| !secret.trim().is_empty());
     let key = key
         .or_else(|| previous.clone())
         .ok_or("The saved TypeSafe API key is missing. Enter a new key.")?;
@@ -1603,7 +1716,7 @@ fn save_legacy_key(
         .map_err(|_| "Could not protect the credential update state.")?;
     suspend_for_connection_change(store, worker)?;
     if credential_changed && let Err(error) = write_credential(vault, None, &key) {
-        restore_legacy_key(vault, previous.as_deref())?;
+        restore_legacy_key(vault, previous_snapshot.as_deref())?;
         return Err(error);
     }
     if store
@@ -1615,12 +1728,13 @@ fn save_legacy_key(
                 if resume { "true" } else { "false" },
             ),
             (CREDENTIAL_CHANGE_PENDING_KEY, "false"),
+            (LEGACY_REMOVAL_PENDING_KEY, "false"),
             (AUTH_REJECTED_KEY, "false"),
         ])
         .is_err()
     {
         if credential_changed {
-            restore_legacy_key(vault, previous.as_deref())?;
+            restore_legacy_key(vault, previous_snapshot.as_deref())?;
         }
         return Err("Could not save the credential update state.");
     }
@@ -1631,10 +1745,10 @@ fn save_legacy_key(
 
 fn restore_legacy_key(
     vault: &impl CredentialVault,
-    previous: Option<&str>,
+    previous: Option<&[u8]>,
 ) -> Result<(), &'static str> {
     match previous {
-        Some(secret) => write_credential(vault, None, secret),
+        Some(secret) => vault.restore_legacy_snapshot(secret),
         None => delete_credential(vault, None),
     }
     .map_err(|_| "Could not restore the API key. Checks are paused. Retry the key update.")
@@ -1660,13 +1774,7 @@ pub(crate) async fn set_typesafe_api_key(
                 .to_owned(),
         );
     }
-    if key.is_none()
-        && app
-            .state::<Store>()
-            .internal_value(CREDENTIAL_CHANGE_PENDING_KEY)
-            .as_deref()
-            == Some("true")
-    {
+    if key.is_none() && legacy_removal_pending(&app.state::<Store>()) {
         return Err(
             "TypeSafe credential removal is incomplete. Retry it in Settings → Checks.".to_owned(),
         );
@@ -1744,7 +1852,6 @@ pub(crate) async fn remove_typesafe_api_key(
         .is_some_and(|active| {
             matches!(active.credential, Some(CredentialReference::LegacyTypeSafe))
         });
-    let retrying_legacy_removal = legacy_removal_pending(&store);
     let saved =
         begin_legacy_removal(&store, &app.state::<WorkerHandle>()).map_err(str::to_owned)?;
     changed(&app);
@@ -1753,19 +1860,11 @@ pub(crate) async fn remove_typesafe_api_key(
         move || finish_legacy_removal(&store, &SystemCredentialVault, &saved)
     })
     .await
-    .map_err(|_| "Credential storage is unavailable.".to_owned())?
-    .map_err(str::to_owned);
+    .map_err(|_| "Credential storage is unavailable.".to_owned())?;
+    STARTUP_ERRORS.record_legacy_removal_result(active_uses_legacy_key, removal);
     if let Err(error) = removal {
-        if active_uses_legacy_key || retrying_legacy_removal {
-            STARTUP_ERRORS.set_unbound(Some(
-                "Could not remove the API key from credential storage.",
-            ));
-        }
         changed(&app);
-        return Err(error);
-    }
-    if active_uses_legacy_key || retrying_legacy_removal {
-        STARTUP_ERRORS.set_unbound(None);
+        return Err(error.to_owned());
     }
     #[cfg(feature = "analytics")]
     if active_uses_legacy_key && was_enabled {

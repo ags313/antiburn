@@ -39,8 +39,8 @@ export function InstalledCheckDetailContent({
     check.clean === 0
   const waiting = installed.waitingForEvents
   const emptyMessage = installed.hasStarted
-    ? "No check results in the current window."
-    : "This check has not checked any sessions yet."
+    ? "No check results in the last 30 days."
+    : "This check has no result in the current report."
   const hasSavedResult = check.finding > 0 || check.clean > 0
   const savedExplanation = check.finding === 0 ? installed.explanation : null
   const savedResultSummary =
@@ -142,12 +142,12 @@ function InstalledCheckStateDetail({ installed }: { installed: InstalledCheckRep
       message = "Review this check's definition and save a valid check file."
       break
     case "paused":
-      title = "Checks are paused"
+      title = "This check is paused"
       message = "Review model-based checks and the selected connection in Settings → Checks."
       break
     case "unsupported":
       title = "Check is not supported"
-      message = "Review this check's definition and the active decision connection."
+      message = "Review the check file and selected connection in Settings → Checks."
       break
     default:
       if (installed.reviewFailed === 0) return null

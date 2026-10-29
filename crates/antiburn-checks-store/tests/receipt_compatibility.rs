@@ -90,6 +90,7 @@ fn file_conversion_and_current_layouts_are_distinct_from_readiness() {
         Some(63),
         Some(64),
         Some(65),
+        Some(66),
         Some(PARSER_REVISION),
         Some(999),
     ] {
@@ -102,7 +103,7 @@ fn file_conversion_and_current_layouts_are_distinct_from_readiness() {
                 )
                 .unwrap();
             let current_layout = parser
-                .is_some_and(|value| [63, 64, 65, PARSER_REVISION].contains(&value))
+                .is_some_and(|value| [63, 64, 65, 66, PARSER_REVISION].contains(&value))
                 && revision == 5;
             assert_eq!(
                 file_compatible(&connection),
@@ -124,6 +125,7 @@ fn journal_conversion_and_current_layouts_are_distinct_from_readiness() {
         Some(63),
         Some(64),
         Some(65),
+        Some(66),
         Some(PARSER_REVISION),
         Some(999),
     ] {
@@ -136,7 +138,7 @@ fn journal_conversion_and_current_layouts_are_distinct_from_readiness() {
                 )
                 .unwrap();
             let current_layout = parser
-                .is_some_and(|value| [63, 64, 65, PARSER_REVISION].contains(&value))
+                .is_some_and(|value| [63, 64, 65, 66, PARSER_REVISION].contains(&value))
                 && revision == 5;
             assert_eq!(
                 journal_compatible(&connection),
@@ -158,6 +160,7 @@ fn empty_receipts_allow_initialization_but_never_make_a_source_ready() {
         Some(63),
         Some(64),
         Some(65),
+        Some(66),
         Some(PARSER_REVISION),
         Some(999),
     ] {

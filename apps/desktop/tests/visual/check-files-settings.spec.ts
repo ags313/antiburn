@@ -109,6 +109,6 @@ test("a failed folder open remains visible after Check files closes", async ({ p
   await disclosure.click()
   await expect(disclosure).toHaveAttribute("aria-expanded", "false")
   await expect(pane.getByRole("alert")).toHaveText(
-    "Could not open a check folder. Reopen Checks to try again.",
+    "Could not open a check folder. Reopen Settings → Checks to try again.",
   )
 })

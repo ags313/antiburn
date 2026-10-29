@@ -57,7 +57,7 @@ export class CheckDirectorySession {
     } catch {
       if (generation === this.generation)
         this.publish({
-          error: "Could not load check folders. Reopen Checks to try again.",
+          error: "Could not load check folders. Reopen Settings → Checks to try again.",
         })
     } finally {
       this.pending = false
@@ -82,7 +82,7 @@ export class CheckDirectorySession {
         this.publish({
           openErrors: new Map(this.state.openErrors).set(
             reference,
-            "Could not open this check folder. Reopen Checks to try again.",
+            "Could not open this check folder. Reopen Settings → Checks to try again.",
           ),
         })
     } finally {

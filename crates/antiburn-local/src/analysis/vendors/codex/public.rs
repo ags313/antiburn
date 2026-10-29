@@ -264,6 +264,55 @@ impl PublicState {
         }
     }
 
+    pub(super) fn close_replaced_output(&mut self, record: &Value) {
+        let payload = &record["payload"];
+        if record["type"] != "response_item"
+            || !matches!(
+                payload["type"].as_str(),
+                Some("custom_tool_call_output" | "function_call_output")
+            )
+        {
+            return;
+        }
+        let Some(active) = &mut self.active else {
+            return;
+        };
+        if !active.valid {
+            return;
+        }
+        let Some(call) = payload["call_id"]
+            .as_str()
+            .or_else(|| payload["callId"].as_str())
+        else {
+            active.invalidate();
+            return;
+        };
+        let call = crate::digest::sha256_hex(call.as_bytes());
+        let turn = payload
+            .pointer("/internal_chat_message_metadata_passthrough/turn_id")
+            .and_then(Value::as_str)
+            .or_else(|| payload["turn_id"].as_str());
+        let complete = match payload.get("output").or_else(|| payload.get("content")) {
+            Some(Value::String(_)) => true,
+            Some(Value::Array(parts)) => parts.iter().all(|part| {
+                matches!(
+                    part["type"].as_str(),
+                    Some("input_text" | "output_text" | "text")
+                ) && part["text"].is_string()
+            }),
+            _ => false,
+        };
+        if self.call_turns.get(&call) != Some(&crate::digest::sha256_hex(active.turn.as_bytes()))
+            || turn.is_some_and(|turn| turn != active.turn)
+            || !complete
+        {
+            active.invalidate();
+            return;
+        }
+        // The wrapper closes its own call. Native item IDs do not bind nested work to it.
+        active.open_calls.remove(&call);
+    }
+
     pub(super) fn end(
         &mut self,
         record: &Value,
@@ -284,7 +333,15 @@ impl PublicState {
             Some("session_meta" | "turn_context" | "response_item" | "event_msg")
         ) {
             self.invalidate();
-            sink.tool_result_gap();
+            let recognized =
+                super::is_recognized_eventless(record["type"].as_str(), payload["type"].as_str());
+            let inert = super::is_inert_codex_record(
+                record,
+                !super::is_proven_echo(record["type"].as_str(), payload["type"].as_str()),
+            );
+            if !recognized || !inert {
+                sink.tool_result_gap();
+            }
         }
         if record["type"] == "event_msg"
             && !matches!(

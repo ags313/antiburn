@@ -194,18 +194,23 @@ fn immutable_input(fixture: &FileFixture, id: &CandidateId) -> String {
 }
 
 fn save_parser_65_receipt(fixture: &FileFixture) {
+    save_parser_receipt(fixture, 65);
+}
+
+fn save_parser_receipt(fixture: &FileFixture, parser_revision: i64) {
     assert_eq!(
         fixture
             .store
             .lock()
             .execute(
-                "UPDATE native_file_delivery SET parser_revision = 65
+                "UPDATE native_file_delivery SET parser_revision = ?4
                WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
                  AND json_extract(cursor_json, '$.revision') = 5",
                 params![
                     fixture.key.environment_key,
                     fixture.key.agent,
-                    fixture.key.session_id
+                    fixture.key.session_id,
+                    parser_revision
                 ],
             )
             .unwrap(),
@@ -214,7 +219,16 @@ fn save_parser_65_receipt(fixture: &FileFixture) {
 }
 
 #[test]
-fn parser_65_receipt_keeps_saved_pending_work_current_before_the_first_parser_66_page() {
+fn parser_65_receipt_keeps_saved_pending_work_current_before_the_first_parser_67_page() {
+    prior_parser_receipt_keeps_saved_pending_work_current(65);
+}
+
+#[test]
+fn parser_66_receipt_keeps_saved_pending_work_current_before_the_first_parser_67_page() {
+    prior_parser_receipt_keeps_saved_pending_work_current(66);
+}
+
+fn prior_parser_receipt_keeps_saved_pending_work_current(parser_revision: i64) {
     let mut fixture =
         FileFixture::with_source(SourceFormat::ClaudeJsonl, CHECK, false, false, true);
     let (call, result) = fixture.result_records(0, true);
@@ -232,7 +246,7 @@ fn parser_65_receipt_keeps_saved_pending_work_current_before_the_first_parser_66
         .store
         .native_evidence_publications_after(0, 100)
         .unwrap();
-    save_parser_65_receipt(&fixture);
+    save_parser_receipt(&fixture, parser_revision);
     fixture.reopen();
 
     let claimed = claim(&fixture.adapter, &candidate);
@@ -262,7 +276,7 @@ fn parser_65_receipt_keeps_saved_pending_work_current_before_the_first_parser_66
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
-        65
+        parser_revision
     );
     assert_eq!(
         fixture
@@ -286,7 +300,16 @@ fn parser_65_receipt_keeps_saved_pending_work_current_before_the_first_parser_66
 }
 
 #[test]
-fn parser_65_receipt_accepts_a_saved_paid_answer_before_the_first_parser_66_page() {
+fn parser_65_receipt_accepts_a_saved_paid_answer_before_the_first_parser_67_page() {
+    prior_parser_receipt_accepts_a_saved_paid_answer(65);
+}
+
+#[test]
+fn parser_66_receipt_accepts_a_saved_paid_answer_before_the_first_parser_67_page() {
+    prior_parser_receipt_accepts_a_saved_paid_answer(66);
+}
+
+fn prior_parser_receipt_accepts_a_saved_paid_answer(parser_revision: i64) {
     let mut fixture =
         FileFixture::with_source(SourceFormat::ClaudeJsonl, CHECK, false, false, true);
     let (call, result) = fixture.result_records(0, true);
@@ -314,7 +337,7 @@ fn parser_65_receipt_accepts_a_saved_paid_answer_before_the_first_parser_66_page
             NOW + 1,
         )
         .unwrap();
-    save_parser_65_receipt(&fixture);
+    save_parser_receipt(&fixture, parser_revision);
     let input = immutable_input(&fixture, &assessment.claimed.id);
     let usage = fixture.store.burn_check_usage_summary().unwrap();
     assert_eq!(

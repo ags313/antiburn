@@ -95,7 +95,15 @@ fn main_64_actual_file_bodies_keep_offsets_joins_and_complete_each_append_once()
         if agent == "claude" {
             assert!(idle.requests.is_empty());
         }
-        append(&input, fixture["source_suffix"].as_str().unwrap());
+        let mut suffix = fixture["source_suffix"].as_str().unwrap().to_owned();
+        if agent == "codex" {
+            // Complete the old partial row with its required timestamp. Keep the saved prefix.
+            suffix = format!(
+                "{},\"timestamp\":\"2026-01-01T00:00:05Z\"}}\n",
+                suffix.strip_suffix("}\n").unwrap()
+            );
+        }
+        append(&input, &suffix);
         let restored = NativeFileCursor::decode(&idle.cursor.encode()).unwrap();
         let next = read_native_file_page(&input, Some(&restored), &|| false).unwrap();
         assert_eq!(next.results.len(), 1, "{agent}");

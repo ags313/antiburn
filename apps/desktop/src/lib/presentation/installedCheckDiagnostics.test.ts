@@ -133,22 +133,28 @@ describe("installed diagnostic detail presentation", () => {
     expect(payload).toEqual(original)
   })
 
-  it("keeps the capture cause without saved-history boilerplate", () => {
+  it.each([
+    ["Live capture is not active for this session.", " "],
+    ["Live capture stopped!", "\t"],
+    ["Did live capture stop?", "\n\n"],
+    ["Live capture is unavailable", ""],
+    ["Live capture stopped.", ""],
+  ])("keeps the capture cause %s without saved-history boilerplate", (cause, separator) => {
     expect(
       installedCheckDiagnosticDetails({
         ...diagnostic,
         code: "opencode-v2-capture-gap",
-        message: "Keep OpenCode and antiburn running, then rescan sessions.",
+        message:
+          "Live activity is not available for this session. Keep OpenCode open, then rescan sessions. Live checks cannot recover missed activity. Saved results cover only their recorded input.",
         details: [
           {
             label: "Reason",
-            value:
-              "Live capture is not active for this session. Live checks cannot replay earlier events. Earlier checks cover only their saved input.",
+            value: separator
+              ? `${cause}${separator}Live checks cannot replay earlier events. Earlier checks cover only their saved input.`
+              : cause,
           },
         ],
       }),
-    ).toEqual([
-      { label: "Reason", value: "Live capture is not active for this session.", code: false },
-    ])
+    ).toEqual([{ label: "Reason", value: cause, code: false }])
   })
 })

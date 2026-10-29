@@ -309,8 +309,13 @@ define these accepted boundaries:
   persists `WebSearchEnd` only in legacy history. It does not persist
   `WebSearchBegin` or collaboration lifecycle sidebands; protocol-shaped fixtures
   do not establish cycle support for them. Independent legacy evidence remains
-  usable. Exact `mcp__server__tool` names, or an unambiguous MCP
-  namespace plus tool name, supply category `mcp`; they do not prove server trust.
+  usable. A completed exec item retains its native result identity. Only an exact
+  same-turn wrapper output closes the separate outer call; it adds no duplicate
+  wrapper result. Recognized inert top-level metadata can invalidate the active
+  cycle without making later request history incomplete. Unknown or unhandled
+  evidence-bearing records still leave a history gap. Exact `mcp__server__tool`
+  names, or an unambiguous MCP namespace plus tool name, supply category `mcp`;
+  they do not prove server trust.
 - Pi 0.84.4 at `b79e4cc834970cca69daebffab7df1da7d1e52c4` requires the accepted
   V3 root and lineage. Complete explicit `toolCall` objects supply calls. Only
   characterized persisted `stop` or `toolUse` stops supply public assistant text.
@@ -389,21 +394,23 @@ their source-specific meaning; none proves a served tier or measured savings.
 
 ### Saved-state revisions and conversion
 
-Parser revision is 66, analyzer revision is 25, evidence schema revision is 22,
+Parser revision is 67, analyzer revision is 25, evidence schema revision is 22,
 and resume snapshot revision is 25. Native file cursor and OpenCode V1 live
-journal revisions are both 5. Compatible parser-63, parser-64, and parser-65
+journal revisions are both 5. Compatible parser-63, parser-64, parser-65, and parser-66
 cursor/state-5 receipts retain committed progress. The named parser-62 predecessor
 uses claim-fenced conversion. Batch resume snapshots require the current parser.
 Unknown parser or cursor revisions fail closed; they do not authorize a rewind
 or resend.
 
-The regular file loader accepts parser 62 with cursor 4, or parser 63, 64, 65, or 66
+The regular file loader accepts parser 62 with cursor 4, or parser 63, 64, 65, 66, or 67
 with cursor 5. V1 live journal validation accepts parser 62 with live state 4
-through its named converter, or parser 63, 64, 65, or 66 with live state 5 and a
+through its named converter, or parser 63, 64, 65, 66, or 67 with live state 5 and a
 valid public baseline. Source identity, owner, sequence, and bounded source
 samples still require validation. A matching layout number alone does not admit
 another parser pair. The saved parser revision and cursor payload advance only
 when page publication commits.
+Parser-66 journal cold retries validate their pinned window with the original
+parser-number hash binding. Upgrade does not change that window or replay it.
 
 Separate named converters accept parser 64 with file cursor 1 or V1 live state 2
 only from producer commit
@@ -446,8 +453,8 @@ accepted results, cooldowns, attempts, or incurred usage. Startup selection also
 excludes pre-boundary publications; a newer selector cursor cannot make their
 older request context safe. The boundary binds the exact session incarnation,
 source, and project directory and survives restart.
-An exact proven parser-65/cursor-5 predecessor keeps its validated request context
-when it advances to parser 66. The historical parser-65 boundary name does not
+An exact proven parser-65 or parser-66 cursor-5 predecessor keeps its validated
+request context when it advances to parser 67. The historical parser-65 boundary name does not
 change, and the upgrade does not create another origin reset.
 Transient read errors do not revoke that request-origin proof. Current evidence
 and idle-continuity checks still apply; new attachments still require a ready source.
@@ -730,7 +737,7 @@ Request-history records include message metadata and user text parts.
 
 | Limit                        |   Value | Scope                                                           |
 | ---------------------------- | ------: | --------------------------------------------------------------- |
-| Parser revision              |      66 | Accepted source parser revision                                 |
+| Parser revision              |      67 | Accepted source parser revision                                 |
 | Resume snapshot revision     |      25 | File-reader resume state                                        |
 | Result observations          |    4096 | Retained results per strict journal page or legacy sink window  |
 | Result payload bytes         | 4194304 | Serialized result payload per strict page or legacy sink window |
@@ -822,7 +829,11 @@ member copies and the final envelope share a 4 MiB native bound; desktop also
 bounds the payload and bindings together. Core admission adds limits of 4 MiB for
 the event plus context, 262,144 JSON nodes, and depth 64. Smaller source budgets
 win. V2 public state and one output batch each use 256 KiB within its 512 KiB
-joiner bound. Codex pending initiating input has a 256-message/4 MiB bound; its
+joiner bound. A V2 step, its calls, and its retained assistant message share one
+frozen request prefix, counted once in retained public state. Output observations
+own their context and remain subject to the separate output bound. Actual state
+or output overflow still leaves a capture gap. Codex pending initiating input has
+a 256-message/4 MiB bound; its
 4,096-entry non-evicting call/turn and finished-task guards withhold later cycles
 when full. Bound failures do not invent partial completed cycles.
 
@@ -1258,7 +1269,7 @@ and Pi can bind matched call and result strings to different known records.
 Codex retains both encoded argument and output string ranges; absent native IDs
 remain absent. Headers, context, comments, skipped lifecycle, and acceptance order
 survive explicit selected storage and contribute to its digest. Parser revision
-66 and resume snapshot revision 25 fence incompatible parser and scope snapshots.
+67 and resume snapshot revision 25 fence incompatible parser and scope snapshots.
 
 ### Current instruction discovery
 
@@ -1642,8 +1653,12 @@ sources. It adds message/part-only activity when the bounded metadata scan
 completes. If that scan reaches its reserved limit, known recent-header sources
 remain visible. An old session changed only through a message can stay omitted
 while that limit persists; there is no eventual backfill guarantee. Returned
-activity times then come from session headers. Required metadata still must fit the hard budget;
-cancellation and other read failures do not become partial success.
+activity times then come from session headers. In a mixed database, a malformed
+V1 or V2 header row does not discard usable sources from the other family.
+Migrated V1 copies remain excluded even when V2 header decoding fails. A row
+error with no usable sibling source still fails discovery. Required metadata
+still must fit the hard budget; cancellation, schema, query, and budget failures
+do not become partial success.
 
 Fast native admission reads at most 256 related sessions, eight recent message
 headers per session, and 1 MiB of metadata. It does not read message bodies.
@@ -1860,7 +1875,7 @@ compactions, or incomplete history prevent clean. OpenCode uses validated
 ordered history, not `parentID` as a fabricated predecessor link.
 
 The route columns use engine turn migration 7 and desktop migration 39. Current
-revisions are parser 66, analyzer 25, evidence schema 22, coverage schema 6, and
+revisions are parser 67, analyzer 25, evidence schema 22, coverage schema 6, and
 resume snapshot 25. Existing revision gates invalidate old projections and
 snapshots; JSON and binary
 evidence round trips and full/resumed replay are covered by tests.

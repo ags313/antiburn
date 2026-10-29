@@ -54,6 +54,35 @@ const savedResults = [
 ]
 
 describe("installed check detail status", () => {
+  it.each([
+    { hasStarted: true, message: "No check results in the last 30 days." },
+    { hasStarted: false, message: "This check has no result in the current report." },
+  ])(
+    "bounds an empty result to the report when hasStarted=$hasStarted",
+    ({ hasStarted, message }) => {
+      render(content({ hasStarted }))
+      expect(screen.getByRole("region", { name: "Check status" })).toHaveTextContent(message)
+      expect(screen.queryByText("This check has not checked any sessions yet.")).toBeNull()
+    },
+  )
+
+  it.each([
+    {
+      status: "paused",
+      title: "This check is paused",
+      message: "Review model-based checks and the selected connection in Settings → Checks.",
+    },
+    {
+      status: "unsupported",
+      title: "Check is not supported",
+      message: "Review the check file and selected connection in Settings → Checks.",
+    },
+  ] as const)("gives Settings guidance for a $status check", ({ status, title, message }) => {
+    render(content({ availability: { status } }))
+    expect(screen.getByRole("heading", { name: title })).toBeVisible()
+    expect(screen.getByText(message)).toBeVisible()
+  })
+
   it.each(
     savedResults.flatMap((saved) =>
       ["checking", "catching up", "waiting"].map((progress) => ({ ...saved, progress })),

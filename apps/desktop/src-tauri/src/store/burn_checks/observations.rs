@@ -7,6 +7,14 @@ use super::{BurnCheckCandidateRecord, BurnCheckObservationRecord, payload_sha256
 use crate::store::Store;
 use crate::store::native_tool_results::trace_effects::InvalidationEffects;
 
+const INVALIDATE_BRANCH_CURRENT_STATUS_SQL: &str =
+    "UPDATE burn_check_current_status SET evidence_valid = 0
+       WHERE evidence_valid = 1 AND check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3
+         AND EXISTS (SELECT 1 FROM burn_check_assessment_history h
+           WHERE h.assessment_id = burn_check_current_status.assessment_id AND NOT EXISTS (
+             SELECT 1 FROM burn_check_candidate_dependency d WHERE d.candidate_id = h.candidate_id
+               AND json_type(d.dependency_binding_json, '$.SessionActivity') = 'object'))";
+
 pub(super) struct RuntimeCheckpoint<'a> {
     pub expected: &'a str,
     pub next: &'a str,
@@ -321,10 +329,10 @@ impl Store {
         }
         if let Some(checkpoint) = &checkpoint {
             for branch in checkpoint.invalidated_branches {
-                effects.current_status_revoked += tx.execute("UPDATE burn_check_current_status SET evidence_valid = 0 WHERE evidence_valid = 1 AND check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3
-                    AND assessment_id IN (SELECT h.assessment_id FROM burn_check_assessment_history h WHERE NOT EXISTS (
-                      SELECT 1 FROM burn_check_candidate_dependency d WHERE d.candidate_id = h.candidate_id
-                        AND json_type(d.dependency_binding_json, '$.SessionActivity') = 'object'))", params![check_id, activation_scope_key, branch])?;
+                effects.current_status_revoked += tx.execute(
+                    INVALIDATE_BRANCH_CURRENT_STATUS_SQL,
+                    params![check_id, activation_scope_key, branch],
+                )?;
                 effects.accepted_evidence_revoked += tx.execute("UPDATE burn_check_assessment_history SET evidence_valid = 0 WHERE evidence_valid = 1 AND check_id = ?1 AND activation_scope_key = ?2 AND branch_key = ?3
                     AND NOT EXISTS (SELECT 1 FROM burn_check_candidate_dependency d WHERE d.candidate_id = burn_check_assessment_history.candidate_id
                       AND json_type(d.dependency_binding_json, '$.SessionActivity') = 'object')", params![check_id, activation_scope_key, branch])?;
@@ -562,3 +570,7 @@ impl Store {
         Ok(true)
     }
 }
+
+#[cfg(test)]
+#[path = "observations_tests.rs"]
+mod tests;

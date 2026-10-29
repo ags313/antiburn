@@ -701,7 +701,7 @@ fn ongoing_source(agent: &str, count: usize) -> (String, String, &'static str, S
             "scope-test", SourceFormat::ClaudeJsonl,
         ),
         "codex" => (
-            json!({"type":"session_meta", "payload":{"id":"synthetic-root", "cli_version":"0.160.1", "thread_source":"user", "history_mode":"legacy"}}).to_string(),
+            json!({"timestamp":"2026-01-01T00:00:00Z", "type":"session_meta", "payload":{"id":"synthetic-root", "cli_version":"0.160.1", "thread_source":"user", "history_mode":"legacy"}}).to_string(),
             "synthetic-root", SourceFormat::CodexRolloutJsonl,
         ),
         "pi" => (
@@ -725,8 +725,8 @@ fn ongoing_source(agent: &str, count: usize) -> (String, String, &'static str, S
                 json!({"type":"user", "uuid":result, "parentUuid":record, "sessionId":session, "version":"2.1.278", "entrypoint":"cli", "isSidechain":false, "message":{"role":"user", "content":[{"type":"tool_result", "tool_use_id":call, "content":"ok", "is_error":false}]}}),
             ),
             "codex" => (
-                json!({"type":"response_item", "payload":{"type":"function_call", "call_id":call, "name":"exec_command", "arguments":"{\"cmd\":\"synthetic test\"}"}}),
-                json!({"type":"response_item", "payload":{"type":"function_call_output", "id":result, "call_id":call, "status":"completed", "output":"ok"}}),
+                json!({"timestamp":"2026-01-01T00:00:04Z", "type":"response_item", "payload":{"type":"function_call", "call_id":call, "name":"exec_command", "arguments":"{\"cmd\":\"synthetic test\"}"}}),
+                json!({"timestamp":"2026-01-01T00:00:05Z", "type":"response_item", "payload":{"type":"function_call_output", "id":result, "call_id":call, "status":"completed", "output":"ok"}}),
             ),
             "pi" => (
                 json!({"type":"message", "id":record, "parentId":parent, "timestamp":"2026-01-01T00:00:04Z", "message":{"role":"assistant", "content":[{"type":"toolCall", "id":call, "name":"bash", "arguments":{"command":"synthetic test"}}]}}),
@@ -1058,8 +1058,8 @@ fn repeated_request_identity_keeps_one_exact_prefix_or_withholds_conflicting_tex
         if conflict {
             repeated["payload"]["content"][0]["text"] = json!("Conflicting request text.");
         }
-        let call = json!({"type":"response_item", "ordinal":4, "payload":{"type":"function_call", "call_id":"new-call", "name":"read_file", "arguments":"{\"path\":\"src/example.rs\"}"}});
-        let output = json!({"type":"response_item", "ordinal":5, "payload":{"type":"function_call_output", "id":"new-result", "call_id":"new-call", "status":"completed", "output":"ok"}});
+        let call = json!({"timestamp":"2026-10-07T10:00:04Z", "type":"response_item", "ordinal":4, "payload":{"type":"function_call", "call_id":"new-call", "name":"read_file", "arguments":"{\"path\":\"src/example.rs\"}"}});
+        let output = json!({"timestamp":"2026-10-07T10:00:05Z", "type":"response_item", "ordinal":5, "payload":{"type":"function_call_output", "id":"new-result", "call_id":"new-call", "status":"completed", "output":"ok"}});
         append(&input, &format!("{repeated}\n{call}\n{output}\n"));
         let page = read_native_file_page(&input, Some(&restored(&cursor)), &|| false).unwrap();
         assert_eq!(page.results.len(), 1);

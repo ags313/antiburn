@@ -56,6 +56,137 @@ const SOURCE_PAGE_SIZE: u16 = 64;
 const SOURCE_PAGES_PER_PASS: usize = 4;
 const EVALUATIONS: usize = 4;
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
+const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct IdleQuery {
+    retry_at: Option<tokio::time::Instant>,
+    failure: Option<diagnostics::RuntimeFailure>,
+}
+
+impl IdleQuery {
+    fn run<T>(
+        &mut self,
+        stage: diagnostics::RuntimeStage,
+        query: impl FnOnce() -> Result<T>,
+    ) -> Option<T> {
+        if self
+            .retry_at
+            .is_some_and(|retry_at| tokio::time::Instant::now() < retry_at)
+        {
+            return None;
+        }
+        match query() {
+            Ok(value) => {
+                self.retry_at = None;
+                self.failure = None;
+                Some(value)
+            }
+            Err(error) => {
+                let failure = diagnostics::RuntimeFailure::classify(stage, &error);
+                failure.trace_if_changed(&mut self.failure, "installed_check_update_failed");
+                self.retry_at = Some(tokio::time::Instant::now() + WORKER_POLL_INTERVAL);
+                None
+            }
+        }
+    }
+}
+
+trait IdleQueries {
+    fn next_idle_deadline(&self) -> Result<Option<i64>>;
+    fn request_idle_catch_up(&self, now_ms: i64) -> Result<usize>;
+}
+
+type AssessmentTaskResult = Result<Option<RunSettlement>, StoreError>;
+
+enum WorkerWake {
+    Update {
+        discover: bool,
+        idle_requested: bool,
+    },
+    Settled(Option<Result<AssessmentTaskResult, tokio::task::JoinError>>),
+    Closed,
+}
+
+struct WorkerTurns {
+    tasks: JoinSet<AssessmentTaskResult>,
+    poll: tokio::time::Interval,
+    lifecycle: tokio::sync::broadcast::Receiver<crate::session_lifecycle::Sequenced>,
+    idle_deadline: IdleQuery,
+    idle_catch_up: IdleQuery,
+}
+
+impl WorkerTurns {
+    fn new(
+        lifecycle: tokio::sync::broadcast::Receiver<crate::session_lifecycle::Sequenced>,
+    ) -> Self {
+        let mut poll = tokio::time::interval(WORKER_POLL_INTERVAL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self {
+            tasks: JoinSet::new(),
+            poll,
+            lifecycle,
+            idle_deadline: IdleQuery::default(),
+            idle_catch_up: IdleQuery::default(),
+        }
+    }
+
+    fn idle_failure(&self) -> Option<&diagnostics::RuntimeFailure> {
+        self.idle_deadline
+            .failure
+            .as_ref()
+            .or(self.idle_catch_up.failure.as_ref())
+    }
+
+    async fn next(
+        &mut self,
+        queries: &impl IdleQueries,
+        state: &InstalledChecks,
+        catch_up_more: bool,
+        request_idle: impl FnOnce() -> bool,
+    ) -> WorkerWake {
+        let now_ms = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
+        let idle_delay = self
+            .idle_deadline
+            .run(diagnostics::RuntimeStage::IdleDeadline, || {
+                queries.next_idle_deadline()
+            })
+            .flatten()
+            .map_or(Duration::from_secs(60), |deadline| {
+                Duration::from_millis(
+                    u64::try_from(deadline.saturating_sub(now_ms).max(1000)).unwrap_or(60_000),
+                )
+            });
+        let discover = tokio::select! {
+            () = state.wake.notified() => true,
+            _ = self.poll.tick() => false,
+            () = tokio::time::sleep(idle_delay) => false,
+            () = tokio::task::yield_now(), if catch_up_more => false,
+            event = self.lifecycle.recv() => match event {
+                Ok(message) => lifecycle_changes_projects(&message.event),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return WorkerWake::Closed,
+            },
+            settled = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                return WorkerWake::Settled(settled);
+            },
+        };
+        let idle_requested = !state.stopping.load(Ordering::Acquire)
+            && request_idle()
+            && self
+                .idle_catch_up
+                .run(diagnostics::RuntimeStage::IdleCatchUp, || {
+                    queries.request_idle_catch_up(
+                        time::OffsetDateTime::now_utc().unix_timestamp() * 1000,
+                    )
+                })
+                .is_some_and(|requested| requested > 0);
+        WorkerWake::Update {
+            discover,
+            idle_requested,
+        }
+    }
+}
 
 /// Only metadata crosses the worker boundary. Engines and credentials stay private.
 #[derive(Default)]
@@ -279,11 +410,13 @@ fn finish_inventory_update<E>(
 fn finish_app_inventory_update<E>(
     app: &tauri::AppHandle,
     state: &InstalledChecks,
-    host: &InstalledCheckHost<E>,
+    host: &mut InstalledCheckHost<E>,
     update: Result<()>,
     stage: diagnostics::RuntimeStage,
     previous_failure: &mut Option<diagnostics::RuntimeFailure>,
+    idle_failure: Option<&diagnostics::RuntimeFailure>,
 ) -> bool {
+    set_runtime_failure(&mut host.definitions, idle_failure);
     finish_inventory_update(
         state,
         host,
@@ -1296,6 +1429,16 @@ impl<E: DecisionEvaluator + 'static> InstalledCheckHost<E> {
     }
 }
 
+impl<E: DecisionEvaluator + 'static> IdleQueries for InstalledCheckHost<E> {
+    fn next_idle_deadline(&self) -> Result<Option<i64>> {
+        InstalledCheckHost::next_idle_deadline(self)
+    }
+
+    fn request_idle_catch_up(&self, now_ms: i64) -> Result<usize> {
+        InstalledCheckHost::request_idle_catch_up(self, now_ms)
+    }
+}
+
 struct EvaluationJob<E> {
     engine: Arc<CheckEngine<StoreCheckStore, E>>,
     store: Arc<StoreCheckStore>,
@@ -1979,11 +2122,20 @@ fn update_source_diagnostic(
 
 fn publish_runtime_failure(state: &InstalledChecks, failure: &diagnostics::RuntimeFailure) {
     let mut definitions = state.metadata.write().expect("installed metadata lock");
-    for definition in definitions.iter_mut() {
+    set_runtime_failure(&mut definitions, Some(failure));
+}
+
+fn set_runtime_failure(
+    definitions: &mut [InstalledCheckDefinition],
+    failure: Option<&diagnostics::RuntimeFailure>,
+) {
+    for definition in definitions {
         definition
             .diagnostics
             .retain(|diagnostic| diagnostic.code != "storage-failed");
-        definition.diagnostics.push(failure.diagnostic());
+        if let Some(failure) = failure {
+            definition.diagnostics.push(failure.diagnostic());
+        }
     }
 }
 
@@ -2076,7 +2228,7 @@ fn attach_directory_diagnostics(
             "discovery-directory-unavailable",
             InstalledCheckDiagnosticSeverity::Error,
             "Allow access to the checks folder",
-            "antiburn cannot read this folder. Check folder permissions and grant access in Settings → Sources if the folder is protected.",
+            "Cannot read this folder. Check folder permissions and grant access in Settings → Sources if the folder is protected.",
             None,
             vec![diagnostics::detail("Folder", directory.to_string_lossy())],
         );
@@ -2198,12 +2350,10 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         InstalledCheckHost::new(store, evaluator, global),
     )?;
     host.current_context = current_context::CurrentContextCapture::new(native_home);
-    let mut tasks = JoinSet::new();
-    let mut poll = tokio::time::interval(Duration::from_secs(1));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut lifecycle = app
-        .state::<crate::session_lifecycle::SessionEvents>()
-        .subscribe();
+    let mut turns = WorkerTurns::new(
+        app.state::<crate::session_lifecycle::SessionEvents>()
+            .subscribe(),
+    );
     let mut last_discovery = None::<Instant>;
     let mut previous_admission = None;
     let mut previous_connection_generation = None;
@@ -2214,44 +2364,41 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
     let mut previous_update_failure = None;
     let mut previous_watch_failure = None;
     loop {
-        let mut discover = false;
-        let now_ms = time::OffsetDateTime::now_utc().unix_timestamp() * 1000;
-        let idle_delay = host
-            .next_idle_deadline()?
-            .map_or(Duration::from_secs(60), |deadline| {
-                Duration::from_millis(
-                    u64::try_from(deadline.saturating_sub(now_ms).max(1000)).unwrap_or(60_000),
-                )
-            });
-        tokio::select! {
-            () = state.wake.notified() => discover = true,
-            _ = poll.tick() => {},
-            () = tokio::time::sleep(idle_delay) => {},
-            () = tokio::task::yield_now(), if catch_up_more => {},
-            event = lifecycle.recv() => {
-                if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) { break; }
-                discover = match event {
-                    Ok(message) => lifecycle_changes_projects(&message.event),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => unreachable!(),
-                };
-            },
-            settled = tasks.join_next(), if !tasks.is_empty() => {
+        let (mut discover, idle_requested) = match turns
+            .next(&host, &state, catch_up_more, || {
+                crate::jev::settings::yaml_discovery_enabled(&app.state::<Store>())
+                    && state.credentials_restored.load(Ordering::Acquire)
+            })
+            .await
+        {
+            WorkerWake::Update {
+                discover,
+                idle_requested,
+            } => (discover, idle_requested),
+            WorkerWake::Closed => break,
+            WorkerWake::Settled(settled) => {
                 match settled {
-                    Some(Ok(Ok(Some(_)))) => { let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ()); },
+                    Some(Ok(Ok(Some(_)))) => {
+                        let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
+                    }
                     Some(Ok(Err(error))) => {
-                        let failure = diagnostics::RuntimeFailure::classify(diagnostics::RuntimeStage::AssessmentSettlement, &anyhow::Error::new(error));
+                        let failure = diagnostics::RuntimeFailure::classify(
+                            diagnostics::RuntimeStage::AssessmentSettlement,
+                            &anyhow::Error::new(error),
+                        );
                         publish_runtime_failure(&state, &failure);
                         let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
-                    },
+                    }
                     Some(Err(error)) => diagnostics::RuntimeFailure::classify(
-                        diagnostics::RuntimeStage::TaskJoin, &error.into(),
-                    ).trace("installed_check_task_failed"),
-                    _ => {},
+                        diagnostics::RuntimeStage::TaskJoin,
+                        &error.into(),
+                    )
+                    .trace("installed_check_task_failed"),
+                    _ => {}
                 }
                 continue;
-            },
-        }
+            }
+        };
         if state.stopping.load(Ordering::Acquire) {
             break;
         }
@@ -2303,10 +2450,11 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
             if finish_app_inventory_update(
                 app,
                 &state,
-                &host,
+                &mut host,
                 update,
                 diagnostics::RuntimeStage::Reconcile,
                 &mut previous_update_failure,
+                turns.idle_failure(),
             ) {
                 if discover {
                     last_discovery = Some(Instant::now());
@@ -2330,8 +2478,7 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         if !state.credentials_restored.load(Ordering::Acquire) {
             continue;
         }
-        if host.request_idle_catch_up(time::OffsetDateTime::now_utc().unix_timestamp() * 1000)? > 0
-        {
+        if idle_requested {
             crate::insights_worker::wake(app);
         }
         let snapshot = app
@@ -2371,10 +2518,11 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         if !finish_app_inventory_update(
             app,
             &state,
-            &host,
+            &mut host,
             reconciliation,
             diagnostics::RuntimeStage::Reconcile,
             &mut previous_update_failure,
+            turns.idle_failure(),
         ) {
             catch_up_more = false;
             last_discovery = None;
@@ -2428,10 +2576,11 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
         if !finish_app_inventory_update(
             app,
             &state,
-            &host,
+            &mut host,
             Ok(()),
             diagnostics::RuntimeStage::SourceCatchUp,
             &mut previous_update_failure,
+            turns.idle_failure(),
         ) {
             if let Err(error) = result {
                 diagnostics::RuntimeFailure::classify(
@@ -2451,8 +2600,8 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
                 if changed {
                     let _ = app.emit(crate::commands::CHECKS_REPORT_CHANGED_EVENT, ());
                 }
-                for job in host.evaluation_jobs(EVALUATIONS.saturating_sub(tasks.len())) {
-                    tasks.spawn(job.run_selected(Arc::clone(&runtime)));
+                for job in host.evaluation_jobs(EVALUATIONS.saturating_sub(turns.tasks.len())) {
+                    turns.tasks.spawn(job.run_selected(Arc::clone(&runtime)));
                 }
                 catch_up_more = more;
             }
@@ -2471,7 +2620,7 @@ async fn run(app: &tauri::AppHandle) -> Result<()> {
             }
         }
     }
-    while let Some(result) = tasks.join_next().await {
+    while let Some(result) = turns.tasks.join_next().await {
         if let Err(error) = result {
             diagnostics::RuntimeFailure::classify(
                 diagnostics::RuntimeStage::TaskJoin,

@@ -547,8 +547,8 @@ describe("Checks", () => {
         }}
       />,
     )
-    expect(screen.getByText("No issues found")).toBeInTheDocument()
-    expect(screen.getByText("No issues found")).toHaveClass("text-label")
+    expect(screen.getByText("No issues in available results")).toBeInTheDocument()
+    expect(screen.getByText("No issues in available results")).toHaveClass("text-label")
     const passingIcon = container.querySelector(".lucide-circle-check")
     expect(passingIcon).toBeInTheDocument()
     expect(passingIcon).toHaveAttribute("width", "24")
@@ -576,7 +576,7 @@ describe("Checks", () => {
         }}
       />,
     )
-    expect(screen.getByText("No issues found")).toBeInTheDocument()
+    expect(screen.getByText("No issues in available results")).toBeInTheDocument()
     expect(screen.queryByText("More evidence is needed")).not.toBeInTheDocument()
     expect(screen.getAllByText("Passed")).toHaveLength(1)
     expect(screen.queryByText("Passed where assessed")).not.toBeInTheDocument()

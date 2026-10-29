@@ -209,7 +209,7 @@ export function BurnCheckTargetActions({
             busy: null,
             review: null,
             status: verificationUnavailable
-              ? "The change was made, but a later session could not confirm the result."
+              ? "Change applied. Automatic verification is unavailable."
               : null,
           }))
         })

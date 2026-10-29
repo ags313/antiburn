@@ -321,6 +321,114 @@ async fn outer_job_trace_deduplicates_real_work_probe_failures_per_activation_an
     assert!(!captured.text().contains("PRIVATE_"));
 }
 
+#[tokio::test(start_paused = true)]
+async fn idle_query_retries_keep_safe_causes_deduplicate_logs_and_reset_after_recovery() {
+    use super::super::{IdleQuery, InstalledCheckHost, InstalledDecisionEvaluator};
+    use std::time::Duration;
+    use tracing::instrument::WithSubscriber;
+
+    let runtime = TraceRuntime::new();
+    let evaluator = std::sync::Arc::new(InstalledDecisionEvaluator::factory(runtime.clone()));
+    let host = InstalledCheckHost::new(runtime.store.clone(), evaluator, None).unwrap();
+    let fail_queries = || {
+        runtime
+            .store
+            .lock()
+            .execute_batch(
+                "ALTER TABLE burn_check_session_attachment RENAME TO PRIVATE_ATTACHMENT_TABLE",
+            )
+            .unwrap();
+    };
+    fail_queries();
+    let mut deadline = IdleQuery::default();
+    let mut catch_up = IdleQuery::default();
+    let captured = LogCapture::default();
+    async {
+        for _ in 0..100 {
+            assert!(
+                deadline
+                    .run(RuntimeStage::IdleDeadline, || host.next_idle_deadline())
+                    .is_none()
+            );
+            assert!(
+                catch_up
+                    .run(RuntimeStage::IdleCatchUp, || host.request_idle_catch_up(1))
+                    .is_none()
+            );
+            tokio::time::advance(Duration::from_millis(999)).await;
+            for query in [&mut deadline, &mut catch_up] {
+                assert!(
+                    query
+                        .run::<()>(RuntimeStage::Worker, || panic!(
+                            "idle queries must wait for the next poll"
+                        ),)
+                        .is_none()
+                );
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert_eq!(captured.events("installed_check_update_failed").len(), 2);
+        for query in [&deadline, &catch_up] {
+            let diagnostic = query.failure.unwrap().diagnostic();
+            assert!(
+                diagnostic.details.iter().any(|detail| {
+                    detail.label == "Failure category" && detail.value == "sqlite"
+                })
+            );
+            assert!(
+                !serde_json::to_string(&diagnostic)
+                    .unwrap()
+                    .contains("PRIVATE_")
+            );
+        }
+        runtime
+            .store
+            .lock()
+            .execute_batch(
+                "ALTER TABLE PRIVATE_ATTACHMENT_TABLE RENAME TO burn_check_session_attachment",
+            )
+            .unwrap();
+        assert!(
+            deadline
+                .run(RuntimeStage::IdleDeadline, || host.next_idle_deadline())
+                .is_some()
+        );
+        assert!(
+            catch_up
+                .run(RuntimeStage::IdleCatchUp, || host.request_idle_catch_up(1))
+                .is_some()
+        );
+        assert!(deadline.failure.is_none());
+        assert!(catch_up.failure.is_none());
+        fail_queries();
+        assert!(
+            deadline
+                .run(RuntimeStage::IdleDeadline, || host.next_idle_deadline())
+                .is_none()
+        );
+        assert!(
+            catch_up
+                .run(RuntimeStage::IdleCatchUp, || host.request_idle_catch_up(1))
+                .is_none()
+        );
+    }
+    .with_subscriber(captured.clone())
+    .await;
+    let failures = captured.events("installed_check_update_failed");
+    assert_eq!(failures.len(), 4);
+    for (failure, stage) in failures
+        .iter()
+        .zip(["idle_deadline", "idle_catch_up"].into_iter().cycle())
+    {
+        assert_eq!(failure.level, tracing::Level::ERROR);
+        assert_eq!(failure.fields["stage"], format!("{stage:?}"));
+        assert_eq!(failure.fields["reason"], "\"sqlite\"");
+        assert_eq!(failure.fields["sqlite_code"], "1");
+    }
+    assert!(captured.events("installed_checks_stopped").is_empty());
+    assert!(!captured.text().contains("PRIVATE_"));
+}
+
 #[test]
 fn worker_trace_keeps_actual_idle_query_sqlite_causes_before_the_stop_boundary() {
     use super::super::{InstalledCheckHost, InstalledDecisionEvaluator};

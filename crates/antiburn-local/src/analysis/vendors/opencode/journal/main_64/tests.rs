@@ -436,7 +436,7 @@ fn main_64_journal_rejects_reused_future_unordered_and_overflowing_counters() {
 #[test]
 fn main_64_named_journal_decoder_rejects_other_parser_layout_pairs() {
     let (_directory, path, _connection, fixture, cursor) = fixture();
-    for parser in [61, 62, 63, 64, 65, PARSER_REVISION, PARSER_REVISION + 1] {
+    for parser in [61, 62, 63, 64, 65, 66, PARSER_REVISION, PARSER_REVISION + 1] {
         for layout in [1, 2, 3, 4, 5, 6] {
             let mut value = fixture["cursor"].clone();
             value["parser_revision"] = serde_json::json!(parser);
