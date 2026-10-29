@@ -296,6 +296,31 @@ impl Fixture {
                 .unwrap()
                 .prompt_action
         );
+        let copied = self
+            .controller
+            .copy_prompt_fix_burn_check_target_current(
+                &self.store,
+                DetectorId::OldModelUsage,
+                &target.finding_id,
+                BurnCheckTargetContext {
+                    environment_key: "native".into(),
+                    window: ReportWindow {
+                        start_epoch: 0,
+                        end_epoch: i64::MAX,
+                    },
+                },
+            )
+            .unwrap();
+        assert!(copied.prompt.contains("gpt-5.5"));
+        assert!(!copied.prompt.contains(PROMPT_REFERENCE_PREFIX));
+        assert_eq!(copied.watch.unwrap().lifecycle, RemediationState::Watching);
+        assert_eq!(
+            self.store
+                .remediation(&watch.remediation_id)
+                .unwrap()
+                .unwrap(),
+            watch
+        );
         watch
     }
 

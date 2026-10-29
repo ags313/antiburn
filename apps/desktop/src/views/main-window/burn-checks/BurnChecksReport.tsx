@@ -259,6 +259,7 @@ function CheckDetailBody({ check, session, state, evidenceActive }: CheckDetailC
           refresh={session.refresh}
           contained
           reportRow
+          active={evidenceActive}
         />
       )
     }
@@ -294,6 +295,7 @@ function CheckDetailBody({ check, session, state, evidenceActive }: CheckDetailC
       refresh={session.refresh}
       contained={targets.data.targets.length === 0}
       reportRow
+      active={evidenceActive}
     />
   )
 }
@@ -328,6 +330,14 @@ function CheckDetail({
     state.targets[check.id]?.data?.targets,
   )
   const targetList = state.targets[check.id]?.data
+  const hasKnownFindings =
+    check.finding > 0 ||
+    (targetList?.targets.length ?? 0) > 0 ||
+    state.aggregate?.wins.some((win) => win.detector === check.id)
+  const shouldLoadTargets =
+    check.lifecycle === "failing" ||
+    check.lifecycle === "awaitingVerification" ||
+    hasKnownFindings
   const named = isUnusedResourceDetector(check.id)
   const resourceNames: [string, string] =
     check.id === "unusedSkills"
@@ -340,6 +350,11 @@ function CheckDetail({
       ? `${targetList.truncated ? "At least " : ""}${targetList.targets.length} affected ${pluralize(targetList.targets.length, resourceNames[0], resourceNames[1])}`
       : null
   const showFindingActions = check.lifecycle === "failing" && check.finding > 0 && targetList
+  const showPromptAction =
+    targetList &&
+    (showFindingActions ||
+      (named && targetList.targets.length > 0) ||
+      targetList.targets.some((target) => target.promptFix.status === "available"))
   const showSnoozedAction = snooze !== undefined || check.lifecycle === "awaitingVerification"
   const nativeDetector = isInstalledCheck(check) ? null : check.id
   const description = isInstalledCheck(check)
@@ -381,11 +396,7 @@ function CheckDetail({
   return (
     <div
       id={`burn-check-${check.id}-detail`}
-      ref={
-        check.lifecycle === "failing" || check.lifecycle === "awaitingVerification"
-          ? trackVisibility
-          : undefined
-      }
+      ref={shouldLoadTargets ? trackVisibility : undefined}
       hidden={!visible}
       tabIndex={-1}
       className="burn-check-detail min-w-0"
@@ -406,12 +417,14 @@ function CheckDetail({
                   />
                 ))}
               </div>
-              {showFindingActions && !isInstalledCheck(check) && (
+              {showPromptAction && !isInstalledCheck(check) && (
                 <div className="max-w-full shrink-0">
                   <CheckDetailActions
                     detector={check.id}
                     targets={targetList.targets}
                     refresh={session.refresh}
+                    active={visible && state.active}
+                    showFindingActions={Boolean(showFindingActions)}
                     reportRow
                   />
                 </div>

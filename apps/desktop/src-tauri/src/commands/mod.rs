@@ -1977,7 +1977,7 @@ fn prompt_fix_outcome(
         }),
         Err(ControllerError::TargetExpired) => Ok(CopyPromptFixBurnCheckTargetOutcome::Expired),
         Err(ControllerError::TargetChanged) => Ok(CopyPromptFixBurnCheckTargetOutcome::Stale),
-        Err(ControllerError::TargetNotFound) => {
+        Err(ControllerError::TargetNotFound | ControllerError::CheckPromptUnavailable) => {
             Ok(CopyPromptFixBurnCheckTargetOutcome::Unavailable {
                 reason: PromptFixUnavailableReason::TargetNotFound,
             })
@@ -2006,7 +2006,6 @@ fn prompt_fix_outcome(
             Ok(CopyPromptFixBurnCheckTargetOutcome::Unavailable { reason })
         }
         Err(ControllerError::AutoFixUnavailable(_))
-        | Err(ControllerError::CheckPromptUnavailable)
         | Err(ControllerError::Conflict)
         | Err(ControllerError::ApplyFailed(_))
         | Err(ControllerError::RecoveryNeeded { .. })
@@ -2015,20 +2014,30 @@ fn prompt_fix_outcome(
     }
 }
 
-/// Returns a bounded prompt and starts or reuses its verification watch.
+/// Builds a current prompt for one stable target identity.
 #[tauri::command]
 pub async fn copy_prompt_fix_burn_check_target(
     window: tauri::WebviewWindow,
-    action_id: String,
+    detector: BurnCheckDetectorId,
+    finding_id: String,
 ) -> CommandResult<CopyPromptFixBurnCheckTargetOutcome> {
     ensure_checks_window(window.label())?;
     let app = window.app_handle().clone();
     let action_app = app.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let request = insights_report_request(epoch_now());
         prompt_fix_outcome(
             action_app
                 .state::<RemediationController>()
-                .copy_prompt_fix_burn_check_target(&action_app.state::<Store>(), &action_id),
+                .copy_prompt_fix_burn_check_target_current(
+                    &action_app.state::<Store>(),
+                    detector.into(),
+                    &finding_id,
+                    BurnCheckTargetContext {
+                        environment_key: request.environment_key,
+                        window: request.window,
+                    },
+                ),
         )
     })
     .await
@@ -2050,12 +2059,13 @@ pub async fn copy_prompt_fix_burn_check(
 ) -> CommandResult<CopyPromptFixBurnCheckOutcome> {
     ensure_checks_window(window.label())?;
     let app = window.app_handle().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let action_app = app.clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
         let request = insights_report_request(epoch_now());
-        match app
+        match action_app
             .state::<RemediationController>()
             .copy_prompt_fix_burn_check(
-                &app.state::<Store>(),
+                &action_app.state::<Store>(),
                 detector.into(),
                 BurnCheckTargetContext {
                     environment_key: request.environment_key,
@@ -2072,23 +2082,36 @@ pub async fn copy_prompt_fix_burn_check(
         }
     })
     .await
-    .map_err(|_| "unable to copy burn check prompt".to_owned())?
+    .map_err(|_| "unable to copy burn check prompt".to_owned())??;
+    if matches!(outcome, CopyPromptFixBurnCheckOutcome::PromptReady { .. }) {
+        crate::insights_worker::wake(&app);
+    }
+    Ok(outcome)
 }
 
 /// Returns one bounded prompt for all selected current targets in one check.
 #[tauri::command]
 pub async fn copy_prompt_fix_burn_check_targets(
     window: tauri::WebviewWindow,
-    action_ids: Vec<String>,
+    detector: BurnCheckDetectorId,
+    finding_ids: Vec<String>,
 ) -> CommandResult<CopyPromptFixBurnCheckOutcome> {
     ensure_checks_window(window.label())?;
     let app = window.app_handle().clone();
     let action_app = app.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let request = insights_report_request(epoch_now());
         match action_app
             .state::<RemediationController>()
-            .copy_prompt_fix_burn_check_targets(&action_app.state::<Store>(), &action_ids)
-        {
+            .copy_prompt_fix_burn_check_targets_current(
+                &action_app.state::<Store>(),
+                detector.into(),
+                &finding_ids,
+                BurnCheckTargetContext {
+                    environment_key: request.environment_key,
+                    window: request.window,
+                },
+            ) {
             Ok(result) => Ok(CopyPromptFixBurnCheckOutcome::PromptReady {
                 prompt: result.prompt,
             }),

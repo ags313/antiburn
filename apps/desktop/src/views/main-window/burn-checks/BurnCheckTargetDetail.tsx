@@ -817,7 +817,9 @@ export function BurnCheckTargetDetail({
         {costLine && (
           <p className="mt-1 type-callout tabular-nums text-label-secondary">{costLine}</p>
         )}
-        {!reportRow && <BurnCheckTargetActions target={target} refresh={refresh} />}
+        {!reportRow && (
+          <BurnCheckTargetActions target={target} refresh={refresh} active={evidenceActive} />
+        )}
         {(smartCheck != null || target.evidenceAvailable) && (
           <section className="mt-2" aria-label="Source details">
             <button
