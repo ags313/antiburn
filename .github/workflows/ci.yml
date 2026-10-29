@@ -281,6 +281,7 @@ jobs:
             crates/antiburn-local
             crates/antiburn-remote
             crates/antiburn-checks-store
+            crates/antiburn-cli-runtime
             apps/cli
           shared-key: ci-engine-${{ matrix.name }}
           cache-bin: false

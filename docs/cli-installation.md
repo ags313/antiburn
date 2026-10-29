@@ -22,9 +22,21 @@ immutable payload. Windows uses a native executable copy, with no `.cmd` shim or
 shell invocation. A missing bundle, DMG unmount, App Translocation, app relocation,
 or AppImage remount cannot invalidate an already staged runtime.
 
-The runtime is internal infrastructure. Installation and Repair do not publish a
-terminal command or change PATH or shell profiles. They do not create an
-`antiburn` alias.
+The runtime is internal infrastructure. First launch prepares only the private
+runtime. Optional explicit `terminal install` creates an `antiburn` command; see
+[terminal setup](../apps/cli/README.md#optional-terminal-command). Startup and
+Repair maintain that command only after opt-in. They never edit PATH or shell
+profiles. Agent integrations do not require terminal setup.
+
+The shared `antiburn-cli-runtime` crate owns runtime and terminal filesystem
+policy. Both the desktop adapter and standalone CLI call it; it has no Tauri or
+product-database dependency. The optional command has a separate
+`terminal-receipt.json` with pending publication and file identity. POSIX links
+point to the durable stable runtime; Windows copies are reconciled on updates.
+Uninstall records opt-out before removing an owned entry, so interrupted removal
+cannot re-enable setup. Modified entries and existing desktop launchers are
+preserved. A manually deleted command is not recreated by startup or Repair.
+Terminal status checks file ownership and runtime validity, not shell resolution.
 
 Reconciliation retires legacy exports only when the receipt records prior
 ownership. On macOS/Linux the legacy path is `~/.local/bin/antiburn-cli`; on
@@ -178,7 +190,8 @@ Do not copy private session data or captured machine paths into public docs.
    Windows native dependencies on the actual build hosts.
 3. Install offline with minimal GUI PATH in a disposable nonadmin account.
    Confirm stable native `capabilities --json` works independently of PATH and no
-   terminal export is created. Restart twice:
+   terminal export is created without opt-in. Repeat after explicit setup and
+   after uninstall, verifying PATH/profile files remain unchanged. Restart twice:
    no duplicates, profile changes, vendor installs, unrelated writes or prompts.
 4. Exercise collisions at each destination, missing/broken owned links, changed
    receipts/files, oversized/corrupt payloads, concurrent locks, interrupted

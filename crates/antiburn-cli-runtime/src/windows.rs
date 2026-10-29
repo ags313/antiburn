@@ -7,7 +7,7 @@ use windows_sys::Win32::Security::{
     WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
 use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
@@ -204,10 +204,10 @@ pub fn replace_preserving_policy(destination: &Path, source: &Path) -> Result<()
             std::ptr::null(),
         )
     };
-    ensure!(
-        result != 0,
-        "CLI replacement deferred; destination may be locked or policy prevents replacement: {}",
-        std::io::Error::last_os_error()
-    );
+    if result == 0 {
+        return Err(std::io::Error::last_os_error()).context(
+            "CLI replacement deferred; destination may be locked or policy prevents replacement",
+        );
+    }
     Ok(())
 }

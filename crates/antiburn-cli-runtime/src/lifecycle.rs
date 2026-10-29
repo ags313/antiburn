@@ -1,3 +1,6 @@
+mod terminal;
+pub use terminal::TerminalState;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -323,11 +326,16 @@ fn retry_startup(
             Ok(()) => return Ok(()),
             Err(error) => {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if !matches!(
+                let busy = matches!(
                     error.downcast_ref::<std::fs::TryLockError>(),
                     Some(std::fs::TryLockError::WouldBlock)
-                ) || remaining.is_zero()
-                {
+                );
+                #[cfg(windows)]
+                let busy = busy
+                    || error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| matches!(error.raw_os_error(), Some(32 | 33)));
+                if !busy || remaining.is_zero() {
                     return Err(error);
                 }
                 std::thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
@@ -337,6 +345,15 @@ fn retry_startup(
 }
 
 impl Installation {
+    pub fn for_terminal(root: PathBuf) -> Self {
+        Self {
+            terminal: root.join("legacy").join(file_name()),
+            payload: root.join("unused-payload"),
+            root,
+            target: crate::TARGET.into(),
+        }
+    }
+
     fn stable(&self) -> PathBuf {
         self.root.join("bin").join(file_name())
     }
@@ -497,7 +514,7 @@ impl Installation {
         self.runtime(&self.receipt()?)
     }
 
-    pub(super) fn runtime_for_test(&self) -> Result<(File, CliRuntime)> {
+    pub fn runtime_for_test(&self) -> Result<(File, CliRuntime)> {
         let lock = self.lock()?;
         let runtime = self.runtime(&self.receipt()?)?;
         Ok((lock, runtime))
@@ -590,7 +607,8 @@ impl Installation {
                 let _ = fs::remove_dir(parent(&path)?);
             }
         }
-        self.retire_terminal(&mut r)
+        self.retire_terminal(&mut r)?;
+        self.reconcile_terminal()
     }
 
     fn retire_terminal(&self, r: &mut Receipt) -> Result<()> {
@@ -1157,11 +1175,12 @@ mod tests {
     #[ignore = "Build a native CLI payload with scripts/build-cli-sidecar.mjs first"]
     fn native_payload_runs_offline_with_a_minimal_path_after_bundle_removal() {
         let mut f = Fixture::new();
-        let original = Path::new(env!("CARGO_MANIFEST_DIR")).join("cli-payload");
+        let original =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/desktop/src-tauri/cli-payload");
         for name in [file_name(), "manifest.json"] {
             fs::copy(original.join(name), f.i.payload.join(name)).unwrap();
         }
-        f.i.target = env!("ANTIBURN_CLI_TARGET").into();
+        f.i.target = crate::TARGET.into();
         f.i.reconcile().unwrap();
         fs::remove_dir_all(&f.i.payload).unwrap();
         let runtime = f.i.resolve().unwrap();

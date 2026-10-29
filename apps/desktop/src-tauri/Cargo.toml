@@ -61,6 +61,7 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+antiburn-cli-runtime = { path = "../../../crates/antiburn-cli-runtime" }
 # Strict installed-check parsing, runtime selection, and decision contracts.
 antiburn-checks = { path = "../../../crates/antiburn-checks" }
 antiburn-checks-store = { path = "../../../crates/antiburn-checks-store" }

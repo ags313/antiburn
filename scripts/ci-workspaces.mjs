@@ -39,6 +39,7 @@ export const WORKSPACES = [
     dependsOn: [
       "checks",
       "checks-store",
+      "cli-runtime",
       "engine",
       "remote",
       "nudge",
@@ -108,10 +109,16 @@ export const WORKSPACES = [
     dependsOn: ["checks", "engine"],
   },
   {
+    id: "cli-runtime",
+    directory: "crates/antiburn-cli-runtime",
+    group: "engine",
+    dependsOn: [],
+  },
+  {
     id: "cli",
     directory: "apps/cli",
     group: "engine",
-    dependsOn: ["engine", "checks-store"],
+    dependsOn: ["engine", "checks-store", "cli-runtime"],
   },
 ];
 

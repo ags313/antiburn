@@ -1,12 +1,7 @@
-mod lifecycle;
-#[cfg(target_os = "macos")]
-mod macos;
 mod probe;
-#[cfg(windows)]
-mod windows;
 
-pub use lifecycle::{CliInstallState, CliRuntime};
-use lifecycle::{Installation, file_name};
+pub use antiburn_cli_runtime::{CliInstallState, CliRuntime};
+use antiburn_cli_runtime::{Installation, file_name};
 use tauri::{Emitter, Manager};
 
 fn installation(app: &tauri::AppHandle) -> Result<Installation, String> {

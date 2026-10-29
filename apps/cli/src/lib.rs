@@ -3,6 +3,7 @@ pub mod cli;
 mod config;
 mod delivery;
 mod logging;
+mod terminal;
 
 use crate::cli::Command;
 
@@ -52,6 +53,7 @@ pub struct Capabilities {
 
 pub enum Response {
     Capabilities(Capabilities),
+    Terminal(terminal::TerminalResponse),
     Checks(checks::PendingChecks),
     Delivery(delivery::DeliveryResponse),
 }
@@ -65,6 +67,16 @@ impl Response {
 
         match self {
             Self::Checks(pending) => pending.write_json(writer).await,
+            Self::Terminal(response) => {
+                let mut output =
+                    serde_json::to_vec(&response).map_err(|error| error.to_string())?;
+                output.push(b'\n');
+                writer
+                    .write_all(&output)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                writer.flush().await.map_err(|error| error.to_string())
+            }
             Self::Capabilities(response) => {
                 let mut output = serde_json::to_vec(&response).map_err(|e| e.to_string())?;
                 output.push(b'\n');
@@ -90,6 +102,20 @@ impl Response {
 
 pub async fn run(cli: cli::Cli) -> Result<Response, CliError> {
     let cli::Cli { config, command } = cli;
+    if let Command::Terminal {
+        command,
+        runtime_root,
+    } = command
+    {
+        if config.is_some() {
+            return Err(CliError::usage(
+                "terminal setup does not use --config; use --runtime-root for another profile",
+            ));
+        }
+        return terminal::run(command, runtime_root)
+            .await
+            .map(Response::Terminal);
+    }
     if matches!(command, Command::Capabilities { .. }) {
         return Ok(Response::Capabilities(Capabilities {
             version: env!("CARGO_PKG_VERSION"),

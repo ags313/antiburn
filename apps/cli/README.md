@@ -91,6 +91,60 @@ cargo build
 Checks write their own local diagnostic log. Capabilities does not initialize file
 logging or load config. Source builds do not install a shell command automatically.
 
+## Optional terminal command
+
+Desktop first launch prepares the private runtime only. To make `antiburn` available
+in a terminal, copy the executable location from Settings → CLI → Technical details
+and run that **quoted absolute path** with `terminal install`. For example:
+
+```sh
+"/absolute/path/to/cli/bin/antiburn-cli" terminal install
+```
+
+In PowerShell, use the call operator before the quoted executable path:
+
+```powershell
+& "C:\absolute\path\to\cli\bin\antiburn-cli.exe" terminal install
+```
+
+The default command directory is `~/.local/bin` on macOS/Linux and
+`%LOCALAPPDATA%\antiburn\bin` on Windows. Pass `--directory /absolute/per-user/bin`
+to choose another user-owned directory. Setup preserves existing commands and does
+not edit PATH or shell profiles. If the directory is absent from PATH, add it using
+your shell's normal configuration. Open a fresh terminal and check what will run:
+
+```sh
+command -v antiburn
+type antiburn
+antiburn capabilities --json
+```
+
+```powershell
+Get-Command antiburn -All
+where.exe antiburn
+antiburn capabilities --json
+```
+
+Some Linux installations already use `antiburn` for the desktop launcher. Setup
+never replaces it. Choose a separate user-owned directory and explicitly decide
+whether that directory should precede the desktop launcher in your PATH. Shell
+aliases, functions, and earlier PATH entries can still shadow the CLI. Launch the
+desktop through its application entry or original absolute path after changing
+command precedence. An installed command file alone does not prove shell resolution.
+
+`antiburn terminal status` inspects setup; `antiburn terminal uninstall` disables it
+and removes only the receipt-owned command. Both return JSON. Uninstall preserves
+the private runtime and agent integrations. Desktop launch and Repair update an
+opted-in command; a manually removed command remains absent until explicit setup.
+Modified or unrelated commands remain untouched and require manual resolution.
+
+Setup requires an already installed, receipt-validated private runtime. Source
+builds must first use Repair in the matching desktop profile. To manage an isolated
+or debug profile, pass `--runtime-root /absolute/profile/cli` to any `terminal`
+subcommand. This is the private `cli` root, not its `bin` directory. Terminal setup
+does not use database configuration: `--config` is rejected; use `--runtime-root`
+instead. Setup and status do not load session databases or create diagnostic logs.
+
 ## Agent session identity: harness findings
 
 Research snapshot: **2026-10-16**. These entries describe current official documentation or source checked for Antiburn's supported inventory. Environment markers are not necessarily session IDs. “Not documented” means no session-ID variable appeared in the sources checked; it does not prove that no implementation exposes one.
