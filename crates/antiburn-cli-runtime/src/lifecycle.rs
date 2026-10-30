@@ -283,6 +283,8 @@ fn atomic_bytes(
         file.sync_all()?;
         #[cfg(windows)]
         super::windows::check_owned(&temp, &file.metadata()?)?;
+        // Windows replacement opens the staging file without sharing.
+        drop(file);
         if replace {
             ensure!(
                 present(path)?,
