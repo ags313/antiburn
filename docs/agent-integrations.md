@@ -85,6 +85,9 @@ config writes refuse hard links, foreign ownership, writable shared files, and
 locked files. Existing macOS files retain permissions, ACLs, and extended
 attributes through cloning and atomic exchange. Other platforms' replacement
 paths remain disabled pending native implementation and acceptance.
+On Windows, receipt and config publication return `platform_native_gate_pending`
+before staging or changing destination files. Windows directory durability is
+not implemented.
 Publication compares the displaced file's bytes, identity, permissions, ACLs,
 and extended attributes. Concurrent changes cause restoration or require review.
 

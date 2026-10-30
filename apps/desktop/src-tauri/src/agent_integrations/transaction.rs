@@ -222,6 +222,9 @@ impl Receipt {
 }
 
 pub fn save_receipt(path: &Path, receipt: &Receipt) -> Result<()> {
+    if cfg!(windows) {
+        return Err("platform_native_gate_pending");
+    }
     let bytes = serde_json::to_vec(receipt).map_err(|_| "state_invalid")?;
     if bytes.len() > 2 * 1024 * 1024 {
         return Err("state_too_large");
@@ -317,6 +320,9 @@ fn publish_inner(
     }
     if read(path)?.as_deref() != expected {
         return Err("concurrent_config_change");
+    }
+    if cfg!(windows) {
+        return Err("platform_native_gate_pending");
     }
     #[cfg(target_os = "macos")]
     let original_metadata = expected
@@ -484,30 +490,137 @@ mod tests {
         assert!(Lock::acquire(&state).is_ok());
     }
 
-    #[test]
-    fn durable_journal_retains_exact_backup_before_publication() {
-        let temp = tempfile::tempdir().unwrap();
-        let state = temp.path().canonicalize().unwrap().join("private");
-        private_directory(&state).unwrap();
-        let target = temp.path().canonicalize().unwrap().join("hooks.json");
+    fn receipt(target: PathBuf) -> Receipt {
         let (installed, delta) = document::append(
             b"{}",
             &["hooks".into(), "test".into()],
             serde_json::json!({"command":"owned"}),
         )
-        .unwrap();
-        let receipt = Receipt::prepare(
+        .expect("Append the owned hook");
+        Receipt::prepare(
             target,
             Some(b"{}".to_vec()),
-            installed.clone(),
+            installed,
             vec![delta],
             "artifact".into(),
         )
-        .unwrap();
-        save_receipt(&state.join("codex.json"), &receipt).unwrap();
-        let loaded = load_receipt(&state.join("codex.json")).unwrap().unwrap();
+        .expect("Prepare the receipt")
+    }
+
+    #[test]
+    fn receipt_round_trip_retains_exact_backup_and_rollback() {
+        let temp = tempfile::tempdir().expect("Create the receipt directory");
+        let state = temp.path().canonicalize().expect("Resolve the directory");
+        let receipt = receipt(state.join("hooks.json"));
+        let path = state.join("codex.json");
+        let bytes = serde_json::to_vec(&receipt).expect("Serialize the receipt");
+        private_file(&path)
+            .expect("Create the receipt fixture")
+            .write_all(&bytes)
+            .expect("Write the receipt fixture");
+        let loaded = load_receipt(&path)
+            .expect("Read the receipt")
+            .expect("Find the receipt");
+        assert_eq!(
+            serde_json::to_vec(&loaded).expect("Serialize the loaded receipt"),
+            bytes
+        );
         assert_eq!(loaded.original, Some(b"{}".to_vec()));
-        assert_eq!(loaded.rollback(&installed).unwrap(), b"{}");
+        assert_eq!(
+            loaded
+                .rollback(&receipt.installed)
+                .expect("Remove the owned hook"),
+            b"{}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_journal_retains_exact_backup_before_publication() {
+        let temp = tempfile::tempdir().expect("Create the receipt directory");
+        let root = temp.path().canonicalize().expect("Resolve the directory");
+        let state = root.join("private");
+        private_directory(&state).expect("Create private state");
+        let path = state.join("codex.json");
+        let mut receipt = receipt(root.join("hooks.json"));
+        for published in [false, true] {
+            receipt.published = published;
+            save_receipt(&path, &receipt).expect("Save the durable receipt");
+            let loaded = load_receipt(&path)
+                .expect("Read the durable receipt")
+                .expect("Find the durable receipt");
+            assert_eq!(loaded.published, published);
+            assert_eq!(loaded.original, Some(b"{}".to_vec()));
+            assert_eq!(
+                loaded
+                    .rollback(&receipt.installed)
+                    .expect("Remove the owned hook"),
+                b"{}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    fn directory_entries(path: &Path) -> Vec<PathBuf> {
+        let mut entries: Vec<_> = fs::read_dir(path)
+            .expect("Read directory entries")
+            .map(|entry| entry.expect("Read the entry").path())
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn receipt_publication_refuses_windows_without_changing_files() {
+        for exists in [false, true] {
+            let temp = tempfile::tempdir().expect("Create the receipt directory");
+            let state = temp.path().canonicalize().expect("Resolve the directory");
+            let path = state.join("codex.json");
+            let receipt = receipt(state.join("hooks.json"));
+            if exists {
+                fs::write(&path, b"original receipt").expect("Write the original receipt");
+            }
+            let before = directory_entries(&state);
+            assert_eq!(
+                save_receipt(&path, &receipt),
+                Err("platform_native_gate_pending")
+            );
+            if exists {
+                assert_eq!(
+                    fs::read(&path).expect("Read the original receipt"),
+                    b"original receipt"
+                );
+            } else {
+                assert!(!path.try_exists().expect("Check the absent receipt"));
+            }
+            assert_eq!(directory_entries(&state), before);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn config_publication_refuses_windows_without_changing_files() {
+        for exists in [false, true] {
+            let temp = tempfile::tempdir().expect("Create the config directory");
+            let root = temp.path().canonicalize().expect("Resolve the directory");
+            let path = root.join("hooks.json");
+            if exists {
+                fs::write(&path, b"{}").expect("Write the original config");
+            }
+            let before = directory_entries(&root);
+            let expected = exists.then_some(b"{}".as_slice());
+            assert_eq!(
+                publish(&path, expected, b"{\"owned\":true}"),
+                Err("platform_native_gate_pending")
+            );
+            if exists {
+                assert_eq!(fs::read(&path).expect("Read the original config"), b"{}");
+            } else {
+                assert!(!path.try_exists().expect("Check the absent config"));
+            }
+            assert_eq!(directory_entries(&root), before);
+        }
     }
 
     #[cfg(target_os = "macos")]

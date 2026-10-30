@@ -127,7 +127,9 @@ impl ProbeDirectory {
                 "antiburn-host-probe-{}",
                 transaction::digest(&random)
             ));
-        let mut builder = std::fs::DirBuilder::new();
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
