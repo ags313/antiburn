@@ -14,8 +14,10 @@
 
 pub mod analysis;
 pub mod checks;
+pub mod digest;
 pub mod discovery;
 pub mod insights;
+pub mod instructions;
 pub mod memories;
 pub mod model;
 pub mod model_catalog;

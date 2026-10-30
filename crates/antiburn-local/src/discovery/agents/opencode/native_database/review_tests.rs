@@ -32,7 +32,7 @@ fn fork_inference_does_not_return_a_partial_winner_after_budget_exhaustion() {
              '{"type":"text","text":"shared"}' FROM numbers;"#
     ).unwrap();
     {
-        let budget = QueryBudget::discovery(&connection, Arc::new(AtomicBool::new(false)));
+        let budget = QueryBudget::new(&connection, Arc::new(AtomicBool::new(false)));
         assert_eq!(
             db_fork_parent_connection(&connection, "ses_child", &budget).as_deref(),
             Some("ses_first")
@@ -89,7 +89,7 @@ fn maximum_v2_cluster_has_an_admission_revision() {
 }
 
 #[test]
-fn completed_v2_sources_survive_v1_history_budget_exhaustion_without_partial_v1() {
+fn recent_v2_and_v1_headers_survive_v1_activity_budget_exhaustion() {
     let connection = Connection::open_in_memory().unwrap();
     connection
         .execute_batch(include_str!(
@@ -107,21 +107,39 @@ fn completed_v2_sources_survive_v1_history_budget_exhaustion_without_partial_v1(
          ) SELECT 'prt_' || n AS id, 'msg_old' AS message_id, 'ses_old' AS session_id,
                   n AS time_created, n AS time_updated, '{}' AS data FROM numbers;"
     ).unwrap();
+    let budget = QueryBudget::new(&connection, Arc::new(AtomicBool::new(false)));
     let result = query_recent_db_session_sources_connection(
         &connection,
         Path::new("/synthetic/opencode.db"),
         1_800_000_000,
-        Arc::new(AtomicBool::new(false)),
+        &budget,
     );
     let DbSourceRead::Ready(logs) = result else {
         panic!("completed V2 results must survive");
     };
-    assert_eq!(logs.len(), 1);
-    assert!(matches!(&logs[0].source, SessionSource::ProviderDb {
+    assert_eq!(logs.len(), 2);
+    assert!(
+        logs.iter()
+            .any(|log| matches!(&log.source, SessionSource::ProviderDb {
         session_id, source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV2), ..
-    } if session_id == "ses_healthy"));
+    } if session_id == "ses_healthy"))
+    );
+    assert!(
+        logs.iter()
+            .any(|log| matches!(&log.source, SessionSource::ProviderDb {
+        session_id, source_format: Some(crate::analysis::SourceFormat::OpenCodeSqliteV1), ..
+    } if session_id == "ses_partial_v1"))
+    );
+    assert!(budget.check().is_ok());
+    drop(budget);
+    let budget = QueryBudget::new(&connection, Arc::new(AtomicBool::new(true)));
     assert!(matches!(
-        merge_db_session_source_branches(logs, Err("cancelled")),
+        query_recent_db_session_sources_connection(
+            &connection,
+            Path::new("/synthetic/opencode.db"),
+            1_800_000_000,
+            &budget,
+        ),
         DbSourceRead::Failed("cancelled")
     ));
 }

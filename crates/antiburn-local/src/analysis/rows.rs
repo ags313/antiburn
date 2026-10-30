@@ -120,12 +120,8 @@ mod native_content_tests {
             assert!(proof.is_bounded());
             assert_eq!(proof.range.end, environment.part.text.len());
             assert!(environment.part.text.contains("café"));
-            let prepared = prepare_session_content(
-                session_id,
-                SourceFormat::CodexRolloutJsonl,
-                content,
-                vec![],
-            );
+            let prepared =
+                prepare_session_content(session_id, SourceFormat::CodexRolloutJsonl, content);
             let environment = prepared
                 .actions
                 .iter()
@@ -888,6 +884,8 @@ impl TurnRowSink {
             }
             NormalizedRecord::Observation(_)
             | NormalizedRecord::ToolResult(_)
+            | NormalizedRecord::PublicMessage(_)
+            | NormalizedRecord::ResponseCycle(_)
             | NormalizedRecord::Unusable(_) => {}
         }
     }

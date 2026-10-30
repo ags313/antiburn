@@ -1165,13 +1165,13 @@ fn omitted_optional_attachment_arrays_keep_earlier_delivered_requests() {
 }
 
 #[test]
-fn retained_context_payloads_count_unique_requests_not_step_copies() {
+fn retained_context_payloads_keep_public_and_total_byte_limits() {
     let mut joiner = OpenCodeV2EventJoiner::new();
     for index in 0..12 {
         let seq = index * 3 + 1;
         let inbox = format!("inbox-{index}");
         joiner.observe(&event(seq, &format!("queued-{index}"), "session.inbox.enqueued", data(json!({
-            "inboxID":inbox, "item":{"type":"user", "payload":{"text":"x".repeat(16 * 1024)}, "delivery":"queue"}
+            "inboxID":inbox, "item":{"type":"user", "payload":{"text":"x".repeat(1024)}, "delivery":"queue"}
         })), seq as f64));
         joiner.observe(&event(
             seq + 1,
@@ -1201,7 +1201,7 @@ fn retained_context_payloads_count_unique_requests_not_step_copies() {
             return;
         }
     }
-    panic!("unique request payloads exceed the byte budget without a gap");
+    panic!("retained public and request payloads exceed their byte budgets without a gap");
 }
 
 #[test]

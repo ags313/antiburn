@@ -73,11 +73,9 @@ fn live_lease_sql(now: &str) -> String {
 pub(crate) fn source_status_sql(now: &str) -> String {
     let live = live_lease_sql(now);
     let capture_match = capture_match_sql();
+    // History gaps limit evidence, not the current capture lease.
     format!(
-        "CASE WHEN ({SOURCE_SQL}) THEN CASE WHEN ({live}) THEN
-            CASE WHEN EXISTS(SELECT 1 FROM opencode_v2_capture d
-              WHERE {capture_match} AND d.history_gap = 1)
-              THEN 'capture-gap' ELSE 'live' END
+        "CASE WHEN ({SOURCE_SQL}) THEN CASE WHEN ({live}) THEN 'live'
           ELSE COALESCE((SELECT NULLIF(d.code, 'live') FROM opencode_v2_source_status d
             WHERE {CURRENT_SOURCE_MATCH_SQL}),
             CASE WHEN EXISTS(SELECT 1 FROM opencode_v2_capture d

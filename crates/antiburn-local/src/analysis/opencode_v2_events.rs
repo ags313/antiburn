@@ -22,6 +22,8 @@ use crate::analysis::{
     UserMessagePosition, UserMessageScope,
 };
 
+mod public;
+
 pub const MAX_RETAINED_CALLS: usize = 256;
 pub const MAX_RETAINED_USERS: usize = 128;
 pub const MAX_STRING_BYTES: usize = 16 * 1024;
@@ -67,6 +69,7 @@ pub struct JoinedToolResult {
     pub content: Option<String>,
     pub outcome: Option<NativeToolOutcome>,
     pub provider_executed: Option<bool>,
+    pub requester: crate::analysis::NativeRequestAttribution,
     pub gaps: Vec<Gap>,
 }
 
@@ -173,6 +176,17 @@ impl JoinedToolResult {
             self.provider_executed,
         );
         ToolResultObservation {
+            facts: Some(crate::analysis::NativeToolFacts::for_call(
+                SourceFormat::OpenCodeSqliteV2,
+                if self.provider_executed != Some(false) {
+                    ""
+                } else {
+                    &self.tool_name
+                },
+                self.input.as_ref(),
+                None,
+                self.requester,
+            )),
             source_format: SourceFormat::OpenCodeSqliteV2,
             session_id: self.session_id,
             record_id: Some(self.assistant_message_id),
@@ -248,6 +262,7 @@ impl PendingInbox {
 
 #[derive(Debug, Clone, Default)]
 struct StepContext {
+    requester: crate::analysis::NativeRequestAttribution,
     users: Option<Arc<UserHistory>>,
     gaps: Vec<Gap>,
 }
@@ -264,7 +279,8 @@ impl StepContext {
     }
 
     fn same_history(&self, other: &Self) -> bool {
-        self.gaps == other.gaps
+        self.requester == other.requester
+            && self.gaps == other.gaps
             && match (&self.users, &other.users) {
                 (None, None) => true,
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
@@ -308,7 +324,8 @@ struct Call {
 
 impl Call {
     fn payload_bytes(&self) -> usize {
-        self.name.as_ref().map_or(0, String::len)
+        self.context.requester.retained_bytes()
+            + self.name.as_ref().map_or(0, String::len)
             + self.input_bytes
             + self.terminal.as_ref().map_or(0, |terminal| {
                 32 + terminal
@@ -355,6 +372,8 @@ pub struct OpenCodeV2EventJoiner {
     retained_bytes: usize,
     history_bytes: Arc<AtomicUsize>,
     gaps: Vec<Gap>,
+    public: public::PublicState,
+    evidence: Vec<crate::analysis::NativeEvidenceEvent>,
 }
 
 impl OpenCodeV2EventJoiner {
@@ -362,14 +381,17 @@ impl OpenCodeV2EventJoiner {
         Self::default()
     }
 
-    /// Keep unfinished steps and calls active, but ignore terminal fingerprints.
+    /// Keep unfinished steps, calls, and public cycles active.
     pub fn has_pending_work(&self) -> bool {
-        !self.steps.is_empty() || self.calls.len() > self.terminal_call_order.len()
+        !self.steps.is_empty()
+            || self.calls.len() > self.terminal_call_order.len()
+            || self.public.has_pending_cycle()
     }
 
     /// Observe one event. Return only the first terminal result for a known call.
     /// Record unknown or unsafe input as a gap. Do not guess a result.
     pub fn observe(&mut self, event: &Value) -> Option<JoinedToolResult> {
+        self.evidence.clear();
         let Some((_, digest)) = event_digest_and_size(event) else {
             self.gap(Gap::CapacityExceeded);
             return None;
@@ -383,7 +405,11 @@ impl OpenCodeV2EventJoiner {
     }
 
     fn observe_with_digest(&mut self, event: &Value, digest: [u8; 32]) -> Option<JoinedToolResult> {
+        self.evidence.clear();
         let result = self.observe_event(event, digest);
+        if self.public.take_omission() {
+            self.gap(Gap::CapacityExceeded);
+        }
         if self.retained_payload_bytes() > MAX_RETAINED_PAYLOAD_BYTES {
             self.calls.clear();
             self.terminal_call_order.clear();
@@ -392,12 +418,44 @@ impl OpenCodeV2EventJoiner {
             self.steps.clear();
             self.seen_event_ids.clear();
             self.seen_event_id_order.clear();
+            self.public.clear();
+            self.evidence.clear();
             self.retained_bytes = self.session_id.as_ref().map_or(0, String::len);
             self.request_history_gap = true;
             self.gap(Gap::CapacityExceeded);
             return None;
         }
         result
+    }
+
+    /// Freeze the verified capture frontier before feeding seed and live events.
+    /// A new joiner is required after reconnect or source continuity loss.
+    pub fn set_live_baseline(&mut self, sequence: u64) {
+        self.public.set_baseline(sequence);
+    }
+
+    /// Observe an event once and return all admitted facts in native order.
+    /// Do not also call `observe` for the same event.
+    pub fn observe_evidence(&mut self, event: &Value) -> crate::analysis::NativeEvidenceBatch {
+        self.observe(event);
+        self.take_evidence()
+    }
+
+    /// Observe immutable captured evidence once and reuse its admitted digest.
+    pub fn observe_captured_evidence(
+        &mut self,
+        event: &CapturedEvent,
+    ) -> crate::analysis::NativeEvidenceBatch {
+        self.observe_captured(event);
+        self.take_evidence()
+    }
+
+    fn take_evidence(&mut self) -> crate::analysis::NativeEvidenceBatch {
+        crate::analysis::NativeEvidenceBatch {
+            source_format: SourceFormat::OpenCodeSqliteV2,
+            events: std::mem::take(&mut self.evidence),
+            history_complete: self.gaps.is_empty() && !self.request_history_gap,
+        }
     }
 
     fn observe_event(&mut self, event: &Value, digest: [u8; 32]) -> Option<JoinedToolResult> {
@@ -481,7 +539,7 @@ impl OpenCodeV2EventJoiner {
             }
         }
 
-        match event_type {
+        let result = match event_type {
             "session.updated" => {
                 if data
                     .get("info")
@@ -593,11 +651,17 @@ impl OpenCodeV2EventJoiner {
                 self.gap(Gap::UnknownShape);
                 None
             }
-        }
+        };
+        let mut public = std::mem::take(&mut self.public);
+        self.evidence = public.observe(self, event, sequence, &session_id, result.as_ref());
+        self.public = public;
+        result
     }
 
     fn retained_payload_bytes(&self) -> usize {
-        self.retained_bytes + self.history_bytes.load(Ordering::Relaxed)
+        self.retained_bytes
+            + self.history_bytes.load(Ordering::Relaxed)
+            + self.public.retained_bytes()
     }
 
     pub fn gaps(&self) -> &[Gap] {
@@ -621,6 +685,7 @@ impl OpenCodeV2EventJoiner {
             return;
         }
         let mut context = StepContext {
+            requester: public::attribution(data.get("model").unwrap_or(&Value::Null)),
             users: self.users.clone(),
             gaps: Vec::new(),
         };
@@ -634,7 +699,7 @@ impl OpenCodeV2EventJoiner {
             }
             return;
         }
-        self.retained_bytes += assistant_message_id.len();
+        self.retained_bytes += assistant_message_id.len() + context.requester.retained_bytes();
         self.steps.insert(
             assistant_message_id,
             Step {
@@ -653,15 +718,19 @@ impl OpenCodeV2EventJoiner {
         if let Some(step) = self.steps.get_mut(&message_id) {
             step.ended = true;
             if step.active_calls == 0 {
-                self.steps.remove(&message_id);
-                self.retained_bytes -= message_id.len();
+                let step = self.steps.remove(&message_id).expect("observed step");
+                self.retained_bytes -= message_id.len() + step.context.requester.retained_bytes();
             }
         }
     }
 
     fn observe_execution_ended(&mut self) {
         // Retry waits can end an execution without a step terminal.
-        self.retained_bytes -= self.steps.keys().map(String::len).sum::<usize>();
+        self.retained_bytes -= self
+            .steps
+            .iter()
+            .map(|(id, step)| id.len() + step.context.requester.retained_bytes())
+            .sum::<usize>();
         self.steps.clear();
         self.calls.retain(|(message_id, call_id), call| {
             if call.terminal.is_some() {
@@ -867,9 +936,9 @@ impl OpenCodeV2EventJoiner {
             .calls
             .get_mut(&(message_id, call_id))
             .expect("inserted call");
-        self.retained_bytes -= call.input_bytes;
+        self.retained_bytes -= call.input_bytes + call.context.requester.retained_bytes();
         call.input_bytes = json_payload_bytes(input);
-        self.retained_bytes += call.input_bytes;
+        self.retained_bytes += call.input_bytes + context.requester.retained_bytes();
         call.input = Some(input.clone());
         call.provider_executed = data.get("executed").and_then(Value::as_bool);
         call.context = context;
@@ -966,6 +1035,7 @@ impl OpenCodeV2EventJoiner {
         }
         let created = event.get("created").and_then(Value::as_f64);
         let result = JoinedToolResult {
+            requester: call.context.requester.clone(),
             session_id: session_id.to_owned(),
             assistant_message_id: message_id.clone(),
             call_id: call_id.clone(),
@@ -991,14 +1061,15 @@ impl OpenCodeV2EventJoiner {
         call.input = None;
         call.input_bytes = 0;
         call.context = StepContext::default();
+        call.provider_executed = provider_executed;
         call.terminal = Some(fingerprint);
         self.retained_bytes += call.payload_bytes() + message_id.len() + call_id.len();
         self.terminal_call_order.push_back(key);
         if let Some(step) = self.steps.get_mut(&message_id) {
             step.active_calls = step.active_calls.saturating_sub(1);
             if step.ended && step.active_calls == 0 {
-                self.steps.remove(&message_id);
-                self.retained_bytes -= message_id.len();
+                let step = self.steps.remove(&message_id).expect("observed step");
+                self.retained_bytes -= message_id.len() + step.context.requester.retained_bytes();
             }
         }
         Some(result)
@@ -1032,6 +1103,7 @@ impl OpenCodeV2EventJoiner {
     }
 
     fn gap(&mut self, gap: Gap) {
+        self.public.invalidate_cycle();
         if !self.gaps.contains(&gap) {
             self.gaps.push(gap);
         }

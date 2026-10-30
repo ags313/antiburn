@@ -34,6 +34,8 @@ const SHARED_FILES = [
   'hooks/brand.ts',
   'hooks/usage.ts',
   'hooks/usage-presentation.ts',
+  'hooks/usage-meter-graphics.ts',
+  'hooks/usage-meter-band.tsx',
   'hooks/usage-font.ts',
   'hooks/usage-font-data.ts',
   'hooks/usage-target.tsx',
@@ -64,10 +66,7 @@ export function releaseFiles(root = ROOT) {
   files.set('LICENSE', containedFile(root, 'LICENSE'))
   const manifest = JSON.parse(files.get('.claude-plugin/plugin.json'))
   if (manifest.name !== 'antiburn') throw new Error('Unexpected public plugin identity')
-  files.set(
-    'hooks/register.ts',
-    containedFile(root, 'integrations/antiburn/claude/register.ts'),
-  )
+  files.set('hooks/register.ts', containedFile(root, 'integrations/antiburn/claude/register.ts'))
   const commands = containedFile(root, 'integrations/antiburn/claude/commands.ts')
     .toString()
     .replaceAll('../../../packages/antiburn-plugin-core/product.mjs', '../lib/product.mjs')
@@ -82,10 +81,7 @@ export function releaseFiles(root = ROOT) {
       files
         .get('hooks/quota-controller.tsx')
         .toString()
-        .replaceAll(
-          '../../../../packages/antiburn-plugin-core/product.mjs',
-          '../lib/product.mjs',
-        )
+        .replaceAll('../../../../packages/antiburn-plugin-core/product.mjs', '../lib/product.mjs')
         .replaceAll('../../../../integrations/antiburn/claude/commands', './commands'),
     ),
   )
@@ -287,8 +283,7 @@ function writeTree(root, destination, files) {
       throw new Error(`Staged output mismatch: ${destination}`)
     writeFileSync(
       ownerStage,
-      JSON.stringify({ owner: 'antiburn-claude-assembler-v1', files: expected }, null, 2) +
-        '\n',
+      JSON.stringify({ owner: 'antiburn-claude-assembler-v1', files: expected }, null, 2) + '\n',
     )
     if (currentExists) renameSync(destination, backup)
     try {
@@ -329,6 +324,10 @@ function devFiles(root, tests = false) {
     const rewrittenText = rewriteDevSource(text)
       .replaceAll('../../../packages/antiburn-plugin-core/product.mjs', '../lib/product.mjs')
       .replaceAll('../../../packages/antiburn-plugin-core/core.mjs', '../lib/core.mjs')
+      .replaceAll(
+        '../../../packages/antiburn-plugin-core/session-checks-validation.mjs',
+        '../lib/session-checks-validation.mjs',
+      )
     files.set(
       path,
       /\.(?:ts|tsx|md|json)$/.test(path)
@@ -344,7 +343,12 @@ function devFiles(root, tests = false) {
     )
   }
   files.set('lib/product.mjs', containedFile(root, 'packages/antiburn-plugin-core/product.mjs'))
-  for (const path of ['core.mjs', 'discovery.mjs', 'probe.mjs'])
+  for (const path of [
+    'core.mjs',
+    'discovery.mjs',
+    'probe.mjs',
+    'session-checks-validation.mjs',
+  ])
     files.set(`lib/${path}`, containedFile(root, `packages/antiburn-plugin-core/${path}`))
   const manifest = JSON.parse(files.get('.claude-plugin/plugin.json'))
   manifest.name = 'antiburn-dev'
@@ -359,17 +363,16 @@ function devFiles(root, tests = false) {
     },
     startupNoticeEnabled: {
       type: 'boolean',
-      title: 'Show the startup notice',
+      title: 'Debug: show CLI discovery at startup',
       description:
         'Show the local CLI availability notice once per session. This does not affect commands or live checks. Reload after changing this option.',
-      default: true,
+      default: false,
     },
   }
   files.set('.claude-plugin/plugin.json', json(manifest))
   files.set('LICENSE', containedFile(root, 'LICENSE'))
   if (tests)
-    for (const [path, bytes] of releaseFiles(root))
-      files.set(`release-reference/${path}`, bytes)
+    for (const [path, bytes] of releaseFiles(root)) files.set(`release-reference/${path}`, bytes)
   const combinedFiles = new Map(
     [...files].map(([path, bytes]) => [`plugins/antiburn-dev/${path}`, bytes]),
   )
@@ -394,8 +397,7 @@ export function assertCapabilities(report) {
   const inventories = (report.contents ?? [])
     .flatMap((entry) => entry.notes ?? [])
     .filter((note) => note.includes(' calls:'))
-  if (inventories.length === 0)
-    throw new Error('Host validation did not report a call inventory')
+  if (inventories.length === 0) throw new Error('Host validation did not report a call inventory')
   const allowed = new Set([
     '$.clock.now',
     '$.command.register',
@@ -410,9 +412,7 @@ export function assertCapabilities(report) {
   const websiteOnly = new Set(['$.env.get', '$.process.run', '$.ui.status'])
   const calls = inventories.flatMap((note) =>
     [
-      ...note.matchAll(
-        /(\$\.[A-Za-z_]+\.[A-Za-z_]+)(.*?)(?=,\s*\$\.[A-Za-z_]+\.[A-Za-z_]+|$)/g,
-      ),
+      ...note.matchAll(/(\$\.[A-Za-z_]+\.[A-Za-z_]+)(.*?)(?=,\s*\$\.[A-Za-z_]+\.[A-Za-z_]+|$)/g),
     ].map((match) => ({ name: match[1], attribution: match[2].trim() })),
   )
   if (!calls.some(({ name }) => name === '$.session.usage'))

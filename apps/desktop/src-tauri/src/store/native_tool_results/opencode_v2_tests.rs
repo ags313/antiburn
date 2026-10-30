@@ -11,6 +11,15 @@ use crate::insights_worker::journal::tests::SyntheticJournal;
 #[path = "opencode_v2_reconciliation_tests.rs"]
 mod reconciliation;
 
+#[path = "opencode_v2_capture_gap_tests.rs"]
+mod capture_gaps;
+
+#[path = "opencode_v2_tracing_tests.rs"]
+mod tracing_tests;
+
+#[path = "opencode_v2_request_history_tests.rs"]
+mod request_history;
+
 fn setup() -> (
     tempfile::TempDir,
     Store,
@@ -89,6 +98,120 @@ fn capture_claim_lookup_returns_the_exact_current_session_claim() {
     assert_eq!(claims[0].cwd, expected.cwd);
     assert_eq!(claims[0].capture_epoch, expected.capture_epoch);
     assert_eq!(claims[0].claim_fence, expected.claim_fence);
+}
+
+#[test]
+fn public_only_v2_batch_commits_all_outputs_with_its_receipt_or_rolls_back() {
+    use crate::store::native_tool_results::ToolResultPublicationOutcome;
+    use antiburn_local::analysis::*;
+    let (_directory, store, _journal, start) = setup();
+    let claim = started(&store, &start);
+    let context = NativeEventContext {
+        first_eligible_position: ToolResultPosition::OpenCodeV2Event {
+            sequence: 5,
+            item_index: 0,
+        },
+        main_session: true,
+        complete_through_event: false,
+        user_messages: Vec::new(),
+    };
+    let batch = NativeEvidenceBatch {
+        source_format: SourceFormat::OpenCodeSqliteV2,
+        history_complete: false,
+        events: vec![
+            NativeEvidenceEvent {
+                live_eligible: true,
+                fact: NativeEvidenceFact::Message(NativeMessageObservation::User(
+                    UserMessageObservation {
+                        revision: 5,
+                        context: context.clone(),
+                        message: UserMessage {
+                            source_format: SourceFormat::OpenCodeSqliteV2,
+                            session_id: claim.key.session_id.clone(),
+                            message_id: "delivered-input".into(),
+                            position: UserMessagePosition::OpenCodeV2Event { sequence: 5 },
+                            origin: UserMessageOrigin::OpenCodeUserText,
+                            scope: UserMessageScope::MainSession,
+                            change: UserMessageChange::Present,
+                            completeness: UserMessageCompleteness::Complete,
+                            proof_revision: 1,
+                            parts: vec![UserMessagePart {
+                                item_index: 0,
+                                native_part_id: None,
+                                text: "Public input.".into(),
+                            }],
+                        },
+                    },
+                )),
+            },
+            NativeEvidenceEvent {
+                live_eligible: true,
+                fact: NativeEvidenceFact::Message(NativeMessageObservation::Public(
+                    PublicMessageObservation {
+                        source_format: SourceFormat::OpenCodeSqliteV2,
+                        session_id: claim.key.session_id.clone(),
+                        record_id: "step-one".into(),
+                        part_id: Some("call-one".into()),
+                        call_id: Some("call-one".into()),
+                        position: ToolResultPosition::OpenCodeV2Event {
+                            sequence: 5,
+                            item_index: 1,
+                        },
+                        revision: 5,
+                        change: ToolResultChange::Update,
+                        eligible: true,
+                        completeness: ToolResultCompleteness::Complete,
+                        context: Some(context),
+                        payload: PublicMessagePayload::ToolCall {
+                            tool_name: "read".into(),
+                            input: Some(NativeToolInput::Text("exact input".into())),
+                            facts: None,
+                            provider_executed: Some(false),
+                        },
+                    },
+                )),
+            },
+        ],
+    };
+    store.lock().execute_batch("CREATE TRIGGER reject_public_call BEFORE INSERT ON native_tool_result_publication
+        WHEN NEW.event_kind = 'tool_call' BEGIN SELECT RAISE(ABORT, 'injected public call failure'); END;").unwrap();
+    assert!(
+        store
+            .advance_opencode_v2_evidence(&claim, 5, &batch, 101, 60)
+            .is_err()
+    );
+    let state: (i64, i64) = store.lock().query_row("SELECT last_sequence, (SELECT COUNT(*) FROM native_tool_result_current) FROM opencode_v2_capture", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(state, (4, 0));
+    store
+        .lock()
+        .execute_batch("DROP TRIGGER reject_public_call")
+        .unwrap();
+    assert!(
+        store
+            .advance_opencode_v2_evidence(&claim, 5, &batch, 101, 60)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .advance_opencode_v2_evidence(&claim, 5, &batch, 102, 60)
+            .unwrap()
+    );
+    let publications = store.native_evidence_publications_after(0, 20).unwrap();
+    assert_eq!(
+        publications
+            .iter()
+            .filter(|e| e.outcome == ToolResultPublicationOutcome::Update)
+            .map(|e| e.event_kind.name())
+            .collect::<Vec<_>>(),
+        ["user_message", "tool_call"]
+    );
+    assert!(
+        store
+            .native_tool_result_publications_after(0, 20)
+            .unwrap()
+            .iter()
+            .all(|e| e.payload.is_none())
+    );
 }
 
 #[test]
@@ -208,6 +331,7 @@ fn detached_scope_change_returns_the_exact_prior_claim_for_retirement() {
 
 fn result(sequence: u64, complete: bool) -> ToolResultObservation {
     ToolResultObservation {
+        facts: None,
         outcome: None,
         provider_executed: None,
         source_format: SourceFormat::OpenCodeSqliteV2,
@@ -368,10 +492,10 @@ fn progress_fences_sequence_and_publication_position_are_enforced() {
 }
 
 #[test]
-fn result_less_events_do_not_write_capture_progress_or_renew_the_lease() {
+fn result_less_events_advance_the_frontier_without_publishing_evidence() {
     let (_dir, store, _journal, start) = setup();
     let claim = started(&store, &start);
-    let before = store.lock().total_changes();
+    let before = store.native_tool_result_publications_after(0, 100).unwrap();
     for sequence in 5..100 {
         assert!(
             store
@@ -379,11 +503,23 @@ fn result_less_events_do_not_write_capture_progress_or_renew_the_lease() {
                 .unwrap()
         );
     }
-    assert_eq!(store.lock().total_changes(), before);
+    assert_eq!(
+        store.native_tool_result_publications_after(0, 100).unwrap(),
+        before
+    );
     let saved = store
         .opencode_v2_capture_claims(std::slice::from_ref(&claim.key))
         .unwrap();
-    assert_eq!(saved[0].last_sequence, claim.last_sequence);
+    assert_eq!(saved[0].last_sequence, Some(99));
+    let expiry: i64 = store
+        .lock()
+        .query_row(
+            "SELECT lease_expires_at_epoch FROM opencode_v2_capture",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(expiry, 161);
 }
 
 #[test]

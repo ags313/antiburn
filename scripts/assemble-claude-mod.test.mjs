@@ -39,7 +39,7 @@ function temporary(t) {
 
 test('release allowlist is self-contained and preserves authoritative assets', () => {
   const files = releaseFiles(root)
-  assert.equal(files.size, 24)
+  assert.equal(files.size, 26)
   assert.equal(files.has('skills/help/SKILL.md'), false)
   const commands = files.get('hooks/commands.ts').toString()
   assert.doesNotMatch(commands, /command\.list|antiburn-plugin|antiburn-mod/)
@@ -60,7 +60,7 @@ test('release allowlist is self-contained and preserves authoritative assets', (
     )
   const manifest = JSON.parse(files.get('.claude-plugin/plugin.json'))
   assert.equal(manifest.name, 'antiburn')
-  assert.equal(manifest.version, '0.2.5')
+  assert.equal(manifest.version, '0.2.6')
   assert.equal(manifest.types, undefined)
   assert.equal(manifest.icon, './assets/icon.png')
   assert.equal(
@@ -89,28 +89,46 @@ test('release allowlist is self-contained and preserves authoritative assets', (
   assert.equal(marketplace.plugins[0].version, undefined)
   const source = marketplace.plugins[0].source
   assert.match(source.sha, /^[a-f0-9]{40}$/)
-  const pinnedPaths = execFileSync(
-    'git',
-    ['ls-tree', '-r', '--name-only', source.sha, '--', source.path],
-    { cwd: root, encoding: 'utf8' },
-  )
-    .trim()
-    .split('\n')
-    .map((path) => path.slice(source.path.length + 1))
-  assert.deepEqual(pinnedPaths.sort(), [...files.keys()].sort())
-  for (const [path, bytes] of files)
-    assert.deepEqual(
-      execFileSync('git', ['show', `${source.sha}:${source.path}/${path}`], {
-        cwd: root,
-      }),
-      bytes,
-      `Pinned artifact differs: ${path}`,
-    )
   assertImports(files)
+  checkTree(join(root, 'plugins/antiburn'), files)
 })
 
-test('plugin icon uses the smaller desktop image without metadata or trailing content', () => {
-  function image(bytes, allowMetadata = false) {
+test('marketplace pin matches authoritative sources at its release commit', (t) => {
+  const marketplace = JSON.parse(readFileSync(join(root, '.claude-plugin/marketplace.json')))
+  const source = marketplace.plugins[0].source
+  const snapshot = temporary(t)
+  const archive = execFileSync(
+    'git',
+    [
+      'archive',
+      source.sha,
+      'scripts/assemble-claude-mod.mjs',
+      'plugins/antiburn-live',
+      source.path,
+      'integrations/antiburn/claude',
+      'packages/antiburn-plugin-core',
+      'LICENSE',
+    ],
+    { cwd: root, maxBuffer: 16 * 1024 * 1024 },
+  )
+  execFileSync('tar', ['-x', '-C', snapshot], { input: archive })
+  const check = () =>
+    execFileSync(process.execPath, ['scripts/assemble-claude-mod.mjs', '--check'], {
+      cwd: snapshot,
+      encoding: 'utf8',
+      stdio: 'pipe',
+    })
+  check()
+  const artifact = join(snapshot, source.path, 'hooks/usage-graphics.ts')
+  writeFileSync(artifact, `${readFileSync(artifact, 'utf8')}\n// Changed artifact.\n`)
+  assert.throws(check, (error) => {
+    assert.match(error.stderr, /Artifact drift:.*hooks\/usage-graphics\.ts/)
+    return true
+  })
+})
+
+test('candidate plugin icon is a compact 512px PNG without metadata or trailing content', () => {
+  function image(bytes) {
     assert.deepEqual(bytes.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
     const data = []
     let header
@@ -119,9 +137,7 @@ test('plugin icon uses the smaller desktop image without metadata or trailing co
       const length = bytes.readUInt32BE(offset)
       const name = bytes.toString('ascii', offset + 4, offset + 8)
       const body = bytes.subarray(offset + 8, offset + 8 + length)
-      assert.ok(
-        ['IHDR', 'IDAT', 'IEND', 'sRGB'].includes(name) || (allowMetadata && name === 'eXIf'),
-      )
+      assert.ok(['IHDR', 'IDAT', 'IEND', 'sRGB'].includes(name))
       if (name === 'IHDR') header = body
       if (name === 'IDAT') data.push(body)
       offset += length + 12
@@ -133,14 +149,62 @@ test('plugin icon uses the smaller desktop image without metadata or trailing co
     }
     assert.fail('PNG has no end chunk')
   }
-  const plugin = readFileSync(join(root, 'plugins/antiburn-live/release/assets/icon.png'))
-  const desktop = readFileSync(join(root, 'apps/desktop/src-tauri/icons/512x512.png'))
+  function pixels(header, scanlines) {
+    const width = header.readUInt32BE(0)
+    const height = header.readUInt32BE(4)
+    const bytesPerPixel = 4
+    const rowLength = width * bytesPerPixel
+    assert.equal(scanlines.length, (rowLength + 1) * height)
+    const output = Buffer.alloc(rowLength * height)
+    let inputOffset = 0
+    for (let row = 0; row < height; row += 1) {
+      const filter = scanlines[inputOffset]
+      inputOffset += 1
+      const rowOffset = row * rowLength
+      for (let column = 0; column < rowLength; column += 1) {
+        const left = column >= bytesPerPixel ? output[rowOffset + column - bytesPerPixel] : 0
+        const up = row > 0 ? output[rowOffset - rowLength + column] : 0
+        const upperLeft =
+          row > 0 && column >= bytesPerPixel
+            ? output[rowOffset - rowLength + column - bytesPerPixel]
+            : 0
+        const paethBase = left + up - upperLeft
+        const paethLeft = Math.abs(paethBase - left)
+        const paethUp = Math.abs(paethBase - up)
+        const paethUpperLeft = Math.abs(paethBase - upperLeft)
+        const predictor = [
+          0,
+          left,
+          up,
+          Math.floor((left + up) / 2),
+          paethLeft <= paethUp && paethLeft <= paethUpperLeft
+            ? left
+            : paethUp <= paethUpperLeft
+              ? up
+              : upperLeft,
+        ][filter]
+        assert.notEqual(predictor, undefined, `Unsupported PNG filter: ${filter}`)
+        output[rowOffset + column] = (scanlines[inputOffset] + predictor) & 0xff
+        inputOffset += 1
+      }
+    }
+    return output
+  }
+  const plugin = readFileSync(join(root, 'plugins/antiburn-live/assets/icon.png'))
   assert.ok(
     plugin.length < 256 * 1024,
     'The entire PNG must fit below the printable-text limit',
   )
-  assert.equal(plugin.equals(desktop), false)
-  assert.deepEqual(image(plugin), image(desktop, true))
+  const { header, scanlines } = image(plugin)
+  assert.equal(header.readUInt32BE(0), 512)
+  assert.equal(header.readUInt32BE(4), 512)
+  assert.equal(header[8], 8)
+  assert.equal(header[9], 6)
+  const rgba = pixels(header, scanlines)
+  assert.ok(
+    rgba.some((value, index) => index % 4 === 3 && value < 255),
+    'The icon must contain at least one transparent pixel',
+  )
 })
 
 test('tree verification rejects stale, omitted, and unexpected files without writing', (t) => {
@@ -369,10 +433,18 @@ test('assembly is deterministic and isolates private, development, and test file
   cpSync(
     join(root, 'integrations/antiburn/claude'),
     join(path, 'integrations/antiburn/claude'),
-    { recursive: true },
+    {
+      recursive: true,
+    },
   )
   mkdirSync(join(path, 'packages/antiburn-plugin-core'), { recursive: true })
-  for (const file of ['product.mjs', 'core.mjs', 'discovery.mjs', 'probe.mjs'])
+  for (const file of [
+    'product.mjs',
+    'core.mjs',
+    'discovery.mjs',
+    'probe.mjs',
+    'session-checks-validation.mjs',
+  ])
     cpSync(
       join(root, 'packages/antiburn-plugin-core', file),
       join(path, 'packages/antiburn-plugin-core', file),
@@ -415,11 +487,12 @@ test('assembly is deterministic and isolates private, development, and test file
   )
   assert.equal(devManifest.name, 'antiburn-dev')
   assert.equal(devManifest.userConfig.usageUiEnabled.default, true)
-  assert.equal(devManifest.userConfig.startupNoticeEnabled.default, true)
+  assert.equal(devManifest.userConfig.startupNoticeEnabled.default, false)
   assert.equal(existsSync(join(plugin, 'release')), false)
   assert.equal(existsSync(join(plugin, '.claude-plugin/types')), false)
   assert.equal(existsSync(join(plugin, 'hooks/register.test.ts')), false)
   assert.equal(existsSync(join(plugin, 'hooks/checks.ts')), true)
+  assert.equal(existsSync(join(plugin, 'lib/session-checks-validation.mjs')), true)
   const dev = readFileSync(join(plugin, 'hooks/register.tsx'), 'utf8')
   assert.doesNotMatch(dev, /plugin: 'antiburn-live'|name: 'antiburn'/)
   assert.match(dev, /commandName = registered.command/)
@@ -497,4 +570,38 @@ test('public hook helpers keep capability and registration arguments in their mo
     }
   }
   assert.ok(checked >= 8)
+})
+
+test('both artifacts package the same meter graphics and flex layout without fixture policy', (t) => {
+  const path = temporary(t)
+  cpSync(join(root, 'plugins'), join(path, 'plugins'), { recursive: true })
+  cpSync(join(root, 'packages'), join(path, 'packages'), { recursive: true })
+  cpSync(join(root, 'integrations'), join(path, 'integrations'), {
+    recursive: true,
+  })
+  cpSync(join(root, 'LICENSE'), join(path, 'LICENSE'))
+  const release = releaseFiles(path)
+  const dev = assemble(path, 'dev')
+  for (const file of ['usage-meter-graphics.ts', 'usage-meter-band.tsx']) {
+    assert.deepEqual(
+      release.get(`hooks/${file}`),
+      readFileSync(join(dev, 'plugins/antiburn-dev/hooks', file)),
+    )
+    assert.doesNotMatch(
+      release.get(`hooks/${file}`).toString(),
+      /usage-fixtures|usageFixture|USAGE_FIXTURES/,
+    )
+  }
+  for (const [entry, expression] of [
+    ['plugins/antiburn-live/release/hooks/quota-controller.tsx', /renderUsageMeterBand\(/],
+    ['plugins/antiburn-live/hooks/register-usage-bands.tsx', /renderUsageMeterBand\(/],
+    ['plugins/antiburn-live/hooks/register-usage-view.tsx', /responsiveMeterSvg\(/],
+  ])
+    assert.match(readFileSync(join(root, entry), 'utf8'), expression)
+  assert.match(
+    release.get('hooks/quota-controller.tsx').toString(),
+    /responsiveMeterSvg\(window, now\)/,
+  )
+  for (const file of release.keys())
+    assert.doesNotMatch(file, /fixtures|debug|burn-controls|register-usage-view/)
 })

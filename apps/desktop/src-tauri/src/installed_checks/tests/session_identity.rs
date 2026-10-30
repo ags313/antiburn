@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn session_deletion_removes_gap_only_selector_state() {
+fn session_deletion_removes_gap_and_attachment_selector_state() {
     let fixture = Fixture::new();
     let mut host = fixture.host();
     host.reconcile(&Admission::Ready).unwrap();
@@ -34,7 +34,7 @@ fn session_deletion_removes_gap_only_selector_state() {
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
                     .get::<_, u64>(0),)
                 .unwrap(),
-            0
+            u64::from(table == "burn_check_observation")
         );
     }
 
@@ -74,8 +74,10 @@ async fn session_recreation_reuses_native_ids_without_old_selection_or_status() 
 
     fixture.publish("main", 4);
     host.catch_up().unwrap();
-    let RecoveryWork::Pending(old_candidate) =
-        adapter.load_recovery(None, 10).unwrap().remove(0).work
+    let RecoveryWork::Pending {
+        candidate: old_candidate,
+        ..
+    } = adapter.load_recovery(None, 10).unwrap().remove(0).work
     else {
         panic!("pending work must exist before deletion");
     };
@@ -126,8 +128,10 @@ async fn session_recreation_reuses_native_ids_without_old_selection_or_status() 
     assert!(adapter.load_recovery(None, 10).unwrap().is_empty());
     fixture.publish("main", 3);
     host.catch_up().unwrap();
-    let RecoveryWork::Pending(new_candidate) =
-        adapter.load_recovery(None, 10).unwrap().remove(0).work
+    let RecoveryWork::Pending {
+        candidate: new_candidate,
+        ..
+    } = adapter.load_recovery(None, 10).unwrap().remove(0).work
     else {
         panic!("re-created native results must produce fresh work");
     };

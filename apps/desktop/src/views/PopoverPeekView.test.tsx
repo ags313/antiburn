@@ -77,7 +77,6 @@ const PROVIDER_DATA: PopoverPeekData = {
 const CHECKS_DATA: PopoverPeekData = {
   kind: "checks",
   presentation: {
-    checking: [],
     activeAssessed: [
       {
         id: "cacheChurn",

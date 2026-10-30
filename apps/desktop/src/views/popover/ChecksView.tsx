@@ -242,14 +242,6 @@ export function ChecksPeek({
           <CheckRows checks={wins} />
         </section>
       )}
-      {presentation.checking.length > 0 && (
-        <section className="mt-4" aria-labelledby="checking-checks">
-          <h2 id="checking-checks" className="px-1 type-caption text-label-tertiary">
-            Checking
-          </h2>
-          <CheckRows checks={presentation.checking} />
-        </section>
-      )}
       {presentation.activeUnavailable.length > 0 && (
         <section className="mt-4" aria-labelledby="unassessed-checks">
           <h2 id="unassessed-checks" className="px-1 type-caption text-label-tertiary">

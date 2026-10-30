@@ -1,7 +1,7 @@
 use antiburn_checks::{compile, diagnostics::DiagnosticCode};
 
 fn definition(categories: &str, condition: &str) -> String {
-    include_str!("../../../docs/burn-check/examples/failed-retry-loop.yml")
+    include_str!("../../../.antiburn/checks/scope-creep.yml")
         .replace(
             "  tool_result:",
             &format!("  tool_result:\n    tools: [{categories}]"),
@@ -10,20 +10,20 @@ fn definition(categories: &str, condition: &str) -> String {
 }
 
 #[test]
-fn accepts_only_reachable_categories_in_the_supported_subset() {
-    assert!(compile(&definition("shell, read, search, edit, other", "")).is_ok());
-    for category in ["write", "delegate", "skill", "mcp"] {
+fn accepts_all_check_categories_without_claiming_source_parity() {
+    assert!(
+        compile(&definition(
+            "shell, read, search, edit, write, delegate, skill, mcp, other",
+            ""
+        ))
+        .is_ok()
+    );
+    for category in [
+        "shell", "read", "search", "edit", "write", "delegate", "skill", "mcp", "other",
+    ] {
         for condition in ["", "if: false\n"] {
-            let errors = compile(&definition(category, condition)).unwrap_err();
-            assert_eq!(errors.len(), 1, "{category}: {errors:?}");
-            assert_eq!(errors[0].code, DiagnosticCode::CompileUnsupportedFeature);
-            assert_eq!(
-                errors[0].config_path.as_deref(),
-                Some("on.tool_result.tools")
-            );
-            assert!(errors[0].span.is_some());
-            assert!(errors[0].message.contains(category));
-            assert!(compile(&definition(&format!("shell, {category}"), condition)).is_err());
+            let compiled = compile(&definition(category, condition)).unwrap();
+            assert_eq!(compiled.trigger.tools.unwrap()[0].as_str(), category);
         }
     }
 }

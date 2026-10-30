@@ -10,15 +10,18 @@ pub(crate) struct State {
     records: IdentityFilter,
     last: Option<String>,
     root: bool,
+    /// A bounded prefix or summary hit can leave the predecessor unproved.
+    order_unproven: bool,
 }
 
 impl State {
-    pub fn new(input: &SessionInput, header: &Value) -> Self {
+    pub fn new(input: &SessionInput, header: &Value, suffix_only: bool) -> Self {
         Self {
             parser: ClaudeStreamState::for_input(input),
             retired_calls: IdentityFilter::default(),
             records: IdentityFilter::default(),
             last: None,
+            order_unproven: suffix_only,
             root: is_root_input(input)
                 && root_record(header, &input.session_id)
                 && header.get("parentUuid") == Some(&Value::Null)
@@ -29,13 +32,19 @@ impl State {
     }
 
     pub fn observe(&mut self, mut value: Value, index: u64, sink: &mut dyn RecordSink) {
+        let suffix_start = self.order_unproven && self.last.is_none();
         let Some(id) = thread_identity_field(&value, "uuid") else {
             if matches!(value["type"].as_str(), Some("user" | "assistant")) {
                 self.root = false;
             }
             return;
         };
-        if self.records.contains(&id) {
+        let retained_record = self.parser.user_message_root.has_record(&value);
+        if self.parser.user_message_root.exact_record_replay(&value) {
+            return;
+        }
+        let summary_hit = self.records.contains(&id);
+        if retained_record || summary_hit {
             for block in value["message"]["content"].as_array().into_iter().flatten() {
                 if block["type"] == "tool_use"
                     && let Some(call_id) = block["id"].as_str()
@@ -54,19 +63,84 @@ impl State {
                 .iter()
                 .map(|(id, call)| id.len() + call.as_ref().map_or(0, |call| call.retained_bytes))
                 .sum();
-            sink.tool_result_admission_gap(crate::analysis::ToolResultAdmission::UnsafeIdentity);
+            if retained_record {
+                sink.native_admission_failure(crate::analysis::NativeAdmissionFailure {
+                    source_format: self.parser.source_format,
+                    session_id: self.parser.session_id.clone(),
+                    position: ToolResultPosition::Jsonl {
+                        record_index: index,
+                        item_index: u32::MAX,
+                    },
+                    reason: ToolResultCompleteness::UnsafeIdentity,
+                });
+                return;
+            }
+            sink.tool_result_gap();
+            self.order_unproven = !self.continues_root(&value);
+            if !self.order_unproven {
+                self.last = Some(id);
+                self.parser.user_message_root.observe_user_slot(&value);
+            }
             return;
         }
         self.records.insert(&id);
-        self.root &= root_record(&value, &self.parser.session_id)
-            && self
-                .last
-                .as_deref()
-                .is_none_or(|last| value["parentUuid"] == last)
-            && value.get("logicalParentUuid").is_none_or(Value::is_null)
-            && value["subtype"] != "compact_boundary"
-            && value["isCompactSummary"] != true;
+        if self.order_unproven && !suffix_start && !self.continues_root(&value) {
+            sink.tool_result_gap();
+            return;
+        }
+        self.order_unproven = false;
+        let unsafe_owner = value["sessionId"]
+            .as_str()
+            .is_some_and(|session| session != self.parser.session_id)
+            || value["isSidechain"] == true
+            || value.get("agentId").is_some();
+        let scope_failure = self.root
+            && (unsafe_owner
+                || (suffix_start && retained_root::retained_parent(&value) == Some(id.as_str()))
+                || self.last.as_ref().is_some_and(|last| {
+                    value.get("parentUuid").is_some()
+                        && retained_root::retained_parent(&value) != Some(last.as_str())
+                }));
+        if scope_failure {
+            sink.native_admission_failure(crate::analysis::NativeAdmissionFailure {
+                source_format: self.parser.source_format,
+                session_id: self.parser.session_id.clone(),
+                position: ToolResultPosition::Jsonl {
+                    record_index: index,
+                    item_index: u32::MAX,
+                },
+                reason: if unsafe_owner {
+                    ToolResultCompleteness::UnsafeOwnership
+                } else {
+                    ToolResultCompleteness::UnsafeOrder
+                },
+            });
+        }
+        self.root = if suffix_start {
+            self.root
+                && root_record(&value, &self.parser.session_id)
+                && retained_root::retained_parent(&value).is_some()
+        } else {
+            self.continues_root(&value)
+        };
         self.last = Some(id);
+        if suffix_start && self.root {
+            self.parser.user_message_root.observe_retained_start(&value);
+        } else {
+            self.parser.user_message_root.observe_user_slot(&value);
+        }
+        if retained_root::is_compaction_boundary(&value) || value["isCompactSummary"] == true {
+            sink.tool_result_gap();
+        }
+        if self.root
+            && !self
+                .parser
+                .user_message_root
+                .admits(&self.parser.session_id)
+        {
+            sink.tool_result_gap();
+            self.root = false;
+        }
         if self.root {
             emit_user_message(&value, index, &self.parser.session_id, sink);
             if value["type"] == "user"
@@ -83,15 +157,38 @@ impl State {
                 .pointer_mut("/message/content")
                 .and_then(Value::as_array_mut)
         {
-            blocks.retain(|block| {
-                block["type"] != "tool_use"
-                    || block["id"].as_str().is_none_or(|id| {
-                        self.parser.native_calls.contains_key(id)
-                            || !self.retired_calls.contains(id)
+            for block in blocks {
+                if block["type"] == "tool_use"
+                    && block["id"].as_str().is_some_and(|id| {
+                        !self.parser.native_calls.contains_key(id)
+                            && self.retired_calls.contains(id)
                     })
-            });
+                {
+                    *block = Value::Null;
+                }
+            }
         }
-        self.parser.capture_native_tool_results(&value, index, sink);
+        self.parser.capture_native_tool_results_with_public(
+            &value,
+            index,
+            sink,
+            scope_failure
+                || (self.root
+                    && self
+                        .parser
+                        .user_message_root
+                        .admits(&self.parser.session_id)),
+        );
+        if self.root && native_activity_record(&value) {
+            crate::analysis::public_events::emit_activity(
+                sink,
+                self.parser.source_format,
+                &self.parser.session_id,
+                index,
+                value["uuid"].as_str().unwrap_or("message"),
+                value.get("timestamp").and_then(parse_ts),
+            );
+        }
         self.parser.native_calls.retain(|_, call| call.is_some());
         self.parser.native_call_bytes = self
             .parser
@@ -130,17 +227,171 @@ impl State {
         self.root
     }
 
+    pub(crate) fn migrate_pre_65_unobserved_suffix(&mut self) {
+        if self.root && self.last.is_none() && self.parser.user_message_root.is_pristine_user_slot()
+        {
+            self.order_unproven = true;
+        }
+    }
+
+    fn continues_root(&self, value: &Value) -> bool {
+        self.root
+            && root_record(value, &self.parser.session_id)
+            && self
+                .last
+                .as_deref()
+                .is_none_or(|last| retained_root::retained_parent(value) == Some(last))
+    }
+
     pub fn invalidate(&mut self) {
         self.root = false;
     }
 }
 
 fn root_record(record: &Value, session: &str) -> bool {
-    record["version"] == "2.1.278"
-        && record["entrypoint"] == "cli"
+    retained_root::is_characterized_cli(record)
         && record["sessionId"] == session
         && record["isSidechain"] == false
         && record.get("agentId").is_none()
         && (!matches!(record["type"].as_str(), Some("user" | "assistant"))
             || record.pointer("/message/role") == record.get("type"))
+}
+
+/// Exact revision-4 layout. Conversion keeps the existing root and record proof.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct StateV4 {
+    parser: ClaudeStreamState,
+    retired_calls: IdentityFilter,
+    records: IdentityFilter,
+    last: Option<String>,
+    root: bool,
+}
+
+impl StateV4 {
+    pub(crate) fn convert(self, history_incomplete: bool) -> State {
+        State {
+            parser: self.parser,
+            retired_calls: self.retired_calls,
+            records: self.records,
+            last: self.last,
+            root: self.root,
+            order_unproven: history_incomplete,
+        }
+    }
+}
+
+#[cfg(test)]
+impl State {
+    pub(crate) fn as_v4(&self) -> StateV4 {
+        StateV4 {
+            parser: self.parser.clone(),
+            retired_calls: self.retired_calls.clone(),
+            records: self.records.clone(),
+            last: self.last.clone(),
+            root: self.root,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::interface::{
+        NormalizedRecord, ToolResultCompleteness, ToolResultObservation, ToolResultStatus,
+    };
+
+    #[derive(Default)]
+    struct ResultSink {
+        results: Vec<ToolResultObservation>,
+    }
+
+    impl RecordSink for ResultSink {
+        fn record(&mut self, record: NormalizedRecord) {
+            if let NormalizedRecord::ToolResult(result) = record {
+                self.results.push(*result);
+            }
+        }
+
+        fn finish(&mut self, _summary: SessionSummary) {}
+    }
+
+    fn record(kind: &str, id: &str, parent: Value, message: Value) -> Value {
+        serde_json::json!({
+            "type": kind,
+            "version": "2.1.309",
+            "entrypoint": "cli",
+            "sessionId": "session",
+            "isSidechain": false,
+            "uuid": id,
+            "parentUuid": parent,
+            "message": message
+        })
+    }
+
+    #[test]
+    fn current_cli_resume_keeps_native_result_delivery() {
+        let input = SessionInput {
+            agent: "claude".to_owned(),
+            session_id: "session".to_owned(),
+            source: RawSource::Jsonl(String::new()),
+            fork_parent_session_id: None,
+            source_format: crate::analysis::SourceFormat::ClaudeJsonl,
+        };
+        let header = serde_json::json!({
+            "type": "user",
+            "version": "2.1.278",
+            "entrypoint": "cli",
+            "sessionId": "session",
+            "isSidechain": false,
+            "uuid": "root",
+            "parentUuid": null,
+            "message": {"role": "user", "content": "Original request."}
+        });
+        let mut state = State::new(&input, &header, false);
+        let mut sink = ResultSink::default();
+        state.observe(header, 0, &mut sink);
+
+        let mut bridge = record(
+            "system",
+            "bridge",
+            Value::String("root".into()),
+            Value::Null,
+        );
+        bridge["subtype"] = Value::String("bridge_status".into());
+        state.observe(bridge, 1, &mut sink);
+        state.observe(
+            record(
+                "assistant",
+                "call-row",
+                Value::String("bridge".into()),
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "call", "name": "Bash", "input": {"command": "false"}}]
+                }),
+            ),
+            2,
+            &mut sink,
+        );
+        state.observe(
+            record(
+                "user",
+                "result-row",
+                Value::String("call-row".into()),
+                serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "call", "content": "synthetic failure", "is_error": true}]
+                }),
+            ),
+            3,
+            &mut sink,
+        );
+
+        assert!(state.main_session());
+        assert_eq!(sink.results.len(), 1);
+        assert_eq!(sink.results[0].status, ToolResultStatus::Error);
+        assert_eq!(
+            sink.results[0].completeness,
+            ToolResultCompleteness::Complete
+        );
+    }
 }

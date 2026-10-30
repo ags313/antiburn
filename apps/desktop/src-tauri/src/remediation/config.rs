@@ -663,37 +663,28 @@ pub(crate) fn managed_configuration_present(agent: AgentKind, home: &Path) -> bo
 mod publication_precondition_tests {
     use super::*;
 
-    #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn publication_config_io_keeps_the_runtime_responsive_during_a_blocked_file_read() {
-        use std::{ffi::CString, io::Write, os::unix::ffi::OsStrExt, time::Instant};
+    async fn publication_config_io_keeps_the_runtime_responsive_during_blocked_work() {
+        use std::time::Instant;
 
         let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join("config-pipe");
-        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `name` is a valid terminated path and the mode has no special bits.
-        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let path = temporary.path().join("config");
+        std::fs::write(&path, b"x").unwrap();
         let (release, wait) = std::sync::mpsc::channel();
-        let write_path = path.clone();
-        let writer = std::thread::spawn(move || {
-            let _ = wait.recv_timeout(Duration::from_secs(2));
-            std::fs::File::create(write_path)
-                .unwrap()
-                .write_all(b"x")
-                .unwrap();
-        });
         let (entered, reading) = tokio::sync::oneshot::channel();
-        let started = Instant::now();
+        let caller = std::thread::current().id();
         let read = tokio::spawn(publication_config_io(move || {
+            assert_ne!(std::thread::current().id(), caller);
             entered.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5))?;
             Ok(std::fs::read(path)?)
         }));
         reading.await.unwrap();
+        let started = Instant::now();
         tokio::time::sleep(Duration::from_millis(10)).await;
         let responsive = started.elapsed() < Duration::from_secs(1);
         let _ = release.send(());
         assert_eq!(read.await.unwrap().unwrap(), b"x");
-        writer.join().unwrap();
         assert!(
             responsive,
             "config file reads must not block the runtime thread"

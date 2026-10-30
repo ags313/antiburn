@@ -27,6 +27,8 @@ use serde::Serialize;
 /// back at the call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventName {
+    /// A private CLI operation completed.
+    CliOperationCompleted,
     /// The application started.
     AppLaunched,
     /// A discovery pass completed, with a bucketed count of what it found.
@@ -91,6 +93,8 @@ pub enum EventName {
     BurnCheckInputPrepared,
     /// An explicit installed-check definition open request settled.
     BurnCheckDefinitionOpened,
+    /// An explicit installed-check directory open request settled.
+    BurnCheckDirectoryOpened,
     /// The Sessions sidebar filter changed to a different selection.
     #[cfg(feature = "analytics")]
     SessionFilterSelected,
@@ -131,6 +135,9 @@ pub enum EventName {
     AppSearchOpened,
     #[cfg(feature = "analytics")]
     AppSearchResultOpened,
+    /// A production promotion panel was viewed or used.
+    #[cfg(feature = "analytics")]
+    PromotionInteraction,
     /// The reader saved a different application interface size preset.
     InterfaceScaleChanged,
     /// The first-run Overview reached a fixed funnel step.
@@ -142,12 +149,9 @@ pub enum EventName {
     /// The first-run Overview's result first showed.
     #[cfg(feature = "analytics")]
     FirstRunFinished,
-    /// A reader viewed an Ignored Instructions finding or acted on its evidence or prompt.
+    /// A model-check master setting or provider operation completed.
     #[cfg(feature = "analytics")]
-    IgnoredInstructionObserved,
-    /// A saved TypeSafe setting, a history run request, or a terminal check result.
-    #[cfg(feature = "analytics")]
-    IgnoredInstructionLifecycle,
+    ModelCheckLifecycle,
     /// One check's enabled preference completed a persisted state transition.
     #[cfg(feature = "analytics")]
     CheckEnablementSaved,
@@ -167,6 +171,7 @@ pub enum EventName {
 /// `docs/analytics.md`.
 #[cfg(all(test, feature = "analytics"))]
 pub const EVERY_EVENT: &[EventName] = &[
+    EventName::CliOperationCompleted,
     EventName::AppLaunched,
     EventName::ScanCompleted,
     EventName::SettingToggled,
@@ -190,6 +195,7 @@ pub const EVERY_EVENT: &[EventName] = &[
     EventName::BurnCheckOutcomeObserved,
     EventName::BurnCheckInputPrepared,
     EventName::BurnCheckDefinitionOpened,
+    EventName::BurnCheckDirectoryOpened,
     EventName::SessionFilterSelected,
     EventName::SessionFiltersChanged,
     EventName::RemoteHostConnectionChecked,
@@ -204,12 +210,12 @@ pub const EVERY_EVENT: &[EventName] = &[
     EventName::NavigationHistoryMoved,
     EventName::AppSearchOpened,
     EventName::AppSearchResultOpened,
+    EventName::PromotionInteraction,
     EventName::InterfaceScaleChanged,
     EventName::FirstRunStepReached,
     EventName::FirstRunAction,
     EventName::FirstRunFinished,
-    EventName::IgnoredInstructionObserved,
-    EventName::IgnoredInstructionLifecycle,
+    EventName::ModelCheckLifecycle,
     EventName::CheckEnablementSaved,
     EventName::StepSettingsViewed,
 ];
@@ -218,6 +224,7 @@ pub const EVERY_EVENT: &[EventName] = &[
 impl EventName {
     pub fn as_str(self) -> &'static str {
         match self {
+            EventName::CliOperationCompleted => "antiburn.cli_operation_completed",
             EventName::AppLaunched => "antiburn.app_launched",
             EventName::ScanCompleted => "antiburn.scan_completed",
             EventName::SettingToggled => "antiburn.setting_toggled",
@@ -241,6 +248,7 @@ impl EventName {
             EventName::BurnCheckOutcomeObserved => "antiburn.burn_check_outcome_observed",
             EventName::BurnCheckInputPrepared => "antiburn.burn_check_input_prepared",
             EventName::BurnCheckDefinitionOpened => "antiburn.burn_check_definition_opened",
+            EventName::BurnCheckDirectoryOpened => "antiburn.burn_check_directory_opened",
             EventName::ProjectFolderAction => "antiburn.project_folder_action",
             EventName::MemoryAction => "antiburn.memory_action",
             EventName::SessionFilterSelected => "antiburn.session_filter_selected",
@@ -255,12 +263,12 @@ impl EventName {
             EventName::NavigationHistoryMoved => "antiburn.navigation_history_moved",
             EventName::AppSearchOpened => "antiburn.app_search_opened",
             EventName::AppSearchResultOpened => "antiburn.app_search_result_opened",
+            EventName::PromotionInteraction => "antiburn.promotion_interaction",
             EventName::InterfaceScaleChanged => "antiburn.interface_scale_changed",
             EventName::FirstRunStepReached => "antiburn.first_run_step_reached",
             EventName::FirstRunAction => "antiburn.first_run_action",
             EventName::FirstRunFinished => "antiburn.first_run_finished",
-            EventName::IgnoredInstructionObserved => "antiburn.ignored_instruction_observed",
-            EventName::IgnoredInstructionLifecycle => "antiburn.ignored_instruction_lifecycle",
+            EventName::ModelCheckLifecycle => "antiburn.ignored_instruction_lifecycle",
             EventName::CheckEnablementSaved => "antiburn.check_enablement_saved",
             EventName::StepSettingsViewed => "antiburn.step_settings_viewed",
         }
@@ -272,6 +280,7 @@ impl EventName {
     /// letting background telemetry extend an interaction session by default.
     pub fn is_user_oriented(self, facts: &Facts) -> bool {
         match self {
+            EventName::CliOperationCompleted => matches!(facts.label, Some("test" | "repair")),
             EventName::SettingToggled
             | EventName::AnalyticsOptedOut
             | EventName::SessionOpened
@@ -281,6 +290,7 @@ impl EventName {
             | EventName::BurnCheckPromptPrepared
             | EventName::BurnCheckPromptCopied
             | EventName::BurnCheckDefinitionOpened
+            | EventName::BurnCheckDirectoryOpened
             | EventName::SessionFilterSelected
             | EventName::SessionFiltersChanged
             | EventName::RemoteHostConnectionChecked
@@ -292,25 +302,26 @@ impl EventName {
             | EventName::AppSearchResultOpened
             | EventName::InterfaceScaleChanged
             | EventName::FirstRunAction
-            | EventName::IgnoredInstructionObserved
             | EventName::CheckEnablementSaved
             | EventName::StepSettingsViewed => true,
+            EventName::PromotionInteraction => matches!(
+                facts.label,
+                Some("primary_activated" | "learn_more_activated" | "command_copied" | "dismissed")
+            ),
             EventName::SurfaceViewed => facts.detail == Some("user"),
             EventName::RemoteSyncCompleted => facts.detail == Some("manual"),
             // `started`, `found`, `read`, and `checked` are reported as the
             // first-run work completes on its own. Only `result` follows a
             // deliberate Next press.
             EventName::FirstRunStepReached => facts.label == Some("result"),
-            // Enablement and provider setup or test outcomes come from settings
-            // commands. Assessment outcomes (`execution_*`, `backfill_*`) come
-            // from background workers, as would any detail not listed here.
-            EventName::IgnoredInstructionLifecycle => matches!(
+            EventName::ModelCheckLifecycle => matches!(
                 facts.detail,
                 Some(
                     "enabled"
                         | "disabled"
                         | "provider_saved"
                         | "provider_switched"
+                        | "connection_removed"
                         | "credential_removed"
                         | "test_succeeded"
                         | "test_failed"
@@ -472,6 +483,25 @@ pub struct Properties {
     pub unrecognized_types: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum CliOperation {
+    Startup,
+    Test,
+    Repair,
+}
+
+pub fn cli_operation_facts(operation: CliOperation, succeeded: bool) -> Facts {
+    Facts {
+        label: Some(match operation {
+            CliOperation::Startup => "startup",
+            CliOperation::Test => "test",
+            CliOperation::Repair => "repair",
+        }),
+        detail: Some(if succeeded { "succeeded" } else { "failed" }),
+        ..Facts::default()
+    }
+}
+
 /// What a caller may attach to an event.
 ///
 /// A struct rather than three positional `Option<&'static str>` arguments,
@@ -528,7 +558,13 @@ impl BurnCheckPreparationOutcome {
     ) -> Option<Self> {
         use antiburn_checks::fit::{PreparationFailureCode, PreparationRecord};
         Some(match preparation {
-            PreparationRecord::Ready(prepared) if prepared.report.omissions.is_empty() => {
+            PreparationRecord::Local(_) => return None,
+            PreparationRecord::Ready(prepared)
+                if prepared
+                    .decisions
+                    .iter()
+                    .all(|decision| decision.report.omissions.is_empty()) =>
+            {
                 Self::Unchanged
             }
             PreparationRecord::Ready(_) => Self::Shortened,
@@ -577,6 +613,28 @@ pub(crate) enum BurnCheckDefinitionOpenOutcome {
 }
 
 impl BurnCheckDefinitionOpenOutcome {
+    pub(crate) fn facts(self) -> Facts {
+        Facts {
+            detail: Some(match self {
+                Self::Succeeded => "succeeded",
+                Self::Missing => "missing",
+                Self::Unavailable => "unavailable",
+                Self::OpenFailed => "open_failed",
+            }),
+            ..Facts::default()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BurnCheckDirectoryOpenOutcome {
+    Succeeded,
+    Missing,
+    Unavailable,
+    OpenFailed,
+}
+
+impl BurnCheckDirectoryOpenOutcome {
     pub(crate) fn facts(self) -> Facts {
         Facts {
             detail: Some(match self {
@@ -685,12 +743,9 @@ pub enum Interaction {
     /// A fix prompt request completed.
     BurnCheckPromptPrepared {
         outcome: PromptPreparationOutcome,
-        check: Option<SmartCheck>,
     },
     /// A prepared fix prompt reached the clipboard.
-    BurnCheckPromptCopied {
-        check: Option<SmartCheck>,
-    },
+    BurnCheckPromptCopied {},
     /// A later result appeared in the visible Burn Checks workspace.
     BurnCheckOutcomeObserved {
         outcome: BurnCheckOutcome,
@@ -710,14 +765,6 @@ pub enum Interaction {
     AppSearchOpened {},
     AppSearchResultOpened {
         category: SearchCategory,
-    },
-    IgnoredInstructionObserved {
-        stage: IgnoredInstructionStage,
-        outcome: IgnoredInstructionOutcome,
-    },
-    SmartCheckObserved {
-        check: SmartCheck,
-        observation: SmartCheckObservation,
     },
     /// The contextual Sessions filters changed.
     SessionFiltersChanged {
@@ -746,6 +793,13 @@ pub enum Interaction {
         label: StepSettingsLabel,
         detail: StepSettingsDetail,
     },
+    /// A production promotion panel was viewed or used.
+    #[serde(rename = "promotionInteraction")]
+    PromotionUsed {
+        campaign: PromotionCampaign,
+        action: PromotionAction,
+        origin: Origin,
+    },
 }
 
 /// A stable, closed analytics identity for a check.
@@ -763,10 +817,6 @@ pub(crate) enum CheckEnablementId {
     OldModelUsage,
     OveruseOfFastMode,
     CacheChurn,
-    IgnoredInstructions,
-    SkillOpportunities,
-    OverExploring,
-    ScopeCreep,
 }
 
 impl From<antiburn_local::checks::DetectorId> for CheckEnablementId {
@@ -783,10 +833,6 @@ impl From<antiburn_local::checks::DetectorId> for CheckEnablementId {
             DetectorId::OldModelUsage => Self::OldModelUsage,
             DetectorId::OveruseOfFastMode => Self::OveruseOfFastMode,
             DetectorId::CacheChurn => Self::CacheChurn,
-            DetectorId::IgnoredInstructions => Self::IgnoredInstructions,
-            DetectorId::SkillOpportunities => Self::SkillOpportunities,
-            DetectorId::OverExploring => Self::OverExploring,
-            DetectorId::ScopeCreep => Self::ScopeCreep,
         }
     }
 }
@@ -804,10 +850,6 @@ impl CheckEnablementId {
             Self::OldModelUsage => "old_model_usage",
             Self::OveruseOfFastMode => "overuse_of_fast_mode",
             Self::CacheChurn => "cache_churn",
-            Self::IgnoredInstructions => "ignored_instructions",
-            Self::SkillOpportunities => "skill_opportunities",
-            Self::OverExploring => "over_exploring",
-            Self::ScopeCreep => "scope_creep",
         }
     }
 }
@@ -824,26 +866,8 @@ pub(crate) fn check_enablement_facts(
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SmartCheck {
-    IgnoredInstructions,
-    ScopeCreep,
-    OverExploring,
-    SkillOpportunities,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SmartCheckObservation {
-    FindingVisible,
-    EvidenceAvailable,
-    EvidenceUnavailable,
-    EvidenceFailed,
-}
-
 #[derive(Debug, Clone, Copy)]
-pub enum SmartCheckProvider {
+pub enum DecisionProvider {
     Jev,
     Cloudflare,
     Ollama,
@@ -854,6 +878,7 @@ pub enum SmartCheckProvider {
 pub enum ProviderSetupOutcome {
     Saved,
     Switched,
+    ConnectionRemoved,
     CredentialRemoved,
 }
 
@@ -863,36 +888,23 @@ pub enum ProviderTestOutcome {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SmartCheckAssessmentOutcome {
-    Finding,
-    Clean,
-    Abstained,
-    Failed,
-}
-
 /// Native operation boundaries own lifecycle events.
 #[derive(Debug, Clone, Copy)]
-pub enum SmartCheckLifecycle {
+pub enum ModelCheckLifecycle {
     Enablement {
         enabled: bool,
     },
     ProviderSetup {
-        provider: SmartCheckProvider,
+        provider: DecisionProvider,
         outcome: ProviderSetupOutcome,
     },
     ProviderTest {
-        provider: SmartCheckProvider,
+        provider: DecisionProvider,
         outcome: ProviderTestOutcome,
-    },
-    Assessment {
-        check: SmartCheck,
-        outcome: SmartCheckAssessmentOutcome,
-        historical: bool,
     },
 }
 
-impl From<crate::jev::config::SystemOneProvider> for SmartCheckProvider {
+impl From<crate::jev::config::SystemOneProvider> for DecisionProvider {
     fn from(provider: crate::jev::config::SystemOneProvider) -> Self {
         use crate::jev::config::SystemOneProvider;
         match provider {
@@ -904,20 +916,8 @@ impl From<crate::jev::config::SystemOneProvider> for SmartCheckProvider {
     }
 }
 
-impl SmartCheckAssessmentOutcome {
-    pub(crate) fn from_evidence(has_finding: bool, clean: bool) -> Self {
-        if has_finding {
-            Self::Finding
-        } else if clean {
-            Self::Clean
-        } else {
-            Self::Abstained
-        }
-    }
-}
-
 #[cfg(feature = "analytics")]
-impl SmartCheckLifecycle {
+impl ModelCheckLifecycle {
     pub fn resolve(self) -> (EventName, Facts) {
         let (label, detail) = match self {
             Self::Enablement { enabled } => {
@@ -928,6 +928,7 @@ impl SmartCheckLifecycle {
                 match outcome {
                     ProviderSetupOutcome::Saved => "provider_saved",
                     ProviderSetupOutcome::Switched => "provider_switched",
+                    ProviderSetupOutcome::ConnectionRemoved => "connection_removed",
                     ProviderSetupOutcome::CredentialRemoved => "credential_removed",
                 },
             ),
@@ -938,26 +939,9 @@ impl SmartCheckLifecycle {
                     ProviderTestOutcome::Failed => "test_failed",
                 },
             ),
-            Self::Assessment {
-                check,
-                outcome,
-                historical,
-            } => (
-                check.as_str(),
-                match (historical, outcome) {
-                    (false, SmartCheckAssessmentOutcome::Finding) => "execution_finding",
-                    (false, SmartCheckAssessmentOutcome::Clean) => "execution_clean",
-                    (false, SmartCheckAssessmentOutcome::Abstained) => "execution_abstained",
-                    (false, SmartCheckAssessmentOutcome::Failed) => "execution_failed",
-                    (true, SmartCheckAssessmentOutcome::Finding) => "backfill_finding",
-                    (true, SmartCheckAssessmentOutcome::Clean) => "backfill_clean",
-                    (true, SmartCheckAssessmentOutcome::Abstained) => "backfill_abstained",
-                    (true, SmartCheckAssessmentOutcome::Failed) => "backfill_failed",
-                },
-            ),
         };
         (
-            EventName::IgnoredInstructionLifecycle,
+            EventName::ModelCheckLifecycle,
             Facts {
                 label: Some(label),
                 detail: Some(detail),
@@ -967,22 +951,21 @@ impl SmartCheckLifecycle {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum IgnoredInstructionStage {
-    Finding,
-    Evidence,
-    Prompt,
+pub enum PromotionCampaign {
+    ClaudeMod,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum IgnoredInstructionOutcome {
-    Visible,
-    Available,
-    Unavailable,
-    Failed,
-    Copied,
+pub enum PromotionAction {
+    AnnouncementViewed,
+    SetupViewed,
+    PrimaryActivated,
+    LearnMoreActivated,
+    CommandCopied,
+    Dismissed,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1381,21 +1364,16 @@ impl Interaction {
                     ..Facts::default()
                 },
             ),
-            Interaction::BurnCheckPromptPrepared { outcome, check } => (
+            Interaction::BurnCheckPromptPrepared { outcome } => (
                 EventName::BurnCheckPromptPrepared,
                 Facts {
-                    label: check.map(SmartCheck::as_str),
                     detail: Some(outcome.as_str()),
                     ..Facts::default()
                 },
             ),
-            Interaction::BurnCheckPromptCopied { check } => (
-                EventName::BurnCheckPromptCopied,
-                Facts {
-                    label: check.map(SmartCheck::as_str),
-                    ..Facts::default()
-                },
-            ),
+            Interaction::BurnCheckPromptCopied {} => {
+                (EventName::BurnCheckPromptCopied, Facts::default())
+            }
             Interaction::BurnCheckOutcomeObserved { outcome, origin } => (
                 EventName::BurnCheckOutcomeObserved,
                 Facts {
@@ -1460,22 +1438,6 @@ impl Interaction {
                     ..Facts::default()
                 },
             ),
-            Interaction::IgnoredInstructionObserved { stage, outcome } => (
-                EventName::IgnoredInstructionObserved,
-                Facts {
-                    label: Some(stage.as_str()),
-                    detail: Some(outcome.as_str()),
-                    ..Facts::default()
-                },
-            ),
-            Interaction::SmartCheckObserved { check, observation } => (
-                EventName::IgnoredInstructionObserved,
-                Facts {
-                    label: Some(check.as_str()),
-                    detail: Some(observation.as_str()),
-                    ..Facts::default()
-                },
-            ),
             Interaction::SessionFiltersChanged { action, agent } => (
                 EventName::SessionFiltersChanged,
                 Facts {
@@ -1518,6 +1480,19 @@ impl Interaction {
                     ..Facts::default()
                 },
             ),
+            Interaction::PromotionUsed {
+                campaign,
+                action,
+                origin,
+            } => (
+                EventName::PromotionInteraction,
+                Facts {
+                    detail: Some(campaign.as_str()),
+                    label: Some(action.as_str()),
+                    origin: Some(origin.as_str()),
+                    ..Facts::default()
+                },
+            ),
         }
     }
 }
@@ -1536,25 +1511,11 @@ macro_rules! wire_values {
 }
 
 #[cfg(feature = "analytics")]
-wire_values!(SmartCheck, {
-    SmartCheck::IgnoredInstructions => "ignored_instructions",
-    SmartCheck::ScopeCreep => "scope_creep",
-    SmartCheck::OverExploring => "over_exploring",
-    SmartCheck::SkillOpportunities => "skill_opportunities",
-});
-#[cfg(feature = "analytics")]
-wire_values!(SmartCheckObservation, {
-    SmartCheckObservation::FindingVisible => "finding_visible",
-    SmartCheckObservation::EvidenceAvailable => "evidence_available",
-    SmartCheckObservation::EvidenceUnavailable => "evidence_unavailable",
-    SmartCheckObservation::EvidenceFailed => "evidence_failed",
-});
-#[cfg(feature = "analytics")]
-wire_values!(SmartCheckProvider, {
-    SmartCheckProvider::Jev => "jev",
-    SmartCheckProvider::Cloudflare => "cloudflare",
-    SmartCheckProvider::Ollama => "ollama",
-    SmartCheckProvider::Custom => "custom",
+wire_values!(DecisionProvider, {
+    DecisionProvider::Jev => "jev",
+    DecisionProvider::Cloudflare => "cloudflare",
+    DecisionProvider::Ollama => "ollama",
+    DecisionProvider::Custom => "custom",
 });
 
 #[cfg(feature = "analytics")]
@@ -1600,21 +1561,6 @@ wire_values!(SessionFilterKind, {
 wire_values!(HistoryDirection, { HistoryDirection::Back => "back", HistoryDirection::Forward => "forward" });
 #[cfg(feature = "analytics")]
 wire_values!(SearchCategory, { SearchCategory::View => "view", SearchCategory::Setting => "setting", SearchCategory::Check => "check" });
-#[cfg(feature = "analytics")]
-wire_values!(IgnoredInstructionStage, {
-    IgnoredInstructionStage::Finding => "finding",
-    IgnoredInstructionStage::Evidence => "evidence",
-    IgnoredInstructionStage::Prompt => "prompt",
-});
-#[cfg(feature = "analytics")]
-wire_values!(IgnoredInstructionOutcome, {
-    IgnoredInstructionOutcome::Visible => "visible",
-    IgnoredInstructionOutcome::Available => "available",
-    IgnoredInstructionOutcome::Unavailable => "unavailable",
-    IgnoredInstructionOutcome::Failed => "failed",
-    IgnoredInstructionOutcome::Copied => "copied",
-});
-
 #[cfg(feature = "analytics")]
 wire_values!(SessionFilterAction, {
     SessionFilterAction::AgentAdded => "agent_added",
@@ -1662,6 +1608,18 @@ wire_values!(FirstRunActionKind, {
     FirstRunActionKind::LiveUsageStarted => "live_usage_started",
     FirstRunActionKind::LiveUsageSkipped => "live_usage_skipped",
     FirstRunActionKind::EnhanceOpened => "enhance_opened",
+});
+
+#[cfg(feature = "analytics")]
+wire_values!(PromotionCampaign, { PromotionCampaign::ClaudeMod => "claude_mod" });
+#[cfg(feature = "analytics")]
+wire_values!(PromotionAction, {
+    PromotionAction::AnnouncementViewed => "announcement_viewed",
+    PromotionAction::SetupViewed => "setup_viewed",
+    PromotionAction::PrimaryActivated => "primary_activated",
+    PromotionAction::LearnMoreActivated => "learn_more_activated",
+    PromotionAction::CommandCopied => "command_copied",
+    PromotionAction::Dismissed => "dismissed",
 });
 
 #[cfg(feature = "analytics")]
@@ -2015,7 +1973,7 @@ mod tests {
     };
     use super::*;
 
-    fn assert_smart_check_payload(
+    fn assert_closed_payload(
         resolved: (EventName, Facts),
         name: &str,
         label: Option<&str>,
@@ -2048,7 +2006,7 @@ mod tests {
             resource_usage: facts.resource_usage,
             unrecognized_types: facts.unrecognized_types,
         };
-        let payload = serde_json::to_value(event).expect("Typed Smart Check event serializes");
+        let payload = serde_json::to_value(event).expect("Typed event serializes");
         assert_eq!(payload["event"], name);
         let mut expected = serde_json::json!({"arch": "aarch64"});
         if let Some(label) = label {
@@ -2060,7 +2018,7 @@ mod tests {
         assert_eq!(payload["properties"], expected);
     }
 
-    const SMART_CHECKS: &[&str] = &[
+    const RETIRED_CHECKS: &[&str] = &[
         "ignored_instructions",
         "scope_creep",
         "over_exploring",
@@ -2094,17 +2052,29 @@ mod tests {
         (BurnCheckDefinitionOpenOutcome::OpenFailed, "open_failed"),
     ];
 
+    const DIRECTORY_OPEN_OUTCOMES: &[(BurnCheckDirectoryOpenOutcome, &str)] = &[
+        (BurnCheckDirectoryOpenOutcome::Succeeded, "succeeded"),
+        (BurnCheckDirectoryOpenOutcome::Missing, "missing"),
+        (BurnCheckDirectoryOpenOutcome::Unavailable, "unavailable"),
+        (BurnCheckDirectoryOpenOutcome::OpenFailed, "open_failed"),
+    ];
+
     #[test]
     fn installed_check_payloads_have_only_closed_outcomes_and_correct_session_classification() {
         for &(outcome, detail) in PREPARATION_OUTCOMES {
             let name = EventName::BurnCheckInputPrepared;
             assert!(!name.is_user_oriented(&outcome.facts()));
-            assert_smart_check_payload((name, outcome.facts()), name.as_str(), None, Some(detail));
+            assert_closed_payload((name, outcome.facts()), name.as_str(), None, Some(detail));
         }
         for &(outcome, detail) in DEFINITION_OPEN_OUTCOMES {
             let name = EventName::BurnCheckDefinitionOpened;
             assert!(name.is_user_oriented(&outcome.facts()));
-            assert_smart_check_payload((name, outcome.facts()), name.as_str(), None, Some(detail));
+            assert_closed_payload((name, outcome.facts()), name.as_str(), None, Some(detail));
+        }
+        for &(outcome, detail) in DIRECTORY_OPEN_OUTCOMES {
+            let name = EventName::BurnCheckDirectoryOpened;
+            assert!(name.is_user_oriented(&outcome.facts()));
+            assert_closed_payload((name, outcome.facts()), name.as_str(), None, Some(detail));
         }
     }
 
@@ -2112,19 +2082,40 @@ mod tests {
     fn installed_check_preparation_excludes_content_paths_counts_and_false_conditions() {
         use antiburn_checks::fit::{
             FitOmission, FitReport, FitStrategy, PreparationFailure, PreparationFailureCode,
-            PreparationRecord, PreparedDecision,
+            PreparationRecord,
         };
-        let mut prepared = PreparedDecision {
-            profile: "private-provider-profile".into(),
-            input: serde_json::json!({"private_input_name": "private transcript"}),
-            request: Some(serde_json::json!({"private_yaml_value": "private request"})),
-            report: FitReport::default(),
-        };
+        use antiburn_checks::prepared_assessment::{PreparedAssessment, PreparedBlock};
+        let mut prepared = PreparedAssessment::new(
+            "private-provider-profile".into(),
+            Default::default(),
+            0,
+            ["private_first_decision", "private_second_decision"]
+                .into_iter()
+                .map(|decision| PreparedBlock {
+                    decision: decision.into(),
+                    original_input: serde_json::json!({"private_input_name": "private transcript"}),
+                    input: serde_json::json!({"private_input_name": "private transcript"}),
+                    request: serde_json::json!({"private_yaml_value": "private request"}),
+                    report: FitReport::default(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            BurnCheckPreparationOutcome::from_record(&PreparationRecord::Local(
+                antiburn_checks::fit::LocalPreparation {
+                    version: 1,
+                    started_at_unix_ms: 1001,
+                    evaluation_budget: Default::default(),
+                },
+            )),
+            None,
+        );
         assert_eq!(
             BurnCheckPreparationOutcome::from_record(&PreparationRecord::Ready(prepared.clone())),
             Some(BurnCheckPreparationOutcome::Unchanged)
         );
-        prepared.report.omissions.push(FitOmission {
+        prepared.decisions[1].report.omissions.push(FitOmission {
             path: "private_input_name[*].private_path".into(),
             strategy: FitStrategy::Truncate,
             original_count: 982_451_653,
@@ -2172,7 +2163,7 @@ mod tests {
             let record = PreparationRecord::Rejected(PreparationFailure {
                 code,
                 detail: "private error /private/check.yml".into(),
-                report: Some(prepared.report.clone()),
+                report: Some(prepared.decisions[1].report.clone()),
                 context: Box::new(antiburn_checks::fit::PreparationFailureContext {
                     decision: Some("private decision name".into()),
                     input_path: Some("private_input_name".into()),
@@ -2182,7 +2173,7 @@ mod tests {
             let outcome = BurnCheckPreparationOutcome::from_record(&record);
             assert_eq!(outcome, expected);
             if let Some(outcome) = outcome {
-                assert_smart_check_payload(
+                assert_closed_payload(
                     (EventName::BurnCheckInputPrepared, outcome.facts()),
                     "antiburn.burn_check_input_prepared",
                     None,
@@ -2197,6 +2188,7 @@ mod tests {
         for (kind, outcome) in [
             ("burnCheckInputPrepared", "shortened"),
             ("burnCheckDefinitionOpened", "succeeded"),
+            ("burnCheckDirectoryOpened", "succeeded"),
         ] {
             assert!(
                 serde_json::from_value::<Interaction>(serde_json::json!({
@@ -2227,6 +2219,7 @@ mod tests {
             .iter()
             .map(|(_, detail)| detail)
             .chain(DEFINITION_OPEN_OUTCOMES.iter().map(|(_, detail)| detail))
+            .chain(DIRECTORY_OPEN_OUTCOMES.iter().map(|(_, detail)| detail))
         {
             assert!(
                 section.contains(&format!("`{detail}`")),
@@ -2235,13 +2228,14 @@ mod tests {
         }
         assert!(section.contains("antiburn.burn_check_input_prepared"));
         assert!(section.contains("antiburn.burn_check_definition_opened"));
+        assert!(section.contains("antiburn.burn_check_directory_opened"));
     }
 
     #[test]
-    fn smart_check_enablement_preserves_the_existing_global_contract() {
+    fn model_check_enablement_preserves_the_existing_global_contract() {
         for enabled in [false, true] {
-            let lifecycle = SmartCheckLifecycle::Enablement { enabled };
-            assert_smart_check_payload(
+            let lifecycle = ModelCheckLifecycle::Enablement { enabled };
+            assert_closed_payload(
                 lifecycle.resolve(),
                 "antiburn.ignored_instruction_lifecycle",
                 Some("enablement"),
@@ -2251,7 +2245,7 @@ mod tests {
     }
 
     #[test]
-    fn smart_check_provider_setup_and_test_payloads_are_closed() {
+    fn decision_provider_setup_and_test_payloads_are_closed() {
         use crate::jev::config::SystemOneProvider;
         for (source, label) in [
             (SystemOneProvider::Jev, "jev"),
@@ -2264,12 +2258,16 @@ mod tests {
                 (ProviderSetupOutcome::Saved, "provider_saved"),
                 (ProviderSetupOutcome::Switched, "provider_switched"),
                 (
+                    ProviderSetupOutcome::ConnectionRemoved,
+                    "connection_removed",
+                ),
+                (
                     ProviderSetupOutcome::CredentialRemoved,
                     "credential_removed",
                 ),
             ] {
-                let lifecycle = SmartCheckLifecycle::ProviderSetup { provider, outcome };
-                assert_smart_check_payload(
+                let lifecycle = ModelCheckLifecycle::ProviderSetup { provider, outcome };
+                assert_closed_payload(
                     lifecycle.resolve(),
                     "antiburn.ignored_instruction_lifecycle",
                     Some(label),
@@ -2280,8 +2278,8 @@ mod tests {
                 (ProviderTestOutcome::Succeeded, "test_succeeded"),
                 (ProviderTestOutcome::Failed, "test_failed"),
             ] {
-                assert_smart_check_payload(
-                    SmartCheckLifecycle::ProviderTest { provider, outcome }.resolve(),
+                assert_closed_payload(
+                    ModelCheckLifecycle::ProviderTest { provider, outcome }.resolve(),
                     "antiburn.ignored_instruction_lifecycle",
                     Some(label),
                     Some(detail),
@@ -2291,137 +2289,57 @@ mod tests {
     }
 
     #[test]
-    fn smart_check_assessment_and_abstention_payloads_are_closed() {
-        for (check, label) in [
-            (SmartCheck::IgnoredInstructions, "ignored_instructions"),
-            (SmartCheck::ScopeCreep, "scope_creep"),
-            (SmartCheck::OverExploring, "over_exploring"),
-            (SmartCheck::SkillOpportunities, "skill_opportunities"),
-        ] {
-            for historical in [false, true] {
-                for (outcome, suffix) in [
-                    (SmartCheckAssessmentOutcome::Finding, "finding"),
-                    (SmartCheckAssessmentOutcome::Clean, "clean"),
-                    (SmartCheckAssessmentOutcome::Abstained, "abstained"),
-                    (SmartCheckAssessmentOutcome::Failed, "failed"),
-                ] {
-                    let lifecycle = SmartCheckLifecycle::Assessment {
-                        check,
-                        outcome,
-                        historical,
-                    };
-                    let detail = format!(
-                        "{}_{suffix}",
-                        if historical { "backfill" } else { "execution" }
-                    );
-                    assert_smart_check_payload(
-                        lifecycle.resolve(),
-                        "antiburn.ignored_instruction_lifecycle",
-                        Some(label),
-                        Some(&detail),
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn smart_check_assessment_requires_a_finding_or_proven_clean_evidence() {
-        assert_eq!(
-            SmartCheckAssessmentOutcome::from_evidence(false, false),
-            SmartCheckAssessmentOutcome::Abstained
-        );
-        assert_eq!(
-            SmartCheckAssessmentOutcome::from_evidence(false, true),
-            SmartCheckAssessmentOutcome::Clean
-        );
-        assert_eq!(
-            SmartCheckAssessmentOutcome::from_evidence(true, false),
-            SmartCheckAssessmentOutcome::Finding
-        );
-        assert_eq!(
-            SmartCheckAssessmentOutcome::from_evidence(true, true),
-            SmartCheckAssessmentOutcome::Finding
-        );
-    }
-
-    #[test]
-    fn smart_check_visible_finding_and_evidence_payloads_are_closed() {
-        for check in SMART_CHECKS {
-            for observation in [
-                "finding_visible",
-                "evidence_available",
-                "evidence_unavailable",
-                "evidence_failed",
-            ] {
-                let interaction: Interaction = serde_json::from_value(serde_json::json!({
-                    "kind":"smartCheckObserved", "check":check, "observation":observation,
-                }))
-                .expect("Authored Smart Check observation uses closed interaction values");
-                assert_smart_check_payload(
-                    interaction.resolve(),
-                    "antiburn.ignored_instruction_observed",
-                    Some(check),
-                    Some(observation),
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn smart_check_prompt_payloads_preserve_legacy_and_classify_four_checks() {
-        for check in [None]
-            .into_iter()
-            .chain(SMART_CHECKS.iter().copied().map(Some))
-        {
-            for outcome in ["ready", "stale", "expired", "unavailable", "failed"] {
-                let mut input =
-                    serde_json::json!({"kind":"burnCheckPromptPrepared", "outcome":outcome});
-                if let Some(check) = check {
-                    input["check"] = check.into();
-                }
-                let interaction: Interaction = serde_json::from_value(input)
-                    .expect("Authored prompt preparation uses closed interaction values");
-                assert_smart_check_payload(
-                    interaction.resolve(),
-                    "antiburn.burn_check_prompt_prepared",
-                    check,
-                    Some(outcome),
-                );
-            }
-            let mut input = serde_json::json!({"kind":"burnCheckPromptCopied"});
-            if let Some(check) = check {
-                input["check"] = check.into();
-            }
-            let interaction: Interaction = serde_json::from_value(input)
-                .expect("Authored prompt copy uses a supported check value");
-            assert_smart_check_payload(
+    fn prompt_payloads_carry_only_the_generic_action_outcome() {
+        for outcome in ["ready", "stale", "expired", "unavailable", "failed"] {
+            let interaction: Interaction = serde_json::from_value(serde_json::json!({
+                "kind":"burnCheckPromptPrepared", "outcome":outcome,
+            }))
+            .expect("Prompt preparation uses a closed outcome");
+            assert_closed_payload(
                 interaction.resolve(),
-                "antiburn.burn_check_prompt_copied",
-                check,
+                "antiburn.burn_check_prompt_prepared",
                 None,
+                Some(outcome),
             );
         }
+        let interaction: Interaction =
+            serde_json::from_value(serde_json::json!({"kind":"burnCheckPromptCopied"}))
+                .expect("Prompt copy carries no properties");
+        assert_closed_payload(
+            interaction.resolve(),
+            "antiburn.burn_check_prompt_copied",
+            None,
+            None,
+        );
     }
 
     #[test]
-    fn smart_check_contracts_reject_private_fields_and_unknown_values() {
+    fn prompt_contracts_reject_check_labels_private_fields_and_unknown_values() {
         let interactions = [
-            serde_json::json!({"kind":"smartCheckObserved", "check":"scope_creep", "observation":"finding_visible"}),
-            serde_json::json!({"kind":"burnCheckPromptPrepared", "check":"over_exploring", "outcome":"ready"}),
-            serde_json::json!({"kind":"burnCheckPromptCopied", "check":"skill_opportunities"}),
-            serde_json::json!({"kind":"ignoredInstructionObserved", "stage":"evidence", "outcome":"available"}),
+            serde_json::json!({"kind":"burnCheckPromptPrepared", "outcome":"ready"}),
+            serde_json::json!({"kind":"burnCheckPromptCopied"}),
         ];
         for input in &interactions {
-            for field in ["check", "observation", "outcome", "stage"] {
-                if input.get(field).is_some() {
-                    let mut invalid = input.clone();
-                    invalid[field] = "private_unknown_value".into();
-                    assert!(serde_json::from_value::<Interaction>(invalid).is_err());
-                }
+            for check in RETIRED_CHECKS
+                .iter()
+                .copied()
+                .chain(["arbitrary_yaml_check"])
+            {
+                let mut invalid = input.clone();
+                invalid["check"] = check.into();
+                assert!(serde_json::from_value::<Interaction>(invalid).is_err());
             }
+            let mut invalid = input.clone();
+            invalid["check"] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<Interaction>(invalid).is_err());
         }
         for field in [
+            "unknownField",
+            "label",
+            "detail",
+            "observation",
+            "stage",
+            "outcome",
             "content",
             "prompt",
             "excerpt",
@@ -2446,27 +2364,74 @@ mod tests {
                 );
             }
         }
+        for outcome in [
+            "private_unknown_value",
+            "execution_clean",
+            "backfill_failed",
+        ] {
+            assert!(
+                serde_json::from_value::<Interaction>(serde_json::json!({
+                    "kind":"burnCheckPromptPrepared", "outcome":outcome,
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]
-    fn ignored_instruction_interactions_accept_only_closed_statuses() {
-        let interaction: Interaction = serde_json::from_str(
-            r#"{"kind":"ignoredInstructionObserved","stage":"evidence","outcome":"available"}"#,
-        )
-        .expect("Authored ignored instruction interaction uses closed status values");
-        let (name, facts) = interaction.resolve();
-        assert_eq!(name.as_str(), "antiburn.ignored_instruction_observed");
-        assert_eq!(facts.label, Some("evidence"));
-        assert_eq!(facts.detail, Some("available"));
-        assert!(facts.unrecognized_types.is_none());
-        assert!(serde_json::from_str::<Interaction>(
-            r#"{"kind":"ignoredInstructionObserved","stage":"evidence","outcome":"private_text"}"#
-        )
-        .is_err());
-        assert!(serde_json::from_str::<Interaction>(
-            r#"{"kind":"ignoredInstructionObserved","stage":"evidence","outcome":"available","excerpt":"private"}"#
-        )
-        .is_err());
+    fn retired_reader_interactions_and_native_lifecycle_payloads_are_rejected() {
+        for check in RETIRED_CHECKS {
+            for observation in [
+                "finding_visible",
+                "evidence_available",
+                "evidence_unavailable",
+                "evidence_failed",
+            ] {
+                assert!(
+                    serde_json::from_value::<Interaction>(serde_json::json!({
+                        "kind":"smartCheckObserved", "check":check, "observation":observation,
+                    }))
+                    .is_err()
+                );
+            }
+        }
+        for stage in ["finding", "evidence", "prompt"] {
+            for outcome in ["visible", "available", "unavailable", "failed", "copied"] {
+                assert!(
+                    serde_json::from_value::<Interaction>(serde_json::json!({
+                        "kind":"ignoredInstructionObserved", "stage":stage, "outcome":outcome,
+                    }))
+                    .is_err()
+                );
+            }
+        }
+        for kind in [
+            "ignoredInstructionLifecycle",
+            "smartCheckLifecycle",
+            "modelCheckLifecycle",
+        ] {
+            for (label, detail) in [
+                ("enablement", "enabled"),
+                ("jev", "provider_saved"),
+                ("jev", "connection_removed"),
+                ("history_window", "future"),
+                ("backfill", "requested"),
+                ("execution", "completed"),
+                ("scope_creep", "execution_clean"),
+            ] {
+                assert!(
+                    serde_json::from_value::<Interaction>(serde_json::json!({
+                        "kind":kind, "label":label, "detail":detail,
+                    }))
+                    .is_err()
+                );
+            }
+        }
+        assert!(
+            !EVERY_EVENT
+                .iter()
+                .any(|name| name.as_str() == "antiburn.ignored_instruction_observed")
+        );
     }
 
     #[test]
@@ -2954,6 +2919,34 @@ mod tests {
     /// User-origin events refresh the timeout; automatic and background
     /// telemetry does not.
     #[test]
+    fn cli_outcomes_have_only_closed_dimensions() {
+        assert!(
+            serde_json::from_value::<Interaction>(serde_json::json!({
+                "kind": "cliOperationCompleted", "label": "startup", "detail": "succeeded"
+            }))
+            .is_err()
+        );
+        for (operation, label) in [
+            (CliOperation::Startup, "startup"),
+            (CliOperation::Test, "test"),
+            (CliOperation::Repair, "repair"),
+        ] {
+            for succeeded in [false, true] {
+                let facts = cli_operation_facts(operation, succeeded);
+                assert_eq!(facts.label, Some(label));
+                assert_eq!(
+                    facts.detail,
+                    Some(if succeeded { "succeeded" } else { "failed" })
+                );
+                assert_eq!(
+                    EventName::CliOperationCompleted.is_user_oriented(&facts),
+                    label != "startup"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn user_oriented_classification_excludes_automatic_events() {
         assert!(EventName::SessionOpened.is_user_oriented(&Facts::default()));
         assert!(EventName::SettingToggled.is_user_oriented(&Facts::default()));
@@ -3003,64 +2996,33 @@ mod tests {
         }
     }
 
-    /// Settings-driven Smart Check outcomes are user activity; assessments,
-    /// live or backfilled, are background work whatever the check.
     #[test]
-    fn smart_check_assessments_never_refresh_the_session() {
+    fn model_check_settings_outcomes_refresh_the_session() {
         let mut lifecycles = vec![
-            (SmartCheckLifecycle::Enablement { enabled: true }, true),
-            (SmartCheckLifecycle::Enablement { enabled: false }, true),
+            ModelCheckLifecycle::Enablement { enabled: true },
+            ModelCheckLifecycle::Enablement { enabled: false },
         ];
         for provider in [
-            SmartCheckProvider::Jev,
-            SmartCheckProvider::Cloudflare,
-            SmartCheckProvider::Ollama,
-            SmartCheckProvider::Custom,
+            DecisionProvider::Jev,
+            DecisionProvider::Cloudflare,
+            DecisionProvider::Ollama,
+            DecisionProvider::Custom,
         ] {
             for outcome in [
                 ProviderSetupOutcome::Saved,
                 ProviderSetupOutcome::Switched,
+                ProviderSetupOutcome::ConnectionRemoved,
                 ProviderSetupOutcome::CredentialRemoved,
             ] {
-                lifecycles.push((
-                    SmartCheckLifecycle::ProviderSetup { provider, outcome },
-                    true,
-                ));
+                lifecycles.push(ModelCheckLifecycle::ProviderSetup { provider, outcome });
             }
             for outcome in [ProviderTestOutcome::Succeeded, ProviderTestOutcome::Failed] {
-                lifecycles.push((
-                    SmartCheckLifecycle::ProviderTest { provider, outcome },
-                    true,
-                ));
+                lifecycles.push(ModelCheckLifecycle::ProviderTest { provider, outcome });
             }
         }
-        for check in [
-            SmartCheck::IgnoredInstructions,
-            SmartCheck::ScopeCreep,
-            SmartCheck::OverExploring,
-            SmartCheck::SkillOpportunities,
-        ] {
-            for outcome in [
-                SmartCheckAssessmentOutcome::Finding,
-                SmartCheckAssessmentOutcome::Clean,
-                SmartCheckAssessmentOutcome::Abstained,
-                SmartCheckAssessmentOutcome::Failed,
-            ] {
-                for historical in [false, true] {
-                    lifecycles.push((
-                        SmartCheckLifecycle::Assessment {
-                            check,
-                            outcome,
-                            historical,
-                        },
-                        false,
-                    ));
-                }
-            }
-        }
-        for (lifecycle, user) in lifecycles {
+        for lifecycle in lifecycles {
             let (name, facts) = lifecycle.resolve();
-            assert_eq!(name.is_user_oriented(&facts), user, "{lifecycle:?}");
+            assert!(name.is_user_oriented(&facts), "{lifecycle:?}");
         }
     }
 
@@ -3073,7 +3035,8 @@ mod tests {
     fn no_variant_escapes_the_catalog() {
         fn listed(event: EventName) -> bool {
             match event {
-                EventName::AppLaunched
+                EventName::CliOperationCompleted
+                | EventName::AppLaunched
                 | EventName::ScanCompleted
                 | EventName::SettingToggled
                 | EventName::AnalyticsOptedOut
@@ -3096,6 +3059,7 @@ mod tests {
                 | EventName::BurnCheckOutcomeObserved
                 | EventName::BurnCheckInputPrepared
                 | EventName::BurnCheckDefinitionOpened
+                | EventName::BurnCheckDirectoryOpened
                 | EventName::ProjectFolderAction
                 | EventName::MemoryAction
                 | EventName::SessionFilterSelected
@@ -3110,27 +3074,26 @@ mod tests {
                 | EventName::NavigationHistoryMoved
                 | EventName::AppSearchOpened
                 | EventName::AppSearchResultOpened
+                | EventName::PromotionInteraction
                 | EventName::InterfaceScaleChanged
                 | EventName::FirstRunStepReached
                 | EventName::FirstRunAction
                 | EventName::FirstRunFinished
+                | EventName::ModelCheckLifecycle
                 | EventName::CheckEnablementSaved
                 | EventName::StepSettingsViewed => true,
-                EventName::IgnoredInstructionObserved | EventName::IgnoredInstructionLifecycle => {
-                    true
-                }
             }
         }
         assert_eq!(
             EVERY_EVENT.len(),
-            45,
+            47,
             "a variant was added to the match above but not to EVERY_EVENT"
         );
         assert!(EVERY_EVENT.iter().copied().all(listed));
     }
 
     #[test]
-    fn check_enablement_ids_cover_every_detector_with_stable_values() {
+    fn check_enablement_ids_cover_all_nine_detectors_with_stable_values() {
         use antiburn_local::checks::DetectorId;
 
         let values: Vec<_> = DetectorId::ALL
@@ -3150,28 +3113,30 @@ mod tests {
                 "old_model_usage",
                 "overuse_of_fast_mode",
                 "cache_churn",
-                "ignored_instructions",
-                "skill_opportunities",
-                "over_exploring",
-                "scope_creep",
             ]
         );
+        for key in RETIRED_CHECKS {
+            assert!(DetectorId::from_key(key).is_none(), "{key}");
+        }
     }
 
     #[test]
     fn check_enablement_facts_carry_only_check_and_saved_state() {
         use antiburn_local::checks::DetectorId;
 
-        let enabled = check_enablement_facts(DetectorId::UnusedSkills, true);
-        assert_eq!(enabled.label, Some("unused_skills"));
-        assert_eq!(enabled.detail, Some("enabled"));
-        assert!(enabled.bucket.is_none());
-        assert!(enabled.origin.is_none());
-
-        let disabled = check_enablement_facts(DetectorId::IgnoredInstructions, false);
-        assert_eq!(disabled.label, Some("ignored_instructions"));
-        assert_eq!(disabled.detail, Some("disabled"));
-        assert!(disabled.unrecognized_types.is_none());
+        for detector in DetectorId::ALL {
+            for enabled in [false, true] {
+                let facts = check_enablement_facts(detector, enabled);
+                let name = EventName::CheckEnablementSaved;
+                assert!(name.is_user_oriented(&facts));
+                assert_closed_payload(
+                    (name, facts),
+                    "antiburn.check_enablement_saved",
+                    Some(detector.key()),
+                    Some(if enabled { "enabled" } else { "disabled" }),
+                );
+            }
+        }
     }
 
     /// The public catalog in `docs/analytics.md` is a promise to a
@@ -3754,6 +3719,105 @@ mod tests {
                 serde_json::from_value::<Interaction>(value.clone()).is_err(),
                 "{value}"
             );
+        }
+    }
+
+    #[test]
+    fn promotion_views_do_not_extend_user_activity() {
+        for action in [
+            PromotionAction::AnnouncementViewed,
+            PromotionAction::SetupViewed,
+            PromotionAction::PrimaryActivated,
+            PromotionAction::LearnMoreActivated,
+            PromotionAction::CommandCopied,
+            PromotionAction::Dismissed,
+        ] {
+            let (name, facts) = Interaction::PromotionUsed {
+                campaign: PromotionCampaign::ClaudeMod,
+                action,
+                origin: Origin::Automatic,
+            }
+            .resolve();
+            assert_eq!(
+                name.is_user_oriented(&facts),
+                !matches!(
+                    action,
+                    PromotionAction::AnnouncementViewed | PromotionAction::SetupViewed
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn promotion_interactions_resolve_only_closed_actions_and_origins() {
+        let cases = [
+            (PromotionAction::AnnouncementViewed, "announcement_viewed"),
+            (PromotionAction::SetupViewed, "setup_viewed"),
+            (PromotionAction::PrimaryActivated, "primary_activated"),
+            (PromotionAction::LearnMoreActivated, "learn_more_activated"),
+            (PromotionAction::CommandCopied, "command_copied"),
+            (PromotionAction::Dismissed, "dismissed"),
+        ];
+
+        for (action, label) in cases {
+            for origin in [Origin::User, Origin::Automatic] {
+                let (name, facts) = Interaction::PromotionUsed {
+                    campaign: PromotionCampaign::ClaudeMod,
+                    action,
+                    origin,
+                }
+                .resolve();
+                assert_eq!(name, EventName::PromotionInteraction);
+                assert_eq!(name.as_str(), "antiburn.promotion_interaction");
+                assert_eq!(facts.label, Some(label));
+                assert_eq!(facts.origin, Some(origin.as_str()));
+                assert_eq!(facts.detail, Some("claude_mod"));
+            }
+        }
+
+        let valid = serde_json::json!({
+            "kind": "promotionInteraction",
+            "campaign": "claude_mod",
+            "action": "command_copied",
+            "origin": "user"
+        });
+        let decoded = serde_json::from_value::<Interaction>(valid.clone()).unwrap();
+        assert_eq!(decoded.resolve().1.detail, Some("claude_mod"));
+        for campaign in [
+            serde_json::json!("unregistered"),
+            serde_json::json!(null),
+            serde_json::json!(12),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["campaign"] = campaign;
+            assert!(serde_json::from_value::<Interaction>(invalid).is_err());
+        }
+        let mut missing_campaign = valid;
+        missing_campaign.as_object_mut().unwrap().remove("campaign");
+        assert!(serde_json::from_value::<Interaction>(missing_campaign).is_err());
+
+        for value in [
+            serde_json::json!({
+                "kind": "promotionInteraction",
+                "campaign": "claude_mod",
+                "action": "installed",
+                "origin": "user"
+            }),
+            serde_json::json!({
+                "kind": "promotionInteraction",
+                "campaign": "claude_mod",
+                "action": "command_copied",
+                "origin": "launch_background"
+            }),
+            serde_json::json!({
+                "kind": "promotionInteraction",
+                "campaign": "claude_mod",
+                "action": "command_copied",
+                "origin": "user",
+                "command": "private command text"
+            }),
+        ] {
+            assert!(serde_json::from_value::<Interaction>(value).is_err());
         }
     }
 }

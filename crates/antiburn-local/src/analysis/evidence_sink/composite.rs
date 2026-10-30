@@ -25,6 +25,51 @@ fn user_message_identity(request: &UserMessage) -> Option<String> {
 }
 
 impl CompositeSink {
+    pub(super) fn native_prefix(
+        &self,
+        source_format: crate::analysis::SourceFormat,
+        session_id: &str,
+        position: crate::analysis::ToolResultPosition,
+        bounded: bool,
+    ) -> (Vec<UserMessage>, bool) {
+        if self.native_admission_failure.is_some() {
+            return (Vec::new(), false);
+        }
+        let matching = self.user_messages.iter().filter(|request| {
+            request.source_format == source_format
+                && request.session_id == session_id
+                && match (request.position, position) {
+                    (
+                        crate::analysis::UserMessagePosition::Jsonl {
+                            record_index: request,
+                        },
+                        crate::analysis::ToolResultPosition::Jsonl { record_index, .. },
+                    ) => request < record_index,
+                    _ => true,
+                }
+        });
+        let mut prefix = Vec::new();
+        let mut prefix_bytes = 0usize;
+        let mut clipped = false;
+        for request in matching.rev() {
+            let bytes = request
+                .parts
+                .iter()
+                .map(|part| part.text.len())
+                .sum::<usize>();
+            if bounded
+                && (prefix.len() >= 256 || bytes > (1024 * 1024usize).saturating_sub(prefix_bytes))
+            {
+                clipped = true;
+                break;
+            }
+            prefix_bytes += bytes;
+            prefix.push(request.clone());
+        }
+        prefix.reverse();
+        (prefix, clipped)
+    }
+
     pub fn new(metrics: SessionMetricsAccumulator, evidence: SessionEvidenceAccumulator) -> Self {
         Self {
             metrics,
@@ -32,6 +77,7 @@ impl CompositeSink {
             turn_rows: None,
             summary: None,
             pre_finish: None,
+            pending_native_finish: None,
             tool_result_observations: Vec::new(),
             tool_result_observation_sizes: Vec::new(),
             native_tool_result_indices: HashMap::new(),
@@ -43,6 +89,10 @@ impl CompositeSink {
             user_message_conflicts: BTreeSet::new(),
             user_messages_bytes: 0,
             user_messages_complete: true,
+            native_evidence: Vec::new(),
+            native_evidence_bytes: 0,
+            native_evidence_complete: true,
+            native_admission_failure: None,
         }
     }
 
@@ -60,6 +110,7 @@ impl CompositeSink {
             turn_rows: Some(turn_rows),
             summary: None,
             pre_finish: None,
+            pending_native_finish: None,
             tool_result_observations: Vec::new(),
             tool_result_observation_sizes: Vec::new(),
             native_tool_result_indices: HashMap::new(),
@@ -71,6 +122,10 @@ impl CompositeSink {
             user_message_conflicts: BTreeSet::new(),
             user_messages_bytes: 0,
             user_messages_complete: true,
+            native_evidence: Vec::new(),
+            native_evidence_bytes: 0,
+            native_evidence_complete: true,
+            native_admission_failure: None,
         }
     }
 
@@ -106,6 +161,86 @@ impl CompositeSink {
         self.user_messages_complete
     }
 
+    pub fn native_evidence(&self) -> &[crate::analysis::NativeEvidenceEvent] {
+        &self.native_evidence
+    }
+
+    pub fn native_evidence_complete(&self) -> bool {
+        self.native_evidence_complete
+    }
+
+    pub fn restore_native_evidence(&mut self, snapshot: &StreamSnapshot) {
+        self.native_evidence.clear();
+        self.native_evidence_bytes = 0;
+        self.native_evidence_complete = snapshot.native_evidence_complete;
+        let Ok(failure) = snapshot
+            .native_admission_failure_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+        else {
+            self.native_evidence_complete = false;
+            return;
+        };
+        self.native_admission_failure = failure;
+        for json in &snapshot.native_evidence_json {
+            match serde_json::from_str::<crate::analysis::NativeEvidenceEvent>(json) {
+                Ok(event) => {
+                    if let crate::analysis::NativeEvidenceFact::AdmissionFailure(failure) =
+                        &event.fact
+                    {
+                        self.native_admission_failure(failure.clone());
+                    }
+                    self.retain_native_evidence(event.fact);
+                }
+                Err(_) => self.native_evidence_complete = false,
+            }
+        }
+    }
+
+    pub(super) fn retain_native_evidence(&mut self, mut fact: crate::analysis::NativeEvidenceFact) {
+        if let Some(failure) = &self.native_admission_failure {
+            fact.invalidate_admission(failure.reason);
+        }
+        let event = crate::analysis::NativeEvidenceEvent {
+            fact,
+            live_eligible: false,
+        };
+        if self.native_evidence.iter().any(|prior| prior == &event) {
+            return;
+        }
+        let size = serde_json::to_vec(&event)
+            .expect("native evidence encodes")
+            .len();
+        if size > MAX_NATIVE_EVIDENCE_BYTES {
+            self.native_evidence_complete = false;
+            return;
+        }
+        while !self.native_evidence.is_empty()
+            && (self.native_evidence.len() >= MAX_NATIVE_EVIDENCE_OBSERVATIONS
+                || self.native_evidence_bytes + size > MAX_NATIVE_EVIDENCE_BYTES)
+        {
+            let old = self.native_evidence.remove(0);
+            self.native_evidence_bytes -= serde_json::to_vec(&old)
+                .expect("native evidence encodes")
+                .len();
+            self.native_evidence_complete = false;
+        }
+        let index = self
+            .native_evidence
+            .iter()
+            .position(|prior| {
+                prior.fact.binding() == event.fact.binding()
+                    && crate::analysis::public_events::compare_positions(
+                        event.fact.position(),
+                        prior.fact.position(),
+                    ) == Some(std::cmp::Ordering::Less)
+            })
+            .unwrap_or(self.native_evidence.len());
+        self.native_evidence_bytes += size;
+        self.native_evidence.insert(index, event);
+    }
+
     /// Restores native tool-result state from a prior resume snapshot.
     /// Call this before recording new results for the resumed stream. Exact
     /// replays then deduplicate against the restored observations. Invalid
@@ -113,6 +248,7 @@ impl CompositeSink {
     /// retained, and they make the collection incomplete. The snapshot's
     /// existing incomplete state and conflict identities are also restored.
     pub fn restore_tool_result_observations(&mut self, snapshot: &StreamSnapshot) {
+        self.restore_native_evidence(snapshot);
         self.tool_result_observations.clear();
         self.tool_result_observation_sizes.clear();
         self.native_tool_result_indices.clear();
@@ -292,7 +428,14 @@ impl CompositeSink {
         self.user_messages_complete = false;
     }
 
-    pub(super) fn observe_native_tool_result(&mut self, result: ToolResultObservation) {
+    pub(super) fn observe_native_tool_result(&mut self, mut result: ToolResultObservation) {
+        if let Some(failure) = &self.native_admission_failure {
+            result.completeness = failure.reason;
+            if let Some(context) = &mut result.context {
+                context.main_session = false;
+                context.complete_through_event = false;
+            }
+        }
         if self.native_tool_result_conflicts.contains("") {
             self.tool_result_observations_complete = false;
             return;
@@ -512,6 +655,16 @@ impl CompositeSink {
                 .collect(),
             user_message_conflicts: self.user_message_conflicts.iter().cloned().collect(),
             user_messages_complete: self.user_messages_complete,
+            native_evidence_json: self
+                .native_evidence
+                .iter()
+                .map(|event| serde_json::to_string(event).expect("native evidence encodes"))
+                .collect(),
+            native_evidence_complete: self.native_evidence_complete,
+            native_admission_failure_json: self
+                .native_admission_failure
+                .as_ref()
+                .map(|failure| serde_json::to_string(failure).expect("admission state encodes")),
         })
     }
 }

@@ -52,7 +52,7 @@ test('presentation is truthful, bounded, and contains no terminal controls', () 
 })
 
 test('real executable discovery follows links but never executes its candidate', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'antiburn-shell-test-'))
+  const dir = await mkdtemp(join(tmpdir(), 'antiburn-core-plugin-test-'))
   try {
     const bin = join(dir, 'bin with spaces;$(never)')
     await mkdir(bin)
@@ -131,11 +131,27 @@ test('Windows searches PATHEXT as files without executing candidates', async () 
     },
   })
   assert.equal(result.state, 'found')
-  assert.deepEqual(paths, ['C:\\bin\\antiburn.COM', 'C:\\bin\\antiburn.EXE'])
+  assert.deepEqual(paths, ['C:\\bin\\antiburn-cli.COM', 'C:\\bin\\antiburn-cli.EXE'])
   assert.equal(
     (await discover({ platform: 'win32', env: { PATH: '\\\\server\\share' } })).state,
     'unavailable',
   )
+})
+
+test('discovery accepts the runtime name and the legacy compatibility export', async () => {
+  for (const name of ['antiburn-cli', 'antiburn']) {
+    const expected = `/compatibility/bin/${name}`
+    assert.equal(
+      (
+        await discover({
+          platform: 'darwin',
+          env: { PATH: '/compatibility/bin' },
+          probe: async (candidate) => candidate === expected,
+        })
+      ).state,
+      'found',
+    )
+  }
 })
 
 test('session guard reserves before async work and persists across reload owners', async () => {

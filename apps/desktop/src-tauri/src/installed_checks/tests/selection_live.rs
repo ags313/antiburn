@@ -86,6 +86,9 @@ async fn opencode_progress_lifecycles_reach_one_assessment_across_store_and_host
     std::fs::create_dir_all(&project).unwrap();
     std::fs::write(global.join("failed-retry-loop.yml"), CHECK).unwrap();
     let store = Arc::new(Store::open(&state).unwrap());
+    store
+        .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+        .unwrap();
     store.replace_repositories(&[repository(&project)]).unwrap();
     let mut source = SyntheticJournal::new(16);
     source.index(&store, project.to_str().unwrap());

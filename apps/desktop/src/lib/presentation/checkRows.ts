@@ -9,6 +9,8 @@ import { CHECK_LABELS } from "./checkDefinitions"
 export interface InstalledCheckRow extends Omit<ChecksCategoryPayload, "id"> {
   id: InstalledCheckId
   installed: InstalledCheckReportPayload
+  checking: boolean
+  checkingCount: number
   reviewFailed: number
   reviewedWithoutStatus: number
 }
@@ -34,13 +36,8 @@ export function checkRows(report: ChecksReportPayload): CheckRow[] {
       unavailable: installed.unavailable,
       reviewFailed: installed.reviewFailed,
       reviewedWithoutStatus: installed.reviewedWithoutStatus,
-      lifecycle:
-        installed.finding > 0
-          ? "failing"
-          : installed.clean > 0 || installed.hasStarted || installed.checkingCount > 0
-            ? "passing"
-            : null,
-      checking: installed.checkingCount > 0,
+      lifecycle: installed.finding > 0 ? "failing" : installed.clean > 0 ? "passing" : null,
+      checking: installed.availability.status === "available" && installed.checkingCount > 0,
       checkingCount: installed.checkingCount,
       agents: installed.agents,
       estimatedTokenBurnBasisPoints: null,

@@ -16,17 +16,34 @@ Thank you for contributing.
 ## Privacy and safety
 
 antiburn keeps its session index locally and needs no project-operated account.
-**Model-based Checks** controls YAML discovery and activation in Settings → Checks.
-**Decision model** exposes Jev only. Definitions select tool results and available
-user-slot text under the [supported subset](docs/burn-check/authoring.md#supported-subset).
-Selected arguments, results, messages, and paths can leave the machine in provider
-requests and can contain private data. Do not upload full transcripts or private
-thinking. Keep provider inputs, responses, credentials, findings, evidence, and
+**Run checks** under Settings → Checks → Model-based checks controls YAML check
+activation. Turning it off does not stop local definition discovery. The app can
+read and parse bounded YAML files and watch their directories, including at cold
+startup, to show names, invalid-file diagnostics, paused check cards, and file
+counts. That discovery does not restore provider configuration, discover model
+capabilities, catch up session sources, or run local/model assessments. Keep the
+existing limits of 256 KiB per definition and 128 files per folder, plus
+directory-access gates.
+The provider controls under **Model-based checks** select the active System One connection: Jev, compatible
+Ollama, Cloudflare, or Custom. Settings owns routing; decision-level YAML `model`
+is an unknown field, not a migration input. Observed coding-agent model fields
+remain evidence, not routing controls. Definitions select available public
+messages, tool calls and results, response-cycle or session facts, current
+instruction text, and declared skill descriptions under
+the [supported subset](docs/burn-check/authoring.md#supported-subset). Selected
+arguments, results, messages, inventories, and paths can leave the machine in
+provider requests and can contain private data. Do not upload full transcripts
+or private thinking. Collect declared descriptions, not full skill bodies, for
+skill inventory inputs. Selected tool results can still contain file text. Keep provider inputs, responses,
+credentials, findings, evidence, and
 native record/call IDs out of first-party analytics. Store only bounded local
-usage aggregates, including the model and price version used for estimates.
+usage aggregates, including the actual provider, model, and price version used
+for estimates. Keep unpriced usage distinct in stored accounting; Settings omits
+absent estimates rather than showing zero. A matching model name does not
+make a Custom or Cloudflare request a TypeSafe-priced request.
 Do not retain request histories or session identifiers for billing summaries.
-Session deletion keeps already-incurred totals. Clear Local Data removes them
-and the rolling usage reservations.
+Session deletion keeps already-incurred totals. **Clear index…** in Settings →
+Privacy removes them and local usage records.
 
 Terminal result state does not prove complete content or history. Preserve usable
 partial evidence with explicit quality fields. Unsafe identity, scope, order, and
@@ -41,14 +58,18 @@ incurred charges. Explicit status success covers assessed work only, not repair,
 whole-session cleanliness, verification, or savings. A probability threshold is
 author policy, not an accuracy guarantee.
 
-Built-in Ignored Instructions, Scope Creep, Over-exploring, and Skill Opportunities
-execution and historical enrollment are suspended. Their saved results,
-preferences, source capabilities, and provider implementations remain. Keep
-engine/helper capability separate from product reachability in coverage claims.
+Validate YAML language support separately from selected-connection capabilities.
+Check criterion count, label-probability support, and confidence support without
+substituting one for another. A provider feature does not enable unsupported YAML
+syntax. Numeric limits cannot bypass failed discovery or establish output support.
+See the [connection contract](docs/burn-check/authoring.md#decision-connections)
+for setup and provider limits.
+
+Keep shared source capability separate from product reachability in coverage claims.
 Current instruction files cannot prove historical activation, and current skill
 inventory cannot prove historical visibility or whole-session non-use. See
-[the retained built-in contract](docs/smart-burn-checks.md) for implementation
-limits and [session coverage](docs/session-coverage.md) for pinned source shapes.
+[session coverage](docs/session-coverage.md) for pinned source shapes and
+[check coverage](docs/check-coverage.md) for reachable behavior.
 
 Use [Burn Checks authoring](docs/burn-check/authoring.md) for YAML changes and
 [the architecture](docs/burn-check/architecture.md) for ownership boundaries.
@@ -61,11 +82,10 @@ setup completes, Settings → Privacy provides the opt-out, payloads contain no
 work or credentials, identifiers
 rotate, and builds without a configured endpoint send nothing.
 
-The retained four-check analytics contract uses closed values only. Suspension
-does not turn schema acceptance or saved results into new execution coverage.
-Do not map arbitrary YAML identities into fixed native check events. Exclude
-historical assessment outcomes from normal adoption and automatic execution
-rates; measure explicit history separately on versions that support enrollment.
+Model-based check analytics record saved master enablement and provider
+setup/test outcomes with closed values. They do not classify authored YAML checks
+or measure findings, assessment outcomes, or historical runs. Generic prompt
+actions carry no check label. Keep these operations separate from engagement.
 See the [measurement contract](docs/analytics-measurement.md).
 
 Take extra care with operations that modify files, stop processes, or can cost
@@ -105,18 +125,15 @@ pnpm --filter @antiburn/desktop test
 pnpm --filter @antiburn/desktop build
 ```
 
-### Smart Check diagnostics
+### Provider and Burn Check diagnostics
 
-Use the [Rust eval guide](apps/desktop/src-tauri/eval/README.md). Each check has
-an ignored `live` quality eval using shared provider/suite/case/limit/capture
-support and an ignored worker `benchmark_large_sessions` throughput test.
-Credentials come only from the
-authorized shell environment. Select exact cases with `ANTIBURN_EVAL_CASES` and
-bound calls with `ANTIBURN_EVAL_LIMIT`. Reports retain errors, abstentions,
-binding diagnostics, accuracy, usage, and latency. Scores are diagnostics, not
-strict thresholds or delivery gates. No recipe, frozen hash, previous passing
-report, or Python tool is required. Do not run every ignored test; imported
-production transport probes can incur charges.
+Use the [Rust eval guide](apps/desktop/src-tauri/eval/README.md) for shared
+provider protocol validation and isolated YAML replay. Live diagnostics require
+explicit authorization and credentials from the shell environment. Select exact
+cases and bound requests. Captures can contain synthetic inputs, answers, usage,
+errors, and latency. A protocol pass does not prove check quality or native source
+coverage. Do not run every ignored test; production transport probes can incur
+charges.
 
 After coverage edits, run from the repository root:
 

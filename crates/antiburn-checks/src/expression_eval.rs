@@ -1,10 +1,33 @@
-//! Pure runtime evaluation for the compiled expression subset.
+//! Pure, bounded evaluation with source traces and frozen-value identity.
 
-use serde::Serialize;
+use std::borrow::Cow;
+
+use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 
 use crate::diagnostics::DiagnosticCode;
-use crate::expression::{BinaryOperator, Expression, ExpressionLiteral, PathSegment};
+use crate::expression::{
+    AccessSegment, BinaryOperator, Expression, ExpressionLiteral, PathSegment,
+};
+
+#[path = "expression_eval/budget.rs"]
+mod budget;
+#[path = "expression_eval/functions.rs"]
+mod functions;
+#[path = "expression_eval/json.rs"]
+mod json;
+#[path = "expression_eval/value.rs"]
+mod value;
+
+pub use budget::{
+    DEFAULT_MAX_EVALUATION_ITEMS, DEFAULT_MAX_GENERATED_BYTES, DEFAULT_MAX_MATERIALIZED_BYTES,
+    EvaluationBudget,
+};
+pub use value::{
+    EvaluatedValue, EvaluationBindings, EvaluationDependency, EvaluationDependencyKind,
+    EvaluationTrace,
+};
+use value::{RuntimeValue, ValueMetadata};
 
 /// The default maximum recursive expression depth for one evaluation.
 pub const DEFAULT_MAX_EVALUATION_DEPTH: usize = 32;
@@ -21,7 +44,8 @@ pub enum EvaluationValue {
 }
 
 /// Resource limits for one pure expression evaluation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluationLimits {
     /// Maximum expression nesting depth, including unary and binary nodes.
     pub max_depth: usize,
@@ -74,137 +98,337 @@ pub fn evaluate_expression_with_limits(
     context: &Value,
     limits: EvaluationLimits,
 ) -> Result<EvaluationValue, EvaluationError> {
-    let mut evaluator = Evaluator {
-        context,
+    let mut budget = EvaluationBudget::new(
         limits,
-        steps: 0,
-    };
-    evaluator.evaluate(expression, 1).map(|value| value.value)
+        DEFAULT_MAX_EVALUATION_ITEMS,
+        DEFAULT_MAX_GENERATED_BYTES,
+    );
+    evaluate_expression_with_budget(
+        expression,
+        context,
+        &EvaluationBindings::new(),
+        &mut budget,
+        1,
+    )
+    .map(|value| value.value)
 }
 
-struct EvaluatedValue {
-    value: EvaluationValue,
-    origin: Option<Vec<PathSegment>>,
+/// Evaluates one leaf under the assessment's shared budget and alias scope.
+///
+/// The caller passes the current template depth, starting at one.
+pub fn evaluate_expression_with_budget(
+    expression: &Expression,
+    context: &Value,
+    bindings: &EvaluationBindings,
+    budget: &mut EvaluationBudget,
+    depth: usize,
+) -> Result<EvaluatedValue, EvaluationError> {
+    Evaluator {
+        context,
+        bindings,
+        budget,
+    }
+    .evaluate(expression, depth)?
+    .finish(budget, depth)
 }
 
-struct Evaluator<'a> {
+struct Evaluator<'a, 'b> {
     context: &'a Value,
-    limits: EvaluationLimits,
-    steps: usize,
+    bindings: &'a EvaluationBindings,
+    budget: &'b mut EvaluationBudget,
 }
 
-impl Evaluator<'_> {
+impl<'a> Evaluator<'a, '_> {
     fn evaluate(
         &mut self,
         expression: &Expression,
         depth: usize,
-    ) -> Result<EvaluatedValue, EvaluationError> {
-        self.step()?;
-        if depth > self.limits.max_depth {
-            return Err(limit_error(
-                "Expression evaluation exceeded the depth limit.",
-            ));
-        }
+    ) -> Result<RuntimeValue<'a>, EvaluationError> {
+        self.budget.step(depth)?;
         match expression {
-            Expression::Literal(literal) => Ok(EvaluatedValue {
-                value: EvaluationValue::Available(literal_value(literal)),
-                origin: None,
-            }),
-            Expression::Path(path) => self.path(path),
-            Expression::Not(value) => match self.evaluate(value, depth + 1)?.value {
-                EvaluationValue::Available(value) => Ok(EvaluatedValue {
-                    value: EvaluationValue::Available(Value::Bool(!is_truthy(&value))),
-                    origin: None,
-                }),
-                EvaluationValue::Unavailable => Ok(EvaluatedValue {
-                    value: EvaluationValue::Unavailable,
-                    origin: None,
-                }),
-            },
+            Expression::Literal(literal) => {
+                if let ExpressionLiteral::String(text) = literal {
+                    self.budget.reserve_generated_bytes(text.len())?;
+                }
+                Ok(RuntimeValue::owned(
+                    literal_value(literal),
+                    EvaluationTrace::default(),
+                ))
+            }
+            Expression::Path(path) => self.path(path, depth),
+            Expression::Access { base, segments } => {
+                let value = self.evaluate(base, depth + 1)?;
+                self.access(value, segments, depth)
+            }
+            Expression::Call {
+                function,
+                arguments,
+            } => self.call(*function, arguments, depth),
+            Expression::Not(value) => {
+                let value = self.evaluate(value, depth + 1)?;
+                let trace = value.trace();
+                match value.value {
+                    Some(value) => Ok(RuntimeValue::owned(Value::Bool(!is_truthy(&value)), trace)),
+                    None => Ok(RuntimeValue::unavailable(ValueMetadata::derived(trace))),
+                }
+            }
             Expression::Binary {
                 operator,
                 left,
                 right,
             } => {
                 let left_value = self.evaluate(left, depth + 1)?;
-                match (operator, left_value) {
-                    (BinaryOperator::And, value) if matches!(&value.value, EvaluationValue::Available(item) if !is_truthy(item)) => {
-                        Ok(value)
-                    }
-                    (BinaryOperator::Or, value) if matches!(&value.value, EvaluationValue::Available(item) if is_truthy(item)) => {
-                        Ok(value)
-                    }
-                    (BinaryOperator::And | BinaryOperator::Or, value)
-                        if matches!(&value.value, EvaluationValue::Unavailable) =>
-                    {
-                        Ok(value)
-                    }
-                    (BinaryOperator::And | BinaryOperator::Or, _) => {
-                        self.evaluate(right, depth + 1)
-                    }
-                    (operator, left_value) => {
-                        let right_value = self.evaluate(right, depth + 1)?;
-                        Ok(EvaluatedValue {
-                            value: compare(operator, left_value, right_value),
-                            origin: None,
-                        })
-                    }
+                let Some(left_json) = left_value.value.as_ref() else {
+                    return Ok(left_value);
+                };
+                if (*operator == BinaryOperator::And && !is_truthy(left_json))
+                    || (*operator == BinaryOperator::Or && is_truthy(left_json))
+                {
+                    return Ok(left_value);
                 }
+                let mut right_value = self.evaluate(right, depth + 1)?;
+                if matches!(operator, BinaryOperator::And | BinaryOperator::Or) {
+                    right_value.metadata.dependencies.merge(&left_value.trace());
+                    return Ok(right_value);
+                }
+                compare(*operator, left_value, right_value, self.budget)
             }
         }
     }
 
-    fn path(&mut self, path: &[PathSegment]) -> Result<EvaluatedValue, EvaluationError> {
+    fn path(
+        &mut self,
+        path: &[PathSegment],
+        depth: usize,
+    ) -> Result<RuntimeValue<'a>, EvaluationError> {
         let Some((PathSegment::Property(root), remaining)) = path.split_first() else {
-            return Ok(unavailable());
+            return Ok(RuntimeValue::unavailable(ValueMetadata::default()));
         };
-        let mut value = match self.context.get(root) {
-            Some(value) => value,
-            None => return Ok(unavailable()),
-        };
-        for (index, segment) in remaining.iter().enumerate() {
-            self.step()?;
-            value = match (segment, value) {
-                (PathSegment::Property(property), Value::Object(object)) => {
-                    match object.get(property) {
-                        Some(value) => value,
-                        None if property == "length" => {
-                            return Ok(unavailable());
-                        }
-                        None => return Ok(unavailable()),
-                    }
-                }
-                (PathSegment::Property(property), Value::Array(items)) if property == "length" => {
-                    if index + 1 != remaining.len() {
-                        return Ok(unavailable());
-                    }
-                    return Ok(EvaluatedValue {
-                        value: EvaluationValue::Available(Value::Number(Number::from(items.len()))),
-                        origin: None,
-                    });
-                }
-                (PathSegment::Index(index), Value::Array(items)) => match items.get(*index) {
-                    Some(value) => value,
-                    None => return Ok(unavailable()),
+        let mut value = if let Some(binding) = self.bindings.get(root) {
+            RuntimeValue {
+                value: match &binding.value {
+                    EvaluationValue::Available(value) => Some(Cow::Borrowed(value)),
+                    EvaluationValue::Unavailable => None,
                 },
-                _ => return Ok(unavailable()),
-            };
+                metadata: binding.metadata.clone(),
+            }
+        } else {
+            RuntimeValue {
+                value: self
+                    .context
+                    .as_object()
+                    .and_then(|object| object.get(root))
+                    .map(Cow::Borrowed),
+                metadata: ValueMetadata::frozen(vec![PathSegment::Property(root.clone())]),
+            }
+        };
+        for (position, segment) in remaining.iter().enumerate() {
+            self.budget.step(depth.saturating_add(position))?;
+            value = self.select(value, segment);
         }
-        Ok(EvaluatedValue {
-            value: EvaluationValue::Available(value.clone()),
-            origin: Some(path.to_vec()),
-        })
+        Ok(value)
     }
 
-    fn step(&mut self) -> Result<(), EvaluationError> {
-        self.steps = self.steps.saturating_add(1);
-        if self.steps > self.limits.max_steps {
-            return Err(limit_error(
-                "Expression evaluation exceeded the step limit.",
-            ));
+    fn select(&mut self, value: RuntimeValue<'a>, segment: &PathSegment) -> RuntimeValue<'a> {
+        let Some(json) = value.value else {
+            return RuntimeValue::unavailable(value.metadata);
+        };
+        if let (PathSegment::Property(property), Value::Array(items)) = (segment, json.as_ref())
+            && property == "length"
+        {
+            return RuntimeValue::owned(
+                Value::Number(Number::from(items.len())),
+                value.metadata.membership_trace(),
+            );
         }
-        Ok(())
+        let membership =
+            matches!(json.as_ref(), Value::Array(_)).then(|| value.metadata.membership_trace());
+        let mut metadata = value.metadata.child(segment);
+        if let Some(membership) = membership {
+            metadata.dependencies.merge(&membership);
+        }
+        let selected = match json {
+            Cow::Borrowed(value) => match (segment, value) {
+                (PathSegment::Property(property), Value::Object(object)) => {
+                    object.get(property).map(Cow::Borrowed)
+                }
+                (PathSegment::Index(index), Value::Array(items)) => {
+                    items.get(*index).map(Cow::Borrowed)
+                }
+                _ => None,
+            },
+            Cow::Owned(value) => match (segment, value) {
+                (PathSegment::Property(property), Value::Object(mut object)) => {
+                    object.remove(property).map(Cow::Owned)
+                }
+                (PathSegment::Index(index), Value::Array(items)) => {
+                    items.into_iter().nth(*index).map(Cow::Owned)
+                }
+                _ => None,
+            },
+        };
+        RuntimeValue {
+            value: selected,
+            metadata,
+        }
     }
+
+    fn access(
+        &mut self,
+        mut value: RuntimeValue<'a>,
+        segments: &[AccessSegment],
+        depth: usize,
+    ) -> Result<RuntimeValue<'a>, EvaluationError> {
+        for (position, segment) in segments.iter().enumerate() {
+            self.budget.step(depth.saturating_add(position))?;
+            if value.value.is_none() {
+                return Ok(value);
+            }
+            match segment {
+                AccessSegment::Property(property) => {
+                    value = self.select(value, &PathSegment::Property(property.clone()))
+                }
+                AccessSegment::Index(index) => {
+                    value = self.select(value, &PathSegment::Index(*index))
+                }
+                AccessSegment::Dynamic(expression) => {
+                    let selector = self.evaluate(expression, depth + 1)?;
+                    let trace = selector.trace();
+                    value.metadata.dependencies.merge(&trace);
+                    let Some(selector) = selector.value else {
+                        return Ok(RuntimeValue::unavailable(ValueMetadata::derived(
+                            value.trace(),
+                        )));
+                    };
+                    let segment = match selector.as_ref() {
+                        Value::String(key) => {
+                            self.budget.reserve_generated_bytes(key.len())?;
+                            Some(PathSegment::Property(key.clone()))
+                        }
+                        Value::Number(number) => integral_index(number).map(PathSegment::Index),
+                        _ => None,
+                    };
+                    let Some(segment) = segment else {
+                        return Ok(RuntimeValue::unavailable(ValueMetadata::derived(
+                            value.trace(),
+                        )));
+                    };
+                    value = self.select(value, &segment);
+                }
+                AccessSegment::Projection => {
+                    return self.project(value, &segments[position + 1..], depth + 1);
+                }
+            }
+        }
+        Ok(value)
+    }
+
+    fn project(
+        &mut self,
+        value: RuntimeValue<'a>,
+        remaining: &[AccessSegment],
+        depth: usize,
+    ) -> Result<RuntimeValue<'a>, EvaluationError> {
+        self.budget.step(depth)?;
+        let mut dependencies = value.metadata.membership_trace();
+        let Some(json) = value.value else {
+            return Ok(RuntimeValue::unavailable(ValueMetadata::derived(
+                dependencies,
+            )));
+        };
+        let count = match json.as_ref() {
+            Value::Array(items) => items.len(),
+            Value::Object(object) => object.len(),
+            _ => {
+                return Ok(RuntimeValue::unavailable(ValueMetadata::derived(
+                    value.metadata.trace(),
+                )));
+            }
+        };
+        self.budget.visit_items(count)?;
+        self.budget
+            .reserve_generated_bytes(count.saturating_add(2))?;
+        let mut output = Vec::with_capacity(count);
+        let mut item_metadata = Vec::with_capacity(count);
+        let entries: Vec<(PathSegment, Cow<'a, Value>)> = match json {
+            Cow::Borrowed(Value::Array(items)) => items
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (PathSegment::Index(index), Cow::Borrowed(value)))
+                .collect(),
+            Cow::Borrowed(Value::Object(object)) => {
+                for key in object.keys() {
+                    self.budget.reserve_generated_bytes(key.len())?;
+                }
+                let mut entries: Vec<_> = object.iter().collect();
+                entries.sort_unstable_by_key(|(key, _)| *key);
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (PathSegment::Property(key.clone()), Cow::Borrowed(value)))
+                    .collect()
+            }
+            Cow::Owned(Value::Array(items)) => items
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| (PathSegment::Index(index), Cow::Owned(value)))
+                .collect(),
+            Cow::Owned(Value::Object(object)) => {
+                let mut entries: Vec<_> = object.into_iter().collect();
+                entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (PathSegment::Property(key), Cow::Owned(value)))
+                    .collect()
+            }
+            _ => unreachable!("projection type is checked"),
+        };
+        for (segment, item) in entries {
+            let item = RuntimeValue {
+                value: Some(item),
+                metadata: value.metadata.child(&segment),
+            };
+            let selected = self.access(item, remaining, depth)?;
+            if selected.value.is_none() {
+                dependencies.merge(&selected.trace());
+                for metadata in &item_metadata {
+                    dependencies.merge(&ValueMetadata::trace(metadata));
+                }
+                return Ok(RuntimeValue::unavailable(ValueMetadata::derived(
+                    dependencies,
+                )));
+            }
+            let selected = selected.finish(self.budget, depth)?;
+            item_metadata.push(selected.metadata);
+            let EvaluationValue::Available(json) = selected.value else {
+                unreachable!("selected value is available")
+            };
+            output.push(json);
+        }
+        let mut result = RuntimeValue::owned(Value::Array(output), dependencies);
+        result.metadata.items = item_metadata;
+        Ok(result)
+    }
+}
+
+fn integral_index(number: &Number) -> Option<usize> {
+    let number = decimal_value(number)?;
+    if number.negative || number.scale > 0 {
+        return None;
+    }
+    let zeros = usize::try_from(number.scale.checked_neg()?).ok()?;
+    if number.digits.len().checked_add(zeros)? > usize::MAX.to_string().len() {
+        return None;
+    }
+    let mut index = 0usize;
+    for digit in number
+        .digits
+        .iter()
+        .copied()
+        .chain(std::iter::repeat_n(0, zeros))
+    {
+        index = index.checked_mul(10)?.checked_add(usize::from(digit))?;
+    }
+    Some(index)
 }
 
 fn literal_value(literal: &ExpressionLiteral) -> Value {
@@ -230,69 +454,80 @@ pub fn is_truthy(value: &Value) -> bool {
     }
 }
 
-fn compare(
-    operator: &BinaryOperator,
-    left: EvaluatedValue,
-    right: EvaluatedValue,
-) -> EvaluationValue {
-    let (EvaluationValue::Available(left_value), EvaluationValue::Available(right_value)) =
-        (left.value, right.value)
-    else {
-        return EvaluationValue::Unavailable;
+fn compare<'a>(
+    operator: BinaryOperator,
+    left: RuntimeValue<'a>,
+    right: RuntimeValue<'a>,
+    budget: &mut EvaluationBudget,
+) -> Result<RuntimeValue<'a>, EvaluationError> {
+    let mut trace = left.trace();
+    trace.merge(&right.trace());
+    let (Some(left_value), Some(right_value)) = (left.value, right.value) else {
+        return Ok(RuntimeValue::unavailable(ValueMetadata::derived(trace)));
+    };
+    let same_identity = match (&left.metadata.identity, &right.metadata.identity) {
+        (Some(left), Some(right)) => left.same(right),
+        _ => false,
     };
     let result = match operator {
-        BinaryOperator::Equal => equal(
-            &left_value,
-            &right_value,
-            left.origin.is_some() && left.origin == right.origin,
-        ),
-        BinaryOperator::NotEqual => !equal(
-            &left_value,
-            &right_value,
-            left.origin.is_some() && left.origin == right.origin,
-        ),
+        BinaryOperator::Equal => equal(&left_value, &right_value, same_identity, budget)?,
+        BinaryOperator::NotEqual => !equal(&left_value, &right_value, same_identity, budget)?,
         BinaryOperator::Less => {
-            ordered(&left_value, &right_value).is_some_and(|order| order.is_lt())
+            ordered(&left_value, &right_value, budget)?.is_some_and(|order| order.is_lt())
         }
         BinaryOperator::LessOrEqual => {
-            ordered(&left_value, &right_value).is_some_and(|order| !order.is_gt())
+            ordered(&left_value, &right_value, budget)?.is_some_and(|order| !order.is_gt())
         }
         BinaryOperator::Greater => {
-            ordered(&left_value, &right_value).is_some_and(|order| order.is_gt())
+            ordered(&left_value, &right_value, budget)?.is_some_and(|order| order.is_gt())
         }
         BinaryOperator::GreaterOrEqual => {
-            ordered(&left_value, &right_value).is_some_and(|order| !order.is_lt())
+            ordered(&left_value, &right_value, budget)?.is_some_and(|order| !order.is_lt())
         }
         BinaryOperator::And | BinaryOperator::Or => unreachable!("logical operators short-circuit"),
     };
-    EvaluationValue::Available(Value::Bool(result))
+    Ok(RuntimeValue::owned(Value::Bool(result), trace))
 }
 
-fn equal(left: &Value, right: &Value, same_origin: bool) -> bool {
-    match (left, right) {
+fn equal(
+    left: &Value,
+    right: &Value,
+    same_origin: bool,
+    budget: &mut EvaluationBudget,
+) -> Result<bool, EvaluationError> {
+    Ok(match (left, right) {
         (Value::Null, Value::Null) => true,
         (Value::Bool(left), Value::Bool(right)) => left == right,
         (Value::Number(left), Value::Number(right)) => decimal_value(left) == decimal_value(right),
-        (Value::String(left), Value::String(right)) => left.to_lowercase() == right.to_lowercase(),
+        (Value::String(left), Value::String(right)) => {
+            lowercase(left, budget)? == lowercase(right, budget)?
+        }
         (Value::Array(_) | Value::Object(_), Value::Array(_) | Value::Object(_)) => same_origin,
         (left, right) => match (coerce_number(left), coerce_number(right)) {
             (Some(left), Some(right)) => left == right,
             _ => false,
         },
-    }
+    })
 }
 
-fn ordered(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
-    match (left, right) {
+fn ordered(
+    left: &Value,
+    right: &Value,
+    budget: &mut EvaluationBudget,
+) -> Result<Option<std::cmp::Ordering>, EvaluationError> {
+    Ok(match (left, right) {
         (Value::String(left), Value::String(right)) => {
-            Some(left.to_lowercase().cmp(&right.to_lowercase()))
+            Some(lowercase(left, budget)?.cmp(&lowercase(right, budget)?))
         }
-        (Value::Number(left), Value::Number(right)) => {
-            decimal_value(left)?.partial_cmp(&decimal_value(right)?)
-        }
+        (Value::Number(left), Value::Number(right)) => decimal_value(left)
+            .zip(decimal_value(right))
+            .map(|(left, right)| left.cmp(&right)),
         (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
+        _ if std::mem::discriminant(left) != std::mem::discriminant(right) => coerce_number(left)
+            .zip(coerce_number(right))
+            .map(|(left, right)| left.cmp(&right)),
         _ => None,
-    }
+    })
 }
 
 fn coerce_number(value: &Value) -> Option<DecimalNumber> {
@@ -441,11 +676,15 @@ fn parse_exponent(source: &str) -> Option<i64> {
     })
 }
 
-fn unavailable() -> EvaluatedValue {
-    EvaluatedValue {
-        value: EvaluationValue::Unavailable,
-        origin: None,
-    }
+fn lowercase(value: &str, budget: &mut EvaluationBudget) -> Result<String, EvaluationError> {
+    // Contextual final sigma changes the character, not its UTF-8 byte count.
+    let bytes = value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(char::len_utf8)
+        .sum();
+    budget.reserve_generated_bytes(bytes)?;
+    Ok(value.to_lowercase())
 }
 
 fn limit_error(message: &str) -> EvaluationError {
@@ -454,3 +693,92 @@ fn limit_error(message: &str) -> EvaluationError {
         message: message.to_owned(),
     }
 }
+
+fn invalid_error(message: &str) -> EvaluationError {
+    EvaluationError {
+        code: DiagnosticCode::RuntimeInvalidContext,
+        message: message.to_owned(),
+    }
+}
+
+/// Converts a scalar to template text and reserves its bytes before allocation.
+pub fn scalar_text(
+    value: &Value,
+    budget: &mut EvaluationBudget,
+) -> Result<String, EvaluationError> {
+    match value {
+        Value::Null => Ok(String::new()),
+        Value::Bool(value) => {
+            let text = if *value { "true" } else { "false" };
+            budget.reserve_generated_bytes(text.len())?;
+            Ok(text.to_owned())
+        }
+        Value::Number(value) => {
+            use std::fmt::Write;
+            struct ByteCount(usize);
+            impl std::fmt::Write for ByteCount {
+                fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                    self.0 += text.len();
+                    Ok(())
+                }
+            }
+            let mut count = ByteCount(0);
+            write!(&mut count, "{value}").expect("counting bytes cannot fail");
+            budget.reserve_generated_bytes(count.0)?;
+            Ok(value.to_string())
+        }
+        Value::String(value) => {
+            budget.reserve_generated_bytes(value.len())?;
+            Ok(value.clone())
+        }
+        Value::Array(_) | Value::Object(_) => Err(invalid_error(
+            "Arrays and objects require explicit toJSON conversion.",
+        )),
+    }
+}
+
+fn copy_value(
+    value: &Value,
+    budget: &mut EvaluationBudget,
+    depth: usize,
+) -> Result<Value, EvaluationError> {
+    check_copy(value, budget, depth)?;
+    Ok(value.clone())
+}
+
+fn check_copy(
+    value: &Value,
+    budget: &mut EvaluationBudget,
+    depth: usize,
+) -> Result<(), EvaluationError> {
+    budget.step(depth)?;
+    match value {
+        Value::Array(items) => {
+            budget.visit_items(items.len())?;
+            budget.reserve_materialized_bytes(items.len().saturating_add(2))?;
+            for item in items {
+                check_copy(item, budget, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Object(object) => {
+            budget.visit_items(object.len())?;
+            budget.reserve_materialized_bytes(object.len().saturating_add(2))?;
+            for (key, value) in object {
+                budget.reserve_materialized_bytes(key.len().saturating_add(3))?;
+                check_copy(value, budget, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::String(value) => budget.reserve_materialized_bytes(value.len()),
+        _ => budget.reserve_materialized_bytes(32),
+    }
+}
+
+#[cfg(test)]
+#[path = "expression_eval/tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "expression_eval/provenance_tests.rs"]
+mod provenance_tests;

@@ -23,14 +23,19 @@ test('release graphics expose keyboard details without motion, previews or websi
   expect(svg).toContain('.pace:focus')
   expect(svg).toContain('RESETS IN 2H 48M')
   expect(svg).toContain('Even pace: 44% used by now')
-  expect(svg).not.toContain('animation:')
+  expect(svg).not.toContain('@keyframes')
   expect(svg).not.toContain('debug')
   expect(svg).not.toContain('<a ')
   expect(meterDescription({ ...window, percent: null }, now)).toContain('Unavailable')
 })
 
 test('release glyphs escape host labels and keep exceeded percentages exact', () => {
-  const window = { kind: 'five_hour', label: '<host & label>', percent: 105, resetsAt: null }
+  const window = {
+    kind: 'five_hour',
+    label: '<host & label>',
+    percent: 105,
+    resetsAt: null,
+  }
   expect(meterSvg(window, 192, now)).toContain('&lt;host &amp; label&gt;')
   expect(meterDescription(window, now)).toContain('105%')
 })
@@ -38,7 +43,13 @@ test('release glyphs escape host labels and keep exceeded percentages exact', ()
 test('quota interaction presentation retains the existing theme, pace marker and reduced-motion behavior', () => {
   const window = primaryWindow(
     normalizeUsage(
-      [{ kind: 'five_hour', percentUsed: 94, resetsAt: '2026-01-01T02:48:00Z' }],
+      [
+        {
+          kind: 'five_hour',
+          percentUsed: 94,
+          resetsAt: '2026-01-01T02:48:00Z',
+        },
+      ],
       now,
     ),
     'five_hour',
@@ -98,7 +109,13 @@ test('checking dots animate opacity without changing the caption, size, or reduc
 test('unrelated redraws retain the same meter source until visible geometry or copy changes', () => {
   const window = primaryWindow(
     normalizeUsage(
-      [{ kind: 'five_hour', percentUsed: 34, resetsAt: '2026-01-01T03:20:00Z' }],
+      [
+        {
+          kind: 'five_hour',
+          percentUsed: 34,
+          resetsAt: '2026-01-01T03:20:00Z',
+        },
+      ],
       now,
     ),
     'five_hour',
@@ -123,12 +140,12 @@ test('desktop labels and status share smaller primary glyphs and exact dot geome
   expect(svg).toContain('scale(0.014 -0.014)')
   expect(svg).not.toContain('scale(0.015 -0.015)')
   const circles = [
-    ...svg.matchAll(/<circle class="(?:used|off)" cx="([\d.]+)" cy="([\d.]+)" r="([\d.]+)"/g),
+    ...svg.matchAll(/<circle class="off" cx="([\d.]+)" cy="([\d.]+)" r="([\d.]+)"/g),
   ]
   expect(circles.length > 2).toBe(true)
-  expect(circles.every((circle) => Number(circle[3]) === 3.5 && Number(circle[2]) === 9)).toBe(
-    true,
-  )
+  expect(
+    circles.every((circle) => Number(circle[3]) === 3.5 && Number(circle[2]) === 9),
+  ).toBe(true)
   for (let index = 1; index < circles.length; index++) {
     expect(
       Math.abs(Number(circles[index]![1]) - Number(circles[index - 1]![1]) - 11) < 1e-9,
@@ -172,7 +189,7 @@ test('filled desktop dots use a quieter opacity while labels retain their ink', 
     'five_hour',
   )
   const svg = meterSvg(window, 288, now)
-  expect(svg).toContain('.used{fill:#ff5914;fill-opacity:0.85}')
+  expect(svg).toContain('.sweep{opacity:0.85}')
   expect(svg).toContain('.ink{fill:#252525}')
 })
 
@@ -185,14 +202,20 @@ test('desktop whole-number labels and exhaustion colors use the raw limit bounda
   ] as const) {
     const reading = primaryWindow(
       normalizeUsage(
-        [{ kind: 'five_hour', percentUsed: percent, resetsAt: '2026-01-01T02:48:00Z' }],
+        [
+          {
+            kind: 'five_hour',
+            percentUsed: percent,
+            resetsAt: '2026-01-01T02:48:00Z',
+          },
+        ],
         now,
       ),
       'five_hour',
     )
     const svg = meterSvg(reading, 288, now)
     expect(svg).toContain(`5-hour: ${shown}.`)
-    expect(svg).toContain(`.used{fill:${color};fill-opacity:0.85}`)
+    expect(svg).toContain(`.used{fill:${color}}`)
     if (percent >= 100) expect(svg).toContain('stroke="#ed4545"')
     expect(reading.percent).toBe(percent)
   }
@@ -201,7 +224,13 @@ test('desktop whole-number labels and exhaustion colors use the raw limit bounda
 test('desktop pace markers have a crisp subtle shadow only on the right', () => {
   const reading = primaryWindow(
     normalizeUsage(
-      [{ kind: 'five_hour', percentUsed: 34, resetsAt: '2026-01-01T02:48:00Z' }],
+      [
+        {
+          kind: 'five_hour',
+          percentUsed: 34,
+          resetsAt: '2026-01-01T02:48:00Z',
+        },
+      ],
       now,
     ),
     'five_hour',
@@ -219,7 +248,12 @@ test('desktop pace markers have a crisp subtle shadow only on the right', () => 
 
 test('responsive meters retain safe accessible SVG for missing, zero, fractional and exceeded readings', () => {
   for (const percent of [null, 0, 1, 2.5, 27, 55, 99.5, 100, 105]) {
-    const reading = { kind: 'five_hour', label: '<host & label>', percent, resetsAt: null }
+    const reading = {
+      kind: 'five_hour',
+      label: '<host & label>',
+      percent,
+      resetsAt: null,
+    }
     const source = responsiveMeterSvg(reading, now)
     expect(source.length < 131072).toBe(true)
     expect(source).toContain('&lt;host &amp; label&gt;')

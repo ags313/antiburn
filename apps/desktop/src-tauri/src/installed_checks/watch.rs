@@ -36,8 +36,11 @@ impl DirectoryWatcher {
                             changed.store(true, Ordering::Release);
                         }
                     }
-                    Err(error) => {
-                        ::tracing::error!(event = "installed_check_watch_failed", error = %error);
+                    Err(_) => {
+                        ::tracing::error!(
+                            event = "installed_check_watch_failed",
+                            reason = "watch_event_failed"
+                        );
                         changed.store(true, Ordering::Release);
                     }
                 }
@@ -70,8 +73,11 @@ impl DirectoryWatcher {
                 Ok(()) => {
                     self.watched.insert(path);
                 }
-                Err(error) => {
-                    ::tracing::error!(event = "installed_check_watch_failed", path = %path.display(), error = %error)
+                Err(_) => {
+                    ::tracing::error!(
+                        event = "installed_check_watch_failed",
+                        reason = "watch_bind_failed"
+                    )
                 }
             }
         }

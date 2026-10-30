@@ -9,6 +9,7 @@ fn observation(
     provider_executed: Option<bool>,
 ) -> ToolResultObservation {
     ToolResultObservation {
+        facts: None,
         source_format: SourceFormat::OpenCodeSqliteV2,
         session_id: "ses_serialization".into(),
         record_id: Some("msg_serialization".into()),

@@ -164,7 +164,7 @@ fn user_turn_with_content(turn_index: u64, content: &str) -> TurnRow {
 }
 
 #[test]
-fn instruction_epoch_survives_appends_and_resets_for_source_replacement() {
+fn source_resumes_survive_appends_and_follow_source_replacement() {
     let store = store();
     let (record, claim) = claimed_projection(&store, "instruction-epoch-publication", 100, 60);
     let key = record.key.clone();
@@ -189,11 +189,17 @@ fn instruction_epoch_survives_appends_and_resets_for_source_replacement() {
             .publish_projections(&record, None, &completion, &[], &initial_sources)
             .unwrap()
     );
-    let (initial_positions, initial_at) = store
-        .observe_burn_check_instruction_epoch(&key, 1, claim.source_generation, "rules-v1", 10_000)
-        .unwrap();
-    assert_eq!(initial_positions.get("s1"), Some(&1));
-    assert_eq!(initial_positions.get("second"), Some(&0));
+    let source_names = || {
+        store
+            .lock()
+            .prepare("SELECT source_key FROM source_resume ORDER BY source_key")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(source_names(), ["s1", "second"]);
 
     let mut appended_session = session("instruction-epoch-publication", 1_000);
     appended_session.source_fingerprint = Some("sv1:instruction-epoch-append".into());
@@ -248,19 +254,7 @@ fn instruction_epoch_survives_appends_and_resets_for_source_replacement() {
             )
             .unwrap()
     );
-    let (appended_positions, appended_at) = store
-        .observe_burn_check_instruction_epoch(
-            &key,
-            1,
-            append_claim.source_generation,
-            "rules-v1",
-            20_000,
-        )
-        .unwrap();
-    assert_eq!(appended_at, initial_at);
-    assert_eq!(appended_positions.get("s1"), Some(&1));
-    assert_eq!(appended_positions.get("second"), Some(&0));
-    assert_eq!(appended_positions.get("new-source"), Some(&0));
+    assert_eq!(source_names(), ["new-source", "s1", "second"]);
 
     let mut replaced_session = appended_session;
     replaced_session.source_fingerprint = Some("sv1:instruction-epoch-rewrite".into());
@@ -315,17 +309,7 @@ fn instruction_epoch_survives_appends_and_resets_for_source_replacement() {
             )
             .unwrap()
     );
-    let (replacement_positions, replacement_at) = store
-        .observe_burn_check_instruction_epoch(
-            &key,
-            1,
-            replacement_claim.source_generation,
-            "rules-v1",
-            30_000,
-        )
-        .unwrap();
-    assert!(replacement_at > initial_at);
-    assert_eq!(replacement_positions.get("s1"), Some(&3));
+    assert_eq!(source_names(), ["new-source", "s1", "second"]);
 
     let mut removed_session = replaced_session;
     removed_session.source_fingerprint = Some("sv1:instruction-epoch-source-removed".into());
@@ -365,18 +349,7 @@ fn instruction_epoch_survives_appends_and_resets_for_source_replacement() {
             )
             .unwrap()
     );
-    let (remaining_positions, removed_at) = store
-        .observe_burn_check_instruction_epoch(
-            &key,
-            1,
-            removal_claim.source_generation,
-            "rules-v1",
-            40_000,
-        )
-        .unwrap();
-    assert!(removed_at > replacement_at);
-    assert_eq!(remaining_positions.len(), 1);
-    assert_eq!(remaining_positions.get("s1"), Some(&3));
+    assert_eq!(source_names(), ["s1"]);
 }
 
 fn insert_waiting_prompt(store: &Store, remediation_id: &str, target_key: &str) {
@@ -1265,6 +1238,52 @@ fn a_prompt_group_marker_activates_every_selected_action_without_using_other_con
         store.remediation("group-extended").unwrap().unwrap().state,
         RemediationState::WaitingForPromptUse
     );
+}
+
+#[test]
+fn per_attempt_markers_activate_only_selected_rows_from_legacy_prompt_groups() {
+    let store = store();
+    let (record, claim) = claimed_projection(&store, "selected-attempt-markers", 100, 60);
+    for (id, group) in [
+        ("selected-one", "old-group"),
+        ("unselected-one", "old-group"),
+        ("selected-two", "other-group"),
+        ("unselected-two", "other-group"),
+    ] {
+        insert_waiting_prompt_group(&store, id, &format!("target-{id}"), group);
+    }
+    insert_waiting_prompt(&store, "new-selected", "new-selected-target");
+    insert_waiting_prompt(&store, "new-unselected", "new-unselected-target");
+    FencedTurnRowStore::new(store.clone(), record.key.clone(), claim.claim_fence)
+        .write_turn_rows(&[user_turn_with_content(
+            0,
+            "Remediation reference: ABR-selected-one\n\
+             Remediation reference: ABR-selected-two\n\
+             Remediation reference: ABR-new-selected",
+        )])
+        .unwrap();
+    let completion = evidence_completion(
+        &claim,
+        PublishedEvidence::Ready,
+        crate::store::test_support::evidence_json(&claim.key),
+    );
+    assert!(
+        store
+            .publish_projections(&record, None, &completion, &[], &[])
+            .unwrap()
+    );
+    for id in ["selected-one", "selected-two", "new-selected"] {
+        assert_eq!(
+            store.remediation(id).unwrap().unwrap().state,
+            RemediationState::Watching
+        );
+    }
+    for id in ["unselected-one", "unselected-two", "new-unselected"] {
+        assert_eq!(
+            store.remediation(id).unwrap().unwrap().state,
+            RemediationState::WaitingForPromptUse
+        );
+    }
 }
 
 #[test]

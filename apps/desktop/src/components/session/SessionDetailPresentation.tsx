@@ -87,7 +87,7 @@ import type { AgentIconRenderer } from "./orchestration/SubagentRosterRow"
 import { SubagentBadge } from "./orchestration/SubagentBadge"
 import { SessionQuotaSection, type SessionQuotaOpenTarget } from "./SessionQuotaSection"
 import { tokensCardModel, type TokensCostSplit } from "./tokensCard"
-import { smartCheckForDetector, type SessionQuotaPayload } from "../../lib/ipc"
+import type { SessionQuotaPayload } from "../../lib/ipc"
 
 /**
  * Skeleton anti-flash timing. A fast load finishes before the delay elapses,
@@ -756,9 +756,7 @@ export function SessionDetailPresentation({
   const snoozedDetectors = snoozedDetectorIds(snoozes.records)
   const costHygieneChecks =
     snoozes.status === "ready"
-      ? visibleSessionHygieneChecks(sessionHygieneChecks(hygiene), snoozedDetectors).filter(
-          (check) => smartCheckForDetector(check.id) === undefined,
-        )
+      ? visibleSessionHygieneChecks(sessionHygieneChecks(hygiene), snoozedDetectors)
       : []
   const hasAssessedHygieneChecks = costHygieneChecks.some(
     (check) => check.status !== "notAssessed",

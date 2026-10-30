@@ -32,31 +32,6 @@ export interface ChecksCategoryPayload {
   clean: number
   /** Sessions without enough evidence for a finding or clean result. */
   unavailable: number
-  /** True when this check assesses selected evidence. */
-  sampled?: boolean
-  /** True only while this category has queued or running work. */
-  checking?: boolean
-  /** Sessions with queued, running, or resumable continuation work. */
-  checkingCount?: number
-  /** True when the assessment uses incomplete context. */
-  partialContext?: boolean
-  reviewState?: "noMatchingWork" | "stopped"
-  reviewCoverage?: {
-    skipped?: number | null
-    contextBlocked?: number | null
-    /** Terminal review targets, including uncertain answers. */
-    reviewed: number
-    /** Null when any applicable session has a missing or capped target inventory. */
-    total: number | null
-    /** Reviewed targets with an uncertain answer; a subset of reviewed. */
-    uncertain: number | null
-    /** Targets without a terminal answer; does not promise another review. */
-    pending: number | null
-    /** Reviewed targets that wait for task completion, not for a review answer. */
-    pendingCompletion?: number | null
-    /** True only when work can continue and the check is queued or running. */
-    continuing: boolean
-  }
   /** Estimated avoidable tokens divided by total used tokens, in basis points from 0 to 10000. */
   estimatedTokenBurnBasisPoints: number | null
 }
@@ -65,7 +40,6 @@ export type ChecksCategoryLifecycle = "failing" | "awaitingVerification" | "pass
 
 /** The bounded subset of the local report needed by All checks. */
 export interface ChecksReportPayload {
-  smartChecksAvailable?: boolean
   /** False while this report snapshot still has queued or running evidence work. */
   evidenceSettled: boolean
   /** Sessions the report window's denominator counts, regardless of evidence
@@ -116,6 +90,17 @@ export interface InstalledCheckDiagnosticPayload {
   affectedSessionCount: number
 }
 
+export type InstalledCheckEvent =
+  | "toolResult"
+  | "userMessage"
+  | "assistantMessage"
+  | "toolCall"
+  | "message"
+  | "turnEnd"
+  | "sessionStart"
+  | "sessionIdle"
+  | "sessionEvent"
+
 /** Current native-window facts for one logical installed definition. */
 export interface InstalledCheckReportPayload {
   effectiveId: InstalledCheckId
@@ -135,7 +120,7 @@ export interface InstalledCheckReportPayload {
   checkingCount: number
   waitingForDataCount: number
   waitingForResultsCount: number
-  waitingForEvents: { event: "toolResult"; count: number; catchingUp: boolean } | null
+  waitingForEvents: { event: InstalledCheckEvent; count: number; catchingUp: boolean } | null
   agents: string[]
   targets: InstalledCheckTargetPayload[]
   targetsTruncated: boolean
@@ -153,20 +138,15 @@ export interface InstalledCheckTargetPayload {
 }
 
 export type BurnCheckDetectorId =
-  | "scopeCreep"
-  | "overExploring"
   | "sessionsOverDepth"
   | "modelOverthinking"
   | "overpoweredSubagents"
   | "unusedMcpServers"
   | "unusedBuiltInTools"
   | "unusedSkills"
-  | "skillOpportunities"
   | "oldModelUsage"
   | "overuseOfFastMode"
   | "cacheChurn"
-  | "ignoredInstructions"
-  | "skillOpportunities"
 
 type BurnCheckEstimateMethod =
   | "repeatedContextAboveDepthCap"
@@ -227,9 +207,6 @@ type BurnCheckSourceFormat =
   | "uncharacterized"
 
 interface BurnCheckFindingPayload {
-  overExploringReason?:
-    "unrelated_files" | "excessive_file_breadth" | "excessive_within_file_reading"
-  decisionProof?: IgnoredInstructionDecisionProofPayload
   detector: BurnCheckDetectorId
   agent: string
   sourceFormat: BurnCheckSourceFormat
@@ -250,7 +227,6 @@ interface BurnCheckDisplayFactsPayload {
     | "speed"
     | "cache"
   resourceIdentity: string | null
-  instructionTitle?: string | null
   currentValue: string | null
   replacementValue: string | null
   scopeKind: "global" | "project" | "session" | "worker"
@@ -373,39 +349,15 @@ export interface BurnCheckEvidenceItemPayload {
   limitation: string | null
 }
 
-interface IgnoredInstructionDecisionDecisionCoveragePayload {
-  source_complete: boolean
-  selected_history_complete: boolean
-  read_request_inventory_complete: boolean
-  results_excluded: boolean
-  user_authority_excluded: boolean
-  limitations: string[]
-}
-
-interface IgnoredInstructionDecisionCitationPayload {
-  claim: "rule_requirement" | "anchored_action" | "prerequisite_contrast" | "observed_context"
-  source_ids: string[]
-}
-
-interface IgnoredInstructionDecisionProofPayload {
-  contrast: string
-  prerequisite: "not_required" | "earlier_request_absent" | "selected_history_conflict"
-  citations: IgnoredInstructionDecisionCitationPayload[]
-  coverage: IgnoredInstructionDecisionDecisionCoveragePayload
-  contextRevision: string
-}
-
 export interface BurnCheckTargetEvidencePayload {
   status: "available" | "unavailable"
   items: BurnCheckEvidenceItemPayload[]
   comparison?: BurnCheckEvidenceComparisonPayload
-  decisionProof?: IgnoredInstructionDecisionProofPayload
   occurrences?: {
     findingId: string
     status: "available" | "unavailable"
     items: BurnCheckEvidenceItemPayload[]
     comparison?: BurnCheckEvidenceComparisonPayload
-    decisionProof?: IgnoredInstructionDecisionProofPayload
   }[]
 }
 
@@ -433,7 +385,7 @@ interface BurnCheckEvidenceComparisonPayload {
   }[]
 }
 
-export interface BurnCheckReadExtentPayload {
+interface BurnCheckReadExtentPayload {
   unit: "lines" | "bytes" | "unknown"
   offset: number | null
   limit: number | null
@@ -565,16 +517,12 @@ export interface AggregateWinsPayload {
 }
 
 export type SessionHygieneBadgeId =
-  | "scopeCreep"
-  | "skillOpportunities"
-  | "overExploring"
   | "sessionOverdepth"
   | "modelOverthinking"
   | "overpoweredSubagents"
   | "obsoleteModel"
   | "fastModeOveruse"
   | "excessCacheRehydration"
-  | "ignoredInstructions"
 
 export type SessionHygieneFindingEvidence =
   | {
@@ -615,9 +563,8 @@ export type SessionHygieneFindingEvidence =
 
 export interface SessionHygieneBadgePayload {
   id: SessionHygieneBadgeId
-  status: "finding" | "clean" | "checking" | "couldntCheck" | "notAssessed" | "noCandidates"
+  status: "finding" | "clean" | "notAssessed"
   notAssessedReason: InsightsNotAssessedReason | null
-  checkReason?: string
   /** Which vendor billing mechanism backs an `excessCacheRehydration`
    *  verdict. Absent for every other badge and for old evidence with no
    *  `repeated_context` marker. */
@@ -674,14 +621,6 @@ export async function listBurnCheckTargets(
   })
 }
 
-/** Loads private evidence for one current target after native revalidation. */
-export async function getBurnCheckTargetEvidence(
-  actionId: string,
-): Promise<BurnCheckTargetEvidencePayload | null> {
-  if (!hasShell()) return null
-  return invoke<BurnCheckTargetEvidencePayload>("get_burn_check_target_evidence", { actionId })
-}
-
 /** Prepares one exact automatic change for semantic review. */
 export async function prepareAutoFixBurnCheckTarget(
   actionId: string,
@@ -702,17 +641,19 @@ export async function applyPreparedBurnCheckOperation(
   })
 }
 
-/** Returns a bounded prompt and starts or reuses its verification watch. */
+/** Builds a current prompt for one stable target identity. */
 export async function copyPromptFixBurnCheckTarget(
-  actionId: string,
+  detector: BurnCheckDetectorId,
+  findingId: string,
 ): Promise<CopyPromptFixBurnCheckTargetOutcome | null> {
   if (!hasShell()) return null
   return invoke<CopyPromptFixBurnCheckTargetOutcome>("copy_prompt_fix_burn_check_target", {
-    actionId,
+    detector,
+    findingId,
   })
 }
 
-/** Returns a generic bounded prompt only for a failed check with no exact target. */
+/** Builds a current bounded prompt for one check. */
 export async function copyPromptFixBurnCheck(
   detector: BurnCheckDetectorId,
 ): Promise<CopyPromptFixBurnCheckOutcome | null> {
@@ -722,11 +663,13 @@ export async function copyPromptFixBurnCheck(
 
 /** Prepares one bounded prompt for all selected exact targets in a check. */
 export async function copyPromptFixBurnCheckTargets(
-  actionIds: string[],
+  detector: BurnCheckDetectorId,
+  findingIds: string[],
 ): Promise<CopyPromptFixBurnCheckOutcome | null> {
   if (!hasShell()) return null
   return invoke<CopyPromptFixBurnCheckOutcome>("copy_prompt_fix_burn_check_targets", {
-    actionIds,
+    detector,
+    findingIds,
   })
 }
 

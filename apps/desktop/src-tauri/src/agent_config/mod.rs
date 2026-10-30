@@ -1,9 +1,11 @@
 //! Safe edits to existing coding-agent settings.
 
 mod config;
+pub mod current_context;
 mod editor;
 pub(crate) mod filesystem;
 mod inventory;
+pub(crate) mod json;
 #[path = "../opencode_config_authority.rs"]
 pub(crate) mod opencode_config_authority;
 pub(crate) mod opencode_current;
@@ -17,8 +19,8 @@ pub use config::{
 pub use editor::AgentConfigEditor;
 pub use inventory::{
     AdvisoryResource, EnabledState, IndexedResourceEvidence, InventoryIssue, InventoryIssueReason,
-    ResourceInventory, ResourceKind, ResourceProvenance, ResourceScope, SkillSnapshotError,
-    advisory_resource_inventory, skill_opportunity_snapshot,
+    ResourceInventory, ResourceKind, ResourceProvenance, ResourceScope,
+    advisory_resource_inventory, skill_definitions,
 };
 
 #[cfg(test)]

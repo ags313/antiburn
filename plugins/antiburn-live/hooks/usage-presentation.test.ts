@@ -228,13 +228,13 @@ test('inline captions center their visible glyphs on the mark and fit the compac
 })
 
 test('pace details sit beside the marker and switch sides near the end', () => {
-  for (const elapsed of [0.05, 0.4, 0.9, 0.99]) {
+  for (const elapsed of [0.05, 0.4, 0.55, 0.9, 0.99]) {
     const reading = { ...window, resetsAt: new Date(NOW + (1 - elapsed) * 5 * 3600000).toISOString() }
     const scene = meterGeometry(reading, 500, NOW, 'inline')
     const marker = scene.marker!
     const text = `Even pace: ${Math.round(marker.value * 100)}%`
     const textWidth = captionWidth(text, 12, false, 0.025)
-    const x = marker.x + 6 + textWidth <= scene.trackX + scene.trackWidth ? marker.x + 6 : marker.x - 6 - textWidth
+    const x = scene.trackX + scene.trackWidth - marker.x >= marker.x - scene.trackX ? marker.x + 6 : marker.x - 6 - textWidth
     const svg = meterSvg(reading, 500, NOW, false, true, { layout: 'inline' })
     expect(svg).toContain(captionSvg(text, x, scene.height / 2 + 3.6, 12, false, 0.025))
     expect(x >= scene.trackX).toBe(true)

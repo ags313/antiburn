@@ -13,6 +13,7 @@ pub(crate) struct State {
     paginated: bool,
     ordinal: Option<u64>,
     suffix_only: bool,
+    public: crate::analysis::public_events::JsonState<super::public::PublicState>,
 }
 
 impl State {
@@ -29,6 +30,7 @@ impl State {
                 .all(|key| meta.get(key).is_none_or(Value::is_null))
             && input.fork_parent_session_id.is_none();
         let mut parser = CodexStreamState::for_input(input);
+        parser.observe_native_request(header, root);
         parser.completed.observe(header, true, &mut HeaderSink);
         Self {
             parser,
@@ -39,17 +41,56 @@ impl State {
             paginated: meta["history_mode"] == "paginated",
             ordinal: None,
             suffix_only,
+            public: Default::default(),
         }
     }
 
     pub fn observe(&mut self, value: Value, index: u64, sink: &mut dyn RecordSink) {
+        let mut public = std::mem::take(&mut self.public.0);
+        public.begin(&value, index, &self.parser.native_turn_id, sink);
+        {
+            let mut capture = super::public::CycleSink::new(
+                &mut public,
+                &value,
+                self.parser.native_turn_id.as_deref(),
+                sink,
+            );
+            self.observe_inner(value.clone(), index, &mut capture);
+        }
+        if self.replaces_exec_content(&value) {
+            public.close_replaced_output(&value);
+        }
+        self.parser.completed.retire_live_replacement(&value);
+        public.end(
+            &value,
+            index,
+            self.root,
+            &self.parser.session_id,
+            (
+                &self.parser.native_request,
+                self.parser.native_turn_id.as_deref(),
+            ),
+            sink,
+        );
+        self.public.0 = public;
+    }
+
+    fn observe_inner(&mut self, value: Value, index: u64, sink: &mut dyn RecordSink) {
+        if !has_required_timestamp(&value) {
+            self.parser.scope.invalidate();
+            sink.record(NormalizedRecord::Unusable(PartialReason::MalformedRecord));
+            return;
+        }
+        self.parser.observe_native_request(&value, self.root);
         if value["type"] == "session_meta" {
             // The first physical header also initializes the parser on full-window startup.
             if index != 0 || self.suffix_only {
+                self.parser.report_ordinal_regression(&value, index, sink);
                 self.root = false;
             }
             return;
         }
+        self.parser.report_ordinal_regression(&value, index, sink);
         if self.paginated {
             let ordinal = value["ordinal"].as_u64();
             if self.ordinal.is_none() {
@@ -98,12 +139,18 @@ impl State {
                     | "web_search_output"
             )
         );
-        if self.paginated
-            && is_call
-            && matches!(
-                payload["name"].as_str(),
-                Some("exec" | "exec_command" | "apply_patch")
-            )
+        let replaced = self.replaces_exec_content(&value);
+        let uncertain_replacement = is_output
+            && !replaced
+            && completed::replaces_exec_content(&value, self.paginated, |id| {
+                self.replaced_calls.contains(id)
+            });
+        if uncertain_replacement {
+            // A filter match cannot prove that this output replaces an exec call.
+            sink.tool_result_gap();
+        }
+        if is_call
+            && replaced
             && let Some(id) = call_id
         {
             self.replaced_calls.insert(id);
@@ -111,8 +158,7 @@ impl State {
         let retired = call_id.is_some_and(|id| {
             self.retired_calls.contains(id) && !self.parser.native_calls.contains_key(id)
         });
-        let replaced = self.paginated && call_id.is_some_and(|id| self.replaced_calls.contains(id));
-        if !(is_call && retired || is_output && replaced) {
+        if !(is_call && retired || is_output && (replaced || uncertain_replacement)) {
             self.parser.capture_native_tool_result(&value, index, sink);
         }
         self.parser.native_calls.retain(|_, call| call.is_some());
@@ -177,6 +223,7 @@ impl State {
                     &self.parser.session_id,
                     index,
                     codex_host_status(payload["item"]["status"].as_str()),
+                    self.parser.completed_facts(&value),
                 )
             {
                 result.context = Some(crate::analysis::ToolResultContext::pending(
@@ -188,12 +235,62 @@ impl State {
         }
     }
 
+    fn replaces_exec_content(&self, record: &Value) -> bool {
+        self.parser.completed.replaces_exec_content(record)
+    }
+
     pub fn main_session(&self) -> bool {
         self.root
     }
 
     pub fn invalidate(&mut self) {
         self.root = false;
+        self.public.0.invalidate();
+    }
+}
+
+/// Exact revision-4 layout. Conversion preserves every retained join and guard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct StateV4 {
+    parser: CodexStreamState,
+    retired_calls: IdentityFilter,
+    replaced_calls: IdentityFilter,
+    completed_ids: IdentityFilter,
+    root: bool,
+    paginated: bool,
+    ordinal: Option<u64>,
+    suffix_only: bool,
+}
+
+impl StateV4 {
+    pub(crate) fn convert(self) -> State {
+        State {
+            parser: self.parser,
+            retired_calls: self.retired_calls,
+            replaced_calls: self.replaced_calls,
+            completed_ids: self.completed_ids,
+            root: self.root,
+            paginated: self.paginated,
+            ordinal: self.ordinal,
+            suffix_only: self.suffix_only,
+            public: Default::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl State {
+    pub(crate) fn as_v4(&self) -> StateV4 {
+        StateV4 {
+            parser: self.parser.clone(),
+            retired_calls: self.retired_calls.clone(),
+            replaced_calls: self.replaced_calls.clone(),
+            completed_ids: self.completed_ids.clone(),
+            root: self.root,
+            paginated: self.paginated,
+            ordinal: self.ordinal,
+            suffix_only: self.suffix_only,
+        }
     }
 }
 

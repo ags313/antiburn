@@ -10,9 +10,11 @@ impl PublishedEvidenceReader for MemoryReader {
 
 fn event(cursor: u64, change: PublishedEvidenceChange) -> PublishedEvidenceEvent {
     PublishedEvidenceEvent {
+        source_evidence_version: None,
         cursor: PublicationCursor(cursor),
         branch: "env/agent/session/main".to_owned(),
         context: Some(PublishedContext {
+            session_selection: None,
             requests: vec![],
             session_id: "session".into(),
             agent_name: "opencode".into(),
@@ -20,6 +22,7 @@ fn event(cursor: u64, change: PublishedEvidenceChange) -> PublishedEvidenceEvent
             version: "context-v1".into(),
             main_session: true,
             complete_through_event: false,
+            inventories: CurrentInventories::default(),
         }),
         change,
     }
@@ -33,6 +36,7 @@ fn result() -> PublishedToolResult {
         revision: 2,
         tool_name: Some("shell".to_owned()),
         category: Some("shell".to_owned()),
+        metadata: Box::default(),
         arguments: Some(serde_json::json!({"command":"true"})),
         content: Some("done".to_owned()),
         outcome: None,
@@ -41,6 +45,103 @@ fn result() -> PublishedToolResult {
         finality: true,
         payload_complete: true,
         validity: EvidenceValidity::Valid,
+    }
+}
+
+#[test]
+fn explicit_unsafe_publication_stays_distinct_from_partial_history_without_an_observation() {
+    let mut unsafe_event = event(
+        2,
+        PublishedEvidenceChange::UnsafeUpdate {
+            reason: "unsafe-identity".into(),
+        },
+    );
+    unsafe_event.context = None;
+    let source = PublishedEvidenceSource::new(
+        MemoryReader(PublishedEvidenceBatch {
+            events: vec![
+                event(
+                    1,
+                    PublishedEvidenceChange::PartialGap {
+                        reason: "history-incomplete".into(),
+                    },
+                ),
+                unsafe_event,
+            ],
+            next: PublicationCursor(2),
+            has_more: false,
+        }),
+        2,
+    )
+    .unwrap();
+    let batch = source.read_batch(PublicationCursor(0)).unwrap();
+    assert_eq!(
+        batch.events,
+        vec![
+            SourceEvent::Gap {
+                cursor: PublicationCursor(1),
+                branch: BranchId("env/agent/session/main".into()),
+                reason: "history-incomplete".into()
+            },
+            SourceEvent::UnsafeUpdate {
+                cursor: PublicationCursor(2),
+                branch: BranchId("env/agent/session/main".into()),
+                reason: "unsafe-identity".into()
+            },
+        ]
+    );
+    assert_eq!(batch.next, PublicationCursor(2));
+    assert!(!batch.has_more);
+}
+
+#[test]
+fn mode_evidence_qualifier_has_equivalent_direct_and_literal_bracket_access() {
+    for expression in [
+        "message.quality.fast_mode_evidence",
+        "message['quality']['fast_mode_evidence']",
+    ] {
+        let source = format!(
+            "name: Mode evidence\non: {{tool_result: {{fast_mode: true}}}}\nactions:\n  - type: status\n    input:\n      result: success\n      message: ${{{{ {expression} }}}}\n"
+        );
+        assert!(crate::compile(&source).is_ok(), "{expression}");
+    }
+}
+
+#[test]
+fn mode_evidence_qualifier_is_frozen_with_known_mode_only() {
+    for mode in [Some(true), Some(false), None] {
+        let mut result = result();
+        result.metadata.attribution.fast_mode = mode;
+        result.metadata.fast_mode_evidence = Some("requested-tier-preference".into());
+        let source = PublishedEvidenceSource::new(
+            MemoryReader(PublishedEvidenceBatch {
+                events: vec![event(1, PublishedEvidenceChange::Upsert(result))],
+                next: PublicationCursor(1),
+                has_more: false,
+            }),
+            1,
+        )
+        .unwrap();
+        let batch = source.read_batch(PublicationCursor(0)).unwrap();
+        let SourceEvent::Observation { observation, .. } = &batch.events[0] else {
+            panic!("expected an observation");
+        };
+        let ObservationKind::ToolResult { message, .. } = &observation.kind else {
+            panic!("expected a tool result");
+        };
+        if let Some(mode) = mode {
+            assert_eq!(message.value["fast_mode"], mode);
+            assert_eq!(
+                message.value["quality"]["fast_mode_evidence"],
+                "requested-tier-preference"
+            );
+        } else {
+            assert!(message.value.get("fast_mode").is_none());
+            assert!(message.value["quality"].get("fast_mode_evidence").is_none());
+        }
+        let frozen = serde_json::to_value(observation).unwrap();
+        let restored: ObservationDraft = serde_json::from_value(frozen.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), frozen);
     }
 }
 
@@ -191,6 +292,7 @@ fn continuity_reset_stays_distinct_from_unsafe_publication_gaps() {
 fn partial_context_is_preserved_with_explicit_quality_fields() {
     let mut event = event(1, PublishedEvidenceChange::Upsert(result()));
     event.context = Some(PublishedContext {
+        session_selection: None,
         requests: vec![(
             "request-1".to_owned(),
             serde_json::json!({"text": "Retry the check.", "kind": "user_message", "source": "opencode"}),
@@ -201,6 +303,7 @@ fn partial_context_is_preserved_with_explicit_quality_fields() {
         version: "context-v1".to_owned(),
         main_session: true,
         complete_through_event: false,
+        inventories: CurrentInventories::default(),
     });
     let reader = MemoryReader(PublishedEvidenceBatch {
         events: vec![event],
@@ -233,22 +336,47 @@ fn partial_context_is_preserved_with_explicit_quality_fields() {
 }
 
 #[test]
+fn empty_pages_can_advance_past_filtered_publications_but_cannot_rewind() {
+    for next in [3, 8] {
+        let source = PublishedEvidenceSource::new(
+            MemoryReader(PublishedEvidenceBatch {
+                events: vec![],
+                next: PublicationCursor(next),
+                has_more: false,
+            }),
+            1,
+        )
+        .unwrap();
+        let batch = source.read_batch(PublicationCursor(3)).unwrap();
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.next, PublicationCursor(next));
+        assert!(!batch.has_more);
+        assert!(matches!(
+            source.read_batch(PublicationCursor(next + 1)),
+            Err(SourceError::InvalidNextCursor { .. })
+        ));
+    }
+}
+
+#[test]
 fn rejects_cursor_gaps_and_bad_page_progress() {
-    let reader = MemoryReader(PublishedEvidenceBatch {
-        events: vec![event(
-            5,
-            PublishedEvidenceChange::Gap {
-                reason: "gap".into(),
-            },
-        )],
-        next: PublicationCursor(4),
-        has_more: false,
-    });
-    let source = PublishedEvidenceSource::new(reader, 1).unwrap();
-    assert!(matches!(
-        source.read_batch(PublicationCursor(3)),
-        Err(SourceError::InvalidNextCursor { .. })
-    ));
+    for next in [4, 6] {
+        let reader = MemoryReader(PublishedEvidenceBatch {
+            events: vec![event(
+                5,
+                PublishedEvidenceChange::Gap {
+                    reason: "gap".into(),
+                },
+            )],
+            next: PublicationCursor(next),
+            has_more: false,
+        });
+        let source = PublishedEvidenceSource::new(reader, 1).unwrap();
+        assert!(matches!(
+            source.read_batch(PublicationCursor(3)),
+            Err(SourceError::InvalidNextCursor { .. })
+        ));
+    }
 }
 
 #[test]
@@ -392,6 +520,7 @@ fn evidence_versions_cover_same_revision_payload_and_context_corrections() {
     assert_ne!(version(original.clone()), version(corrected));
     let mut context_changed = original.clone();
     context_changed.context = Some(PublishedContext {
+        session_selection: None,
         requests: vec![("request-1".into(), serde_json::json!("API request"))],
         session_id: "session-1".into(),
         agent_name: "opencode".into(),
@@ -399,6 +528,7 @@ fn evidence_versions_cover_same_revision_payload_and_context_corrections() {
         version: "context-v1".into(),
         main_session: true,
         complete_through_event: true,
+        inventories: CurrentInventories::default(),
     });
     assert_ne!(version(original.clone()), version(context_changed.clone()));
     let before = version(context_changed.clone());

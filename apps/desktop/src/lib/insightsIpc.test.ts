@@ -4,6 +4,7 @@ import {
   applyPreparedBurnCheckOperation,
   copyPromptFixBurnCheckTarget,
   copyPromptFixBurnCheck,
+  copyPromptFixBurnCheckTargets,
   getBurnCheckAggregateWins,
   getChecksReport,
   listBurnCheckTargets,
@@ -80,7 +81,7 @@ describe("burn check IPC", () => {
     expect(result?.targets[0]?.display.estimatedOpportunity).toBeNull()
   })
 
-  it("keeps stable finding identity out of freshness-sensitive actions", async () => {
+  it("uses stable identity for Copy and expiring handles for Auto Fix", async () => {
     invoke
       .mockResolvedValueOnce({ outcome: "reviewReady", review: {} })
       .mockResolvedValueOnce({ outcome: "appliedAwaitingVerification", watchId: "watch-1" })
@@ -98,7 +99,7 @@ describe("burn check IPC", () => {
 
     await prepareAutoFixBurnCheckTarget("action-1")
     await applyPreparedBurnCheckOperation("prepared-1")
-    await copyPromptFixBurnCheckTarget("action-1")
+    await copyPromptFixBurnCheckTarget("oldModelUsage", "finding-1")
 
     expect(invoke).toHaveBeenNthCalledWith(1, "prepare_auto_fix_burn_check_target", {
       actionId: "action-1",
@@ -107,17 +108,29 @@ describe("burn check IPC", () => {
       preparedOperationId: "prepared-1",
     })
     expect(invoke).toHaveBeenNthCalledWith(3, "copy_prompt_fix_burn_check_target", {
-      actionId: "action-1",
+      detector: "oldModelUsage",
+      findingId: "finding-1",
     })
   })
 
-  it("sends only the detector for a check-level fallback prompt", async () => {
+  it("sends only the detector for a current check-level prompt", async () => {
     invoke.mockResolvedValue({ outcome: "promptReady", prompt: "Inspect the evidence." })
 
     await copyPromptFixBurnCheck("oldModelUsage")
 
     expect(invoke).toHaveBeenCalledWith("copy_prompt_fix_burn_check", {
       detector: "oldModelUsage",
+    })
+  })
+
+  it("uses stable target identities for a selected prompt batch", async () => {
+    invoke.mockResolvedValue({ outcome: "promptReady", prompt: "Inspect both targets." })
+
+    await copyPromptFixBurnCheckTargets("unusedSkills", ["finding-1", "finding-2"])
+
+    expect(invoke).toHaveBeenCalledWith("copy_prompt_fix_burn_check_targets", {
+      detector: "unusedSkills",
+      findingIds: ["finding-1", "finding-2"],
     })
   })
 

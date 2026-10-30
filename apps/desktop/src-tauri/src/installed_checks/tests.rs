@@ -1,10 +1,14 @@
 use std::collections::VecDeque;
 
-use antiburn_checks::actions::ChoiceResult;
-use antiburn_checks::check_store::{CandidateClaim, EvaluatedCandidate, RecoveryWork};
+use antiburn_checks::check_store::{CandidateClaim, ClaimOutcome, RecoveryWork};
+use antiburn_checks::decision::{DecisionAttempt, DecisionInput, Question};
 use antiburn_checks::definition_lifecycle::{InactiveKind, LifecycleState, LifecycleTransition};
 use antiburn_checks::domain::{FrozenCandidate, Generation};
+use antiburn_checks::engine::PreparationValidationPurpose;
 use antiburn_checks::engine::RunOutcome;
+use antiburn_checks::expression_eval::EvaluationBudget;
+use antiburn_checks::prepared_assessment::PreparedAssessment;
+use antiburn_checks::results::{ChoiceResult, DecisionResult, NamedAnswer, QuestionResult};
 use antiburn_local::analysis::{
     CompositeSink, EvidenceSource, RawSource, SessionEvidenceAccumulator, SessionInput,
     SessionMetricsAccumulator, SourceCapabilities, SourceFormat, SourceKind, reader_for,
@@ -13,6 +17,7 @@ use serde_json::{Value, json};
 
 use super::*;
 
+mod inventory_freeze;
 mod startup_tests;
 use crate::insights_report::installed_checks::read_installed_checks;
 use crate::store::{
@@ -21,16 +26,55 @@ use crate::store::{
 };
 
 mod analytics;
+mod cursor_desktop;
+mod idle_recovery;
 mod journal_delivery;
 mod opencode_v2_fairness;
 mod opencode_v2_source_gates;
+mod removal;
+mod selected_connections;
 mod selection_live;
 mod session_identity;
+mod source_recovery;
 
 const CHECK: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../../docs/burn-check/examples/failed-retry-loop.yml"
+    "/../../../crates/antiburn-checks/tests/fixtures/retry-review.yml"
 ));
+
+pub(crate) fn definition_metadata_for_activation(
+    activation: &EffectiveActivation,
+) -> InstalledCheckDefinition {
+    let definition = EffectiveDefinition {
+        id: activation.id.definition_id.clone(),
+        scope: activation.definition_scope,
+        source_paths: activation.source_paths.clone(),
+        content_revision: activation.revision,
+        state: DefinitionState::Ready(Box::new((*activation.compiled).clone())),
+    };
+    definition_metadata(
+        &activation.id.scope,
+        &definition,
+        &LifecycleState::Active(activation.clone()),
+        &Admission::Ready,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn disable_completion_notifies_waiters_without_regressing_the_boundary() {
+    let state = InstalledChecks::default();
+    let completed = state.completed.notified();
+    tokio::pin!(completed);
+    completed.as_mut().enable();
+
+    state.complete_disable(2);
+    tokio::time::timeout(Duration::from_secs(1), completed)
+        .await
+        .unwrap();
+    state.complete_disable(1);
+    assert_eq!(state.disabled_turn.load(Ordering::Acquire), 2);
+}
 
 #[test]
 fn scope_work_includes_admitted_pending_delivery_but_not_stale_reset_work() {
@@ -132,6 +176,10 @@ fn disabling_yaml_discovery_deactivates_and_fences_active_generations() {
     let scope = host.projects.keys().next().unwrap().clone();
     let active = host.projects[&scope].active[0].clone();
 
+    fixture
+        .store
+        .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "false")
+        .unwrap();
     host.deactivate_active().unwrap();
 
     assert!(host.projects[&scope].active.is_empty());
@@ -201,7 +249,7 @@ async fn startup_with_discovery_disabled_fences_saved_work_before_reenable() {
             .remove(0)
             .work
         {
-            RecoveryWork::Pending(candidate) => {
+            RecoveryWork::Pending { candidate, .. } => {
                 assert!(!answered);
                 candidate
             }
@@ -335,14 +383,42 @@ impl ScriptedEvaluator {
 }
 
 impl DecisionEvaluator for ScriptedEvaluator {
-    fn evaluate<'a>(
+    fn prepare(
+        &self,
+        activation: &EffectiveActivation,
+        inputs: Vec<DecisionInput>,
+        budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, antiburn_checks::fit::PreparationFailure> {
+        TypeSafeDecisionEvaluator::new(
+            crate::jev::client::TypeSafeClient::new("synthetic".into()).unwrap(),
+        )
+        .prepare(activation, inputs, budget)
+    }
+
+    fn validate_prepared(
+        &self,
+        activation: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        _: PreparationValidationPurpose,
+    ) -> Result<(), antiburn_checks::fit::PreparationFailure> {
+        crate::jev::decision_evaluator::validate_prepared_assessment(activation, prepared)
+    }
+
+    fn evaluate_prepared<'a>(
         &'a self,
         activation: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        input: &'a Value,
-        attempt_number: u8,
+        prepared: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         Box::pin(async move {
+            let input = &prepared
+                .decisions
+                .iter()
+                .find(|block| block.decision == attempt.decision)
+                .expect("named fixture input")
+                .input;
+            let attempt_number = attempt.number;
             self.inputs.lock().unwrap().push(input.clone());
             self.started.notify_one();
             if self.wait.load(Ordering::Acquire) {
@@ -356,33 +432,50 @@ impl DecisionEvaluator for ScriptedEvaluator {
                 .expect("scripted attempt");
             match label {
                 Ok(label) => {
-                    let decision = &activation.compiled.decision;
-                    let labels = decision
-                        .criteria
+                    let declaration = activation
+                        .compiled
+                        .decisions
                         .iter()
-                        .map(|(label, _)| label.clone())
-                        .collect::<Vec<_>>();
-                    Ok(EvaluatedCandidate {
-                        choices: vec![
-                            ChoiceResult::validate(
-                                &decision.name,
-                                &decision.question_id,
-                                &labels,
-                                label,
-                                labels
-                                    .iter()
-                                    .map(|candidate| {
-                                        (
-                                            candidate.clone(),
-                                            if candidate == label { 0.99 } else { 0.005 },
-                                        )
-                                    })
-                                    .collect(),
+                        .find(|block| block.name == attempt.decision)
+                        .expect("named model fixture");
+                    let answers = declaration
+                        .outputs
+                        .iter()
+                        .map(|output| {
+                            let Question::Choice { criteria, .. } = &output.question else {
+                                panic!("this fixture requires Choice questions")
+                            };
+                            let probabilities = criteria
+                                .iter()
+                                .map(|(candidate, _)| {
+                                    (
+                                        candidate.clone(),
+                                        if candidate == label { 0.99 } else { 0.005 },
+                                    )
+                                })
+                                .collect();
+                            NamedAnswer::new(
+                                &output.name,
+                                QuestionResult::Choice(
+                                    ChoiceResult::new(
+                                        &output.question,
+                                        label,
+                                        Some(probabilities),
+                                        Some(0.99),
+                                    )
+                                    .unwrap(),
+                                ),
                             )
-                            .unwrap(),
-                        ],
-                        attempts: attempt_number,
-                    })
+                            .unwrap()
+                        })
+                        .collect();
+                    Ok(DecisionResult::new(
+                        declaration,
+                        &activation.compiled.question_requirements(),
+                        answers,
+                        attempt_number,
+                    )
+                    .unwrap())
                 }
                 Err(kind) => Err(EvaluationFailure {
                     code: EvaluationFailureCode::ProviderUnavailable,
@@ -413,6 +506,9 @@ impl Fixture {
         std::fs::create_dir_all(project.join(".antiburn/checks")).unwrap();
         std::fs::write(global.join("failed-retry-loop.yml"), CHECK).unwrap();
         let store = Arc::new(Store::open_in_memory(directory.path()).unwrap());
+        store
+            .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+            .unwrap();
         let fixture = Self {
             directory,
             store,
@@ -554,16 +650,40 @@ impl Fixture {
                 .unwrap()
         );
         if environment == "native" {
+            let path = self.directory.path().join(format!("{session_id}.jsonl"));
+            std::fs::write(&path, transcript(session_id, count)).unwrap();
+            let input = SessionInput {
+                agent: "pi".into(),
+                session_id: session_id.into(),
+                source: RawSource::File(path),
+                source_format: SourceFormat::PiV3Jsonl,
+                fork_parent_session_id: None,
+            };
+            let mut cursor = None;
+            loop {
+                let page = antiburn_local::analysis::file_live::read_native_file_page(
+                    &input,
+                    cursor.as_ref(),
+                    &|| false,
+                )
+                .unwrap();
+                let more = page.has_more;
+                cursor = Some(page.cursor);
+                if !more {
+                    break;
+                }
+            }
+            let cursor = serde_json::to_string(&cursor.unwrap()).unwrap();
             self.store.lock().execute(
             "INSERT INTO native_file_delivery (environment_key, agent, session_id, incarnation,
                 source_label, cwd, parser_revision, cursor_json, observed_generation, pending, active_until_epoch)
-             SELECT environment_key, agent, session_id, incarnation, source_label, cwd, ?4, '{}', source_generation, 0, 0
+             SELECT environment_key, agent, session_id, incarnation, source_label, cwd, ?4, ?5, source_generation, 0, 0
                FROM session WHERE environment_key = ?1 AND agent = 'pi' AND session_id = ?2
              ON CONFLICT(environment_key, agent, session_id) DO UPDATE SET
                incarnation = excluded.incarnation, source_label = excluded.source_label, cwd = excluded.cwd,
-               observed_generation = excluded.observed_generation, pending = 0, cursor_json = '{}',
+                observed_generation = excluded.observed_generation, pending = 0, cursor_json = excluded.cursor_json,
                parser_revision = excluded.parser_revision",
-            rusqlite::params![environment, session_id, cwd.to_str(), antiburn_local::analysis::PARSER_REVISION],
+            rusqlite::params![environment, session_id, cwd.to_str(), antiburn_local::analysis::PARSER_REVISION, cursor],
         ).unwrap();
         }
     }
@@ -590,6 +710,38 @@ fn status_writes(store: &Store, definition: &InstalledCheckDefinition) -> Vec<(S
     ).unwrap().query_map(rusqlite::params![definition.check_id, definition.activation_scope_key], |row| {
         Ok((row.get(0)?, row.get(1)?))
     }).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+}
+
+fn runtime_definition_bindings(store: &Store) -> Vec<String> {
+    store.lock().prepare(
+        "SELECT json_array(check_id, activation_scope_key, generation, definition_revision, name)
+         FROM burn_check_runtime_definition ORDER BY check_id, activation_scope_key",
+    ).unwrap().query_map([], |row| row.get(0)).unwrap()
+        .collect::<rusqlite::Result<_>>().unwrap()
+}
+
+fn failed_directory_inventory(
+    host: &mut InstalledCheckHost<ScriptedEvaluator>,
+    state: &InstalledChecks,
+) -> Vec<InstalledCheckDefinition> {
+    let update = host.reconcile(&Admission::Ready);
+    let failure = update
+        .as_ref()
+        .unwrap_err()
+        .downcast_ref::<CheckDirectoryReadFailure>()
+        .expect("typed check folder failure");
+    assert!(!failure.directories.is_empty());
+    assert!(!host.inventory_ready);
+    assert!(!finish_inventory_update(
+        state,
+        host,
+        update,
+        diagnostics::RuntimeStage::Reconcile,
+        &mut None,
+        |_| {},
+    ));
+    assert!(!state.delivery_ready.load(Ordering::Acquire));
+    state.metadata.read().unwrap().clone()
 }
 
 async fn run_due_at(
@@ -622,6 +774,72 @@ fn transcript(session_id: &str, count: usize) -> String {
         .collect::<Vec<_>>()
         .join("\n")
         + "\n"
+}
+
+#[tokio::test]
+async fn quiet_project_catchup_persists_empty_page_progress_and_resumes_matching_work() {
+    let fixture = Fixture::new();
+    fixture.publish("main", 3);
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    host.catch_up().unwrap();
+    let scope = host.projects.keys().next().unwrap().clone();
+    let active = host.projects[&scope].active[0].clone();
+    let before = host.projects[&scope]
+        .store
+        .load_source_progress(&active)
+        .unwrap();
+    let other_project = fixture.directory.path().join("other-project");
+    fixture.publish_in_cwd("native", "other", 2, &other_project);
+    let source = PublishedEvidenceSource::new(
+        StorePublishedEvidenceReader::for_live_project(
+            &fixture.store,
+            &scope.environment,
+            &scope.session_cwd,
+        )
+        .with_activation(&active.id),
+        SOURCE_PAGE_SIZE,
+    )
+    .unwrap();
+    let page = source.read_batch(before.publication_cursor).unwrap();
+    assert!(page.events.is_empty());
+    assert!(page.next > before.publication_cursor);
+    assert!(!page.has_more);
+
+    assert_eq!(host.catch_up().unwrap(), (false, false));
+    let mut expected = before;
+    expected.publication_cursor = page.next;
+    assert_eq!(
+        host.projects[&scope]
+            .store
+            .load_source_progress(&active)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(host.catch_up().unwrap(), (false, false));
+    drop(host);
+
+    let mut restarted = fixture.host();
+    restarted.reconcile(&Admission::Ready).unwrap();
+    assert_eq!(
+        restarted.projects[&scope]
+            .store
+            .load_source_progress(&active)
+            .unwrap(),
+        expected
+    );
+    fixture.publish("main", 4);
+    assert_eq!(restarted.catch_up().unwrap(), (true, false));
+    let progress = restarted.projects[&scope]
+        .store
+        .load_source_progress(&active)
+        .unwrap();
+    assert!(progress.publication_cursor > expected.publication_cursor);
+    assert_eq!(
+        progress.observation_position.0,
+        expected.observation_position.0 + 1
+    );
+    assert!(fixture.evaluator.inputs.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -977,7 +1195,7 @@ async fn project_override_removal_and_recreation_reset_bootstrap() {
         .join(".antiburn/checks/failed-retry-loop.yml");
     std::fs::write(
         &path,
-        CHECK.replace("name: Failed retry loop", "name: Project Retry Review"),
+        CHECK.replace("name: Synthetic retry review", "name: Project Retry Review"),
     )
     .unwrap();
     let mut host = fixture.host();
@@ -1030,7 +1248,7 @@ async fn abandoned_dispatch_stays_unknown_and_replay_never_enters_live_metadata(
     host.catch_up().unwrap();
     let scope = host.projects.keys().next().unwrap().clone();
     let project = &host.projects[&scope];
-    let RecoveryWork::Pending(candidate) = project
+    let RecoveryWork::Pending { candidate, .. } = project
         .store
         .load_recovery(None, 1)
         .unwrap()
@@ -1045,10 +1263,58 @@ async fn abandoned_dispatch_stays_unknown_and_replay_never_enters_live_metadata(
     else {
         panic!("claim candidate")
     };
-    project
-        .store
-        .record_dispatch_intent(&claim, 100_000, Duration::from_secs(60), 1)
+    let activation = &project.active[0];
+    let mut budget = EvaluationBudget::default();
+    let inputs = activation
+        .compiled
+        .decisions
+        .iter()
+        .map(|decision| {
+            let antiburn_checks::preparation::PreparationOutcome::Ready(input) =
+                antiburn_checks::preparation::prepare_decision_input_with_budget(
+                    decision,
+                    &candidate,
+                    &mut budget,
+                )
+            else {
+                panic!("frozen fixture input must be available")
+            };
+            DecisionInput {
+                decision: decision.name.clone(),
+                input,
+            }
+        })
+        .collect();
+    let prepared = fixture
+        .evaluator
+        .prepare(activation, inputs, budget)
         .unwrap();
+    fixture
+        .evaluator
+        .validate_prepared(
+            activation,
+            &prepared,
+            PreparationValidationPurpose::Dispatch,
+        )
+        .unwrap();
+    assert_eq!(
+        project
+            .store
+            .record_preparation(
+                &claim,
+                &antiburn_checks::fit::PreparationRecord::Ready(prepared)
+            )
+            .unwrap(),
+        ClaimOutcome::Current
+    );
+    let attempt = DecisionAttempt::new("review", 1).unwrap();
+    assert_eq!(
+        project
+            .store
+            .record_dispatch_intent(&claim, 100_000, Duration::from_secs(60), &attempt)
+            .unwrap(),
+        ClaimOutcome::Current
+    );
     let replay_scope = ActivationScope {
         run: RunScope::Replay("local-diagnostic".into()),
         ..scope.clone()
@@ -1091,6 +1357,13 @@ async fn abandoned_dispatch_stays_unknown_and_replay_never_enters_live_metadata(
     );
     assert!(fixture.evaluator.inputs.lock().unwrap().is_empty());
     assert!(status_writes(&fixture.store, &restarted.definitions[0]).is_empty());
+    let attempts: (u64, u64) = fixture.store.lock().query_row(
+        "SELECT COUNT(*), SUM(attempt_id = ?1 AND decision_name = 'review' AND attempt_number = 1
+             AND state = 'settled' AND outcome = 'unknown') FROM burn_check_evaluation_attempt",
+        [antiburn_checks::decision::attempt_id(&candidate.fingerprint, &attempt)],
+        |row| Ok((row.get(0)?, row.get(1)?))
+    ).unwrap();
+    assert_eq!(attempts, (1, 1));
     let detail: String = fixture
         .store
         .lock()
@@ -1110,7 +1383,7 @@ fn invalid_unsupported_and_unbound_winners_remain_visible() {
         fixture
             .project
             .join(".antiburn/checks/failed-retry-loop.yml"),
-        "name: Broken\non: {turn_end: null}\nactions: []\n",
+        "name: Unsupported\non: {tool_result: null}\nactions:\n  - type: message\n    input: {text: Unsupported action}\n",
     )
     .unwrap();
     let mut host = fixture.host();
@@ -1152,7 +1425,7 @@ async fn remote_sessions_do_not_create_live_activations_or_statuses() {
         fixture
             .project
             .join(".antiburn/checks/failed-retry-loop.yml"),
-        CHECK.replace("name: Failed retry loop", "name: Project Retry Review"),
+        CHECK.replace("name: Synthetic retry review", "name: Project Retry Review"),
     )
     .unwrap();
     let mut host = fixture.host();
@@ -1189,7 +1462,7 @@ fn global_checks_are_visible_before_a_project_is_indexed() {
     let mut host = fixture.host();
     host.reconcile(&Admission::Ready).unwrap();
     assert_eq!(host.definitions.len(), 1);
-    assert_eq!(host.definitions[0].name, "Failed retry loop");
+    assert_eq!(host.definitions[0].name, "Synthetic retry review");
     assert_eq!(host.definitions[0].generation, None);
     assert!(matches!(
         host.definitions[0].availability,
@@ -1262,7 +1535,7 @@ async fn unreadable_definition_revokes_an_in_flight_answer_and_other_checks_cont
 }
 
 #[test]
-fn oversized_and_unavailable_project_definitions_do_not_fall_back_or_block_other_projects() {
+fn oversized_overrides_do_not_fall_back_and_unreadable_folders_preserve_other_projects() {
     let fixture = Fixture::new();
     let other = fixture.directory.path().join("other");
     std::fs::create_dir(&other).unwrap();
@@ -1298,24 +1571,59 @@ fn oversized_and_unavailable_project_definitions_do_not_fall_back_or_block_other
             .iter()
             .any(|definition| definition.source.scope == InstalledCheckScope::Global)
     );
+    let state = InstalledChecks::default();
+    state.credentials_restored.store(true, Ordering::Release);
+    publish_inventory(&state, &fixture.store, &host.definitions, |_| {}).unwrap();
+    update_delivery_readiness(&state, &host, true);
+    assert!(state.delivery_ready.load(Ordering::Acquire));
+    let bindings = runtime_definition_bindings(&fixture.store);
+    let definitions = host.definitions.clone();
     std::fs::remove_dir_all(fixture.project.join(".antiburn/checks")).unwrap();
     std::fs::write(fixture.project.join(".antiburn/checks"), "not a directory").unwrap();
-    host.reconcile(&Admission::Ready).unwrap();
-    assert_eq!(
-        host.evaluation_jobs(1)[0].activation.id.scope.session_cwd,
-        other.to_string_lossy()
-    );
-    assert!(host.definitions.iter().any(|definition| matches!(
+    let reported = failed_directory_inventory(&mut host, &state);
+    assert_eq!(host.definitions, definitions);
+    assert_eq!(runtime_definition_bindings(&fixture.store), bindings);
+    assert!(reported.iter().any(|definition| matches!(
         definition.availability,
         InstalledCheckAvailability::Invalid { .. }
     )));
+    assert!(reported.iter().any(|definition| definition.source.scope
+        == InstalledCheckScope::Global
+        && matches!(
+            definition.availability,
+            InstalledCheckAvailability::Paused { .. }
+        )));
+    let report = read_installed_checks(&fixture.store, &reported).unwrap();
     assert!(
-        host.definitions
+        report[0]
+            .diagnostics
             .iter()
-            .any(|definition| definition.source.scope == InstalledCheckScope::Global)
+            .any(|diagnostic| diagnostic.code == "discovery-directory-unavailable")
     );
+    assert!(
+        report[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "storage-failed")
+    );
+    assert_eq!(report[0].checking_count, 0);
     let mut restarted = fixture.host();
-    restarted.reconcile(&Admission::Ready).unwrap();
+    let restarted_state = InstalledChecks::default();
+    failed_directory_inventory(&mut restarted, &restarted_state);
+    assert!(restarted.definitions.is_empty());
+    assert_eq!(runtime_definition_bindings(&fixture.store), bindings);
+    std::fs::remove_file(fixture.project.join(".antiburn/checks")).unwrap();
+    std::fs::create_dir(fixture.project.join(".antiburn/checks")).unwrap();
+    std::fs::write(&path, vec![b'x'; MAX_FILE_BYTES as usize + 1]).unwrap();
+    let update = restarted.reconcile(&Admission::Ready);
+    assert!(finish_inventory_update(
+        &restarted_state,
+        &restarted,
+        update,
+        diagnostics::RuntimeStage::Reconcile,
+        &mut None,
+        |_| {},
+    ));
     assert_eq!(
         restarted.evaluation_jobs(1)[0]
             .activation
@@ -1323,6 +1631,22 @@ fn oversized_and_unavailable_project_definitions_do_not_fall_back_or_block_other
             .scope
             .session_cwd,
         other.to_string_lossy()
+    );
+    assert!(restarted.definitions.iter().any(|definition| {
+        definition.source.scope == InstalledCheckScope::Project
+            && matches!(
+                definition.availability,
+                InstalledCheckAvailability::Invalid { .. }
+            )
+    }));
+    assert!(
+        !read_installed_checks(&fixture.store, &restarted.definitions).unwrap()[0]
+            .diagnostics
+            .iter()
+            .any(|diagnostic| matches!(
+                diagnostic.code.as_str(),
+                "discovery-directory-unavailable" | "storage-failed"
+            ))
     );
 }
 
@@ -1345,7 +1669,7 @@ fn repository_root_definitions_bind_to_exact_subdirectory_evidence_scopes() {
         .join(".antiburn/checks/failed-retry-loop.yml");
     std::fs::write(
         &definition,
-        CHECK.replace("name: Failed retry loop", "name: Root Definition"),
+        CHECK.replace("name: Synthetic retry review", "name: Root Definition"),
     )
     .unwrap();
     let mut host = fixture.host();
@@ -1563,7 +1887,7 @@ async fn native_watcher_reconciles_created_replaced_and_recreated_global_and_rep
         let temporary = directory.join(".save.tmp");
         std::fs::write(
             &temporary,
-            CHECK.replace("name: Failed retry loop", "name: Atomic Save"),
+            CHECK.replace("name: Synthetic retry review", "name: Atomic Save"),
         )
         .unwrap();
         std::fs::rename(&temporary, &path).unwrap();
@@ -1585,7 +1909,7 @@ async fn native_watcher_reconciles_created_replaced_and_recreated_global_and_rep
                 .iter()
                 .any(
                     |definition| definition.source.path.as_deref() == path.to_str()
-                        && definition.name == "Failed retry loop"
+                        && definition.name == "Synthetic retry review"
                 )
         );
 
@@ -1971,14 +2295,17 @@ fn definition_diagnostics_are_error_level_located_safe_and_deduplicated_until_re
     });
     let logs = captured.0.lock().unwrap();
     assert!(logs.iter().all(|log| log.starts_with("ERROR")
-        && log.contains("path=")
         && log.contains("code=")
         && log.contains("line=")
         && log.contains("column=")
-        && log.contains("config_location=")));
+        && !log.contains("path=")
+        && !log.contains("config_location=")));
     assert!(logs.iter().any(|log| log.contains("yaml-syntax")));
     assert!(logs.iter().any(|log| log.contains("config-unknown-field")));
-    assert!(logs.iter().all(|log| !log.contains("PAYLOAD_CANARY")));
+    assert!(
+        logs.iter().all(|log| !log.contains("PAYLOAD_CANARY")
+            && !log.contains(fixture.global.to_str().unwrap()))
+    );
     assert!(
         host.definitions
             .iter()
@@ -2100,14 +2427,98 @@ fn discovered_invalid_files_and_duplicates_have_actionable_located_report_diagno
 }
 
 #[test]
+fn discovered_invalid_choice_and_score_criteria_keep_safe_guidance_and_location() {
+    let fixture = Fixture::new();
+    for (kind, criteria) in [("choice", "{low: Low.}"), ("score", "[Low.]")] {
+        let yaml = format!(
+            "name: Invalid {kind}\non:\n  tool_result:\ndecisions:\n  review:\n    input: {{activity: available}}\n    output:\n      verdict:\n        type: {kind}\n        question: How useful is this?\n        criteria: {criteria}\nactions:\n  - type: status\n    input: {{result: failure}}\n"
+        );
+        std::fs::write(fixture.global.join(format!("invalid-{kind}.yml")), yaml).unwrap();
+    }
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+    for kind in ["choice", "score"] {
+        let row = report
+            .iter()
+            .find(|row| row.name == format!("invalid-{kind}.yml"))
+            .unwrap();
+        let diagnostic = row
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "config-invalid-value")
+            .unwrap();
+        assert_eq!(diagnostic.title, "Correct the question criteria");
+        assert!(diagnostic.message.contains("For Choice"));
+        assert!(
+            diagnostic
+                .message
+                .contains("For Score, use an ordered array")
+        );
+        assert!(
+            diagnostic
+                .details
+                .iter()
+                .any(|detail| detail.value == "decisions.review.output.verdict.criteria")
+        );
+        let source = diagnostic.source.as_ref().unwrap();
+        assert_eq!((source.line, source.column), (Some(11), Some(19)));
+        assert!(source.reference.starts_with("check-source:"));
+    }
+}
+
+fn assert_result_seed_before_fresh_user(store: &Store, mixed: bool) {
+    let candidates = store
+        .lock()
+        .prepare("SELECT frozen_input_json FROM burn_check_candidate ORDER BY trigger_position")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|row| {
+            serde_json::from_str::<antiburn_checks::domain::FrozenCandidate>(&row.unwrap()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(candidates.len(), if mixed { 2 } else { 1 });
+    let seeded = &candidates[0].messages;
+    assert_eq!(seeded.len(), 3);
+    assert!(
+        seeded
+            .iter()
+            .all(|message| message.value["kind"] == "tool_result")
+    );
+    if mixed {
+        let selected = &candidates[1].messages;
+        assert_eq!(selected.len(), 4);
+        assert_eq!(&selected[..3], seeded);
+        assert_eq!(selected[3].value["kind"], "user_message");
+        assert!(selected[3].value.to_string().contains("Fresh user work"));
+    }
+    assert_eq!(
+        store
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_check_session_attachment",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn inaccessible_directory_without_previous_definitions_has_a_report_row_and_recovers() {
     let fixture = Fixture::new();
     std::fs::remove_file(fixture.global.join("failed-retry-loop.yml")).unwrap();
     std::fs::remove_dir(&fixture.global).unwrap();
     std::fs::write(&fixture.global, "not a folder").unwrap();
     let mut host = fixture.host();
-    host.reconcile(&Admission::Ready).unwrap();
-    let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+    let state = InstalledChecks::default();
+    let reported = failed_directory_inventory(&mut host, &state);
+    assert!(host.definitions.is_empty());
+    assert!(runtime_definition_bindings(&fixture.store).is_empty());
+    assert!(!antiburn_checks_store::runtime_snapshot_ready(&fixture.store.lock()).unwrap());
+    let report = read_installed_checks(&fixture.store, &reported).unwrap();
     assert_eq!(report.len(), 1);
     let diagnostic = &report[0].diagnostics[0];
     assert_eq!(diagnostic.code, "discovery-directory-unavailable");
@@ -2116,15 +2527,204 @@ fn inaccessible_directory_without_previous_definitions_has_a_report_row_and_reco
         diagnostic.details[0].value,
         fixture.global.to_string_lossy()
     );
-    assert!(host.definitions[0].definition_sources.is_empty());
+    assert!(reported[0].definition_sources.is_empty());
+    assert_eq!(failed_directory_inventory(&mut host, &state), reported);
     std::fs::remove_file(&fixture.global).unwrap();
     std::fs::create_dir(&fixture.global).unwrap();
-    host.reconcile(&Admission::Ready).unwrap();
+    let update = host.reconcile(&Admission::Ready);
+    assert!(finish_inventory_update(
+        &state,
+        &host,
+        update,
+        diagnostics::RuntimeStage::Reconcile,
+        &mut None,
+        |_| {},
+    ));
+    assert!(antiburn_checks_store::runtime_snapshot_ready(&fixture.store.lock()).unwrap());
+    assert!(state.metadata.read().unwrap().is_empty());
     assert!(
         read_installed_checks(&fixture.store, &host.definitions)
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn overlapping_global_and_disabled_project_folder_preserves_failure_and_recovers() {
+    for saved_history in [false, true] {
+        let fixture = Fixture::new();
+        let shared = fixture.project.join(".antiburn/checks");
+        let check_path = shared.join("failed-retry-loop.yml");
+        std::fs::write(&check_path, CHECK).unwrap();
+        let mut previous = InstalledCheckHost::new(
+            Arc::clone(&fixture.store),
+            Arc::clone(&fixture.evaluator),
+            Some(shared.clone()),
+        )
+        .unwrap();
+        if saved_history {
+            previous.reconcile(&Admission::Ready).unwrap();
+            fixture.publish("main", 3);
+            previous.catch_up().unwrap();
+            fixture.evaluator.answer("stuck");
+            assert_eq!(
+                previous
+                    .evaluation_jobs(1)
+                    .pop()
+                    .unwrap()
+                    .run()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .outcome,
+                RunOutcome::Accepted
+            );
+        }
+        assert!(
+            fixture
+                .store
+                .set_repository_enabled(&repository(&fixture.project).key, false)
+                .unwrap()
+        );
+        assert_eq!(
+            native_repositories(fixture.store.repositories().unwrap()).get(&fixture.project),
+            Some(&false)
+        );
+        let scope = ActivationScope {
+            environment: "native".into(),
+            session_cwd: fixture.project.to_string_lossy().into_owned(),
+            run: RunScope::Live,
+        };
+        assert!(live_projects(&fixture.store).unwrap().contains(&scope));
+        if saved_history {
+            previous.reconcile(&Admission::Ready).unwrap();
+            assert_eq!(previous.definitions.len(), 1);
+            assert!(matches!(
+                previous.definitions[0].availability,
+                InstalledCheckAvailability::Paused { .. }
+            ));
+        }
+        drop(previous);
+        let snapshot = || {
+            [
+                "SELECT json_array(check_id, activation_scope_key, generation, definition_revision, enabled, bootstrap_sequence, applied_sequence, checkpoint_json)
+                 FROM burn_check_activation ORDER BY check_id, activation_scope_key",
+                "SELECT json_array(assessment_id, candidate_id, outcome, evidence_valid, actions_json)
+                 FROM burn_check_assessment_history ORDER BY assessment_id",
+                "SELECT json_array(check_id, activation_scope_key, branch_key, generation, status, assessment_id, evidence_valid)
+                 FROM burn_check_current_status ORDER BY check_id, activation_scope_key, branch_key",
+            ].map(|sql| fixture.store.lock().prepare(sql).unwrap()
+                .query_map([], |row| row.get::<_, String>(0)).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap())
+        };
+        let saved = snapshot();
+        assert_eq!(saved[1].len(), usize::from(saved_history));
+        let bindings = runtime_definition_bindings(&fixture.store);
+        assert_eq!(bindings.len(), usize::from(saved_history));
+        std::fs::remove_file(&check_path).unwrap();
+        std::fs::remove_dir(&shared).unwrap();
+        std::fs::write(&shared, "not a folder").unwrap();
+        let mut host = InstalledCheckHost::new(
+            Arc::clone(&fixture.store),
+            Arc::clone(&fixture.evaluator),
+            Some(shared.clone()),
+        )
+        .unwrap();
+        let state = InstalledChecks::default();
+        state.credentials_restored.store(true, Ordering::Release);
+        let reported = failed_directory_inventory(&mut host, &state);
+        assert!(host.definitions.is_empty());
+        assert!(host.projects.is_empty());
+        assert_eq!(host.watch_directories, vec![shared.clone()]);
+        assert_eq!(runtime_definition_bindings(&fixture.store), bindings);
+        assert_eq!(snapshot(), saved);
+        assert_eq!(
+            antiburn_checks_store::runtime_snapshot_ready(&fixture.store.lock()).unwrap(),
+            saved_history
+        );
+        let report = read_installed_checks(&fixture.store, &reported).unwrap();
+        assert_eq!(report.len(), 1);
+        let folders = report[0]
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "discovery-directory-unavailable")
+            .collect::<Vec<_>>();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].details[0].value, shared.to_string_lossy());
+        assert!(
+            report[0]
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "storage-failed")
+        );
+        assert_eq!(failed_directory_inventory(&mut host, &state), reported);
+        assert_eq!(runtime_definition_bindings(&fixture.store), bindings);
+        assert_eq!(snapshot(), saved);
+
+        std::fs::remove_file(&shared).unwrap();
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::write(&check_path, CHECK).unwrap();
+        let update = host.reconcile(&Admission::Ready);
+        assert!(finish_inventory_update(
+            &state,
+            &host,
+            update,
+            diagnostics::RuntimeStage::Reconcile,
+            &mut None,
+            |_| {},
+        ));
+        assert!(host.inventory_ready);
+        assert_eq!(host.definitions.len(), 1);
+        assert!(matches!(
+            host.definitions[0].availability,
+            InstalledCheckAvailability::Paused { .. }
+        ));
+        assert_eq!(
+            host.definitions[0].activation_scope_key,
+            StoreCheckStore::activation_scope_key(&scope)
+        );
+        assert_eq!(
+            host.definitions[0].source.scope,
+            InstalledCheckScope::Global
+        );
+        assert!(host.projects.contains_key(&scope));
+        assert_eq!(
+            host.definitions[0].source.path.as_deref(),
+            check_path.to_str()
+        );
+        assert_eq!(host.definitions[0].definition_sources.len(), 1);
+        assert!(host.evaluation_jobs(1).is_empty());
+        assert!(
+            host.projects
+                .values()
+                .all(|project| project.active.is_empty())
+        );
+        update_delivery_readiness(&state, &host, true);
+        assert!(!state.delivery_ready.load(Ordering::Acquire));
+        assert_eq!(host.watch_directories, vec![shared.clone()]);
+        assert!(antiburn_checks_store::runtime_snapshot_ready(&fixture.store.lock()).unwrap());
+        assert_eq!(runtime_definition_bindings(&fixture.store).len(), 1);
+        assert_eq!(
+            fixture.evaluator.inputs.lock().unwrap().len(),
+            usize::from(saved_history)
+        );
+        let metadata = state.metadata.read().unwrap().clone();
+        assert_eq!(metadata, host.definitions);
+        assert!(
+            metadata
+                .iter()
+                .all(
+                    |definition| !definition.diagnostics.iter().any(|diagnostic| matches!(
+                        diagnostic.code.as_str(),
+                        "discovery-directory-unavailable" | "storage-failed"
+                    ))
+                )
+        );
+        if saved_history {
+            assert_eq!(runtime_definition_bindings(&fixture.store), bindings);
+            assert_eq!(snapshot(), saved);
+        }
+    }
 }
 
 #[test]
@@ -2175,7 +2775,7 @@ fn provider_admission_errors_are_typed_and_clear_when_configured() {
         (Admission::ProviderNotConfigured, "provider-not-configured"),
         (Admission::AuthenticationRejected, "provider-authentication"),
         (
-            Admission::Unsupported("Jev is required".into()),
+            Admission::Unsupported("The selected connection is unavailable".into()),
             "provider-unavailable",
         ),
     ] {
@@ -2190,6 +2790,214 @@ fn provider_admission_errors_are_typed_and_clear_when_configured() {
             .diagnostics
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn capability_pauses_preserve_definition_generation_windows_and_accepted_status() {
+    let fixture = Fixture::new();
+    let mut host = fixture.host();
+    host.capabilities = Some(ModelCapabilities::jev_default());
+    host.reconcile(&Admission::Ready).unwrap();
+    fixture.publish("main", 3);
+    host.catch_up().unwrap();
+    fixture.evaluator.answer("stuck");
+    assert_eq!(
+        host.evaluation_jobs(1)
+            .pop()
+            .unwrap()
+            .run()
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome,
+        RunOutcome::Accepted
+    );
+    let scope = host.projects.keys().next().unwrap().clone();
+    let active = host.projects[&scope].active[0].clone();
+    let source = host.projects[&scope]
+        .store
+        .load_source_progress(&active)
+        .unwrap();
+    let accepted = status_writes(&fixture.store, &host.definitions[0]);
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(
+        read_installed_checks(&fixture.store, &host.definitions).unwrap()[0].finding,
+        1
+    );
+    for unavailable in ["choice", "probabilities", "criteria", "authentication"] {
+        let mut capabilities = ModelCapabilities::jev_default();
+        match unavailable {
+            "choice" => capabilities.output.choice = None,
+            "probabilities" => capabilities.output.choice.as_mut().unwrap().probabilities = false,
+            "criteria" => {
+                capabilities
+                    .output
+                    .choice
+                    .as_mut()
+                    .unwrap()
+                    .maximum_criteria = 2
+            }
+            _ => {}
+        }
+        host.capabilities = Some(capabilities);
+        host.reconcile(&if unavailable == "authentication" {
+            Admission::AuthenticationRejected
+        } else {
+            Admission::Ready
+        })
+        .unwrap();
+        if unavailable == "authentication" {
+            assert!(host.evaluation_jobs(1).is_empty());
+        }
+        assert_ne!(
+            host.definitions[0].availability,
+            InstalledCheckAvailability::Available,
+            "{unavailable}"
+        );
+        assert_eq!(host.projects[&scope].active[0].id, active.id);
+        assert_eq!(
+            status_writes(&fixture.store, &host.definitions[0]),
+            accepted
+        );
+        assert_eq!(
+            host.projects[&scope]
+                .store
+                .load_source_progress(&active)
+                .unwrap(),
+            source
+        );
+        let report = read_installed_checks(&fixture.store, &host.definitions).unwrap();
+        assert_eq!(report[0].finding, 1, "{unavailable}");
+        assert_eq!(report[0].checking_count, 0);
+        assert!(!matches!(
+            report[0].availability,
+            InstalledCheckAvailability::Invalid { .. }
+        ));
+        host.capabilities = Some(ModelCapabilities::jev_default());
+        host.reconcile(&Admission::Ready).unwrap();
+        assert_eq!(host.projects[&scope].active[0].id, active.id);
+        assert_eq!(
+            status_writes(&fixture.store, &host.definitions[0]),
+            accepted
+        );
+        assert!(!host.evaluation_jobs(1).is_empty());
+        assert_eq!(
+            read_installed_checks(&fixture.store, &host.definitions).unwrap()[0].finding,
+            1
+        );
+    }
+}
+
+#[test]
+fn choice_admission_checks_confidence_and_label_only_requirements_without_changing_policy() {
+    use antiburn_checks::decision::{QuestionKind, QuestionRequirements};
+    let mut capabilities = ModelCapabilities::jev_default();
+    let mut requirements = QuestionRequirements {
+        decision: "review".into(),
+        question: "verdict".into(),
+        kind: QuestionKind::Choice,
+        criteria_count: 2,
+        probabilities: false,
+        confidence: false,
+    };
+    capabilities.output.choice.as_mut().unwrap().probabilities = false;
+    capabilities.output.choice.as_mut().unwrap().confidence = false;
+    assert!(question_admission(std::slice::from_ref(&requirements), &capabilities).is_ok());
+    requirements.probabilities = true;
+    assert!(
+        question_admission(std::slice::from_ref(&requirements), &capabilities)
+            .unwrap_err()
+            .contains("probabilities")
+    );
+    requirements.probabilities = false;
+    requirements.confidence = true;
+    assert!(
+        question_admission(std::slice::from_ref(&requirements), &capabilities)
+            .unwrap_err()
+            .contains("confidence")
+    );
+    requirements.confidence = false;
+    capabilities.criteria_per_question.value = Some(1);
+    assert!(
+        question_admission(std::slice::from_ref(&requirements), &capabilities)
+            .unwrap_err()
+            .contains("supports 1 to 1")
+    );
+}
+
+#[test]
+fn all_typed_question_requirements_include_whole_and_dynamic_detail_reads() {
+    let source = "name: Typed admission\non:\n  tool_result:\ndecisions:\n  review:\n    input: {activity: '${{ message.tool.result }}'}\n    output:\n      verdict:\n        type: choice\n        question: Is this clear?\n        criteria: {clear: Clear., concern: Concern.}\n      severity:\n        type: score\n        question: How severe is this?\n        criteria: [low, high]\n      applies:\n        type: noul\n        question: Does this apply?\nactions:\n  - type: status\n    if: EXPRESSION\n    input: {result: failure}\n";
+    for expression in [
+        "contains(toJSON(decisions.review.details), 'confidence')",
+        "contains(toJSON((decisions.*.details)[message.tool.arguments.index]), 'confidence')",
+    ] {
+        let compiled =
+            antiburn_checks::compiler::compile(&source.replace("EXPRESSION", expression)).unwrap();
+        let requirements = compiled.question_requirements();
+        assert_eq!(requirements.len(), 3);
+        assert!(
+            requirements
+                .iter()
+                .filter(|requirement| requirement.criteria_count > 0)
+                .all(|requirement| requirement.probabilities && requirement.confidence)
+        );
+        for field in [
+            "score",
+            "score-confidence",
+            "choice-probabilities",
+            "noul",
+            "questions",
+        ] {
+            let mut caps = ModelCapabilities::jev_default();
+            match field {
+                "score" => caps.output.score = None,
+                "score-confidence" => caps.output.score.as_mut().unwrap().confidence = false,
+                "choice-probabilities" => {
+                    caps.output.choice.as_mut().unwrap().probabilities = false
+                }
+                "noul" => caps.output.noul = false,
+                "questions" => caps.questions_per_request.value = Some(2),
+                _ => unreachable!(),
+            }
+            assert!(
+                question_admission(&requirements, &caps).is_err(),
+                "{field} {expression}"
+            );
+        }
+    }
+}
+
+#[test]
+fn provider_discovery_requires_due_work_in_a_current_attached_source() {
+    let fixture = Fixture::new();
+    let mut host = fixture.host();
+    host.reconcile(&Admission::Ready).unwrap();
+    let scope = host.projects.keys().next().unwrap().clone();
+    let active = host.projects[&scope].active[0].clone();
+    let store = Arc::clone(&host.projects[&scope].store);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    assert!(!store.has_due_candidate(&active, now).unwrap());
+    fixture.publish("main", 3);
+    host.catch_up().unwrap();
+    assert!(store.has_due_candidate(&active, now).unwrap());
+    fixture
+        .store
+        .lock()
+        .execute("UPDATE session SET cwd = '/workspace/other'", [])
+        .unwrap();
+    assert!(!store.has_due_candidate(&active, now).unwrap());
+    fixture
+        .store
+        .lock()
+        .execute("UPDATE session SET cwd = ?1", [&scope.session_cwd])
+        .unwrap();
+    assert!(store.has_due_candidate(&active, now).unwrap());
+    fixture
+        .store
+        .cancel_unfinished_burn_check_assessments_for_connection_change()
+        .unwrap();
+    assert!(!store.has_due_candidate(&active, now).unwrap());
 }
 
 #[cfg(target_os = "macos")]
@@ -2212,14 +3020,21 @@ fn protected_repository_without_grant_is_not_read_or_watched() {
         )
         .unwrap();
     let mut host = fixture.host();
-    host.reconcile(&Admission::Ready).unwrap();
+    let state = InstalledChecks::default();
+    let reported = failed_directory_inventory(&mut host, &state);
     assert_eq!(host.watch_directories, vec![fixture.global.clone()]);
     assert!(host.evaluation_jobs(1).is_empty());
-    assert!(
-        host.definitions[0]
-            .diagnostic
-            .as_deref()
-            .unwrap()
-            .contains("Folder access is not granted")
+    assert!(host.definitions.is_empty());
+    assert!(runtime_definition_bindings(&fixture.store).is_empty());
+    let report = read_installed_checks(&fixture.store, &reported).unwrap();
+    let diagnostic = report[0]
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "discovery-directory-unavailable")
+        .unwrap();
+    assert!(diagnostic.message.contains("grant access"));
+    assert_eq!(
+        diagnostic.details[0].value,
+        root.join(".antiburn/checks").to_string_lossy()
     );
 }

@@ -63,6 +63,137 @@ fn saved_results(store: &Store) -> (String, String, String, String) {
 }
 
 #[test]
+fn parser_67_reconciliation_keeps_parser_66_results_unknown_delivery_and_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let (store, adapter, active) =
+        fixture_with_store(Arc::new(Store::open(directory.path()).unwrap()));
+    let accepted = apply(
+        &adapter,
+        &active,
+        &event(&store, 1, "accepted", "branch-a", 1),
+    );
+    let assessment = answer(&adapter, &active, claim(&adapter, &accepted), 0.99);
+    assert_eq!(
+        adapter.accept(&assessment).unwrap(),
+        AcceptanceOutcome::Accepted
+    );
+    let unknown = apply(
+        &adapter,
+        &active,
+        &event(&store, 2, "unknown", "branch-b", 1),
+    );
+    let claimed = claim(&adapter, &unknown);
+    adapter
+        .dispatch_review(&claimed, 100_000, Duration::ZERO, 1)
+        .unwrap();
+    adapter
+        .record_attempt_failure(
+            &claimed,
+            &review_attempt(1),
+            AttemptFailure::Unknown,
+            &EvaluationDiagnostic {
+                code: antiburn_checks::engine::EvaluationFailureCode::DeliveryUnknown,
+                detail: "Synthetic unknown delivery.".into(),
+            },
+        )
+        .unwrap();
+    for (candidate, usage) in [
+        (
+            &accepted,
+            Some(antiburn_local::analysis::jev::JevUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+            }),
+        ),
+        (&unknown, None),
+    ] {
+        store
+            .record_burn_check_decision_usage(
+                &hex(&candidate.fingerprint),
+                &review_attempt(1),
+                &active.id.definition_id,
+                ("custom-systemone", "synthetic-model"),
+                usage,
+                100,
+            )
+            .unwrap();
+    }
+    store
+        .lock()
+        .execute(
+            "INSERT INTO session_evidence (environment_key, agent, session_id, status,
+             analyzed_generation, parser_revision, analyzer_revision, evidence_schema_revision)
+         SELECT environment_key, agent, session_id, 'ready', source_generation, 66, ?1, ?2
+           FROM session",
+            params![
+                antiburn_local::analysis::ANALYZER_REVISION,
+                antiburn_local::analysis::EVIDENCE_SCHEMA_REVISION
+            ],
+        )
+        .unwrap();
+    let saved = saved_results(&store);
+    let usage = store.burn_check_usage_summary().unwrap();
+    assert_eq!(usage.confirmed_calls, 1);
+    assert_eq!(usage.unknown_outcomes, 1);
+    let progress = adapter.load_source_progress(&active).unwrap();
+    let attempts = |store: &Store| {
+        store
+            .lock()
+            .prepare(
+                "SELECT json_array(attempt_id, state, outcome, response_json)
+           FROM burn_check_evaluation_attempt ORDER BY attempt_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let before_attempts = attempts(&store);
+    let revisions = crate::analysis::projection_revisions();
+    assert_eq!(revisions.parser_revision, 67);
+    assert_eq!(
+        store
+            .reconcile_evidence_revisions(&["fixture"], revisions)
+            .unwrap(),
+        2
+    );
+    assert_eq!(saved_results(&store), saved);
+    assert_eq!(store.burn_check_usage_summary().unwrap(), usage);
+    assert_eq!(attempts(&store), before_attempts);
+    assert_eq!(adapter.load_source_progress(&active).unwrap(), progress);
+    drop(adapter);
+    drop(store);
+
+    let store = Arc::new(Store::open(directory.path()).unwrap());
+    let adapter = Arc::new(
+        StoreCheckStore::new(
+            store.clone(),
+            "parser-67-restart".into(),
+            active.id.scope.clone(),
+        )
+        .unwrap(),
+    );
+    adapter.register_activation(&active).unwrap();
+    let engine = CheckEngine::new(adapter.clone(), Arc::new(NoEvaluator));
+    assert_eq!(engine.recover_pending().unwrap().candidates, 0);
+    assert!(adapter.load_recovery(None, 10).unwrap().is_empty());
+    assert_eq!(saved_results(&store), saved);
+    assert_eq!(store.burn_check_usage_summary().unwrap(), usage);
+    assert_eq!(adapter.load_source_progress(&active).unwrap(), progress);
+    assert_eq!(attempts(&store), before_attempts);
+    let unknown_outcomes: i64 = store
+        .lock()
+        .query_row(
+            "SELECT COUNT(*) FROM burn_check_evaluation_attempt WHERE outcome = 'unknown'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unknown_outcomes, 1);
+}
+
+#[test]
 fn source_gaps_preserve_accepted_status_and_only_segment_resets_cancel_pending_work() {
     for reset in [false, true] {
         for status in ["success", "failure"] {
@@ -105,12 +236,7 @@ fn source_gaps_preserve_accepted_status_and_only_segment_resets_cancel_pending_w
                     }
                     "dispatching" => {
                         adapter
-                            .record_dispatch_intent(
-                                &claim(&adapter, &pending),
-                                100_000,
-                                Duration::ZERO,
-                                1,
-                            )
+                            .dispatch_review(&claim(&adapter, &pending), 100_000, Duration::ZERO, 1)
                             .unwrap();
                     }
                     "answered" => {

@@ -1,8 +1,5 @@
 //! Exact burn-check targets and direct remediation actions.
 
-#[cfg(test)]
-mod citation_tests;
-mod comparison;
 pub(crate) mod config;
 #[cfg(test)]
 mod coverage_contract;
@@ -15,8 +12,8 @@ mod opencode_v2_subagent_tests;
 mod opencode_v2_tests;
 #[cfg(test)]
 mod opencode_v2_watch_tests;
+mod prompts;
 mod recovery;
-mod scope_evidence;
 mod stored;
 mod target;
 mod vendors;
@@ -64,7 +61,6 @@ use crate::store::{
 };
 use vendors::{ActionSupport, RemediationAction, vendor_policy};
 
-use comparison::*;
 use config::*;
 pub(crate) use config::{PublicationConfigAttribution, publication_config_attribution_async};
 pub(crate) use config::{PublicationSettingAttribution, publication_config_attribution};
@@ -85,14 +81,6 @@ use stored::{
 pub(crate) use target::passive_remediations;
 use target::*;
 pub(crate) use watch::evaluate_dirty_remediation;
-
-type ScopeEvidenceCache = BTreeMap<
-    (SessionKey, u64, i64, Option<String>, i64),
-    Option<(
-        crate::scope_creep_worker::Publication,
-        crate::smart_check_inputs::SmartCheckInputSnapshot,
-    )>,
->;
 
 fn representative_paths(
     store: &Store,
@@ -138,481 +126,6 @@ const PREPARED_CACHE_LIMIT: usize = 8;
 const PREPARED_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const TARGET_DOMAIN: &[u8] = b"antiburn/remediation-target/v2\0";
 const PROMPT_REFERENCE_PREFIX: &str = "Remediation reference: ABR-";
-const SMART_CHECKS_ENABLED_AT_KEY: &str = "internal:burnChecksEnabledAtEpochV1";
-
-fn smart_check_master_generation(store: &Store, detector: DetectorId) -> Option<String> {
-    crate::jev::worker::registered_check_ids()
-        .contains(&detector)
-        .then(|| store.internal_value(SMART_CHECKS_ENABLED_AT_KEY))
-        .flatten()
-}
-
-fn smart_check_master_available(store: &Store, detector: DetectorId) -> bool {
-    !crate::jev::worker::registered_check_ids().contains(&detector)
-        || store.internal_value(SMART_CHECKS_ENABLED_AT_KEY).is_some()
-}
-
-fn unavailable_instruction_evidence() -> BurnCheckTargetEvidence {
-    BurnCheckTargetEvidence {
-        comparison: None,
-        decision_proof: None,
-        status: BurnCheckEvidenceStatus::Unavailable,
-        items: Vec::new(),
-        occurrences: Vec::new(),
-    }
-}
-
-fn stored_skill_opportunity_evidence(cause: &FindingCause) -> Option<BurnCheckTargetEvidence> {
-    let FindingCause::SkillOpportunity {
-        evidence: Some(evidence),
-        ..
-    } = cause
-    else {
-        return None;
-    };
-    let comparison = &evidence.comparison;
-    let mut skill_limits = vec!["The current skill does not prove past availability."];
-    if comparison.skill.reference.partial {
-        skill_limits.push("Only selected byte ranges support this recommendation. The full reference was not reviewed.");
-    }
-    if comparison.limitations.contains(
-        &antiburn_local::checks::skill_opportunities::SkillOpportunityLimit::CreationTimeUnknown,
-    ) {
-        skill_limits.push("Creation time is unavailable.");
-    }
-    if comparison.limitations.contains(
-        &antiburn_local::checks::skill_opportunities::SkillOpportunityLimit::WorkTimeUnknown,
-    ) {
-        skill_limits.push("The recorded work time is unavailable.");
-    }
-    let mut items = vec![BurnCheckEvidenceItem {
-        label: BurnCheckEvidenceLabel::Instruction,
-        source_label: comparison.skill.name.clone(),
-        reference: comparison.skill.identity.clone(),
-        observed_at_ms: None,
-        start_line: None,
-        end_line: None,
-        excerpt: comparison.skill.description.clone(),
-        explanation: match comparison.skill.reference.source {
-            antiburn_local::checks::skill_opportunities::SkillReferenceSource::Description => "This is selected text from the current skill description.",
-            antiburn_local::checks::skill_opportunities::SkillReferenceSource::MarkdownFallback => "This is selected text from the current skill Markdown file. The skill has no description.",
-        }.to_owned(),
-        limitation: Some(skill_limits.join(" ")),
-    }];
-    items.extend(
-        comparison.work.iter().map(|work| BurnCheckEvidenceItem {
-            label: BurnCheckEvidenceLabel::ObservedAction,
-            source_label: "Recorded work".to_owned(),
-            reference: work.reference.id.clone(),
-            observed_at_ms: work.timestamp_ms,
-            start_line: None,
-            end_line: None,
-            excerpt: work.text.clone(),
-            explanation:
-                "This observed work could benefit from the selected current skill reference."
-                    .to_owned(),
-            limitation: Some(if work.partial {
-                let ranges = work.ranges.iter().map(|(start, end)| format!("{start}..{end}")).collect::<Vec<_>>().join(", ");
-                format!("{} Only selected work byte ranges ({ranges} of {} bytes) support this recommendation. Offsets refer to check-selected action text. Excerpts omit gaps between ranges; the full work was not reviewed.", evidence.absence_limit, work.total_bytes)
-            } else {
-                evidence.absence_limit.clone()
-            }),
-        }),
-    );
-    items.extend(comparison.task.iter().map(|task| BurnCheckEvidenceItem {
-        label: BurnCheckEvidenceLabel::Context,
-        source_label: "Recorded task context".into(),
-        reference: task.reference.id.clone(),
-        observed_at_ms: task.timestamp_ms,
-        start_line: None,
-        end_line: None,
-        excerpt: task.text.clone(),
-        explanation: String::new(),
-        limitation: None,
-    }));
-    items.extend(
-        comparison
-            .used_current_skills
-            .iter()
-            .map(|skill| BurnCheckEvidenceItem {
-                label: BurnCheckEvidenceLabel::Context,
-                source_label: format!("Current used-skill reference · {}", skill.name),
-                reference: skill.identity.clone(),
-                observed_at_ms: None,
-                start_line: None,
-                end_line: None,
-                excerpt: bounded_evidence_excerpt(&skill.description),
-                explanation: match skill.reference.source {
-                    antiburn_local::checks::skill_opportunities::SkillReferenceSource::Description => "This selected current description supplies context about a recorded skill.",
-                    antiburn_local::checks::skill_opportunities::SkillReferenceSource::MarkdownFallback => "This selected current Markdown supplies context about a recorded skill without a description.",
-                }.into(),
-                limitation: Some(
-                    if skill.reference.partial {
-                        "Only selected byte ranges were reviewed. Current text does not prove the reference at the time of work."
-                    } else {
-                        "Current text does not prove the reference at the time of work."
-                    }.into(),
-                ),
-            }),
-    );
-    Some(BurnCheckTargetEvidence {
-        comparison: None,
-        decision_proof: None,
-        status: BurnCheckEvidenceStatus::Available,
-        items,
-        occurrences: Vec::new(),
-    })
-}
-
-fn complete_skill_opportunity_evidence(
-    mut evidence: BurnCheckTargetEvidence,
-    skill: &antiburn_local::checks::skill_opportunities::SkillOpportunityFinding,
-    actions: &[antiburn_local::analysis::jev_evidence::ContentAction],
-) -> BurnCheckTargetEvidence {
-    if skill
-        .comparison
-        .work
-        .iter()
-        .chain(&skill.comparison.task)
-        .any(|citation| !actions.iter().any(|action| citation.matches_action(action)))
-    {
-        return unavailable_instruction_evidence();
-    }
-    for task in &skill.comparison.task {
-        let Some(action) = actions
-            .iter()
-            .find(|action| action.reference == task.reference)
-        else {
-            return unavailable_instruction_evidence();
-        };
-        if let Some(item) = evidence.items.iter_mut().find(|item| {
-            item.label == BurnCheckEvidenceLabel::Context && item.reference == task.reference.id
-        }) {
-            item.source_label = if action.turn_role == "user" && action.authority == "user" {
-                "Requested task"
-            } else {
-                "Recorded task context"
-            }
-            .into();
-        }
-    }
-    for reference in &skill.comparison.use_citations {
-        let Some(action) = actions.iter().find(|action| &action.reference == reference) else {
-            return unavailable_instruction_evidence();
-        };
-        evidence.items.push(BurnCheckEvidenceItem {
-            label: BurnCheckEvidenceLabel::Context,
-            source_label: "Recorded skill use".into(),
-            reference: reference.id.clone(),
-            observed_at_ms: action.timestamp_ms,
-            start_line: None,
-            end_line: None,
-            excerpt: bounded_evidence_excerpt(&action.text),
-            explanation: "This event supports the equivalent-skill comparison.".into(),
-            limitation: Some(
-                "A recorded request does not prove successful skill execution.".into(),
-            ),
-        });
-    }
-    if skill.evidence.iter().any(|citation| {
-        !evidence
-            .items
-            .iter()
-            .any(|item| item.reference == citation.source_id)
-    }) {
-        return unavailable_instruction_evidence();
-    }
-    if let Some(basis) = &skill.explanation_basis {
-        use antiburn_local::checks::skill_opportunities::SkillRelationship;
-        if basis.version == 1
-            && let Some(work) = skill.comparison.work.first()
-        {
-            let relationship = match basis.relationship {
-                SkillRelationship::UsefulProcedure => {
-                    Some(("usefulProcedure", "provides a useful procedure"))
-                }
-                SkillRelationship::SpecialistCheck => {
-                    Some(("specialistCheck", "provides a specialist check"))
-                }
-                _ => None,
-            };
-            if let Some((relationship, purpose)) = relationship {
-                evidence.comparison = Some(BurnCheckEvidenceComparison {
-                    source_ranges: skill
-                        .comparison
-                        .work
-                        .iter()
-                        .chain(&skill.comparison.task)
-                        .flat_map(|citation| {
-                            citation.ranges.iter().map(|&(start_byte, end_byte)| {
-                                BurnCheckSourceRange {
-                                    reference: citation.reference.id.clone(),
-                                    start_byte,
-                                    end_byte,
-                                    range_source: "selected_action_text".into(),
-                                }
-                            })
-                        })
-                        .chain(skill.comparison.skill.reference.ranges.iter().map(
-                            |&(start_byte, end_byte)| BurnCheckSourceRange {
-                                reference: skill.comparison.skill.identity.clone(),
-                                start_byte,
-                                end_byte,
-                                range_source: "skill_definition".into(),
-                            },
-                        ))
-                        .collect(),
-                    explanation: Some(BurnCheckExplanation {
-                        version: 1,
-                        relationship: relationship.into(),
-                        text: format!(
-                            "{} {purpose} for the recorded work {}: {}.",
-                            skill.comparison.skill.name,
-                            explanation_quote(&work.text),
-                            explanation_quote(&skill.comparison.skill.description)
-                        ),
-                        references: vec![
-                            skill.comparison.skill.identity.clone(),
-                            work.reference.id.clone(),
-                        ],
-                    }),
-                    ..Default::default()
-                });
-            }
-        }
-    }
-    evidence
-}
-
-fn stored_instruction_evidence(cause: &FindingCause) -> Option<BurnCheckTargetEvidence> {
-    let FindingCause::IgnoredInstructionConflict(evidence) = cause else {
-        return None;
-    };
-    if evidence.instruction_excerpt.is_empty() && evidence.action_excerpt.is_empty() {
-        return None;
-    }
-    let mut instruction_limits = Vec::new();
-    if evidence.instruction_excerpt.is_empty() {
-        instruction_limits.push("The instruction text was not saved with this finding.");
-    }
-    if evidence.instruction_excerpt_truncated || evidence.instruction_excerpt.len() > 4096 {
-        instruction_limits.push("The saved instruction excerpt is incomplete.");
-    }
-    match evidence.provenance {
-        antiburn_local::analysis::ignored_instructions::InstructionProvenance::CurrentFileComparison =>
-            instruction_limits.push("Note: this session may have run on outdated instructions."),
-        antiburn_local::analysis::ignored_instructions::InstructionProvenance::ObservedRead =>
-            instruction_limits.push("We saw the instruction in the session, but cannot tell if it was active before the action."),
-        antiburn_local::analysis::ignored_instructions::InstructionProvenance::RecordedInjection => {},
-    }
-    if !evidence.limitations.is_empty() {
-        instruction_limits.push("The assessment records additional evidence limits. Review the action and section before deciding.");
-    }
-    Some(BurnCheckTargetEvidence {
-        comparison: None,
-        decision_proof: IgnoredInstructionDecisionProof::from_cause(cause),
-        status: BurnCheckEvidenceStatus::Available,
-        occurrences: Vec::new(),
-        items: vec![
-            BurnCheckEvidenceItem {
-                label: BurnCheckEvidenceLabel::Instruction,
-                source_label: evidence
-                    .source
-                    .strip_prefix("project:")
-                    .or_else(|| evidence.source.strip_prefix("home:"))
-                    .unwrap_or(&evidence.source)
-                    .to_owned(),
-                reference: if evidence.decision_record().is_some() {
-                    format!("{}:{}", evidence.instruction_id, evidence.rule_id)
-                } else {
-                    evidence.rule_heading.clone()
-                },
-                observed_at_ms: None,
-                start_line: Some(evidence.start_line),
-                end_line: Some(evidence.end_line),
-                excerpt: if evidence.instruction_excerpt.is_empty() {
-                    "Instruction text unavailable.".to_owned()
-                } else {
-                    bounded_evidence_excerpt(&evidence.instruction_excerpt)
-                },
-                explanation: format!("Saved instruction text used for this comparison. {} conflict · {}.",
-                    match evidence.certainty {
-                        antiburn_local::analysis::ignored_instructions::FindingCertainty::Likely => "Likely",
-                        antiburn_local::analysis::ignored_instructions::FindingCertainty::Possible => "Possible",
-                    },
-                    match evidence.provenance {
-                        antiburn_local::analysis::ignored_instructions::InstructionProvenance::RecordedInjection => "recorded instruction",
-                        antiburn_local::analysis::ignored_instructions::InstructionProvenance::ObservedRead => "instruction seen in the session",
-                        antiburn_local::analysis::ignored_instructions::InstructionProvenance::CurrentFileComparison => "current instruction file comparison; historical activation is unconfirmed",
-                    }),
-                limitation: (!instruction_limits.is_empty()).then(|| instruction_limits.join(" ")),
-            },
-            BurnCheckEvidenceItem {
-                label: BurnCheckEvidenceLabel::ObservedAction,
-                source_label: "Session action".to_owned(),
-                reference: evidence.action_id.clone(),
-                observed_at_ms: evidence.action_timestamp_ms,
-                start_line: None,
-                end_line: None,
-                excerpt: if evidence.action_excerpt.is_empty() {
-                    "Action text unavailable.".to_owned()
-                } else {
-                    bounded_evidence_excerpt(&evidence.action_excerpt)
-                },
-                explanation: evidence.decision_record().and_then(|decision| decision.contrast_template())
-                    .unwrap_or("Saved action text that Antiburn compared with the instruction.").to_owned(),
-                limitation: if evidence.action_excerpt.is_empty() {
-                    Some("The action text was not saved with this finding.".to_owned())
-                } else { (evidence.action_excerpt_truncated || evidence.action_excerpt.len() > 4096)
-                    .then(|| "The saved action excerpt is incomplete.".to_owned())
-                },
-            },
-        ],
-    })
-}
-
-fn merge_instruction_evidence(
-    saved: Option<BurnCheckTargetEvidence>,
-    validated: BurnCheckTargetEvidence,
-) -> BurnCheckTargetEvidence {
-    let Some(mut saved) = saved else {
-        return validated;
-    };
-    if saved.decision_proof.is_some() && validated.status == BurnCheckEvidenceStatus::Unavailable {
-        return unavailable_instruction_evidence();
-    }
-    saved.decision_proof = validated.decision_proof;
-    let action = &mut saved.items[1];
-    action.explanation = saved.decision_proof.as_ref().map_or_else(
-        || "Saved action text that Antiburn compared with the instruction.".to_owned(),
-        |proof| proof.contrast.clone(),
-    );
-    let context_limit = if validated.status == BurnCheckEvidenceStatus::Unavailable {
-        Some("Session context is unavailable or cannot be validated against the saved action and source.".to_owned())
-    } else {
-        validated
-            .items
-            .iter()
-            .find(|item| item.label == BurnCheckEvidenceLabel::ObservedAction)
-            .and_then(|item| item.limitation.clone())
-    };
-    if let Some(limit) = context_limit {
-        action.limitation = Some(match action.limitation.take() {
-            Some(existing) => format!("{existing} {limit}"),
-            None => limit,
-        });
-    }
-    saved.items.extend(
-        validated
-            .items
-            .into_iter()
-            .filter(|item| item.label == BurnCheckEvidenceLabel::Context),
-    );
-    saved
-}
-
-fn validated_evidence_references(
-    evidence: &antiburn_local::remediation::IgnoredInstructionConflictEvidence,
-    actions: &BTreeMap<String, antiburn_local::analysis::jev_evidence::ContentAction>,
-) -> Option<(Vec<String>, bool)> {
-    use antiburn_local::analysis::ignored_instructions::content_action_digest;
-    let anchor = actions.get(&evidence.action_id)?;
-    if evidence.action_digest.is_empty()
-        || content_action_digest(anchor) != evidence.action_digest
-        || (evidence.action_timestamp_ms.is_some()
-            && anchor.timestamp_ms != evidence.action_timestamp_ms)
-    {
-        return None;
-    }
-    let decision = evidence.decision_record();
-    if let Some(decision) = decision
-        && (anchor.reference != decision.action_anchor.source
-            || anchor.authority != decision.action_authority)
-    {
-        return None;
-    }
-    let context_ids = evidence
-        .nearby_context_ids
-        .iter()
-        .chain(&evidence.counterevidence_ids)
-        .map(String::as_str)
-        .chain(decision.into_iter().flat_map(|decision| {
-            decision
-                .selected_evidence
-                .iter()
-                .map(|identity| identity.source.id.as_str())
-        }))
-        .filter(|id| *id != evidence.action_id)
-        .collect();
-    let available = actions
-        .iter()
-        .filter(|(_, action)| {
-            action.reference.source_key_digest == anchor.reference.source_key_digest
-                && action.reference.thread_digest == anchor.reference.thread_digest
-                && decision.is_none_or(|decision| {
-                    decision
-                        .selected_evidence
-                        .iter()
-                        .find(|identity| identity.source.id == action.reference.id)
-                        .is_none_or(|identity| {
-                            identity.source == action.reference
-                                && identity.content_digest == content_action_digest(action)
-                        })
-                })
-        })
-        .map(|(id, _)| id.clone())
-        .collect();
-    let (mut references, missing) =
-        available_evidence_references(&evidence.action_id, &context_ids, &available)?;
-    if decision.is_some() && missing {
-        return None;
-    }
-    references.sort_by_key(|id| {
-        let action = &actions[id];
-        (
-            action.timestamp_ms,
-            action.reference.turn_index,
-            action.reference.part_index,
-        )
-    });
-    Some((references, missing))
-}
-
-fn validated_instruction_content(
-    session_identity: &str,
-    source_format: SourceFormat,
-    published: antiburn_local::analysis::PublishedContent,
-    published_fence: i64,
-    source_generation: i64,
-) -> Option<antiburn_local::analysis::jev_evidence::SessionContentEvidence> {
-    use antiburn_local::analysis::ignored_instructions::{
-        IgnoredInstructionsCheck, prepare_session_content, select_session_content,
-    };
-    use antiburn_local::analysis::jev::JevCheck;
-
-    if published.publication_fence != published_fence
-        || published.source_generation != Some(source_generation)
-    {
-        return None;
-    }
-    let content = prepare_session_content(session_identity, source_format, published, Vec::new());
-    Some(select_session_content(
-        &content,
-        IgnoredInstructionsCheck.input_selection(),
-    ))
-}
-
-fn prompt_watch_supported(detectors: impl IntoIterator<Item = DetectorId>) -> bool {
-    detectors.into_iter().any(|detector| {
-        !matches!(
-            detector,
-            DetectorId::IgnoredInstructions
-                | DetectorId::SkillOpportunities
-                | DetectorId::OverExploring
-                | DetectorId::ScopeCreep
-        )
-    })
-}
 
 fn resource_target_matches(
     expected: &insights_report::UnusedResourceTarget,
@@ -742,7 +255,6 @@ struct TimedTarget {
     id: String,
     value: CachedTarget,
     check_preferences_revision: u64,
-    smart_master_generation: Option<String>,
     created_at_epoch: i64,
 }
 
@@ -752,7 +264,6 @@ struct PreparedAutoFix {
     prepared: Option<PreparedConfigOperation>,
     retained_bytes: usize,
     check_preferences_revision: u64,
-    smart_master_generation: Option<String>,
     created_at_epoch: i64,
     completed: Option<AutoFixResult>,
 }
@@ -846,13 +357,9 @@ impl RemediationController {
         &self,
         store: &Store,
     ) -> Result<BurnCheckRemediationProgress, ControllerError> {
-        let mut enabled = store
+        let enabled = store
             .enabled_checks()
             .map_err(|_| ControllerError::PersistenceFailed)?;
-        if store.internal_value(SMART_CHECKS_ENABLED_AT_KEY).is_none() {
-            enabled
-                .retain(|detector| !crate::jev::worker::registered_check_ids().contains(detector));
-        }
         let records = store
             .remediations_with_display_snapshots(MAX_REMEDIATION_PROGRESS_RECORDS)
             .map_err(|_| ControllerError::PersistenceFailed)?;
@@ -976,12 +483,8 @@ impl RemediationController {
                     break;
                 }
             }
-            category.lifecycle = resolve_category_lifecycle(
-                category.id.into(),
-                category.finding,
-                category.clean,
-                awaiting_evidence,
-            );
+            category.lifecycle =
+                resolve_category_lifecycle(category.finding, category.clean, awaiting_evidence);
         }
         Ok(())
     }
@@ -1003,14 +506,6 @@ impl RemediationController {
                 truncated: false,
             });
         }
-        let smart_master_generation = smart_check_master_generation(store, detector);
-        if !smart_check_master_available(store, detector) {
-            return Ok(BurnCheckTargetList {
-                targets: Vec::new(),
-                sample_sessions: Vec::new(),
-                truncated: false,
-            });
-        }
         if matches!(
             detector,
             DetectorId::UnusedMcpServers
@@ -1023,7 +518,6 @@ impl RemediationController {
                 context,
                 options,
                 check_preferences_revision,
-                smart_master_generation,
             );
         }
         let page = insights_report::list_current_findings(
@@ -1092,12 +586,7 @@ impl RemediationController {
                 .display()
                 .map_err(|_| ControllerError::Internal)?;
             let display_facts = burn_check_display_facts(&target, None);
-            let instruction_project = matches!(
-                target.findings[0].finding.cause(),
-                FindingCause::IgnoredInstructionConflict(evidence)
-                    if evidence.source.starts_with("project:")
-            );
-            let has_project_path = target.scope_kind == "project" || instruction_project;
+            let has_project_path = target.scope_kind == "project";
             let watch = store
                 .latest_remediation_for_target(
                     &target.findings[0].environment_key,
@@ -1127,13 +616,6 @@ impl RemediationController {
             };
             let target_samples = sample_sessions(&target.findings);
             targets.push(BurnCheckTarget {
-                over_exploring_reason: match target.finding().cause() {
-                    FindingCause::OverExploring(decision) => Some(decision.reason),
-                    _ => None,
-                },
-                decision_proof: IgnoredInstructionDecisionProof::from_cause(
-                    target.finding().cause(),
-                ),
                 finding_id: stable_finding_id(&target),
                 action_id: id.clone(),
                 finding: display,
@@ -1184,12 +666,7 @@ impl RemediationController {
                     Err(reason) => PromptFixAvailability::Unavailable(reason),
                 },
                 watch,
-                evidence_available: target.findings.iter().any(|finding| {
-                    finding.finding.detector == DetectorId::IgnoredInstructions
-                        || stored_skill_opportunity_evidence(finding.finding.cause()).is_some()
-                        || finding.finding.detector == DetectorId::OverExploring
-                        || finding.finding.detector == DetectorId::ScopeCreep
-                }),
+                evidence_available: false,
                 coverage_limits: vec![CoverageLimit::CurrentPublishedEvidenceOnly],
                 sample_sessions: target_samples,
                 expires_at_epoch: expires,
@@ -1199,17 +676,11 @@ impl RemediationController {
                     id,
                     value: target,
                     check_preferences_revision,
-                    smart_master_generation: smart_master_generation.clone(),
                     created_at_epoch: options.now,
                 });
             }
         }
-        if !self.check_policy_matches(
-            store,
-            detector,
-            check_preferences_revision,
-            smart_master_generation.as_deref(),
-        )? {
+        if !self.check_policy_matches(store, detector, check_preferences_revision)? {
             return Ok(BurnCheckTargetList {
                 targets: Vec::new(),
                 sample_sessions: Vec::new(),
@@ -1239,7 +710,6 @@ impl RemediationController {
         context: BurnCheckTargetContext,
         options: TargetListOptions<'_>,
         check_preferences_revision: u64,
-        smart_master_generation: Option<String>,
     ) -> Result<BurnCheckTargetList, ControllerError> {
         let request = insights_report::ReportRequest {
             environment_key: context.environment_key.clone(),
@@ -1335,8 +805,6 @@ impl RemediationController {
                     .cloned(),
             );
             targets.push(BurnCheckTarget {
-                over_exploring_reason: None,
-                decision_proof: None,
                 finding_id: stable_finding_id(&target),
                 action_id: id.clone(),
                 finding: display,
@@ -1366,17 +834,11 @@ impl RemediationController {
                     id,
                     value: target,
                     check_preferences_revision,
-                    smart_master_generation: smart_master_generation.clone(),
                     created_at_epoch: options.now,
                 });
             }
         }
-        if !self.check_policy_matches(
-            store,
-            detector,
-            check_preferences_revision,
-            smart_master_generation.as_deref(),
-        )? {
+        if !self.check_policy_matches(store, detector, check_preferences_revision)? {
             return Ok(BurnCheckTargetList {
                 targets: Vec::new(),
                 sample_sessions: Vec::new(),
@@ -1460,33 +922,8 @@ impl RemediationController {
         store: &Store,
         action_id: &str,
     ) -> Result<PromptFixResult, ControllerError> {
-        let now = now_epoch();
-        let target = self.cached_target(store, action_id, now)?;
-        self.revalidate(&target)?;
-        let base_prompt = remediation_prompt(target.finding())
-            .map_err(ControllerError::PromptUnavailable)?
-            .into_string();
-        let paths = representative_paths(
-            store,
-            target.findings.iter().map(|finding| {
-                SessionKey::new(
-                    finding.environment_key.as_str(),
-                    finding.agent.as_str(),
-                    finding.session_id.as_str(),
-                )
-            }),
-        )?;
-        let (reference, prompt_group_id) =
-            self.prompt_reference_for_targets(store, std::slice::from_ref(&target))?;
-        let prompt = prompt_with_evidence_paths(&base_prompt, &paths, Some(&reference))
-            .map_err(ControllerError::PromptUnavailable)?;
-        let (watches, prompt) = self.persist_prompt_watches(
-            store,
-            std::slice::from_ref(&target),
-            prompt_group_id.as_deref(),
-            &prompt,
-            now,
-        )?;
+        let target = self.cached_target(store, action_id, now_epoch())?;
+        let (watches, prompt) = self.copy_current_prompt_for_cached_targets(store, &[target])?;
         let watch = watches
             .into_iter()
             .next()
@@ -1494,645 +931,6 @@ impl RemediationController {
             .transpose()?
             .flatten();
         Ok(PromptFixResult { prompt, watch })
-    }
-
-    pub fn burn_check_target_evidence(
-        &self,
-        store: &Store,
-        action_id: &str,
-    ) -> Result<BurnCheckTargetEvidence, ControllerError> {
-        let target = match self.cached_target(store, action_id, now_epoch()) {
-            Ok(target) => target,
-            Err(ControllerError::TargetNotFound | ControllerError::TargetExpired) => {
-                return Ok(unavailable_instruction_evidence());
-            }
-            Err(error) => return Err(error),
-        };
-        if !matches!(
-            target.finding().detector,
-            DetectorId::IgnoredInstructions
-                | DetectorId::SkillOpportunities
-                | DetectorId::OverExploring
-                | DetectorId::ScopeCreep
-        ) {
-            return Err(ControllerError::TargetNotFound);
-        }
-        let mut result = unavailable_instruction_evidence();
-        let mut scope_snapshots = BTreeMap::new();
-        for current in target.findings.iter().take(MAX_TARGETS) {
-            if let FindingCause::ScopeCreep(scope) = current.finding.cause() {
-                let evidence =
-                    self.validated_scope_creep_evidence(store, current, &mut scope_snapshots)?;
-                if result.occurrences.is_empty() {
-                    result.status = evidence.status;
-                    result.items = evidence.items.clone();
-                }
-                result.occurrences.push(BurnCheckEvidenceOccurrence {
-                    comparison: evidence.comparison,
-                    decision_proof: None,
-                    finding_id: scope.id.clone(),
-                    status: evidence.status,
-                    items: evidence.items,
-                });
-                continue;
-            }
-            if let FindingCause::OverExploring(decision) = current.finding.cause() {
-                let evidence = self.validated_over_exploring_evidence(store, current)?;
-                if result.occurrences.is_empty() {
-                    result.status = evidence.status;
-                    result.items = evidence.items.clone();
-                }
-                result.occurrences.push(BurnCheckEvidenceOccurrence {
-                    comparison: evidence.comparison,
-                    decision_proof: None,
-                    finding_id: decision.work_item_id.clone(),
-                    status: evidence.status,
-                    items: evidence.items,
-                });
-                continue;
-            }
-            if let FindingCause::SkillOpportunity {
-                evidence: Some(skill),
-                ..
-            } = current.finding.cause()
-            {
-                if !insights_report::revalidate_current_finding(&self.data_dir, current)
-                    .map_err(|_| ControllerError::Internal)?
-                {
-                    return Ok(unavailable_instruction_evidence());
-                }
-                let evidence = stored_skill_opportunity_evidence(current.finding.cause())
-                    .ok_or(ControllerError::TargetChanged)?;
-                let snapshot = {
-                    let key = SessionKey::new(
-                        &current.environment_key,
-                        &current.agent,
-                        &current.session_id,
-                    );
-                    let Ok(snapshot) = store.load_smart_check_inputs(
-                        &key,
-                        current.published_fence,
-                        current.source_generation,
-                        crate::smart_check_inputs::DetectorInput::SkillOpportunities,
-                    ) else {
-                        return Ok(unavailable_instruction_evidence());
-                    };
-                    snapshot
-                };
-                let evidence = complete_skill_opportunity_evidence(
-                    evidence,
-                    skill,
-                    snapshot.content().actions.as_slice(),
-                );
-                if result.occurrences.is_empty() {
-                    result.status = evidence.status;
-                    result.items = evidence.items.clone();
-                }
-                result.occurrences.push(BurnCheckEvidenceOccurrence {
-                    comparison: evidence.comparison,
-                    decision_proof: None,
-                    finding_id: skill.comparison.id.clone(),
-                    status: evidence.status,
-                    items: evidence.items,
-                });
-                continue;
-            }
-            if !insights_report::revalidate_current_finding(&self.data_dir, current)
-                .map_err(|_| ControllerError::Internal)?
-            {
-                return Ok(unavailable_instruction_evidence());
-            }
-            let saved = stored_instruction_evidence(current.finding.cause());
-            let validated = self.validated_instruction_evidence(store, current)?;
-            let mut evidence = merge_instruction_evidence(saved, validated);
-            evidence.comparison = instruction_comparison(current.finding.cause(), &evidence);
-            if result.occurrences.is_empty() {
-                result.status = evidence.status;
-                result.items = evidence.items.clone();
-                result.decision_proof = evidence.decision_proof.clone();
-            }
-            result.occurrences.push(BurnCheckEvidenceOccurrence {
-                comparison: evidence.comparison,
-                decision_proof: evidence.decision_proof,
-                finding_id: match current.finding.cause() {
-                    FindingCause::IgnoredInstructionConflict(evidence) => {
-                        evidence.assessment_finding_id.clone()
-                    }
-                    _ => return Err(ControllerError::TargetChanged),
-                },
-                status: evidence.status,
-                items: evidence.items,
-            });
-        }
-        result.comparison = result
-            .occurrences
-            .first()
-            .and_then(|occurrence| occurrence.comparison.clone());
-        Ok(result)
-    }
-
-    fn validated_scope_creep_evidence(
-        &self,
-        store: &Store,
-        current: &CurrentFinding,
-        snapshots: &mut ScopeEvidenceCache,
-    ) -> Result<BurnCheckTargetEvidence, ControllerError> {
-        let FindingCause::ScopeCreep(scope) = current.finding.cause() else {
-            return Ok(unavailable_instruction_evidence());
-        };
-        let key = crate::store::SessionKey::new(
-            &current.environment_key,
-            &current.agent,
-            &current.session_id,
-        );
-        let cache_key = (
-            key.clone(),
-            current.incarnation,
-            current.source_generation,
-            current.source_fingerprint.clone(),
-            current.published_fence,
-        );
-        if !snapshots.contains_key(&cache_key) {
-            let publication = crate::scope_creep_worker::current_publication(
-                &store.lock(),
-                &crate::scope_creep_worker::SourceFence {
-                    key: &key,
-                    incarnation: current.incarnation,
-                    source_generation: current.source_generation,
-                    source_fingerprint: current.source_fingerprint.as_deref(),
-                    published_fence: current.published_fence,
-                },
-            )
-            .map_err(|_| ControllerError::Internal)?;
-            let snapshot = match publication {
-                Some(publication) => store
-                    .load_smart_check_inputs(
-                        &key,
-                        current.published_fence,
-                        current.source_generation,
-                        crate::smart_check_inputs::DetectorInput::ScopeCreep,
-                    )
-                    .ok()
-                    .map(|snapshot| (publication, snapshot)),
-                None => None,
-            };
-            snapshots.insert(cache_key.clone(), snapshot);
-        }
-        let Some((publication, snapshot)) = snapshots.get(&cache_key).and_then(Option::as_ref)
-        else {
-            return Ok(unavailable_instruction_evidence());
-        };
-        if !publication
-            .assessment
-            .findings
-            .iter()
-            .any(|finding| finding == scope.as_ref())
-        {
-            return Ok(unavailable_instruction_evidence());
-        }
-        let Some(group) = scope_evidence::accepted_scope_group(publication, scope) else {
-            return Ok(unavailable_instruction_evidence());
-        };
-        Ok(scope_evidence::scope_group_evidence(
-            scope,
-            &group,
-            snapshot.scope(),
-            &snapshot.content().actions,
-        )
-        .unwrap_or_else(unavailable_instruction_evidence))
-    }
-
-    fn validated_over_exploring_evidence(
-        &self,
-        store: &Store,
-        current: &CurrentFinding,
-    ) -> Result<BurnCheckTargetEvidence, ControllerError> {
-        let FindingCause::OverExploring(decision) = current.finding.cause() else {
-            return Ok(unavailable_instruction_evidence());
-        };
-        if !insights_report::revalidate_current_finding(&self.data_dir, current)
-            .map_err(|_| ControllerError::Internal)?
-        {
-            return Ok(unavailable_instruction_evidence());
-        }
-        let key = crate::store::SessionKey {
-            environment_key: current.environment_key.clone(),
-            agent: current.agent.clone(),
-            session_id: current.session_id.clone(),
-        };
-        let Ok(snapshot) = store.load_smart_check_inputs(
-            &key,
-            current.published_fence,
-            current.source_generation,
-            crate::smart_check_inputs::DetectorInput::OverExploring,
-        ) else {
-            return Ok(unavailable_instruction_evidence());
-        };
-        let Some(mut items) =
-            validated_read_task_items(decision, snapshot.scope(), &snapshot.content().actions)
-        else {
-            return Ok(unavailable_instruction_evidence());
-        };
-        let mut reads = Vec::new();
-        for binding in &decision.reads {
-            let Some(request) = snapshot
-                .content()
-                .actions
-                .iter()
-                .find(|action| action.reference.id == binding.request_id)
-            else {
-                return Ok(unavailable_instruction_evidence());
-            };
-            if request
-                .metadata
-                .read_request
-                .as_ref()
-                .is_none_or(|read| read.reference_id != binding.request_id)
-            {
-                return Ok(unavailable_instruction_evidence());
-            }
-            let result = match (&binding.result_id, &binding.output_digest) {
-                (None, None) => None,
-                (Some(id), Some(digest)) => {
-                    let Some(result) = snapshot
-                        .content()
-                        .actions
-                        .iter()
-                        .find(|action| &action.reference.id == id)
-                    else {
-                        return Ok(unavailable_instruction_evidence());
-                    };
-                    if antiburn_local::analysis::ignored_instructions::sha256_hex(
-                        result.text.as_bytes(),
-                    ) != *digest
-                        || !result.reference.stable
-                        || result.tool_call_id.is_none()
-                        || result.tool_call_id != request.tool_call_id
-                        || result.tool_name != request.tool_name
-                        || result.metadata.read_result.as_ref().is_none_or(|read| {
-                            read.reference_id != *id
-                                || read.request_reference_id.as_deref()
-                                    != Some(binding.request_id.as_str())
-                                || read.recorded_output_digest != *digest
-                        })
-                    {
-                        return Ok(unavailable_instruction_evidence());
-                    }
-                    Some(result)
-                }
-                _ => return Ok(unavailable_instruction_evidence()),
-            };
-            for action in std::iter::once(request).chain(result) {
-                items.push(BurnCheckEvidenceItem {
-                    label: BurnCheckEvidenceLabel::ObservedAction, source_label: "Recorded read".into(),
-                    reference: action.reference.id.clone(), observed_at_ms: action.timestamp_ms,
-                    start_line: None, end_line: None, excerpt: bounded_evidence_excerpt(&action.text),
-                    explanation: current.finding.display().map_err(|_| ControllerError::TargetChanged)?.observation,
-                    limitation: Some("The assessment uses bounded representative text ranges. A read request alone does not prove returned content. Not every read or token in the episode is waste.".into()),
-                });
-            }
-            let read = request
-                .metadata
-                .read_request
-                .as_ref()
-                .ok_or(ControllerError::TargetChanged)?;
-            let returned = result.and_then(|action| action.metadata.read_result.as_ref());
-            reads.push(BurnCheckReadEvidence {
-                request_reference: binding.request_id.clone(),
-                result_reference: binding.result_id.clone(),
-                paths: read.paths.clone(),
-                requested_extent: read.extent.clone(),
-                returned_extent: returned.and_then(|read| read.returned_extent.clone()),
-                result_status: returned.map(|read| read.status),
-            });
-        }
-        let explanation = over_exploring_explanation(
-            decision,
-            &snapshot.content().actions,
-            &mut items,
-            &reads,
-        )
-        .or_else(|| {
-            (!items.is_empty()).then(|| BurnCheckExplanation {
-                version: 1,
-                relationship: "recordedEvidence".into(),
-                text: "The finding uses recorded task context and read activity. Review the evidence before acting.".into(),
-                references: Vec::new(),
-            })
-        });
-        let source_ranges = decision
-            .selected_source_snippets()
-            .filter(|_| explanation.is_some())
-            .map(|snippets| {
-                snippets
-                    .map(|snippet| BurnCheckSourceRange {
-                        reference: snippet.reference.id.clone(),
-                        start_byte: snippet.range.0,
-                        end_byte: snippet.range.1,
-                        range_source: "selected_action_text".into(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(BurnCheckTargetEvidence {
-            comparison: Some(BurnCheckEvidenceComparison {
-                reads,
-                explanation,
-                source_ranges,
-                ..Default::default()
-            }),
-            decision_proof: None,
-            status: BurnCheckEvidenceStatus::Available,
-            items,
-            occurrences: Vec::new(),
-        })
-    }
-
-    fn validated_instruction_evidence(
-        &self,
-        store: &Store,
-        current: &CurrentFinding,
-    ) -> Result<BurnCheckTargetEvidence, ControllerError> {
-        let antiburn_local::remediation::FindingCause::IgnoredInstructionConflict(evidence) =
-            current.finding.cause()
-        else {
-            return Ok(unavailable_instruction_evidence());
-        };
-        let antiburn_local::remediation::IgnoredInstructionConflictEvidence {
-            assessment_revision,
-            rule_id,
-            start_line,
-            end_line,
-            source,
-            provenance,
-            action_id,
-            nearby_context_ids,
-            counterevidence_ids,
-            certainty,
-            limitations,
-            ..
-        } = evidence.as_ref();
-
-        let key = SessionKey::new(
-            current.environment_key.as_str(),
-            current.agent.as_str(),
-            current.session_id.as_str(),
-        );
-        let session_identity = format!(
-            "{}\0{}\0{}",
-            current.environment_key, current.agent, current.session_id
-        );
-        let context_ids: BTreeSet<_> = nearby_context_ids
-            .iter()
-            .chain(counterevidence_ids)
-            .map(String::as_str)
-            .chain(evidence.decision_record().into_iter().flat_map(|decision| {
-                decision
-                    .selected_evidence
-                    .iter()
-                    .map(|identity| identity.source.id.as_str())
-            }))
-            .filter(|reference| *reference != action_id)
-            .collect();
-        let mut actions = BTreeMap::new();
-        if let Some(decision) = evidence.decision_record() {
-            let references: Vec<_> = std::iter::once(&decision.action_anchor.source)
-                .chain(
-                    decision
-                        .selected_evidence
-                        .iter()
-                        .map(|identity| &identity.source),
-                )
-                .collect();
-            let Some(published) = store
-                .published_turn_content_identities_selected(
-                    &key,
-                    current.source_generation,
-                    &references,
-                    &context_ids,
-                    antiburn_local::analysis::jev::JevCheck::input_selection(
-                        &antiburn_local::analysis::ignored_instructions::IgnoredInstructionsCheck,
-                    ),
-                )
-                .map_err(|_| ControllerError::Internal)?
-            else {
-                return Ok(unavailable_instruction_evidence());
-            };
-            let Some(content) = validated_instruction_content(
-                &session_identity,
-                current.finding.source_format,
-                published,
-                current.published_fence,
-                current.source_generation,
-            ) else {
-                return Ok(unavailable_instruction_evidence());
-            };
-            actions.extend(
-                content
-                    .actions
-                    .into_iter()
-                    .map(|action| (action.reference.id.clone(), action)),
-            );
-        } else {
-            let mut content_cursor = None;
-            for _ in 0..16 {
-                let Some(page) = store
-                .published_turn_content_keyset_selected(
-                    &key,
-                    antiburn_local::analysis::SelectedContentRequest {
-                        source_generation: current.source_generation,
-                        after_ms: Some(i64::MIN),
-                        source_positions: &BTreeMap::from([("*".to_owned(), 0)]),
-                        cursor: content_cursor.as_ref(),
-                        selection: antiburn_local::analysis::jev::JevCheck::input_selection(
-                            &antiburn_local::analysis::ignored_instructions::IgnoredInstructionsCheck,
-                        ),
-                    },
-                )
-                .map_err(|_| ControllerError::Internal)?
-            else {
-                return Ok(unavailable_instruction_evidence());
-            };
-                let published = page.content;
-                let more = published.coverage.more_parts;
-                let next_cursor = page.next_cursor;
-                let Some(evidence) = validated_instruction_content(
-                    &session_identity,
-                    current.finding.source_format,
-                    published,
-                    current.published_fence,
-                    current.source_generation,
-                ) else {
-                    return Ok(unavailable_instruction_evidence());
-                };
-                for action in evidence.actions {
-                    if action.reference.id == *action_id
-                        || context_ids.contains(action.reference.id.as_str())
-                    {
-                        actions.insert(action.reference.id.clone(), action);
-                    }
-                }
-                if actions.len() == context_ids.len() + 1 || !more {
-                    break;
-                }
-                content_cursor = next_cursor;
-            }
-        }
-        let Some((references, context_missing)) = validated_evidence_references(evidence, &actions)
-        else {
-            return Ok(unavailable_instruction_evidence());
-        };
-        let mut items = vec![BurnCheckEvidenceItem {
-            label: BurnCheckEvidenceLabel::Instruction,
-            source_label: source.strip_prefix("project:").or_else(|| source.strip_prefix("home:")).unwrap_or(source).to_owned(),
-            reference: if evidence.decision_record().is_some() {
-                format!("{}:{}", evidence.instruction_id, rule_id)
-            } else {
-                rule_id.clone()
-            },
-            observed_at_ms: None,
-            start_line: Some(*start_line),
-            end_line: Some(*end_line),
-            excerpt: "Instruction text unavailable.".to_owned(),
-            explanation: format!(
-                "{} conflict · {}.",
-                match certainty {
-                    antiburn_local::analysis::ignored_instructions::FindingCertainty::Likely => "Likely",
-                    antiburn_local::analysis::ignored_instructions::FindingCertainty::Possible => "Possible",
-                },
-                match provenance {
-                    antiburn_local::analysis::ignored_instructions::InstructionProvenance::RecordedInjection => "recorded instruction",
-                    antiburn_local::analysis::ignored_instructions::InstructionProvenance::ObservedRead => "instruction seen in the session",
-                    antiburn_local::analysis::ignored_instructions::InstructionProvenance::CurrentFileComparison => "current instruction file",
-                },
-            ),
-            limitation: Some("The instruction text was not saved with this finding. Current files cannot fill historical evidence gaps.".to_owned()),
-        }];
-        for reference in references {
-            let Some(action) = actions.get(&reference) else {
-                return Ok(unavailable_instruction_evidence());
-            };
-            let is_observed_action = action.reference.id == *action_id;
-            let excerpt = bounded_evidence_excerpt(&action.text);
-            items.push(BurnCheckEvidenceItem {
-                label: if is_observed_action {
-                    BurnCheckEvidenceLabel::ObservedAction
-                } else {
-                    BurnCheckEvidenceLabel::Context
-                },
-                source_label: if is_observed_action {
-                    "Observed session action".to_owned()
-                } else {
-                    "Session context".to_owned()
-                },
-                reference: action.reference.id.clone(),
-                observed_at_ms: action.timestamp_ms,
-                start_line: None,
-                end_line: None,
-                excerpt,
-                explanation: if is_observed_action {
-                    "This is the action cited by the assessment.".to_owned()
-                } else if counterevidence_ids.contains(&action.reference.id) {
-                    "This event is cited as counterevidence, not as another violation.".to_owned()
-                } else {
-                    "This nearby event provides context for the assessment, not another violation."
-                        .to_owned()
-                },
-                limitation: if action.truncated || action.text.len() > 4096 {
-                    Some("The saved event text is incomplete.".to_owned())
-                } else {
-                    None
-                },
-            });
-        }
-        if context_missing
-            && let Some(action) = items
-                .iter_mut()
-                .find(|item| item.label == BurnCheckEvidenceLabel::ObservedAction)
-        {
-            action.limitation = Some(match action.limitation.take() {
-                Some(existing) => format!("{existing} Some nearby context is no longer available."),
-                None => "Some nearby context is no longer available.".to_owned(),
-            });
-        }
-        if !limitations.is_empty() && items[0].limitation.is_none() {
-            items[0].limitation = Some(
-                "The assessment records additional evidence limits. Review the action and section before deciding.".to_owned(),
-            );
-        }
-        if assessment_revision.is_empty() {
-            return Ok(unavailable_instruction_evidence());
-        }
-        Ok(BurnCheckTargetEvidence {
-            comparison: None,
-            decision_proof: IgnoredInstructionDecisionProof::from_cause(current.finding.cause()),
-            status: BurnCheckEvidenceStatus::Available,
-            items,
-            occurrences: Vec::new(),
-        })
-    }
-
-    pub fn copy_prompt_fix_burn_check(
-        &self,
-        store: &Store,
-        detector: DetectorId,
-        context: BurnCheckTargetContext,
-    ) -> Result<CheckPromptFixResult, ControllerError> {
-        if !store
-            .check_enabled(detector)
-            .map_err(|_| ControllerError::PersistenceFailed)?
-            || !smart_check_master_available(store, detector)
-        {
-            return Err(ControllerError::CheckPromptUnavailable);
-        }
-        let targets = self.list_burn_check_targets(store, detector, context)?;
-        let now = now_epoch();
-        if targets.targets.is_empty() {
-            if detector == DetectorId::IgnoredInstructions {
-                return Ok(CheckPromptFixResult {
-                    prompt: fallback_remediation_prompt(detector)
-                        .map_err(ControllerError::PromptUnavailable)?
-                        .into_string(),
-                });
-            }
-            return Err(ControllerError::CheckPromptUnavailable);
-        }
-        if targets.truncated {
-            let base = fallback_remediation_prompt(detector)
-                .map_err(ControllerError::PromptUnavailable)?
-                .into_string();
-            let paths = representative_paths(
-                store,
-                targets.sample_sessions.iter().map(|sample| {
-                    SessionKey::new(&sample.environment_key, &sample.agent, &sample.session_id)
-                }),
-            )?;
-            let selected = targets
-                .targets
-                .iter()
-                .map(|target| self.cached_target(store, &target.action_id, now))
-                .collect::<Result<Vec<_>, _>>()?;
-            let (reference, prompt_group_id) =
-                self.prompt_reference_for_targets(store, &selected)?;
-            let prompt = prompt_with_evidence_paths(&base, &paths, Some(&reference))
-                .map_err(ControllerError::PromptUnavailable)?;
-            let (_, prompt) = self.persist_prompt_watches(
-                store,
-                &selected,
-                prompt_group_id.as_deref(),
-                &prompt,
-                now,
-            )?;
-            return Ok(CheckPromptFixResult { prompt });
-        }
-        self.copy_prompt_fix_burn_check_targets(
-            store,
-            &targets
-                .targets
-                .into_iter()
-                .map(|target| target.action_id)
-                .collect::<Vec<_>>(),
-        )
     }
 
     pub fn copy_prompt_fix_burn_check_targets(
@@ -2151,106 +949,7 @@ impl RemediationController {
             }
             targets.push(self.cached_target(store, action_id, now)?);
         }
-        let detector = targets[0].finding().detector;
-        if targets
-            .iter()
-            .any(|target| target.finding().detector != detector)
-        {
-            return Err(ControllerError::CheckPromptUnavailable);
-        }
-
-        // Validate every selected identity before this action records any watch.
-        self.revalidate_all(&targets)?;
-
-        if targets
-            .iter()
-            .all(|target| target.finding().is_advisory_resource())
-        {
-            let (reference, prompt_group_id) =
-                self.prompt_reference_for_targets(store, &targets)?;
-            let base = fallback_remediation_prompt(detector)
-                .map_err(ControllerError::PromptUnavailable)?
-                .into_string();
-            let paths = representative_paths(
-                store,
-                targets.iter().flat_map(|target| {
-                    target.evidence_sessions().into_iter().map(|sample| {
-                        SessionKey::new(sample.environment_key, sample.agent, sample.session_id)
-                    })
-                }),
-            )?;
-            let base = prompt_with_evidence_paths(&base, &paths, None)
-                .map_err(ControllerError::PromptUnavailable)?;
-            let items =
-                targets
-                    .iter()
-                    .enumerate()
-                    .map(|(index, target)| {
-                        remediation_prompt(target.finding())
-                            .map_err(ControllerError::PromptUnavailable)?;
-                        let display = target
-                            .finding()
-                            .display()
-                            .map_err(ControllerError::PromptUnavailable)?;
-                        let resource = display.facts.labels.first().ok_or(
-                            ControllerError::PromptUnavailable(
-                                RemediationUnavailableReason::EssentialIdentityUnavailable,
-                            ),
-                        )?;
-                        let resource = serde_json::to_string(resource)
-                            .map_err(|_| ControllerError::Internal)?;
-                        Ok(format!(
-                            "{}. Agent: {}; scope: {}; resource: {resource}",
-                            index + 1,
-                            display.agent.slug(),
-                            target.scope_kind,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, ControllerError>>()?;
-            let prompt = prompt_with_evidence_paths(
-                &format!("{base}\n\nUnused targets\n{}", items.join("\n")),
-                &[],
-                Some(&reference),
-            )
-            .map_err(ControllerError::PromptUnavailable)?;
-            let (_, prompt) = self.persist_prompt_watches(
-                store,
-                &targets,
-                prompt_group_id.as_deref(),
-                &prompt,
-                now,
-            )?;
-            return Ok(CheckPromptFixResult { prompt });
-        }
-
-        let (reference, prompt_group_id) = self.prompt_reference_for_targets(store, &targets)?;
-        let mut prompt_parts = Vec::with_capacity(targets.len());
-        for target in &targets {
-            let base = remediation_prompt(target.finding())
-                .map_err(ControllerError::PromptUnavailable)?
-                .into_string();
-            let paths = representative_paths(
-                store,
-                target.findings.iter().map(|finding| {
-                    SessionKey::new(
-                        finding.environment_key.as_str(),
-                        finding.agent.as_str(),
-                        finding.session_id.as_str(),
-                    )
-                }),
-            )?;
-            prompt_parts.push((base, paths));
-        }
-        let mut sections = Vec::with_capacity(targets.len());
-        for (index, (base, paths)) in prompt_parts.into_iter().enumerate() {
-            let prompt = prompt_with_evidence_paths(&base, &paths, None)
-                .map_err(ControllerError::PromptUnavailable)?;
-            sections.push(format!("Exact target {}\n{prompt}", index + 1));
-        }
-        let prompt = prompt_with_evidence_paths(&sections.join("\n\n"), &[], Some(&reference))
-            .map_err(ControllerError::PromptUnavailable)?;
-        let (_, prompt) =
-            self.persist_prompt_watches(store, &targets, prompt_group_id.as_deref(), &prompt, now)?;
+        let (_, prompt) = self.copy_current_prompt_for_cached_targets(store, &targets)?;
         Ok(CheckPromptFixResult { prompt })
     }
 
@@ -2304,12 +1003,7 @@ impl RemediationController {
         let initial_check_preferences_revision = store
             .check_preferences_revision()
             .map_err(|_| ControllerError::PersistenceFailed)?;
-        let initial_master_marker = store.internal_value(SMART_CHECKS_ENABLED_AT_KEY);
         let target = self.cached_target(store, action_id, now)?;
-        let initial_smart_master_generation = crate::jev::worker::registered_check_ids()
-            .contains(&target.finding().detector)
-            .then_some(initial_master_marker)
-            .flatten();
         self.revalidate(&target)?;
         if let Some(watch) = store
             .latest_remediation_for_target(
@@ -2513,14 +1207,6 @@ impl RemediationController {
         if check_preferences_revision != initial_check_preferences_revision {
             return Err(ControllerError::TargetChanged);
         }
-        if smart_check_master_generation(store, target.finding().detector)
-            != initial_smart_master_generation
-        {
-            return Err(ControllerError::TargetChanged);
-        }
-        if !smart_check_master_available(store, target.finding().detector) {
-            return Err(ControllerError::TargetNotFound);
-        }
         if !enabled.contains(&target.finding().detector) {
             return Err(ControllerError::TargetNotFound);
         }
@@ -2541,7 +1227,6 @@ impl RemediationController {
             prepared: Some(prepared),
             retained_bytes,
             check_preferences_revision,
-            smart_master_generation: initial_smart_master_generation,
             created_at_epoch: now,
             completed: None,
         });
@@ -2565,13 +1250,7 @@ impl RemediationController {
         let (enabled, check_preferences_revision) = store
             .check_preferences_snapshot()
             .map_err(|_| ControllerError::PersistenceFailed)?;
-        let current_smart_master_generation = store.internal_value(SMART_CHECKS_ENABLED_AT_KEY);
-        let (
-            target,
-            prepared,
-            prepared_check_preferences_revision,
-            prepared_smart_master_generation,
-        ) = {
+        let (target, prepared, prepared_check_preferences_revision) = {
             let mut state = self.state.lock().map_err(|_| ControllerError::Internal)?;
             let index = state
                 .prepared
@@ -2595,18 +1274,11 @@ impl RemediationController {
                 state.prepared.remove(index);
                 return Err(ControllerError::TargetNotFound);
             }
-            if crate::jev::worker::registered_check_ids().contains(&entry.target.finding().detector)
-                && entry.smart_master_generation != current_smart_master_generation
-            {
-                state.prepared.remove(index);
-                return Err(ControllerError::TargetChanged);
-            }
             let prepared = entry.prepared.take().ok_or(ControllerError::Conflict)?;
             (
                 entry.target.clone(),
                 prepared,
                 entry.check_preferences_revision,
-                entry.smart_master_generation.clone(),
             )
         };
         if let Err(error) = self.revalidate_prepared(store, &target, &prepared) {
@@ -2617,7 +1289,6 @@ impl RemediationController {
             store,
             target.finding().detector,
             prepared_check_preferences_revision,
-            prepared_smart_master_generation.as_deref(),
         )? {
             self.remove_prepared(prepared_operation_id);
             return Err(ControllerError::TargetChanged);
@@ -2629,7 +1300,6 @@ impl RemediationController {
                 &[(remediation, guards)],
                 target.finding().detector,
                 prepared_check_preferences_revision,
-                prepared_smart_master_generation.as_deref(),
             )
             .map_err(|_| ControllerError::PersistenceFailed)?
             .and_then(|mut watches| watches.pop())
@@ -2731,13 +1401,9 @@ impl RemediationController {
 
     pub fn aggregate_wins(&self, store: &Store) -> Result<AggregateWins, ControllerError> {
         let now_ms = now_epoch().saturating_mul(1_000);
-        let mut enabled = store
+        let enabled = store
             .enabled_checks()
             .map_err(|_| ControllerError::PersistenceFailed)?;
-        if store.internal_value(SMART_CHECKS_ENABLED_AT_KEY).is_none() {
-            enabled
-                .retain(|detector| !crate::jev::worker::registered_check_ids().contains(detector));
-        }
         let snoozed = store
             .burn_check_snoozes()
             .map_err(|_| ControllerError::PersistenceFailed)?
@@ -3178,7 +1844,6 @@ impl RemediationController {
         let (enabled, check_preferences_revision) = store
             .check_preferences_snapshot()
             .map_err(|_| ControllerError::PersistenceFailed)?;
-        let current_smart_master_generation = store.internal_value(SMART_CHECKS_ENABLED_AT_KEY);
         let state = self.state.lock().map_err(|_| ControllerError::Internal)?;
         let entry = state
             .targets
@@ -3192,14 +1857,6 @@ impl RemediationController {
         if entry.check_preferences_revision != check_preferences_revision {
             return Err(ControllerError::TargetChanged);
         }
-        if crate::jev::worker::registered_check_ids().contains(&entry.value.finding().detector)
-            && entry.smart_master_generation != current_smart_master_generation
-        {
-            return Err(ControllerError::TargetChanged);
-        }
-        if !smart_check_master_available(store, entry.value.finding().detector) {
-            return Err(ControllerError::TargetNotFound);
-        }
         if !enabled.contains(&entry.value.finding().detector) {
             return Err(ControllerError::TargetNotFound);
         }
@@ -3211,16 +1868,11 @@ impl RemediationController {
         store: &Store,
         detector: DetectorId,
         expected_revision: u64,
-        expected_smart_master_generation: Option<&str>,
     ) -> Result<bool, ControllerError> {
         let (enabled, current_revision) = store
             .check_preferences_snapshot()
             .map_err(|_| ControllerError::PersistenceFailed)?;
-        Ok(enabled.contains(&detector)
-            && current_revision == expected_revision
-            && smart_check_master_available(store, detector)
-            && smart_check_master_generation(store, detector).as_deref()
-                == expected_smart_master_generation)
+        Ok(enabled.contains(&detector) && current_revision == expected_revision)
     }
 
     fn reduce_resource_report(
@@ -3236,35 +1888,6 @@ impl RemediationController {
             },
         )
         .map_err(|_| ControllerError::Internal)
-    }
-
-    /// Revalidates a whole batch with one report reduce per distinct context,
-    /// instead of one reduce per target.
-    fn revalidate_all(&self, targets: &[CachedTarget]) -> Result<(), ControllerError> {
-        let mut reports: Vec<(BurnCheckTargetContext, insights_report::ReducedReport)> = Vec::new();
-        for target in targets {
-            let Some(resource) = &target.resource else {
-                self.revalidate(target)?;
-                continue;
-            };
-            let index = match reports
-                .iter()
-                .position(|(context, _)| *context == resource.context)
-            {
-                Some(index) => index,
-                None => {
-                    reports.push((
-                        resource.context.clone(),
-                        self.reduce_resource_report(&resource.context)?,
-                    ));
-                    reports.len() - 1
-                }
-            };
-            if !resource_is_current(&reports[index].1, resource) {
-                return Err(ControllerError::TargetChanged);
-            }
-        }
-        Ok(())
     }
 
     fn revalidate(&self, target: &CachedTarget) -> Result<(), ControllerError> {
@@ -3538,131 +2161,6 @@ impl RemediationController {
         }
     }
 
-    fn prompt_reference_for_targets(
-        &self,
-        store: &Store,
-        targets: &[CachedTarget],
-    ) -> Result<(String, Option<String>), ControllerError> {
-        if targets.is_empty() {
-            let group = random_id().map_err(|_| ControllerError::Internal)?;
-            return Ok((group.clone(), Some(group.clone())));
-        }
-        let existing = targets
-            .iter()
-            .map(|target| {
-                store
-                    .latest_action_remediation_for_target(
-                        target.environment_key(),
-                        target.agent.slug(),
-                        &target.scope_kind,
-                        &target.scope_key,
-                        &target.target_key,
-                    )
-                    .map_err(|_| ControllerError::Internal)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let active = existing
-            .iter()
-            .filter_map(Option::as_ref)
-            .filter(|watch| watch.state != RemediationState::Recurred)
-            .collect::<Vec<_>>();
-        if active.is_empty() {
-            let group = random_id().map_err(|_| ControllerError::Internal)?;
-            return Ok((group.clone(), Some(group)));
-        }
-        if active
-            .iter()
-            .any(|watch| watch.state != RemediationState::WaitingForPromptUse)
-        {
-            return Err(ControllerError::CheckPromptUnavailable);
-        }
-        let first_group = active[0].prompt_group_id.clone();
-        if let Some(group) = first_group.as_ref().filter(|group| {
-            active
-                .iter()
-                .all(|watch| watch.prompt_group_id.as_deref() == Some(group.as_str()))
-        }) {
-            return Ok((group.clone(), Some(group.clone())));
-        }
-        if targets.len() == 1 && active.len() == 1 {
-            return Ok((active[0].remediation_id.clone(), None));
-        }
-        Err(ControllerError::CheckPromptUnavailable)
-    }
-
-    fn persist_prompt_watches(
-        &self,
-        store: &Store,
-        targets: &[CachedTarget],
-        prompt_group_id: Option<&str>,
-        prompt: &str,
-        now: i64,
-    ) -> Result<(Vec<RemediationRecord>, String), ControllerError> {
-        if !prompt_watch_supported(targets.iter().map(|target| target.finding().detector)) {
-            return Ok((Vec::new(), prompt.to_owned()));
-        }
-        let detector = targets
-            .first()
-            .map(|target| target.finding().detector)
-            .ok_or(ControllerError::TargetNotFound)?;
-        let (enabled, check_preferences_revision) = store
-            .check_preferences_snapshot()
-            .map_err(|_| ControllerError::PersistenceFailed)?;
-        if !enabled.contains(&detector) {
-            return Err(ControllerError::TargetNotFound);
-        }
-        let smart_master_generation = smart_check_master_generation(store, detector);
-        if !smart_check_master_available(store, detector) {
-            return Err(ControllerError::TargetNotFound);
-        }
-        let watch_inputs = targets
-            .iter()
-            .map(|target| {
-                let (mut remediation, guards) = self.watch_input(
-                    target,
-                    RemediationState::WaitingForPromptUse,
-                    None,
-                    now,
-                    prompt_group_id,
-                )?;
-                let mut result: serde_json::Value = serde_json::from_str(&remediation.result_json)
-                    .map_err(|_| ControllerError::Internal)?;
-                result["promptText"] = serde_json::Value::String(prompt.to_owned());
-                remediation.result_json = result.to_string();
-                Ok((remediation, guards))
-            })
-            .collect::<Result<Vec<_>, ControllerError>>()?;
-        let watches = store
-            .create_or_reuse_remediations_for_enabled_check(
-                &watch_inputs,
-                detector,
-                check_preferences_revision,
-                smart_master_generation.as_deref(),
-            )
-            .map_err(|_| ControllerError::PersistenceFailed)?
-            .ok_or(ControllerError::TargetChanged)?;
-        for (target, watch) in targets.iter().zip(watches.iter()) {
-            self.persist_display_snapshot(
-                store,
-                watch,
-                target,
-                "action",
-                now.saturating_mul(1_000),
-            )?;
-        }
-        let stored_prompt = watches
-            .first()
-            .and_then(|watch| stored_string(&watch.result_json, "promptText"))
-            .ok_or(ControllerError::PersistenceFailed)?;
-        if watches.iter().any(|watch| {
-            stored_string(&watch.result_json, "promptText").as_deref()
-                != Some(stored_prompt.as_str())
-        }) {
-            return Err(ControllerError::PersistenceFailed);
-        }
-        Ok((watches, stored_prompt))
-    }
-
     #[cfg(all(test, not(windows)))]
     fn start_watch(
         &self,
@@ -3679,11 +2177,6 @@ impl RemediationController {
         if !enabled.contains(&target.finding().detector) {
             return Err(ControllerError::TargetNotFound);
         }
-        let smart_master_generation =
-            smart_check_master_generation(store, target.finding().detector);
-        if !smart_check_master_available(store, target.finding().detector) {
-            return Err(ControllerError::TargetNotFound);
-        }
         let (remediation, guards) =
             self.watch_input(target, state, boundary_ms, now, prompt_group_id)?;
         store
@@ -3691,7 +2184,6 @@ impl RemediationController {
                 &[(remediation, guards)],
                 target.finding().detector,
                 check_preferences_revision,
-                smart_master_generation.as_deref(),
             )
             .map_err(|_| ControllerError::PersistenceFailed)?
             .and_then(|mut watches| watches.pop())
@@ -3749,22 +2241,11 @@ impl RemediationController {
 }
 
 fn resolve_category_lifecycle(
-    detector: DetectorId,
     finding: u64,
     clean: u64,
     awaiting_evidence: bool,
 ) -> Option<ChecksCategoryLifecyclePayload> {
-    if finding > 0
-        && matches!(
-            detector,
-            DetectorId::IgnoredInstructions
-                | DetectorId::SkillOpportunities
-                | DetectorId::OverExploring
-                | DetectorId::ScopeCreep
-        )
-    {
-        Some(ChecksCategoryLifecyclePayload::Failing)
-    } else if awaiting_evidence {
+    if awaiting_evidence {
         Some(ChecksCategoryLifecyclePayload::AwaitingVerification)
     } else if clean > 0 {
         Some(ChecksCategoryLifecyclePayload::Passing)
@@ -3784,14 +2265,6 @@ fn display_config_file(path: &Path, home: &Path) -> String {
     path.strip_prefix(home)
         .map(|relative| format!("~/{}", relative.display()))
         .unwrap_or_else(|_| path.display().to_string())
-}
-
-fn stored_string(value: &str, key: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(value)
-        .ok()?
-        .get(key)?
-        .as_str()
-        .map(str::to_owned)
 }
 
 const fn remediation_policy_is_current(definition: &WatchDefinition) -> bool {
