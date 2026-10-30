@@ -19,9 +19,17 @@ pub(super) struct RequestHistory {
     parts: BTreeMap<String, (u64, Value)>,
     #[serde(default)]
     removed_messages: BTreeSet<String>,
+    #[serde(default)]
+    removed_parts: BTreeMap<String, RemovedPart>,
     bytes: usize,
     incomplete: bool,
     unsafe_identity: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RemovedPart {
+    owner: String,
+    kind: Option<String>,
 }
 
 impl RequestHistory {
@@ -34,7 +42,7 @@ impl RequestHistory {
     }
 
     pub(super) fn bound(&mut self, records: usize, bytes: usize) {
-        while self.messages.len() + self.parts.len() + self.removed_messages.len() > records
+        while self.messages.len() + self.parts.len() + self.tombstone_count() > records
             || self.bytes > bytes
         {
             if !self.evict_oldest() {
@@ -57,6 +65,103 @@ impl RequestHistory {
         self.removed_messages.contains(id)
     }
 
+    pub(super) fn is_removed_part(&self, id: &str) -> bool {
+        self.removed_parts.contains_key(id)
+    }
+
+    pub(super) fn owns_non_tool_part(&self, id: &str, owner: &str) -> bool {
+        self.parts.get(id).is_some_and(|(_, part)| {
+            part["messageID"] == owner && part["type"].as_str().is_some_and(|kind| kind != "tool")
+        }) || self.removed_parts.get(id).is_some_and(|part| {
+            part.owner == owner && part.kind.as_deref().is_some_and(|kind| kind != "tool")
+        })
+    }
+
+    pub(super) fn retained_user_identities(
+        &self,
+        frontier: u64,
+    ) -> impl Iterator<Item = (&str, u64)> {
+        self.messages.keys().filter_map(move |id| {
+            self.retained_user_identity_position(id, frontier)
+                .map(|position| (id.as_str(), position))
+        })
+    }
+
+    pub(super) fn retained_user_identity_position(&self, id: &str, frontier: u64) -> Option<u64> {
+        let (header_sequence, info) = self.messages.get(id)?;
+        if info["role"] != "user" || *header_sequence > frontier {
+            return None;
+        }
+        let position = self
+            .parts
+            .values()
+            .filter(|(sequence, part)| part["messageID"] == id && *sequence <= frontier)
+            .map(|(sequence, _)| (*sequence).max(*header_sequence))
+            .min()
+            .unwrap_or(*header_sequence);
+        Some(position)
+    }
+
+    pub(super) fn remove_part(
+        &mut self,
+        id: &str,
+        owner: &str,
+        known_kind: Option<&str>,
+        records: usize,
+        bytes: usize,
+    ) {
+        self.incomplete = true;
+        let kind = if let Some((_, part)) = self.parts.get(id) {
+            if part["messageID"] != owner {
+                self.unsafe_identity = true;
+                return;
+            }
+            part["type"].as_str().map(str::to_owned)
+        } else {
+            known_kind.map(str::to_owned)
+        };
+        if let Some((_, part)) = self.parts.remove(id) {
+            self.bytes = self.bytes.saturating_sub(part.to_string().len());
+        }
+        if let Some(previous) = self.removed_parts.get(id) {
+            self.unsafe_identity |= previous.owner != owner;
+            return;
+        }
+        if self.unsafe_identity {
+            return;
+        }
+        let size = id.len() + owner.len() + kind.as_ref().map_or(0, String::len);
+        if self.tombstone_count() >= records || self.tombstone_bytes().saturating_add(size) > bytes
+        {
+            self.unsafe_identity = true;
+            return;
+        }
+        self.removed_parts.insert(
+            id.to_owned(),
+            RemovedPart {
+                owner: owner.to_owned(),
+                kind,
+            },
+        );
+        self.bytes = self.bytes.saturating_add(size);
+        self.bound(records, bytes);
+    }
+
+    fn tombstone_count(&self) -> usize {
+        self.removed_messages.len() + self.removed_parts.len()
+    }
+
+    fn tombstone_bytes(&self) -> usize {
+        self.removed_messages.iter().map(String::len).sum::<usize>()
+            + self
+                .removed_parts
+                .iter()
+                .map(|(id, part)| {
+                    id.len() + part.owner.len() + part.kind.as_ref().map_or(0, String::len)
+                })
+                .sum::<usize>()
+    }
+
     pub(super) fn remove_message(&mut self, id: &str, records: usize, bytes: usize) {
         self.incomplete = true;
         if let Some((_, message)) = self.messages.remove(id) {
@@ -72,8 +177,8 @@ impl RequestHistory {
         if self.is_removed_message(id) || self.unsafe_identity {
             return;
         }
-        let removed_bytes: usize = self.removed_messages.iter().map(String::len).sum();
-        if self.removed_messages.len() >= records || removed_bytes.saturating_add(id.len()) > bytes
+        if self.tombstone_count() >= records
+            || self.tombstone_bytes().saturating_add(id.len()) > bytes
         {
             // Keep deletion proof. Reject all ownership if another tombstone cannot fit.
             self.unsafe_identity = true;
@@ -86,6 +191,50 @@ impl RequestHistory {
 
     pub(super) fn main_session(&self) -> bool {
         self.root && !self.unsafe_identity
+    }
+
+    pub(super) fn admission_failure(&self) -> Option<crate::analysis::ToolResultCompleteness> {
+        if self.unsafe_identity {
+            Some(crate::analysis::ToolResultCompleteness::UnsafeIdentity)
+        } else if !self.root {
+            Some(crate::analysis::ToolResultCompleteness::UnsafeOwnership)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn tool_facts(
+        &self,
+        session: &str,
+        message: &str,
+        name: &str,
+        arguments: Option<&Value>,
+    ) -> crate::analysis::NativeToolFacts {
+        let info = self
+            .messages
+            .get(message)
+            .filter(|(_, info)| info["role"] == "assistant")
+            .map(|(_, info)| info);
+        let request = info.filter(|info| {
+            !self.unsafe_identity
+                && info["id"] == message
+                && info["sessionID"] == session
+                && self.parts.values().any(|(_, part)| {
+                    part["type"] == "step-start"
+                        && part["messageID"] == message
+                        && part["sessionID"] == session
+                })
+        });
+        crate::analysis::NativeToolFacts::for_call(
+            SourceFormat::OpenCodeSqliteV1,
+            name,
+            arguments,
+            None,
+            crate::analysis::NativeRequestAttribution::observed(
+                request.and_then(|info| info["providerID"].as_str()),
+                request.and_then(|info| info["modelID"].as_str()),
+            ),
+        )
     }
 
     pub(super) fn observe(&mut self, kind: &str, data: &Value, session: &str, sequence: u64) {
@@ -114,22 +263,38 @@ impl RequestHistory {
             }
             "message.part.updated.1" => {
                 let part = &data["part"];
-                if part["messageID"]
-                    .as_str()
-                    .is_some_and(|id| self.is_removed_message(id))
+                if self.unsafe_identity
+                    || part["id"]
+                        .as_str()
+                        .is_some_and(|id| self.is_removed_part(id))
+                    || part["messageID"]
+                        .as_str()
+                        .is_some_and(|id| self.is_removed_message(id))
                 {
                     return;
                 }
                 if part["type"] == "compaction" {
                     self.incomplete = true;
                 }
-                if part["type"] != "tool"
+                let user_part = part["type"] != "tool"
                     && part["messageID"].as_str().is_some_and(|id| {
                         self.messages
                             .get(id)
                             .is_some_and(|(_, info)| info["role"] == "user")
-                    })
-                    && let Some(id) = part["id"].as_str()
+                    });
+                let request_start = part["type"] == "step-start"
+                    && part["sessionID"] == session
+                    && part["messageID"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty() && id.len() <= EVIDENCE_STRING_CAP);
+                if (user_part
+                    || request_start
+                    || part["id"]
+                        .as_str()
+                        .is_some_and(|id| self.parts.contains_key(id)))
+                    && let Some(id) = part["id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= EVIDENCE_STRING_CAP)
                 {
                     self.retain(false, id, part, sequence);
                 }
@@ -149,11 +314,16 @@ impl RequestHistory {
             }
             "session.deleted.1" => self.incomplete = true,
             "message.part.removed.1" => {
-                if let Some(id) = data["partID"].as_str()
-                    && let Some((_, part)) = self.parts.remove(id)
+                if let (Some(id), Some(owner)) =
+                    (bounded_id(&data["partID"]), bounded_id(&data["messageID"]))
                 {
-                    self.bytes = self.bytes.saturating_sub(part.to_string().len());
-                    self.incomplete = true;
+                    self.remove_part(
+                        id,
+                        owner,
+                        None,
+                        MAX_USER_MESSAGE_OBSERVATIONS,
+                        MAX_USER_MESSAGE_COLLECTION_BYTES,
+                    );
                 }
             }
             _ => {}
@@ -185,7 +355,7 @@ impl RequestHistory {
             return;
         }
         while !exists
-            && (self.messages.len() + self.parts.len() + self.removed_messages.len()
+            && (self.messages.len() + self.parts.len() + self.tombstone_count()
                 >= MAX_USER_MESSAGE_OBSERVATIONS
                 || self.bytes.saturating_add(size) > MAX_USER_MESSAGE_COLLECTION_BYTES)
         {
@@ -198,7 +368,7 @@ impl RequestHistory {
             .saturating_sub(previous_size)
             .saturating_add(size);
         if (!exists
-            && self.messages.len() + self.parts.len() + self.removed_messages.len()
+            && self.messages.len() + self.parts.len() + self.tombstone_count()
                 >= MAX_USER_MESSAGE_OBSERVATIONS)
             || next_bytes > MAX_USER_MESSAGE_COLLECTION_BYTES
         {
@@ -331,5 +501,83 @@ impl RequestHistory {
             complete_through_event: complete,
             user_messages,
         }
+    }
+}
+
+fn bounded_id(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .filter(|id| !id.is_empty() && id.len() <= EVIDENCE_STRING_CAP)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn part_tombstone_overflow_keeps_request_history_fail_closed_after_restart() {
+        let mut history = RequestHistory {
+            root: true,
+            ..RequestHistory::default()
+        };
+        let header =
+            json!({"sessionID":"root","info":{"id":"user","sessionID":"root","role":"user"}});
+        let part = json!({"sessionID":"root","part":{"id":"part-a","sessionID":"root","messageID":"user","type":"text","text":"Deleted input"}});
+        history.observe("message.updated.1", &header, "root", 1);
+        history.observe("message.part.updated.1", &part, "root", 2);
+        history.remove_part("part-a", "user", None, 2, 1024);
+        history.remove_part("part-b", "user", None, 2, 1024);
+        history.remove_part("overflow", "user", None, 2, 1024);
+        assert_eq!(history.removed_parts.len(), 2);
+        assert!(!history.main_session());
+        let mut restored: RequestHistory =
+            serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
+        restored.observe("message.updated.1", &header, "root", 5);
+        restored.observe("message.part.updated.1", &part, "root", 6);
+        assert!(!restored.main_session());
+        assert!(!restored.parts.contains_key("part-a"));
+        assert_eq!(restored.removed_parts, history.removed_parts);
+        assert!(restored.freeze("root", "", 6).user_messages.is_empty());
+    }
+
+    #[test]
+    fn evicted_step_start_cannot_be_replaced_by_retained_assistant_metadata() {
+        let mut history = RequestHistory::default();
+        let assistant = json!({"sessionID":"facts","info":{
+            "id":"assistant-1","sessionID":"facts","role":"assistant",
+            "providerID":"openai","modelID":"synthetic-model",
+            "path":{"cwd":"/synthetic/project"}
+        }});
+        history.observe("message.updated.1", &assistant, "facts", 1);
+        history.observe(
+            "message.part.updated.1",
+            &json!({"sessionID":"facts","part":{
+                "id":"step-1","messageID":"assistant-1","sessionID":"facts","type":"step-start"
+            }}),
+            "facts",
+            2,
+        );
+        let mut history: RequestHistory =
+            serde_json::from_value(serde_json::to_value(history).unwrap()).unwrap();
+        assert_eq!(
+            history
+                .tool_facts("facts", "assistant-1", "write", None)
+                .requester
+                .model_key()
+                .as_deref(),
+            Some("openai/synthetic-model")
+        );
+        history.bound(0, 0);
+        assert_eq!(history.bytes, 0);
+        assert!(history.messages.is_empty());
+        assert!(history.parts.is_empty());
+        history.observe("message.updated.1", &assistant, "facts", 3);
+        assert_eq!(
+            history
+                .tool_facts("facts", "assistant-1", "write", None)
+                .requester,
+            crate::analysis::NativeRequestAttribution::default()
+        );
     }
 }

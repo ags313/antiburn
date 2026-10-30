@@ -669,8 +669,11 @@ fn antiburn_custom_message_preserves_pi_v3_native_continuation() {
     input.source_format = SourceFormat::PiV3Jsonl;
     let (coverage, reasons, session) = collect(&input);
 
-    assert_eq!(coverage, RecordCoverage::Complete);
-    assert!(reasons.is_empty());
+    assert_eq!(coverage, RecordCoverage::Partial);
+    assert_eq!(
+        reasons,
+        BTreeSet::from([PartialReason::AttributionIncomplete])
+    );
     assert!(session.events.iter().any(|event| !event.tools.is_empty()));
 }
 

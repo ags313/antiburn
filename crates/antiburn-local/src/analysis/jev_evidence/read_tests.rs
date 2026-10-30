@@ -134,7 +134,7 @@ fn unqualified_native_metadata_and_nonread_facts_are_discarded() {
         status: JevReadStatus::Success,
         kind: JevReadResultKind::File,
         recorded_output_bytes: 8,
-        recorded_output_digest: crate::checks::ignored_instructions::sha256_hex(b"observed"),
+        recorded_output_digest: crate::digest::sha256_hex(b"observed"),
         returned_extent: Some(JevReadExtent {
             unit: JevReadUnit::Lines,
             offset: Some(1),
@@ -232,7 +232,6 @@ fn selected_read_metadata_changes_evidence_identity_only_when_opted_in() {
         publication_fence: 1,
         selected_input_digest: String::new(),
         actions,
-        instructions: vec![],
         complete: true,
         limitations: vec![],
         excluded_thinking_parts: 0,
@@ -240,13 +239,8 @@ fn selected_read_metadata_changes_evidence_identity_only_when_opted_in() {
     };
     let selection = JevInputSelection::from_fields(&[JevInputField::ReadFileRequest]);
     let before = select_session_content(&evidence, selection);
-    let store =
-        crate::analysis::jev_evidence::selected_evidence_store(&before.actions, selection, 1)
-            .unwrap();
-    let retrieved: JevReadRequest = serde_json::from_str(
-        store
-            .get("request", JevInputField::ReadFileRequest)
-            .unwrap(),
+    let retrieved: JevReadRequest = serde_json::from_value(
+        serde_json::to_value(&before.actions[0].metadata.read_request).unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -255,7 +249,7 @@ fn selected_read_metadata_changes_evidence_identity_only_when_opted_in() {
     );
     let legacy = select_session_content(
         &evidence,
-        crate::checks::ignored_instructions::INPUT_SELECTION,
+        JevInputSelection::from_fields(&[JevInputField::OtherToolInput]),
     );
     evidence.actions[0]
         .metadata
@@ -272,7 +266,7 @@ fn selected_read_metadata_changes_evidence_identity_only_when_opted_in() {
         legacy,
         select_session_content(
             &evidence,
-            crate::checks::ignored_instructions::INPUT_SELECTION
+            JevInputSelection::from_fields(&[JevInputField::OtherToolInput])
         )
     );
 }

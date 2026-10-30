@@ -107,7 +107,7 @@ impl Fixture {
                 JevInputSelection::from_fields(fields),
             )
             .unwrap();
-            prepare_session_content("ses_outcomes", SourceFormat::OpenCodeSqliteV2, page, vec![])
+            prepare_session_content("ses_outcomes", SourceFormat::OpenCodeSqliteV2, page)
         })
     }
 }

@@ -4,18 +4,18 @@ use std::sync::{Arc, Mutex};
 
 use antiburn_local::analysis::jev::{JevInputField, JevInputSelection};
 use antiburn_local::analysis::jev_evidence::*;
-use antiburn_local::analysis::session_scope::{
-    SCOPE_SELECTION, ScopeAuthority, ScopeMissingReason, SessionScopeBoundary, SessionScopeBranch,
-    SessionScopeBuilder,
-};
 use antiburn_local::analysis::*;
-use antiburn_local::checks::skill_opportunities::*;
-use antiburn_local::model::AgentKind;
 use antiburn_local::pricing::ModelTokens;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 
 const READ_PIN: &str = "opencode/tool/plugin/read.ts@843a6c514e606b436a7fe713422ace0a93ad3d61";
+const SKILL_USE_SELECTION: JevInputSelection = JevInputSelection::from_fields(&[
+    JevInputField::UserMessage,
+    JevInputField::AssistantMessage,
+    JevInputField::OtherToolInput,
+    JevInputField::OtherToolOutput,
+]);
 const READ_SELECTION: JevInputSelection = JevInputSelection::from_fields(&[
     JevInputField::ReadFilePath,
     JevInputField::ReadFileRequest,
@@ -176,25 +176,7 @@ fn prepared(
     messages: Vec<Value>,
     selection: JevInputSelection,
 ) -> SessionContentEvidence {
-    prepare_session_content(
-        "session",
-        source,
-        published(source, messages, selection),
-        vec![],
-    )
-}
-
-fn boundary(content: &SessionContentEvidence) -> SkillUseBoundary {
-    SkillUseBoundary {
-        session_identity: content.session_identity_digest.clone(),
-        native_session_id: "root".into(),
-        publication_fence: content.publication_fence,
-        scope: SkillScope {
-            agent: AgentKind::OpenCode,
-            project_identity: None,
-            environment_identity: "native".into(),
-        },
-    }
+    prepare_session_content("session", source, published(source, messages, selection))
 }
 
 #[test]
@@ -305,7 +287,7 @@ fn selected_request_without_raw_text_retains_only_bound_v2_ranges() {
             .text
             .is_empty()
     );
-    let content = prepare_session_content("session", source, page, vec![]);
+    let content = prepare_session_content("session", source, page);
     let request = content
         .actions
         .iter()
@@ -390,9 +372,8 @@ fn retained_read_proofs_cannot_attach_a_range_to_a_different_returned_filename()
         .unwrap();
     part.part.text = "Read file src/new.rs, lines 7-8\n7: first\n8: second".into();
     let result = part.part.metadata.read_result.as_mut().unwrap();
-    result.recorded_output_digest =
-        antiburn_local::checks::ignored_instructions::sha256_hex(part.part.text.as_bytes());
-    let content = prepare_session_content("session", source, page, vec![]);
+    result.recorded_output_digest = antiburn_local::digest::sha256_hex(part.part.text.as_bytes());
+    let content = prepare_session_content("session", source, page);
     let result = content
         .actions
         .iter()
@@ -419,7 +400,7 @@ fn missing_and_background_output_stays_partial_after_durable_selected_publicatio
             let page = published(source, vec![assistant(vec![shell])], selection);
             assert_eq!(page.coverage.stored_truncated_parts, 1, "{page:#?}");
             let content = select_session_content(
-                &prepare_session_content("session", source, page, vec![]),
+                &prepare_session_content("session", source, page),
                 selection,
             );
             assert_eq!(content.actions.len(), 1);
@@ -623,7 +604,7 @@ fn altered_native_proofs_cannot_promote_v2_read_output() {
             }
             _ => unreachable!(),
         }
-        let content = prepare_session_content("session", source, changed, vec![]);
+        let content = prepare_session_content("session", source, changed);
         let result = content
             .actions
             .iter()
@@ -702,7 +683,7 @@ fn unbound_v2_requests_and_duplicate_calls_cannot_prove_returned_ranges() {
             }
             _ => unreachable!(),
         }
-        let content = prepare_session_content("session", source, changed, vec![]);
+        let content = prepare_session_content("session", source, changed);
         let result = content
             .actions
             .iter()
@@ -764,34 +745,31 @@ fn v2_skill_metadata_display_name_does_not_become_a_requested_id_or_success() {
                 );
             }
         }
-        let snapshot = SkillUseSnapshot::from_published_content(
-            &select_session_content(&content, SKILL_USE_SELECTION),
-            &boundary(&content),
-        )
-        .unwrap();
-        assert_eq!(snapshot.events().len(), 2, "{content:#?}");
+        let selected = select_session_content(&content, SKILL_USE_SELECTION);
+        let facts = skill_facts(&selected);
+        assert_eq!(facts.len(), 2, "{content:#?}");
+        assert_eq!(facts[0].status, JevRecordedSkillStatus::Requested);
+        assert_eq!(facts[1].status, JevRecordedSkillStatus::Unknown);
+        for fact in &facts {
+            assert_eq!(fact.identity, JevRecordedSkillIdentityKind::NativeId);
+            let proof = fact.native_skill.as_ref().unwrap();
+            assert_eq!(proof.id, "review-id");
+            assert!(!proof.origin.is_injected());
+            assert_eq!(
+                proof.producer,
+                JevNativeSkillProducer::OpenCodeV2Skill843a6c51
+            );
+        }
+        assert_eq!(facts[0].native_skill.as_ref().unwrap().display_name, None);
         assert_eq!(
-            snapshot.events()[0].skill,
-            RecordedSkillIdentity::NativeId {
-                id: "review-id".into(),
-                display_name: None,
-            }
+            facts[1]
+                .native_skill
+                .as_ref()
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Review")
         );
-        assert_eq!(
-            snapshot.events()[1].skill,
-            RecordedSkillIdentity::NativeId {
-                id: "review-id".into(),
-                display_name: Some("Review".into()),
-            }
-        );
-        assert_eq!(snapshot.events()[0].lifecycle, SkillUseLifecycle::Requested);
-        assert_eq!(snapshot.events()[1].lifecycle, SkillUseLifecycle::Unknown);
-        assert!(!snapshot.events()[0].injected_context && !snapshot.events()[1].injected_context);
-        assert_eq!(
-            snapshot.events()[0].producer,
-            SkillUseProducer::OpenCodeV2Skill843a6c51
-        );
-        assert!(!snapshot.proves_session_wide_absence());
     }
 }
 
@@ -824,7 +802,7 @@ fn skill_results_bind_to_the_request_message_and_normalized_part_index() {
         assert_eq!(fact.request_part_index, Some(request.reference.part_index));
         assert!(fact.matches_action(result, source));
 
-        for mutation in 0..3 {
+        for mutation in 0..7 {
             let mut altered = content.clone();
             let result = altered
                 .actions
@@ -835,25 +813,34 @@ fn skill_results_bind_to_the_request_message_and_normalized_part_index() {
             match mutation {
                 0 => fact.request_message_id = Some("other-message".into()),
                 1 => fact.request_part_index = Some(0),
-                _ => {
+                2 => {
                     fact.request_message_id = None;
                     fact.request_part_index = None;
                 }
+                _ => {}
             }
-            let snapshot = skill_snapshot(&altered);
+            let request_index = altered
+                .actions
+                .iter()
+                .position(|action| action.kind == "tool_input")
+                .unwrap();
+            match mutation {
+                3 => altered.actions[request_index].tool_call_id = Some("other-call".into()),
+                4 => altered.actions[request_index].reference.thread_digest = "0".repeat(64),
+                5 => altered.actions[request_index].reference.source_key_digest = "0".repeat(64),
+                6 => altered
+                    .actions
+                    .insert(0, altered.actions[request_index].clone()),
+                _ => {}
+            }
+            let selected = select_session_content(&altered, SKILL_USE_SELECTION);
             assert!(
-                snapshot
-                    .events()
+                selected
+                    .actions
                     .iter()
-                    .all(|event| event.request_reference.is_none()
-                        || event.lifecycle == SkillUseLifecycle::Unknown),
+                    .filter(|action| action.kind == "tool_result")
+                    .all(|action| action.metadata.recorded_skill_result.is_none()),
                 "{mutation}"
-            );
-            assert!(
-                snapshot
-                    .coverage()
-                    .limitations
-                    .contains(&SkillUseLimit::IncompleteSelectedContent)
             );
         }
     }
@@ -864,12 +851,19 @@ fn injected_user(skills: Vec<Value>) -> Value {
         "text":"Review the code", "skills":skills})
 }
 
-fn skill_snapshot(content: &SessionContentEvidence) -> SkillUseSnapshot {
-    SkillUseSnapshot::from_published_content(
-        &select_session_content(content, SKILL_USE_SELECTION),
-        &boundary(content),
-    )
-    .unwrap()
+fn skill_facts(content: &SessionContentEvidence) -> Vec<&JevRecordedSkillResult> {
+    content
+        .actions
+        .iter()
+        .filter_map(|action| {
+            let fact = action.metadata.recorded_skill_result.as_ref()?;
+            assert!(
+                fact.matches_action(action, content.source_format),
+                "{action:#?}"
+            );
+            Some(fact)
+        })
+        .collect()
 }
 
 #[test]
@@ -887,36 +881,28 @@ fn injected_native_ids_and_display_names_survive_without_document_paths_or_calls
             SKILL_USE_SELECTION,
         );
         let selected = select_session_content(&content, SKILL_USE_SELECTION);
-        let snapshot = skill_snapshot(&content);
-        assert_eq!(snapshot.events().len(), 2, "{content:#?}");
-        assert_eq!(
-            snapshot.events()[0].skill,
-            RecordedSkillIdentity::NativeId {
-                id: "review-id".into(),
-                display_name: Some("Review".into())
-            }
-        );
-        assert_eq!(
-            snapshot.events()[1].skill,
-            RecordedSkillIdentity::NativeId {
-                id: "audit-id".into(),
-                display_name: Some("Audit".into())
-            }
-        );
-        for event in snapshot.events() {
-            assert!(event.injected_context);
-            assert_eq!(event.native_body, Some(JevNativeSkillBody::Recorded));
-            assert_eq!(event.lifecycle, SkillUseLifecycle::Unknown);
-            assert_eq!(event.authority, "unknown");
-            assert!(event.tool_call_id.is_none());
+        let facts = skill_facts(&selected);
+        assert_eq!(facts.len(), 2, "{content:#?}");
+        for (fact, id, name) in [
+            (facts[0], "review-id", "Review"),
+            (facts[1], "audit-id", "Audit"),
+        ] {
+            assert_eq!(fact.identity, JevRecordedSkillIdentityKind::NativeId);
+            let proof = fact.native_skill.as_ref().unwrap();
+            assert_eq!(proof.id, id);
+            assert_eq!(proof.display_name.as_deref(), Some(name));
+            assert!(proof.origin.is_injected());
+            assert_eq!(proof.body, JevNativeSkillBody::Recorded);
+            assert_eq!(fact.status, JevRecordedSkillStatus::Unknown);
+            assert!(fact.call_id.is_none());
         }
-        assert!(snapshot.evidence().events.is_empty());
         for action in &selected.actions {
             let Some(fact) = action.metadata.recorded_skill_result.as_ref() else {
                 continue;
             };
             assert!(fact.matches_action(action, source));
             assert!(fact.name.is_none() && fact.location.is_none());
+            assert_eq!(action.authority, "unknown");
             assert!(action.metadata.human_text.is_none());
             assert!(action.metadata.user_text_history.is_none());
         }
@@ -928,7 +914,6 @@ fn injected_native_ids_and_display_names_survive_without_document_paths_or_calls
                 .count(),
             2
         );
-        assert!(!snapshot.proves_session_wide_absence());
     }
 }
 
@@ -944,34 +929,20 @@ fn injected_missing_bodies_keep_native_identity_with_partial_coverage() {
             "id":"review-id", "name":"Review"})])],
             SKILL_USE_SELECTION,
         );
-        let snapshot = skill_snapshot(&content);
-        assert_eq!(snapshot.events().len(), 1, "{content:#?}");
-        assert_eq!(
-            snapshot.events()[0].skill,
-            RecordedSkillIdentity::NativeId {
-                id: "review-id".into(),
-                display_name: Some("Review".into())
-            }
-        );
-        assert_eq!(
-            snapshot.events()[0].native_body,
-            Some(JevNativeSkillBody::Unavailable)
-        );
+        let facts = skill_facts(&content);
+        assert_eq!(facts.len(), 1, "{content:#?}");
+        let proof = facts[0].native_skill.as_ref().unwrap();
+        assert_eq!(proof.id, "review-id");
+        assert_eq!(proof.display_name.as_deref(), Some("Review"));
+        assert_eq!(proof.body, JevNativeSkillBody::Unavailable);
+        assert!(!facts[0].complete);
+        assert!(proof.origin.is_injected());
         assert!(!select_session_content(&content, SKILL_USE_SELECTION).complete);
-        assert_eq!(snapshot.coverage().status, SkillUseStatus::Partial);
-        assert!(
-            snapshot
-                .coverage()
-                .limitations
-                .contains(&SkillUseLimit::IncompleteSelectedContent)
-        );
-        assert!(snapshot.events()[0].injected_context);
-        assert!(snapshot.evidence().events.is_empty());
     }
 }
 
 #[test]
-fn duplicate_injected_ids_and_raw_name_collisions_remain_distinct_and_partial() {
+fn duplicate_injected_ids_and_raw_name_collisions_keep_distinct_native_references() {
     let content = prepared(
         SourceFormat::OpenCodeSqliteV2,
         vec![injected_user(vec![
@@ -981,27 +952,13 @@ fn duplicate_injected_ids_and_raw_name_collisions_remain_distinct_and_partial() 
         ])],
         SKILL_USE_SELECTION,
     );
-    let snapshot = skill_snapshot(&content);
-    assert_eq!(snapshot.events().len(), 3, "{content:#?}");
-    assert_eq!(snapshot.coverage().status, SkillUseStatus::Partial);
-    assert!(
-        snapshot
-            .coverage()
-            .limitations
-            .contains(&SkillUseLimit::DuplicateNativeSkillId)
-    );
-    assert!(
-        snapshot
-            .coverage()
-            .limitations
-            .contains(&SkillUseLimit::NativeSkillIdentityCollision)
-    );
-    assert_ne!(snapshot.events()[0].skill, snapshot.events()[2].skill);
-    assert_ne!(
-        snapshot.events()[0].reference,
-        snapshot.events()[1].reference
-    );
-    assert!(snapshot.evidence().events.is_empty());
+    let facts = skill_facts(&content);
+    assert_eq!(facts.len(), 3, "{content:#?}");
+    assert_eq!(facts[0].native_skill.as_ref().unwrap().id, "review-id");
+    assert_eq!(facts[1].native_skill.as_ref().unwrap().id, "review-id");
+    assert_eq!(facts[2].native_skill.as_ref().unwrap().id, "Review");
+    assert_ne!(facts[0].ranges, facts[1].ranges);
+    assert_ne!(content.actions[0].reference, content.actions[1].reference);
 }
 
 #[test]
@@ -1013,7 +970,7 @@ fn injected_proof_changes_cannot_grant_authority_or_borrow_another_native_field(
         "id":"review-id", "name":"Review", "text":"Review instructions"})])],
         SKILL_USE_SELECTION,
     );
-    for mutation in 0..7 {
+    for mutation in 0..9 {
         let mut changed = page.clone();
         let part = changed
             .parts
@@ -1100,15 +1057,15 @@ fn injected_proof_changes_cannot_grant_authority_or_borrow_another_native_field(
             }
             _ => unreachable!(),
         }
-        let content = prepare_session_content("session", source, changed, vec![]);
+        let content = prepare_session_content("session", source, changed);
         if mutation == 0 {
-            let snapshot = skill_snapshot(&content);
-            assert_eq!(snapshot.events().len(), 1);
+            assert_eq!(skill_facts(&content).len(), 1);
             assert!(
-                snapshot
-                    .events()
+                content
+                    .actions
                     .iter()
-                    .all(|event| event.authority == "unknown" && event.injected_context)
+                    .filter(|action| action.metadata.recorded_skill_result.is_some())
+                    .all(|action| action.authority == "unknown")
             );
         } else {
             assert!(
@@ -1118,7 +1075,6 @@ fn injected_proof_changes_cannot_grant_authority_or_borrow_another_native_field(
                     .all(|action| action.metadata.recorded_skill_result.is_none()),
                 "mutation {mutation}: {content:#?}"
             );
-            assert!(skill_snapshot(&content).events().is_empty());
         }
         assert!(
             content
@@ -1164,7 +1120,7 @@ fn skill_injection_and_question_answers_do_not_supply_human_approval() {
 }
 
 #[test]
-fn scope_preparation_keeps_v2_answers_unknown_and_does_not_infer_plan_approval() {
+fn content_preparation_keeps_v2_answers_unknown_and_does_not_infer_plan_approval() {
     let mut question = tool(
         "question",
         json!({"questions":[{
@@ -1178,14 +1134,18 @@ fn scope_preparation_keeps_v2_answers_unknown_and_does_not_infer_plan_approval()
         SourceFormat::OpenCodeSqliteV2,
         SourceFormat::OpenCodeV2SessionExport,
     ] {
-        let mut page = published(
+        let page = published(
             source,
             vec![
                 injected_user(vec![json!({
             "id":"review-id", "name":"Review", "text":"Review instructions"})]),
                 assistant(vec![question.clone(), plan.clone()]),
             ],
-            SCOPE_SELECTION,
+            JevInputSelection::from_fields(&[
+                JevInputField::UserMessage,
+                JevInputField::UserAnswer,
+                JevInputField::PlanReference,
+            ]),
         );
         let user = page
             .parts
@@ -1202,48 +1162,26 @@ fn scope_preparation_keeps_v2_answers_unknown_and_does_not_infer_plan_approval()
                 .iter()
                 .all(|part| part.part.metadata.human_text.is_none())
         );
-        page.source_generation = Some(7);
-        let last = page.parts.last().unwrap();
-        let scope_boundary = SessionScopeBoundary {
-            source_key: last.source_key.clone(),
-            thread_id: last.thread_id.clone(),
-            turn_index: last.turn_index,
-            part_index: last.part_index,
-            branch: SessionScopeBranch::ProvenLinear,
-        };
-        let mut builder =
-            SessionScopeBuilder::new(source, scope_boundary, page.publication_fence, 7, true)
-                .unwrap();
-        builder.push_page(page, false).unwrap();
-        let scope = builder.finish().unwrap();
+        let content = prepare_session_content("session", source, page);
         assert!(
-            scope
-                .occurrences()
+            content
+                .actions
                 .iter()
-                .all(|occurrence| occurrence.authority != ScopeAuthority::User)
+                .all(|action| action.metadata.human_text.is_none())
         );
+        let answers: Vec<_> = content
+            .actions
+            .iter()
+            .flat_map(|action| &action.metadata.user_answers)
+            .collect();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].origin, JevUserAnswerOrigin::UnknownOrigin);
+        assert!(!answers[0].is_authoritative_user_response());
         assert!(
-            scope
-                .occurrences()
+            content
+                .actions
                 .iter()
-                .any(|occurrence| occurrence.field == JevInputField::UserAnswer
-                    && occurrence.authority == ScopeAuthority::UnknownInfluence)
-        );
-        assert!(
-            scope
-                .occurrences()
-                .iter()
-                .all(|occurrence| occurrence.field != JevInputField::PlanReference)
-        );
-        assert!(
-            scope
-                .limitations()
-                .contains(&ScopeMissingReason::NoUserContext)
-        );
-        assert!(
-            scope
-                .limitations()
-                .contains(&ScopeMissingReason::UnresolvedInfluence)
+                .all(|action| action.metadata.plan_references.is_empty())
         );
     }
 }

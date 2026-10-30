@@ -2293,13 +2293,12 @@ mod tests {
             ]),
         )
         .unwrap();
-        let prepared = crate::checks::ignored_instructions::prepare_session_content(
+        let prepared = crate::analysis::jev_evidence::prepare_session_content(
             "selected-query",
             crate::analysis::SourceFormat::ClaudeJsonl,
             command,
-            Vec::new(),
         );
-        let selected = crate::checks::ignored_instructions::select_session_content(
+        let selected = crate::analysis::jev_evidence::select_session_content(
             &prepared,
             JevInputSelection::from_fields(&[
                 crate::analysis::jev::JevInputField::BashCommandInput,
@@ -2486,26 +2485,11 @@ mod tests {
                 .all(|part| part.part.metadata.user_answers.is_empty()
                     && part.part.metadata.plan_references.is_empty())
         );
-        let evidence =
-            prepare_session_content("s1", SourceFormat::ClaudeJsonl, content, Vec::new());
+        let evidence = prepare_session_content("s1", SourceFormat::ClaudeJsonl, content);
         let selected = select_session_content(&evidence, selection);
-        let store = selected_evidence_store(&selected.actions, selection, 1).unwrap();
-        let id = &selected.actions[0].reference.id;
-        assert_eq!(
-            serde_json::from_str::<Vec<JevUserAnswer>>(
-                store.get(id, JevInputField::UserAnswer).unwrap()
-            )
-            .unwrap(),
-            answers
-        );
-        assert_eq!(
-            serde_json::from_str::<Vec<JevPlanReference>>(
-                store.get(id, JevInputField::PlanReference).unwrap()
-            )
-            .unwrap(),
-            plans
-        );
-        assert!(store.get(id, JevInputField::OtherToolOutput).is_none());
+        assert_eq!(selected.actions[0].metadata.user_answers, answers);
+        assert_eq!(selected.actions[0].metadata.plan_references, plans);
+        assert!(selected.actions[0].text.is_empty());
         let wrong_fence = query_turn_content_offset_selected(
             &conn,
             &KEY,
@@ -2639,12 +2623,11 @@ mod tests {
         assert_eq!(content.parts.len(), 20);
         assert!(!content.coverage.bytes_capped);
         assert!(!content.coverage.more_parts);
-        let selected = crate::checks::ignored_instructions::select_session_content(
-            &crate::checks::ignored_instructions::prepare_session_content(
+        let selected = crate::analysis::jev_evidence::select_session_content(
+            &crate::analysis::jev_evidence::prepare_session_content(
                 "s1",
                 crate::analysis::SourceFormat::ClaudeJsonl,
                 content,
-                Vec::new(),
             ),
             selection,
         );

@@ -280,7 +280,7 @@ export function BurnCheckTargetChooserDialog({
     setStatus(
       failed
         ? applyMessage(failed, applied, prepared.length)
-        : `${applied} ${pluralize(applied, "change", "changes")} applied.${verificationUnavailable ? " A later session could not confirm the results." : ""}`,
+        : `${applied} ${pluralize(applied, "change", "changes")} applied.${verificationUnavailable ? " Some applied changes cannot be verified automatically." : ""}`,
     )
     setStep("result")
     refresh()

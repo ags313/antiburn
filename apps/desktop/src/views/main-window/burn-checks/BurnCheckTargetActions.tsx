@@ -92,7 +92,6 @@ export function BurnCheckTargetActions({
     bindRoot: bindCopyRoot,
     copy,
   } = useBurnCheckPromptCopy({
-    detector: target.finding.detector,
     subject: `${target.finding.detector}:${target.findingId}`,
     active,
     prepare: () => copyPromptFixBurnCheckTarget(target.finding.detector, target.findingId),
@@ -210,7 +209,7 @@ export function BurnCheckTargetActions({
             busy: null,
             review: null,
             status: verificationUnavailable
-              ? "The change was made, but a later session could not confirm the result."
+              ? "Change applied. Automatic verification is unavailable."
               : null,
           }))
         })

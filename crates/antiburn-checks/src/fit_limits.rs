@@ -2,6 +2,53 @@ use std::io::{self, Write};
 
 use super::*;
 
+/// One bounded preparation or immutable saved-validation pass.
+#[derive(Clone, Debug, Default)]
+pub struct FittingWorkBudget {
+    consumed: u64,
+}
+
+impl FittingWorkBudget {
+    pub const MAXIMUM: u64 = 64 * 1024 * 1024;
+
+    #[must_use]
+    pub fn consumed(&self) -> u64 {
+        self.consumed
+    }
+
+    pub fn charge(&mut self, bytes: u64) -> Result<(), PreparationFailure> {
+        let observed = self.consumed.saturating_add(bytes);
+        self.consumed = observed;
+        if observed > Self::MAXIMUM {
+            return Err(resource_limit(PreparationBudget {
+                kind: PreparationBudgetKind::WorkBytes,
+                observed,
+                maximum: Self::MAXIMUM,
+            }));
+        }
+        Ok(())
+    }
+
+    pub fn measure(&mut self, value: &impl Serialize) -> Result<u64, PreparationFailure> {
+        self.charge(0)?;
+        let bytes = measure_preparation_bytes(
+            value,
+            Self::MAXIMUM - self.consumed,
+            PreparationBudgetKind::WorkBytes,
+        )
+        .map_err(|mut error| {
+            if let Some(budget) = &mut error.context.budget {
+                budget.observed = self.consumed.saturating_add(budget.observed);
+                budget.maximum = Self::MAXIMUM;
+                self.consumed = budget.observed;
+            }
+            error
+        })?;
+        self.charge(bytes)?;
+        Ok(bytes)
+    }
+}
+
 pub(super) fn resource_limit(budget: PreparationBudget) -> PreparationFailure {
     PreparationFailure {
         code: PreparationFailureCode::PreparationResourceLimit,

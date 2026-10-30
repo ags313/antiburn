@@ -22,13 +22,9 @@ export const CHECK_SENTENCES: Record<BurnCheckDetectorId, string> = {
   unusedMcpServers: "Some connected tool servers loaded tools that were not used.",
   unusedBuiltInTools: "Some built-in tools were loaded but not used.",
   unusedSkills: "Some skills were loaded but not used.",
-  skillOpportunities: "This work matches a skill that may help with similar tasks.",
-  overExploring: "Some files or sections read were not needed for the task.",
-  scopeCreep: "Some proposed or attempted work went beyond the agreed task.",
   oldModelUsage: "Some sessions used an older model when a newer one was available.",
   overuseOfFastMode: "Some work paid for speed it did not need.",
   cacheChurn: "Some sessions kept paying to reload the same context.",
-  ignoredInstructions: "Selected actions conflict with current or recorded instruction text.",
 }
 
 export function CheckPromptAction({
@@ -42,7 +38,6 @@ export function CheckPromptAction({
   active?: boolean
 }) {
   const { busy, copied, status, bindRoot, copy } = useBurnCheckPromptCopy({
-    detector,
     subject: detector,
     active,
     prepare: () => copyPromptFixBurnCheck(detector),

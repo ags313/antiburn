@@ -1,4 +1,5 @@
 import { expect, test, type Page, type TestInfo } from "@playwright/test"
+import { SETTINGS_PANES } from "../../src/lib/settingsPanes"
 
 const scales = [90, 100, 110, 125, 150, 175, 200] as const
 const surfaces = [
@@ -493,15 +494,7 @@ test.describe("issue 507 targeted journeys", () => {
       page,
     }, testInfo) => {
       await openFixture(page, "settings", { scale: 200, theme })
-      for (const pane of [
-        "General",
-        "Privacy",
-        "Notifications",
-        "Usage",
-        "Sources",
-        "Appearance",
-        "About",
-      ]) {
+      for (const { label: pane } of SETTINGS_PANES) {
         await selectNavigationItem(page, "settings", pane)
         await expect(page.getByRole("tabpanel", { name: pane })).toBeVisible()
         await expectNoHorizontalOverflow(page)

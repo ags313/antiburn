@@ -2,41 +2,85 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll, Waker};
 
-use antiburn_checks::actions::{ChoiceResult, plan_status_actions};
+use antiburn_checks::actions::plan_status_actions;
 use antiburn_checks::compiler::compile;
+use antiburn_checks::decision::DecisionInput;
 use antiburn_checks::domain::{
     BranchId, EvidenceVersion, FrozenContext, Message, NativeOrderKey, ObservationDraft,
     ObservationKind,
 };
 use antiburn_checks::engine::{
-    CheckEngine, DecisionEvaluator, DecisionFuture, EvaluationFailure, RunOutcome, StartOutcome,
+    CheckEngine, DecisionEvaluator, DecisionFuture, EvaluationFailure,
+    PreparationValidationPurpose, RunOutcome, StartOutcome,
 };
+use antiburn_checks::expression_eval::EvaluationBudget;
+use antiburn_checks::prepared_assessment::{PreparedAssessment, PreparedBlock};
+use antiburn_checks::results::{ChoiceResult, NamedAnswer, QuestionResult};
 use antiburn_checks::source::SourceEvent;
 use serde_json::json;
 
 use super::*;
 
+#[path = "runtime_tracing_tests.rs"]
+mod tracing_tests;
+
+#[path = "runtime_admission_tests.rs"]
+mod admission;
+#[path = "runtime_connection_tests.rs"]
+mod connections;
+#[path = "runtime_decision_tests.rs"]
+mod decisions;
+#[path = "runtime_events_tests.rs"]
+mod events;
+#[path = "runtime_expression_tests.rs"]
+mod expressions;
 #[path = "runtime_failure_tests.rs"]
 mod failures;
 #[path = "runtime_gap_tests.rs"]
 mod gaps;
+#[path = "runtime_local_tests.rs"]
+mod local;
 #[path = "runtime_preparation_tests.rs"]
 mod preparation;
+#[path = "runtime_progress_tests.rs"]
+mod progress;
+#[path = "runtime_recovery_validation_tests.rs"]
+mod recovery_validation;
+#[path = "runtime_registry_tests.rs"]
+mod registry;
 #[path = "runtime_selection_tests.rs"]
 mod selection;
+#[path = "runtime_snapshot_tests.rs"]
+mod snapshots;
 #[path = "runtime_unsafe_update_tests.rs"]
 mod unsafe_updates;
 
-const CHECK: &str = "name: Retry\non:\n  tool_result:\ndecisions:\n  review:\n    model: typesafe/jev-1.13.0\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    if: ${{ decisions.review.details.verdict.probabilities.yes > 0.9 }}\n    input: {result: failure}\n";
+const CHECK: &str = "name: Retry\non:\n  tool_result:\ndecisions:\n  review:\n    input: {activity: \"${{ message.tool.result.status }}\"}\n    output:\n      verdict:\n        type: choice\n        question: Is this useful?\n        criteria: {yes: Yes., no: No.}\nactions:\n  - type: status\n    if: ${{ decisions.review.details.verdict.probabilities.yes > 0.9 }}\n    input: {result: failure}\n";
 
 struct NoEvaluator;
 impl DecisionEvaluator for NoEvaluator {
-    fn evaluate<'a>(
+    fn prepare(
+        &self,
+        _: &EffectiveActivation,
+        _: Vec<DecisionInput>,
+        _: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
+        panic!("store source tests do not prepare provider requests")
+    }
+    fn validate_prepared(
+        &self,
+        _: &EffectiveActivation,
+        _: &PreparedAssessment,
+        _: PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        panic!("store source tests do not validate provider requests")
+    }
+    fn evaluate_prepared<'a>(
         &'a self,
         _: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        _: &'a serde_json::Value,
-        _: u8,
+        _: &'a PreparedAssessment,
+        _: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
         panic!("store tests do not send provider requests")
     }
@@ -57,6 +101,9 @@ fn fixture_with_definition(
     store: Arc<Store>,
     source: &str,
 ) -> (Arc<Store>, Arc<StoreCheckStore>, EffectiveActivation) {
+    store
+        .set_internal_value_checked("internal:yamlBurnChecksDiscoveryEnabledV1", "true")
+        .unwrap();
     let scope = ActivationScope {
         environment: "native".into(),
         session_cwd: "/repo".into(),
@@ -85,6 +132,18 @@ fn fixture_with_definition(
             Some(&active),
         )
         .unwrap();
+    antiburn_checks_store::replace_runtime_definitions(
+        &mut store.lock(),
+        &[antiburn_checks_store::RuntimeDefinition {
+            check_id: active.id.definition_id.clone(),
+            activation_scope_key: adapter.activation_scope_key.clone(),
+            generation: Some(active.id.generation.0.try_into().unwrap()),
+            definition_revision: hex(&active.revision),
+            name: active.compiled.name.clone(),
+            availability: antiburn_checks_store::DefinitionAvailability::Available,
+        }],
+    )
+    .unwrap();
     (store, adapter, active)
 }
 
@@ -95,10 +154,12 @@ fn event(store: &Store, sequence: u64, id: &str, branch: &str, revision: u64) ->
         VALUES (?1, 'update', 'native', 'fixture', ?2, 'fixture', ?3, '{}', ?4, '{}', 1, 1, 1)", params![sequence, branch, id, revision]).unwrap();
     SourceBatch {
         events: vec![SourceEvent::Observation {
+            source_evidence_version: None,
             cursor: PublicationCursor(sequence),
             identity: id.into(),
             revision,
             observation: Box::new(ObservationDraft {
+                first_eligible_publication: None,
                 first_terminal_publication: None,
                 branch: BranchId(branch.into()),
                 native_order: NativeOrderKey(id.into()),
@@ -139,7 +200,7 @@ fn apply(
         .unwrap()
         .into_iter()
         .find_map(|record| match record.work {
-            RecoveryWork::Pending(candidate) if candidate.trigger_position == position => {
+            RecoveryWork::Pending { candidate, .. } if candidate.trigger_position == position => {
                 Some(candidate)
             }
             _ => None,
@@ -162,38 +223,199 @@ fn transient_diagnostic() -> EvaluationDiagnostic {
     }
 }
 
+fn review_attempt(number: u8) -> DecisionAttempt {
+    DecisionAttempt::new("review", number).unwrap()
+}
+
+fn prepared_review(
+    profile: &str,
+    input: serde_json::Value,
+    request: serde_json::Value,
+    report: antiburn_checks::fit::FitReport,
+    budget: EvaluationBudget,
+) -> PreparedAssessment {
+    PreparedAssessment::new(
+        profile.into(),
+        budget,
+        0,
+        vec![PreparedBlock {
+            decision: "review".into(),
+            original_input: input.clone(),
+            input,
+            request,
+            report,
+        }],
+    )
+    .unwrap()
+}
+
+fn prepare_inputs(
+    inputs: Vec<DecisionInput>,
+    budget: EvaluationBudget,
+    profile: &str,
+) -> PreparedAssessment {
+    PreparedAssessment::new(
+        profile.into(),
+        budget,
+        0,
+        inputs
+            .into_iter()
+            .map(|input| PreparedBlock {
+                decision: input.decision,
+                original_input: input.input.clone(),
+                input: input.input,
+                request: json!({"exact": "saved"}),
+                report: Default::default(),
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+
+fn validate_fixture_preparation(
+    active: &EffectiveActivation,
+    prepared: &PreparedAssessment,
+    profile: &str,
+) -> Result<(), PreparationFailure> {
+    let invalid = || PreparationFailure {
+        code: antiburn_checks::fit::PreparationFailureCode::IncompatibleProfile,
+        detail: "The saved synthetic preparation does not match its construction policy.".into(),
+        report: None,
+        context: Default::default(),
+    };
+    prepared
+        .validate_for_declarations(&active.compiled.decisions)
+        .map_err(|_| invalid())?;
+    if prepared.profile != profile
+        || prepared
+            .decisions
+            .iter()
+            .any(|block| block.request != json!({"exact": "saved"}))
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn review_result(active: &EffectiveActivation, number: u8, yes: f64) -> DecisionResult {
+    let block = active
+        .compiled
+        .decisions
+        .iter()
+        .find(|block| block.name == "review")
+        .unwrap();
+    let question = block
+        .outputs
+        .iter()
+        .find(|question| question.name == "verdict")
+        .unwrap();
+    DecisionResult::new(
+        block,
+        &active.compiled.question_requirements(),
+        vec![
+            NamedAnswer::new(
+                "verdict",
+                QuestionResult::Choice(
+                    ChoiceResult::new(
+                        &question.question,
+                        if yes > 0.5 { "yes" } else { "no" },
+                        Some(BTreeMap::from([
+                            ("yes".into(), yes),
+                            ("no".into(), 1.0 - yes),
+                        ])),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap(),
+        ],
+        number,
+    )
+    .unwrap()
+}
+
+fn next_review_attempt(adapter: &StoreCheckStore, claimed: &ClaimedCandidate) -> u8 {
+    let active = adapter
+        .registered_activation(&claimed.candidate.activation)
+        .unwrap();
+    let progress = adapter.load_decision_progress(claimed).unwrap();
+    let DecisionProgressState::Next { attempt, .. } = validate_decision_progress(
+        &active.compiled.decisions,
+        &active.compiled.question_requirements(),
+        &progress,
+    )
+    .unwrap()
+    .state
+    else {
+        panic!("review must have a next attempt")
+    };
+    assert_eq!(attempt.decision, "review");
+    attempt.number
+}
+
+impl StoreCheckStore {
+    fn dispatch_review(
+        &self,
+        claimed: &ClaimedCandidate,
+        now_ms: u64,
+        cooldown: Duration,
+        number: u8,
+    ) -> Result<ClaimOutcome, StoreError> {
+        let current: bool = self.store.lock().query_row("SELECT EXISTS(SELECT 1 FROM burn_check_candidate WHERE candidate_id = ?1 AND claim_owner = ?2 AND claim_fence = ?3 AND state = 'claimed')", params![hex(&claimed.id.0), self.owner, claimed.fence], |row| row.get(0)).unwrap();
+        if !current {
+            return self.record_dispatch_intent(claimed, now_ms, cooldown, &review_attempt(number));
+        }
+        if self.load_preparation(claimed)?.is_none() {
+            self.record_preparation(
+                claimed,
+                &PreparationRecord::Ready(prepared_review(
+                    "fixture-v1",
+                    json!({}),
+                    json!({"exact": "saved"}),
+                    Default::default(),
+                    EvaluationBudget::default(),
+                )),
+            )?;
+        }
+        self.record_dispatch_intent(claimed, now_ms, cooldown, &review_attempt(number))
+    }
+
+    fn fail_review(
+        &self,
+        claimed: &ClaimedCandidate,
+        number: u8,
+        outcome: AttemptFailure,
+        diagnostic: &EvaluationDiagnostic,
+    ) -> Result<ClaimOutcome, StoreError> {
+        self.record_attempt_failure(claimed, &review_attempt(number), outcome, diagnostic)
+    }
+}
+
 fn answer(
     adapter: &StoreCheckStore,
     active: &EffectiveActivation,
     claimed: ClaimedCandidate,
     yes: f64,
 ) -> AssessmentAcceptance {
+    let number = next_review_attempt(adapter, &claimed);
     adapter
-        .record_dispatch_intent(
-            &claimed,
-            100_000,
-            Duration::from_secs(60),
-            claimed.next_attempt,
-        )
+        .dispatch_review(&claimed, 100_000, Duration::from_secs(60), number)
         .unwrap();
-    let evaluated = EvaluatedCandidate {
-        choices: vec![
-            ChoiceResult::validate(
-                "review",
-                "verdict",
-                &["yes".into(), "no".into()],
-                if yes > 0.5 { "yes" } else { "no" },
-                BTreeMap::from([("yes".into(), yes), ("no".into(), 1.0 - yes)]),
-            )
-            .unwrap(),
-        ],
-        attempts: claimed.next_attempt,
-    };
-    adapter.record_answer(&claimed, &evaluated).unwrap();
+    let result = review_result(active, number, yes);
+    adapter
+        .record_decision_answer(&claimed, &review_attempt(number), &result)
+        .unwrap();
+    let evaluated = EvaluatedAssessment::new(
+        &active.compiled.decisions,
+        &active.compiled.question_requirements(),
+        vec![result],
+    )
+    .unwrap();
     let actions = plan_status_actions(
         &active.compiled.actions,
         &claimed.candidate.context.value,
-        &evaluated.choices,
+        &evaluated,
         claimed.prior_status,
     )
     .unwrap();
@@ -421,10 +643,10 @@ fn safe_retry_number_survives_restart_and_unknown_dispatch_never_resends() {
     let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
     let first = claim(&adapter, &candidate);
     adapter
-        .record_dispatch_intent(&first, 100_000, Duration::from_secs(60), 1)
+        .dispatch_review(&first, 100_000, Duration::from_secs(60), 1)
         .unwrap();
     adapter
-        .record_attempt_failure(
+        .fail_review(
             &first,
             1,
             AttemptFailure::SafeTransient,
@@ -434,22 +656,19 @@ fn safe_retry_number_survives_restart_and_unknown_dispatch_never_resends() {
     let restarted =
         StoreCheckStore::new(store.clone(), "owner-2".into(), active.id.scope.clone()).unwrap();
     restarted.register_activation(&active).unwrap();
-    assert!(matches!(
-        restarted.claim_due(&candidate, 120_000, false).unwrap(),
-        CandidateClaim::NotDue {
-            retry_at_unix_ms: 160_000
-        }
-    ));
-    let retry = claim(&restarted, &candidate);
-    assert_eq!(retry.next_attempt, 2);
+    let CandidateClaim::Claimed(retry) = restarted.claim_due(&candidate, 120_000, false).unwrap()
+    else {
+        panic!("resumed work bypasses its own started cooldown");
+    };
+    assert_eq!(next_review_attempt(&restarted, &retry), 2);
     assert_eq!(
         restarted
-            .record_dispatch_intent(&first, 100_000, Duration::ZERO, 2)
+            .dispatch_review(&first, 100_000, Duration::ZERO, 2)
             .unwrap(),
         ClaimOutcome::Stale
     );
     restarted
-        .record_dispatch_intent(&retry, 100_000, Duration::ZERO, 2)
+        .dispatch_review(&retry, 100_000, Duration::ZERO, 2)
         .unwrap();
     let recovered =
         StoreCheckStore::new(store.clone(), "owner-3".into(), active.id.scope.clone()).unwrap();
@@ -681,11 +900,11 @@ fn retention_prunes_unused_frozen_inputs_and_preserves_current_status_evidence()
             &event(&store, sequence, "one", branch, 1),
         );
         let claimed = claim(&adapter, &candidate);
-        let prepared = antiburn_checks::fit::PreparedDecision {
-            profile: "fixture-v1".into(),
-            input: json!({"text": "retained evidence"}),
-            request: Some(json!({"exact": "provider request"})),
-            report: antiburn_checks::fit::FitReport {
+        let prepared = prepared_review(
+            "fixture-v1",
+            json!({"text": "retained evidence"}),
+            json!({"exact": "provider request"}),
+            antiburn_checks::fit::FitReport {
                 omissions: vec![antiburn_checks::fit::FitOmission {
                     path: "text".into(),
                     strategy: antiburn_checks::fit::FitStrategy::Truncate,
@@ -693,7 +912,8 @@ fn retention_prunes_unused_frozen_inputs_and_preserves_current_status_evidence()
                     retained_count: 1024,
                 }],
             },
-        };
+            EvaluationBudget::default(),
+        );
         adapter
             .record_preparation(&claimed, &PreparationRecord::Ready(prepared))
             .unwrap();
@@ -723,16 +943,25 @@ fn retention_prunes_unused_frozen_inputs_and_preserves_current_status_evidence()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     for (branch, saved) in prepared {
-        let PreparationRecord::Ready(prepared) = serde_json::from_str(&saved).unwrap() else {
-            panic!("ready report remains available");
-        };
-        assert_eq!(prepared.report.omissions[0].retained_count, 1024);
+        let prepared: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(
+            prepared["decisions"][0]["report"]["omissions"][0]["retained_count"],
+            1024
+        );
         if branch == "failure" {
-            assert!(prepared.request.is_some());
-            assert_eq!(prepared.input["text"], "retained evidence");
+            assert!(prepared["decisions"][0].get("request").is_some());
+            assert_eq!(
+                prepared["decisions"][0]["input"]["text"],
+                "retained evidence"
+            );
+            assert_eq!(
+                prepared["decisions"][0]["original_input"]["text"],
+                "retained evidence"
+            );
         } else {
-            assert!(prepared.request.is_none());
-            assert_eq!(prepared.input, json!({}));
+            for payload in ["original_input", "input", "request"] {
+                assert!(prepared["decisions"][0].get(payload).is_none());
+            }
         }
     }
     assert_eq!(
@@ -821,7 +1050,7 @@ fn v75_migration_preserves_existing_data_and_supports_runtime_acceptance() {
             .unwrap(),
         "preserved"
     );
-    assert_eq!(connection.query_row("SELECT COUNT(*) FROM burn_check_assessment WHERE check_id = 'existing-detector' AND session_id = 'migration-session'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(connection.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'burn_check_assessment'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     assert_eq!(
         connection
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -875,7 +1104,7 @@ fn recovery_uses_keyset_pages_and_replay_has_an_independent_scope() {
         if records.is_empty() {
             break;
         }
-        let RecoveryWork::Pending(candidate) = &records[0].work else {
+        let RecoveryWork::Pending { candidate, .. } = &records[0].work else {
             panic!("pending candidate expected");
         };
         let id = CandidateId::from(candidate);
@@ -904,10 +1133,12 @@ fn recovery_uses_keyset_pages_and_replay_has_an_independent_scope() {
         .unwrap();
     let page = SourceBatch {
         events: vec![SourceEvent::Observation {
+            source_evidence_version: None,
             cursor: PublicationCursor(1),
             identity: "same-native-id".into(),
             revision: 1,
             observation: Box::new(ObservationDraft {
+                first_eligible_publication: None,
                 first_terminal_publication: None,
                 branch: BranchId("a".into()),
                 native_order: NativeOrderKey("one".into()),
@@ -966,7 +1197,8 @@ fn clear_and_session_deletion_remove_frozen_selector_payloads() {
     engine
         .apply_source_page(&active, &event(&store, 1, "one", "branch", 1))
         .unwrap();
-    let RecoveryWork::Pending(candidate) = adapter.load_recovery(None, 10).unwrap().remove(0).work
+    let RecoveryWork::Pending { candidate, .. } =
+        adapter.load_recovery(None, 10).unwrap().remove(0).work
     else {
         panic!("pending candidate expected");
     };
@@ -1041,29 +1273,31 @@ fn clear_and_session_deletion_remove_frozen_selector_payloads() {
 struct RecordingEvaluator(Mutex<Vec<u8>>);
 
 impl DecisionEvaluator for RecordingEvaluator {
-    fn evaluate<'a>(
+    fn prepare(
+        &self,
+        _: &EffectiveActivation,
+        inputs: Vec<DecisionInput>,
+        budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
+        Ok(prepare_inputs(inputs, budget, "fixture-v1"))
+    }
+    fn validate_prepared(
+        &self,
+        activation: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        _: PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        validate_fixture_preparation(activation, prepared, "fixture-v1")
+    }
+    fn evaluate_prepared<'a>(
         &'a self,
-        _: &'a EffectiveActivation,
+        active: &'a EffectiveActivation,
         _: &'a FrozenCandidate,
-        _: &'a serde_json::Value,
-        number: u8,
+        _: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
-        self.0.lock().unwrap().push(number);
-        Box::pin(async move {
-            Ok(EvaluatedCandidate {
-                attempts: 1,
-                choices: vec![
-                    ChoiceResult::validate(
-                        "review",
-                        "verdict",
-                        &["yes".into(), "no".into()],
-                        "yes",
-                        BTreeMap::from([("yes".into(), 0.99), ("no".into(), 0.01)]),
-                    )
-                    .unwrap(),
-                ],
-            })
-        })
+        self.0.lock().unwrap().push(attempt.number);
+        Box::pin(async move { Ok(review_result(active, attempt.number, 0.99)) })
     }
 }
 
@@ -1074,17 +1308,35 @@ struct ControlledEvaluator {
 }
 
 impl DecisionEvaluator for ControlledEvaluator {
-    fn evaluate<'a>(
+    fn prepare(
+        &self,
+        _: &EffectiveActivation,
+        inputs: Vec<DecisionInput>,
+        budget: EvaluationBudget,
+    ) -> Result<PreparedAssessment, PreparationFailure> {
+        Ok(prepare_inputs(inputs, budget, "fixture-v1"))
+    }
+    fn validate_prepared(
+        &self,
+        active: &EffectiveActivation,
+        prepared: &PreparedAssessment,
+        purpose: PreparationValidationPurpose,
+    ) -> Result<(), PreparationFailure> {
+        RecordingEvaluator(Mutex::new(Vec::new())).validate_prepared(active, prepared, purpose)
+    }
+    fn evaluate_prepared<'a>(
         &'a self,
-        _: &'a EffectiveActivation,
+        active: &'a EffectiveActivation,
         candidate: &'a FrozenCandidate,
-        input: &'a serde_json::Value,
-        number: u8,
+        prepared: &'a PreparedAssessment,
+        attempt: &'a DecisionAttempt,
     ) -> DecisionFuture<'a> {
-        self.inputs
-            .lock()
-            .unwrap()
-            .push((candidate.trigger_position.0, input.clone(), number));
+        let number = attempt.number;
+        self.inputs.lock().unwrap().push((
+            candidate.trigger_position.0,
+            prepared.decisions[0].input.clone(),
+            number,
+        ));
         let first = candidate.trigger_position == ObservationPosition(51);
         Box::pin(std::future::poll_fn(move |_| {
             if first && !self.released.load(Ordering::SeqCst) {
@@ -1098,33 +1350,40 @@ impl DecisionEvaluator for ControlledEvaluator {
                     attempts: number,
                 }));
             }
-            Poll::Ready(Ok(EvaluatedCandidate {
-                attempts: number,
-                choices: vec![
-                    ChoiceResult::validate(
-                        "review",
-                        "verdict",
-                        &["yes".into(), "no".into()],
-                        "yes",
-                        BTreeMap::from([("yes".into(), 0.99), ("no".into(), 0.01)]),
-                    )
-                    .unwrap(),
-                ],
-            }))
+            Poll::Ready(Ok(review_result(active, number, 0.99)))
         }))
     }
 }
 
 fn poll_settlement(
-    mut task: antiburn_checks::engine::EvaluationTask<'_>,
+    task: antiburn_checks::engine::EvaluationTask<'_>,
 ) -> antiburn_checks::engine::RunSettlement {
-    let Poll::Ready(result) = task
-        .as_mut()
-        .poll(&mut TaskContext::from_waker(Waker::noop()))
-    else {
-        panic!("scripted evaluator must settle");
-    };
-    result.unwrap()
+    poll_task_result(task).unwrap()
+}
+
+fn poll_task_result(
+    mut task: antiburn_checks::engine::EvaluationTask<'_>,
+) -> Result<antiburn_checks::engine::RunSettlement, antiburn_checks::engine::EvaluationTaskError> {
+    for _ in 0..1024 {
+        if let Poll::Ready(result) = task
+            .as_mut()
+            .poll(&mut TaskContext::from_waker(Waker::noop()))
+        {
+            return result;
+        }
+    }
+    panic!("scripted evaluator must settle within the test poll bound")
+}
+
+fn assert_start_error<E: DecisionEvaluator + 'static>(
+    engine: &CheckEngine<StoreCheckStore, E>,
+    active: &EffectiveActivation,
+) {
+    match engine.start_one_due(active, 100_000) {
+        Err(_) => {}
+        Ok(StartOutcome::Started(task)) => assert!(poll_task_result(task).is_err()),
+        _ => panic!("the injected storage error must reach the caller"),
+    }
 }
 
 #[test]
@@ -1205,13 +1464,13 @@ fn correction_between_safe_failure_and_retry_intent_prevents_a_second_send() {
     let claimed = claim(&adapter, &candidate);
     assert_eq!(
         adapter
-            .record_dispatch_intent(&claimed, 0, Duration::ZERO, 1)
+            .dispatch_review(&claimed, 0, Duration::ZERO, 1)
             .unwrap(),
         ClaimOutcome::Current
     );
     assert_eq!(
         adapter
-            .record_attempt_failure(
+            .fail_review(
                 &claimed,
                 1,
                 AttemptFailure::SafeTransient,
@@ -1225,7 +1484,7 @@ fn correction_between_safe_failure_and_retry_intent_prevents_a_second_send() {
         .unwrap();
     assert_eq!(
         adapter
-            .record_dispatch_intent(&claimed, 0, Duration::ZERO, 2)
+            .dispatch_review(&claimed, 0, Duration::ZERO, 2)
             .unwrap(),
         ClaimOutcome::Stale
     );
@@ -1413,22 +1672,45 @@ fn non_window_overflow_is_durable_and_keeps_earlier_pending_events() {
 
 #[test]
 fn startup_admission_refills_oldest_eligible_sessions_after_the_cap() {
+    use antiburn_local::analysis::file_live::{NativeFileCursor, read_native_file_page};
+    use antiburn_local::analysis::{RawSource, SessionInput, SourceFormat};
+
     let (store, adapter, active) = fixture();
+    let directory = tempfile::tempdir().unwrap();
     for index in 0..130 {
         let session_id = format!("startup-{index:03}");
+        let path = directory.path().join(format!("{session_id}.jsonl"));
+        let header = json!({"type": "session", "version": 3, "id": session_id, "cwd": "/repo"});
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        let page = read_native_file_page(
+            &SessionInput {
+                agent: "pi".into(),
+                session_id: session_id.clone(),
+                source: RawSource::File(path.clone()),
+                source_format: SourceFormat::PiV3Jsonl,
+                fork_parent_session_id: None,
+            },
+            None,
+            &|| false,
+        )
+        .unwrap();
+        assert!(!page.has_more);
+        let cursor = NativeFileCursor::decode(&page.cursor.encode()).unwrap();
         store.lock().execute(
             "INSERT INTO session (environment_key, agent, session_id, source_kind, source_label,
-                cwd, updated_at_epoch, first_seen_at, last_seen_at)
-             VALUES ('native', 'pi', ?1, 'file', ?2, '/repo', ?3, 'now', 'now')",
-            params![session_id, format!("/tmp/{session_id}.jsonl"), index],
+                cwd, updated_at_epoch, first_seen_at, last_seen_at, source_format)
+             VALUES ('native', 'pi', ?1, 'file', ?2, '/repo', ?3, 'now', 'now', ?4)",
+            params![session_id, path.to_string_lossy(), index,
+                serde_json::to_string(&SourceFormat::PiV3Jsonl).unwrap()],
         ).unwrap();
         store.lock().execute(
             "INSERT INTO native_file_delivery (environment_key, agent, session_id, incarnation,
                 source_label, cwd, parser_revision, cursor_json, observed_generation, pending, active_until_epoch)
-             SELECT environment_key, agent, session_id, incarnation, source_label, cwd, ?2, '{}',
+             SELECT environment_key, agent, session_id, incarnation, source_label, cwd, ?2, ?3,
                 source_generation, 0, 0 FROM session WHERE environment_key = 'native'
                 AND agent = 'pi' AND session_id = ?1",
-            params![session_id, antiburn_local::analysis::PARSER_REVISION],
+            params![session_id, antiburn_local::analysis::PARSER_REVISION,
+                serde_json::to_string(&cursor).unwrap()],
         ).unwrap();
     }
 
@@ -1497,13 +1779,17 @@ fn normalized_partial_result_exposes_authored_identity_and_remains_assessable() 
     event(&store, 1, "one", "branch", 1);
     let page = PublishedEvidenceSource::new(PublishedReader(PublishedEvidenceBatch {
         events: vec![PublishedEvidenceEvent {
+            source_evidence_version: None,
             cursor: PublicationCursor(1), branch: "branch".into(),
             context: Some(PublishedContext {
+                session_selection: None,
+                inventories: Default::default(),
                 requests: vec![("request".into(), json!({"source": "fixture", "kind": "user_message", "text": "Review available results."}))],
                 session_id: "branch".into(), agent_name: "fixture".into(), project_root: Some("/repo".into()),
                 version: "request-prefix-1".into(), main_session: true, complete_through_event: false,
             }),
             change: PublishedEvidenceChange::Upsert(PublishedToolResult {
+                metadata: Box::default(),
                 first_terminal_publication: None,
                 identity: "one".into(), native_order: NativeOrderKey("native-one".into()), revision: 1,
                 tool_name: None, category: None, arguments: None, content: Some("Useful partial result".into()),
@@ -1549,9 +1835,10 @@ fn saved_answers_reject_invalid_probabilities_and_wrong_choice_declarations() {
         let assessment = answer(&adapter, &active, claim(&adapter, &candidate), 0.99);
         let mut saved = serde_json::to_value(assessment.evaluated).unwrap();
         if corruption == "probabilities" {
-            saved["choices"][0]["probabilities"] = json!({"yes": 1.5, "no": -0.5});
+            saved["decisions"][0]["answers"][0]["result"]["probabilities"] =
+                json!({"yes": 1.5, "no": -0.5});
         } else {
-            saved["choices"][0]["question"] = json!("other_question");
+            saved["decisions"][0]["answers"][0]["name"] = json!("other_question");
         }
         store
             .lock()
@@ -1570,7 +1857,21 @@ fn saved_answers_reject_invalid_probabilities_and_wrong_choice_declarations() {
         )
         .unwrap();
         restarted.register_activation(&active).unwrap();
-        assert!(restarted.load_recovery(None, 10).is_err(), "{corruption}");
+        let restarted = Arc::new(restarted);
+        let engine = CheckEngine::new(restarted.clone(), Arc::new(NoEvaluator));
+        assert_eq!(engine.recover_pending().unwrap().candidates, 0);
+        let diagnostic: String = store.lock().query_row(
+            "SELECT diagnostic_json FROM burn_check_candidate WHERE candidate_id = ?1 AND state = 'execution_failed'",
+            [hex(&candidate.fingerprint)],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            serde_json::from_str::<EvaluationDiagnostic>(&diagnostic)
+                .unwrap()
+                .code,
+            antiburn_checks::engine::EvaluationFailureCode::InvalidDecision,
+            "{corruption}",
+        );
         assert_eq!(
             restarted.claim_due(&candidate, 200_000, true).unwrap(),
             CandidateClaim::Stale
@@ -1603,28 +1904,41 @@ fn saved_answers_reject_invalid_probabilities_and_wrong_choice_declarations() {
 #[test]
 fn recovered_safe_retry_passes_the_durable_number_to_the_evaluator() {
     use antiburn_checks::engine::{ExecutionPolicy, RunOutcome, StartOutcome};
-    use std::task::{Context, Poll, Waker};
 
     let (store, adapter, active) = fixture();
     let candidate = apply(&adapter, &active, &event(&store, 1, "one", "branch", 1));
     let claimed = claim(&adapter, &candidate);
     let evaluator = Arc::new(RecordingEvaluator(Mutex::new(vec![])));
     let antiburn_checks::preparation::PreparationOutcome::Ready(input) =
-        antiburn_checks::preparation::prepare_decision_input(&active.compiled, &candidate)
+        antiburn_checks::preparation::prepare_decision_input(
+            &active.compiled.decisions[0],
+            &candidate,
+        )
     else {
         panic!("fixture input must be available");
     };
     adapter
         .record_preparation(
             &claimed,
-            &PreparationRecord::Ready(evaluator.prepare(&active, input).unwrap()),
+            &PreparationRecord::Ready(
+                evaluator
+                    .prepare(
+                        &active,
+                        vec![DecisionInput {
+                            decision: "review".into(),
+                            input,
+                        }],
+                        EvaluationBudget::default(),
+                    )
+                    .unwrap(),
+            ),
         )
         .unwrap();
     adapter
-        .record_dispatch_intent(&claimed, 0, Duration::ZERO, 1)
+        .dispatch_review(&claimed, 0, Duration::ZERO, 1)
         .unwrap();
     adapter
-        .record_attempt_failure(
+        .fail_review(
             &claimed,
             1,
             AttemptFailure::SafeTransient,
@@ -1640,13 +1954,9 @@ fn recovered_safe_retry_passes_the_durable_number_to_the_evaluator() {
         ExecutionPolicy::SequentialReplay,
     );
     assert_eq!(engine.recover_pending().unwrap().candidates, 1);
-    let StartOutcome::Started(mut task) = engine.start_one_due(&active, 1).unwrap() else {
+    let StartOutcome::Started(task) = engine.start_one_due(&active, 1).unwrap() else {
         panic!("recovered retry must start");
     };
-    let Poll::Ready(settlement) = task.as_mut().poll(&mut Context::from_waker(Waker::noop()))
-    else {
-        panic!("scripted evaluator settles immediately");
-    };
-    assert_eq!(settlement.unwrap().outcome, RunOutcome::Accepted);
+    assert_eq!(poll_settlement(task).outcome, RunOutcome::Accepted);
     assert_eq!(*evaluator.0.lock().unwrap(), [2]);
 }

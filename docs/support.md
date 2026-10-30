@@ -108,12 +108,31 @@ database open. Antiburn does not start or replace that service.
 Burn checks shows a local diagnostic when the service is unavailable, rejects its
 credential, uses a different source, has an unsupported version, or exceeds a
 capture limit. These states do not count as a passed check. A capture gap records
-missed activity. After reconnect, safe future results can run, but missed results
+unobserved history; it does not prove that an event was lost. After reconnect,
+safe future results can run without an alert about the older gap. Missed results
 do not replay. Earlier assessments keep the input they actually checked.
 
 Connection diagnostics contain closed error codes and safe action text. They do
 not include credentials, raw event bodies, or database paths. Connection outcomes
 stay local; shared OpenCode surface events do not measure V2 connection success.
+
+### YAML source limits
+
+The five native live routes supply only the public events their source contracts
+can prove. Claude's characterized CLI 2.1.278/2.1.309 lineage does not supply
+public assistant completion or response cycles. Pi's inert Antiburn advisory can
+preserve native continuity but does not become a user request or native activity.
+
+Cursor Desktop has a separate ordered snapshot tool-result route for its
+characterized native inline main-session source. Recorded header order, exact
+bubble/call identities, and current ready cached evidence are required. Cursor
+CLI and generic stores do not inherit it. It does not supply separate public
+message/call, cycle, or host-session events. See
+[source coverage](session-coverage.md#cursor-desktop-yaml-tool-evidence).
+
+YAML status checks do not grant the native remediation features below. Burn
+Checks use the experimental `v1-alpha` draft, without backward compatibility.
+Missing features are unassigned future work; beta and stable scope are not set.
 
 ## Burn Check remediation
 
@@ -135,7 +154,7 @@ exact binding limits. The same document has the exhaustive prompt matrix.
 | Codex       | Supported         | D/T/S/M/K/O/F               | Prompts for all nine checks                                 |
 | OpenCode    | Supported         | D/S/M/K/O                   | Prompts for D, S, M, B, K, O, and C                         |
 | Cursor      | Finding-only O    | None                        | Current M/K inventory; prompts for characterized O findings |
-| Pi          | Supported         | D/T/O/C                     | Prompts for D, T, S, M, K, O, and C; B unavailable          |
+| Pi          | Supported         | D/T/O                       | Prompts for D, T, S, M, K, O, and C; B unavailable          |
 | Antigravity | Finding-only D/O  | None                        | Current M/K inventory; prompts for D and O                  |
 
 ### Second-tier product coverage
@@ -163,7 +182,7 @@ attribution, and Claude fast mode writes `false`. A controller-reported runtime
 or managed override can prevent an immediate behavior change; the review shows
 this warning. Each explicit Copy prepares fresh prompt text, including retries
 after clipboard failure. Check-level Copy queries current targets. Incomplete
-queries, missing selected identities, and empty Ignored Instructions queries can
+queries and missing selected identities can
 receive bounded inspection text without a current finding claim. Matched
 unsupported targets remain unavailable. Existing watch
 state and full watch capacity do not block valid prompt text. Copy preserves
@@ -292,12 +311,34 @@ the next time it looks.
 
 ## Network
 
-**Model-based Checks** can send an authored YAML check's selected tool results,
-arguments, and available user-slot text to TypeSafe through Jev. Configure it in
-**Settings → Checks → Decision model**. Jev is the only exposed decision route.
+**Model-based checks** can send an authored YAML check's selected tool results,
+arguments, and available user-slot text to the selected System One connection.
+In **Settings → Checks → Model-based checks**, turn **Run checks** off during
+setup. Choose **Add connection**, select Jev, Ollama, Cloudflare, or Custom, enter
+its fields, and select **Add connection** in the dialog. The first connection
+becomes selected without enabling checks. Choose **Use** for another saved
+connection, then enable **Run checks** when ready. **Edit** and **Save** update a
+connection without selecting another one. **Remove** can delete any connection;
+removing the selected connection turns checks off and clears selection. Saved
+results and usage remain. **Test connection** in the dialog is optional, sends synthetic input,
+and can incur provider charges. Ollama requires an endpoint that supports System
+One. Compatible models and output capabilities are required; an arbitrary chat
+endpoint is not supported. Custom supports direct System One and
+Cloudflare-envelope responses, but unknown limits block execution.
+The app manages supported limits without manual overrides. See
+[decision connections](burn-check/authoring.md#decision-connections) for the
+provider-specific fields and limits. The selected Settings connection owns
+routing; decision-level YAML `model` is rejected as an unknown field.
+Local status checks send no model request. They still require **Run checks** to
+be on and a configured connection to be selected. The connection's credential
+and authentication rules, and the source and runtime requirements, still apply.
+With **Run checks** off, the app still reads and parses bounded local YAML
+definitions and watches their directories, including at cold startup. This
+supplies names, diagnostics, paused cards, and file counts. It does not restore provider
+configuration, discover model capabilities, catch up session sources, or run
+assessments.
 Partial history and fields are identified; missing images are not analyzed.
-Provider usage charges can apply. Built-in smart-check execution and historical
-enrollment are suspended, with saved results and preferences retained. See
+Provider usage charges can apply. See
 [Burn Checks](burn-check/README.md) and the [privacy policy](privacy-policy.md).
 
 antiburn needs no account or backend for its main work. The connections it makes
@@ -349,11 +390,11 @@ signed bundle and restarts antiburn. The app never depends on either connection.
   with a rejected name replaced by a fixed placeholder instead of being sent;
   the app version; and the operating system. The payload has no
   field able to carry anything else. The analytics-session identifier changes
-  after 30 minutes without a captured analytics event, when the app restarts,
+  after 30 minutes without a user-oriented analytics event, when the app restarts,
   or when the installation identifier rotates.
   Its generator is memory-only, but each queued event stores the value on disk
-  until that event is sent or removed. Background events can keep it active, so
-  it does not measure a user visit or time spent. Because each event is
+  until that event is sent or removed. Background events do not extend its
+  inactivity timeout. It does not measure a user visit or time spent. Because each event is
   timestamped and the installation identifier lasts up to 30 days, the events
   do show roughly when events were captured within that window; they do not show
   the content or identity of what the app was used on. Resource ranges can

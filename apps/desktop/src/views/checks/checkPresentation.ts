@@ -1,16 +1,12 @@
 import {
   Bot,
   BookOpen,
-  BookOpenCheck,
   Brain,
   Database,
   Gauge,
   History,
   Layers3,
-  Search,
   Server,
-  Sparkles,
-  Target,
   Wrench,
   CircleCheck,
   type LucideIcon,
@@ -18,7 +14,6 @@ import {
 
 import type { BurnCheckDetectorId, BurnCheckTargetPayload } from "../../lib/insightsIpc"
 import { isInstalledCheck, checkLabel, type CheckRow } from "../../lib/presentation/checkRows"
-import { checkHasProvisionalResult } from "../../lib/presentation/checkStatus"
 import { checkRowStatus, checkStatusFacts } from "../../lib/presentation/checkRowStatus"
 import {
   formatApiEquivalentUsd,
@@ -59,19 +54,6 @@ export const CHECK_UI: Record<BurnCheckDetectorId, CheckUiMetadata> = {
     icon: BookOpen,
     recommendation: "Load this skill only when the request needs it to avoid unused context.",
   },
-  skillOpportunities: {
-    icon: Sparkles,
-    recommendation: "Use this current skill for similar future work.",
-  },
-  overExploring: {
-    icon: Search,
-    recommendation: "Read only the files and sections needed for future work.",
-  },
-  scopeCreep: {
-    icon: Target,
-    recommendation:
-      "Keep future work within the agreed task. Ask for approval before adding work.",
-  },
   oldModelUsage: {
     icon: History,
     recommendation:
@@ -85,10 +67,6 @@ export const CHECK_UI: Record<BurnCheckDetectorId, CheckUiMetadata> = {
     icon: Database,
     recommendation: "Keep stable context reusable to avoid paid cache rehydration.",
   },
-  ignoredInstructions: {
-    icon: BookOpenCheck,
-    recommendation: "Follow the cited instruction and correct the affected work.",
-  },
 }
 
 const CHECK_ICONS: Record<BurnCheckDetectorId, LucideIcon> = {
@@ -98,13 +76,9 @@ const CHECK_ICONS: Record<BurnCheckDetectorId, LucideIcon> = {
   unusedMcpServers: CHECK_UI.unusedMcpServers.icon,
   unusedBuiltInTools: CHECK_UI.unusedBuiltInTools.icon,
   unusedSkills: CHECK_UI.unusedSkills.icon,
-  skillOpportunities: CHECK_UI.skillOpportunities.icon,
-  overExploring: CHECK_UI.overExploring.icon,
-  scopeCreep: CHECK_UI.scopeCreep.icon,
   oldModelUsage: CHECK_UI.oldModelUsage.icon,
   overuseOfFastMode: CHECK_UI.overuseOfFastMode.icon,
   cacheChurn: CHECK_UI.cacheChurn.icon,
-  ignoredInstructions: CHECK_UI.ignoredInstructions.icon,
 }
 
 function tokenBurnLabel(category: CheckRow): string | null {
@@ -133,56 +107,19 @@ export function checkRowPresentation(
   targets?: readonly BurnCheckTargetPayload[],
 ) {
   const failed = category.lifecycle === "failing"
-  const provisional = checkHasProvisionalResult(category)
   const status = checkStatusFacts(category)
-  const metric =
-    failed && category.id !== "ignoredInstructions" ? tokenBurnLabel(category) : null
+  const metric = failed ? tokenBurnLabel(category) : null
   return {
     Icon: isInstalledCheck(category) ? CircleCheck : CHECK_ICONS[category.id],
     label: checkLabel(category),
-    provisional,
     checking: status.checking === true,
-    coverage: category.reviewCoverage
-      ? [
-          category.reviewCoverage.total == null
-            ? `${category.reviewCoverage.reviewed} reviewed`
-            : `${category.reviewCoverage.reviewed} of ${category.reviewCoverage.total} reviewed`,
-          `${category.reviewCoverage.uncertain} uncertain`,
-          `${category.reviewCoverage.pending} pending`,
-        ].join(" · ")
-      : null,
-    evidenceLimits: [
-      ...(category.sampled
-        ? [
-            {
-              label: "This check has been sampled",
-              details: [
-                "This check samples matching items. No issue in the sample does not mean every item is clear.",
-                ...(category.checking && category.reviewCoverage?.continuing
-                  ? ["Review is continuing."]
-                  : []),
-              ],
-            },
-          ]
-        : []),
-      ...(category.partialContext
-        ? [
-            {
-              label: "This check used partial context",
-              details: [
-                "Some task or session details were missing. That may limit what this check can confirm.",
-              ],
-            },
-          ]
-        : []),
-    ],
     summary: checkRowStatus(category).text,
     metric,
     costLine: failed ? summedCostLine(targets) : null,
     iconTone:
       category.lifecycle === "failing"
         ? "bg-system-red/10 text-system-red-text"
-        : status.lifecycle === "passing" && !provisional
+        : status.lifecycle === "passing"
           ? "bg-system-green/10 text-system-green"
           : "bg-surface-card text-label-secondary",
     metricTone:

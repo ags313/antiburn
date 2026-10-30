@@ -31,14 +31,15 @@ pub(crate) fn next_live_source_in(
                             (d.incarnation IS NULL OR d.incarnation <> s.incarnation
                              OR ((d.source_label <> s.source_label OR d.cwd IS NOT s.cwd)
                                  AND d.cursor_json IS NULL)
-                             OR d.parser_revision <> ?1) AS reset,
+                              ) AS reset,
                             d.pending, d.blocked, d.observed_generation,
                             d.next_attempt_at_epoch, d.lease_expires_at_epoch,
                             s.source_generation
                        FROM session s LEFT JOIN native_file_delivery d
                          USING(environment_key, agent, session_id)
                       WHERE s.environment_key = 'native' AND s.wsl_distro IS NULL
-                        AND s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'
+                         AND s.agent IN ('claude-code', 'codex', 'pi') AND s.source_kind = 'file'
+                         AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62, 63, 64, 65, 66))
                         AND s.cwd IS NOT NULL AND s.cwd <> ''
                         AND ({LIVE_ACTIVATION_SQL}) AND ({ROOT_SESSION_SQL})
                  ), journal_rows AS (
@@ -46,13 +47,14 @@ pub(crate) fn next_live_source_in(
                             s.updated_at_epoch, d.service_ticket,
                             (d.incarnation IS NULL OR d.incarnation <> s.incarnation
                              OR d.source_label <> s.source_label OR d.cwd IS NOT s.cwd
-                             OR d.parser_revision <> ?1 OR d.main_session <> 1) AS reset,
+                              OR d.main_session <> 1) AS reset,
                             d.pending, d.blocked, d.observed_generation,
                             d.next_attempt_at_epoch, d.lease_expires_at_epoch,
                             s.source_generation
                        FROM session s LEFT JOIN opencode_journal_delivery d
                          USING(environment_key, agent, session_id)
-                       WHERE ({OPENCODE_V1_SOURCE_SQL}) AND s.wsl_distro IS NULL
+                        WHERE ({OPENCODE_V1_SOURCE_SQL}) AND s.wsl_distro IS NULL
+                        AND (d.parser_revision IS NULL OR d.parser_revision IN (?1, 62, 63, 64, 65, 66))
                         AND s.cwd IS NOT NULL AND s.cwd <> ''
                         AND ({ROOT_SESSION_SQL}) AND ({LIVE_ACTIVATION_SQL})
                  ), eligible AS (

@@ -1,13 +1,8 @@
 import { useCallback, useRef, useState } from "react"
 
 import { writeClipboardText } from "../../../lib/clipboard"
-import {
-  noteInteraction,
-  smartCheckForDetector,
-  type PromptPreparationAnalyticsOutcome,
-} from "../../../lib/ipc"
+import { noteInteraction, type PromptPreparationAnalyticsOutcome } from "../../../lib/ipc"
 import type {
-  BurnCheckDetectorId,
   CopyPromptFixBurnCheckOutcome,
   CopyPromptFixBurnCheckTargetOutcome,
 } from "../../../lib/insightsIpc"
@@ -18,14 +13,12 @@ type CopyFeedback = { busy: boolean; copied: boolean; status: string | null }
 const INITIAL_FEEDBACK: CopyFeedback = { busy: false, copied: false, status: null }
 
 export function useBurnCheckPromptCopy({
-  detector,
   subject,
   active,
   prepare,
   refresh,
   onCopied,
 }: {
-  detector: BurnCheckDetectorId
   subject: string
   active: boolean
   prepare: () => Promise<PromptOutcome>
@@ -54,12 +47,10 @@ export function useBurnCheckPromptCopy({
     if (copiedTimeout.current) clearTimeout(copiedTimeout.current)
     setFeedback({ busy: true, copied: false, status: null })
     const isCurrent = () => owner.current === request && currentSubject.current === subject
-    const check = smartCheckForDetector(detector)
     const reportPrepared = (outcome: PromptPreparationAnalyticsOutcome) =>
       noteInteraction({
         kind: "burnCheckPromptPrepared",
         outcome,
-        ...(check ? { check } : {}),
       })
     const fail = (status: string) => {
       if (!isCurrent()) return
@@ -99,7 +90,7 @@ export function useBurnCheckPromptCopy({
       fail("The fix prompt could not be copied. Try again.")
       return
     }
-    noteInteraction({ kind: "burnCheckPromptCopied", ...(check ? { check } : {}) })
+    noteInteraction({ kind: "burnCheckPromptCopied" })
     if (!isCurrent()) return
     request.pending = false
     setFeedback({ busy: false, copied: true, status: null })

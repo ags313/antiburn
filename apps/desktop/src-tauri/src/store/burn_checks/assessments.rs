@@ -5,6 +5,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use super::{BurnCheckCandidateClaim, payload_sha256};
 use crate::store::Store;
 use antiburn_checks::check_store::AcceptanceOutcome;
+use antiburn_checks::fit::PreparationRecord;
 
 type AnsweredCandidateRow = (
     String,
@@ -15,6 +16,7 @@ type AnsweredCandidateRow = (
     i64,
     i64,
     String,
+    Option<String>,
     Option<String>,
 );
 
@@ -35,11 +37,35 @@ impl Store {
         if accepted {
             return Ok(AcceptanceOutcome::AlreadyAccepted);
         }
+        if !crate::store::native_tool_results::request_origin::new_candidate_request_origin_current_in(
+            &tx, &claim.candidate_id,
+        )? {
+            tx.execute("UPDATE burn_check_candidate SET state = 'stale', updated_at_epoch = ?2
+                WHERE candidate_id = ?1 AND state = 'answered'", params![claim.candidate_id, now_epoch])?;
+            tx.commit()?;
+            return Ok(AcceptanceOutcome::Stale);
+        }
+        let paused: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM burn_check_candidate c WHERE c.candidate_id = ?1 AND c.state = 'answered'
+               AND CASE WHEN json_valid(c.activation_scope_key)
+                 THEN json_extract(c.activation_scope_key, '$.run') = 'Live' ELSE 0 END
+               AND (EXISTS(SELECT 1 FROM setting WHERE key = 'internal:yamlBurnChecksDiscoveryEnabledV1' AND value <> 'true')
+                 OR EXISTS(SELECT 1 FROM setting WHERE
+                   (key = 'internal:typesafeCredentialChangePendingV1' AND value = 'true')
+                   OR (key IN ('internal:smartChecksConnectionChangePendingV1',
+                               'internal:smartChecksCredentialRemovalPendingV1') AND value <> '')
+                   OR (key = 'internal:typesafeAuthRejectedV1' AND value = 'true'))))",
+            [&claim.candidate_id],
+            |row| row.get(0),
+        )?;
+        if paused {
+            return Ok(AcceptanceOutcome::Deferred);
+        }
         let candidate: Option<AnsweredCandidateRow> = tx
             .query_row(
                 "SELECT c.check_id, c.activation_scope_key, c.generation, c.branch_key,
                         c.trigger_position, c.selected_publication_head, a.applied_sequence,
-                        c.session_key_json, c.answer_json
+                        c.session_key_json, c.answer_json, c.preparation_json
                    FROM burn_check_candidate c JOIN burn_check_activation a
                      USING(check_id, activation_scope_key)
                    WHERE c.candidate_id = ?1 AND c.state = 'answered'
@@ -57,6 +83,7 @@ impl Store {
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
                     ))
                 },
             )
@@ -71,43 +98,83 @@ impl Store {
             applied_sequence,
             session_json,
             persisted_answer,
+            preparation,
         )) = candidate
         else {
             tx.execute("UPDATE burn_check_candidate SET state = 'stale' WHERE candidate_id = ?1 AND state = 'answered' AND claim_owner = ?2 AND claim_fence = ?3", params![claim.candidate_id, claim.owner, claim.fence])?;
             tx.commit()?;
             return Ok(AcceptanceOutcome::Stale);
         };
-        let persisted_answer: serde_json::Value = serde_json::from_str(
-            persisted_answer
-                .as_deref()
-                .context("answered candidate has no saved response")?,
-        )?;
+        let persisted_answer = persisted_answer
+            .as_deref()
+            .context("answered candidate has no saved response")?;
+        antiburn_checks::results::decode_results(persisted_answer.as_bytes())?;
+        let persisted_answer: serde_json::Value = serde_json::from_str(persisted_answer)?;
         if persisted_answer != *answer {
             anyhow::bail!("answer does not match the durable response");
         }
+        let preparation = preparation
+            .as_deref()
+            .map(|saved| {
+                antiburn_checks::preparation::decode_preparation_record(saved.as_bytes())
+                    .map_err(|error| anyhow::anyhow!(error.detail))
+            })
+            .transpose()?;
+        let local_answer = *answer
+            == serde_json::to_value(antiburn_checks::results::EvaluatedAssessment::local())?;
+        if local_answer {
+            let Some(PreparationRecord::Local(preparation)) = &preparation else {
+                anyhow::bail!("a local answer requires its saved local preparation");
+            };
+            preparation
+                .validate_for_resume()
+                .map_err(|error| anyhow::anyhow!(error.detail))?;
+            let attempted: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM burn_check_evaluation_attempt WHERE candidate_id = ?1)",
+                [&claim.candidate_id], |row| row.get(0),
+            )?;
+            ensure!(!attempted, "local work cannot retain provider attempts");
+        } else {
+            ensure!(
+                !matches!(preparation, Some(PreparationRecord::Local(_))),
+                "a local preparation requires an empty zero-attempt answer"
+            );
+        }
         let (environment_key, agent, session_id): (String, String, String) =
             serde_json::from_str(&session_json)?;
+        let target = crate::store::native_tool_results::evidence::target_predicate("p", 5, 6, 7);
         let newer_publication: bool = tx.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM native_tool_result_publication
-                 WHERE environment_key = ?1 AND agent = ?2 AND session_id = ?3
-                   AND publication_sequence > ?4)",
-            params![environment_key, agent, session_id, applied_sequence],
+            &format!(
+                "SELECT EXISTS(
+                SELECT 1 FROM native_tool_result_publication p
+                 WHERE p.environment_key = ?1 AND p.agent = ?2 AND p.session_id = ?3
+                    AND p.publication_sequence > ?4 AND {target})"
+            ),
+            params![
+                environment_key,
+                agent,
+                session_id,
+                applied_sequence,
+                check_id,
+                activation_scope_key,
+                generation
+            ],
             |row| row.get(0),
         )?;
         if applied_sequence < selected_head || newer_publication {
             return Ok(AcceptanceOutcome::Deferred);
         }
         let mut statement = tx.prepare(
-            "SELECT d.source_format, d.native_revision, d.evidence_version, d.removed,
-                    d.payload_sha256, o.source_format, o.native_revision, o.evidence_version,
+            "SELECT d.source_format, COALESCE(d.native_revision, -1), d.evidence_version, d.removed,
+                     d.payload_sha256, o.source_format, COALESCE(o.native_revision, -1), o.evidence_version,
                     o.removed, o.payload_json
                FROM burn_check_candidate_dependency d
                LEFT JOIN burn_check_observation o
                  ON o.check_id = ?2 AND o.activation_scope_key = ?3
                 AND o.observation_id = d.observation_id
                 AND o.session_key_json = d.session_key_json
-              WHERE d.candidate_id = ?1",
+              WHERE d.candidate_id = ?1 AND (d.dependency_binding_json IS NULL
+                OR json_type(d.dependency_binding_json, '$.HostObservation') = 'object')",
         )?;
         let dependencies = statement
             .query_map(
@@ -129,7 +196,11 @@ impl Store {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
-        let mut dependencies_current = true;
+        let mut dependencies_current =
+            crate::store::native_tool_results::observers::typed_dependencies_current_in(
+                &tx,
+                &claim.candidate_id,
+            )?;
         for (
             source_format,
             native_revision,

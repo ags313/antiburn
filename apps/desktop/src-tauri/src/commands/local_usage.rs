@@ -6,6 +6,8 @@
 
 use super::*;
 use crate::UiReadStore;
+use std::collections::BTreeSet;
+
 use crate::store::UsageOrigins;
 
 /// Per-provider token and cost totals derived from the sessions already indexed

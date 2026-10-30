@@ -153,6 +153,62 @@ fn skill_estimate_uses_only_frontmatter_listing_fields() {
 }
 
 #[test]
+fn partial_skill_inventory_preserves_deterministic_names_and_listing_limits() {
+    let (_temporary, home, project) = roots();
+    let skills = home.join(".claude/skills");
+    for (name, text) in [
+        (
+            "review",
+            "---\nname: review\ndescription: Review code.\n---\nPrivate body.\n",
+        ),
+        ("malformed", "---\ndescription: [\n---\n"),
+        (
+            "missing-description",
+            "---\nname: missing-description\n---\nPrivate body.\n",
+        ),
+    ] {
+        write(&skills.join(name).join("SKILL.md"), text);
+    }
+    let invalid_utf8 = skills.join("invalid-utf8/SKILL.md");
+    write(&invalid_utf8, "");
+    fs::write(&invalid_utf8, b"\xff").unwrap();
+    let oversized = skills.join("oversized/SKILL.md");
+    write(&oversized, "");
+    fs::write(&oversized, vec![b'x'; 256 * 1024 + 1]).unwrap();
+    let inventory = advisory_resource_inventory(
+        &ConfigContext::native(AgentKind::Claude, &home, Some(project)),
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        resource(
+            &inventory,
+            ResourceKind::Skill,
+            "review",
+            ResourceScope::Global
+        )
+        .definition_tokens,
+        Some(6)
+    );
+    for name in ["malformed", "missing-description", "invalid-utf8"] {
+        let skill = resource(&inventory, ResourceKind::Skill, name, ResourceScope::Global);
+        assert_eq!(skill.enabled, EnabledState::Enabled);
+        assert_eq!(skill.definition_tokens, None);
+    }
+    assert!(
+        !inventory
+            .resources
+            .iter()
+            .any(|resource| resource.canonical_name == "oversized")
+    );
+    assert!(inventory.issues.contains(&InventoryIssue {
+        kind: Some(ResourceKind::Skill),
+        scope: ResourceScope::Global,
+        reason: InventoryIssueReason::Config(ConfigUnavailableReason::FileTooLarge),
+    }));
+}
+
+#[test]
 fn claude_exact_mcp_tool_permission_is_not_a_built_in_candidate() {
     let (_temporary, home, project) = roots();
     write(
@@ -185,7 +241,7 @@ fn legacy_opencode_parser_keeps_a_direct_server_named_servers() {
         advisory_resource_inventory(&context, []),
         Err(ConfigUnavailableReason::RuntimeOverride)
     );
-    let inventory = discover_inventory(&context, [], false).unwrap().finish();
+    let inventory = discover_inventory(&context, []).unwrap().finish();
 
     assert_eq!(
         resource(
@@ -413,7 +469,7 @@ fn legacy_opencode_parser_merges_jsonc_mcp_tools_and_skill_roots() {
         advisory_resource_inventory(&context, []),
         Err(ConfigUnavailableReason::RuntimeOverride)
     );
-    let inventory = discover_inventory(&context, [], false).unwrap().finish();
+    let inventory = discover_inventory(&context, []).unwrap().finish();
 
     assert_eq!(
         resource(

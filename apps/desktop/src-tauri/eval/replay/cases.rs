@@ -17,9 +17,9 @@ pub(super) struct Definition {
 }
 
 pub(super) const DEFINITION: Definition = Definition {
-    id: "failed-retry-loop",
-    path: "docs/burn-check/examples/failed-retry-loop.yml",
-    yaml: include_str!("../../../../../docs/burn-check/examples/failed-retry-loop.yml"),
+    id: "synthetic-retry-review",
+    path: "crates/antiburn-checks/tests/fixtures/retry-review.yml",
+    yaml: include_str!("../../../../../crates/antiburn-checks/tests/fixtures/retry-review.yml"),
 };
 
 pub(super) struct Case {
@@ -206,6 +206,7 @@ impl Fixture {
                     item_index: 0,
                 };
                 ToolResultObservation {
+                    facts: None,
                     outcome: None,
                     provider_executed: None,
                     source_format: SourceFormat::ClaudeJsonl,
@@ -319,7 +320,10 @@ impl Fixture {
                         "arguments_available": true,
                         "result_content_available": true,
                         "request_history_complete": self.complete_context,
-                        "main_session": true
+                        "main_session": true,
+                        "paths_available": false,
+                        "paths_complete": false,
+                        "paths_limits": []
                     }),
                 "source-quality details differ from session evidence"
             );

@@ -128,18 +128,37 @@ impl Store {
         connection: &rusqlite::Connection,
         cutoff_epoch: i64,
     ) -> Result<()> {
+        let eligible = "SELECT c.candidate_id FROM burn_check_candidate c
+            WHERE c.created_at_epoch < ?1
+              AND c.state IN ('accepted', 'coalesced', 'not_assessed', 'execution_failed', 'cancelled', 'stale')
+              AND NOT EXISTS(SELECT 1 FROM burn_check_assessment_history h
+                JOIN burn_check_current_status s USING(assessment_id) WHERE h.candidate_id = c.candidate_id)";
         connection.execute(
-            "UPDATE burn_check_candidate SET frozen_input_json = '{}', dependencies_json = '{}',
+            &format!(
+                "UPDATE burn_check_evaluation_attempt SET response_json = NULL
+            WHERE candidate_id IN ({eligible})"
+            ),
+            [cutoff_epoch],
+        )?;
+        connection.execute(
+            &format!(
+                "UPDATE burn_check_assessment_history SET answer_json = NULL
+            WHERE candidate_id IN ({eligible})"
+            ),
+            [cutoff_epoch],
+        )?;
+        connection.execute(
+            &format!("UPDATE burn_check_candidate SET frozen_input_json = '{{}}', dependencies_json = '{{}}', answer_json = NULL,
                 preparation_json = CASE WHEN json_extract(preparation_json, '$.status') = 'ready'
-                    THEN json_set(preparation_json, '$.input', json('{}'), '$.request', NULL)
+                    THEN CASE WHEN json_type(preparation_json, '$.decisions') = 'array'
+                        THEN json_set(preparation_json, '$.decisions', json((
+                            SELECT COALESCE(json_group_array(CASE WHEN type = 'object'
+                                THEN json_remove(value, '$.original_input', '$.input', '$.request')
+                                ELSE json('{{}}') END), '[]')
+                            FROM json_each(preparation_json, '$.decisions'))))
+                        ELSE json_remove(preparation_json, '$.original_input', '$.input', '$.request') END
                     ELSE preparation_json END
-              WHERE created_at_epoch < ?1
-                AND state IN ('accepted', 'coalesced', 'not_assessed',
-                              'execution_failed', 'cancelled', 'stale')
-                AND candidate_id NOT IN (
-                    SELECT candidate_id FROM burn_check_assessment_history
-                     WHERE assessment_id IN (
-                         SELECT assessment_id FROM burn_check_current_status))",
+              WHERE candidate_id IN ({eligible})"),
             params![cutoff_epoch],
         )?;
         Ok(())

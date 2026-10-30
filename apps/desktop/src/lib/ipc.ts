@@ -334,6 +334,18 @@ export type Interaction =
       action: "reveal" | "archive" | "restore" | "remove_index_line" | "open_from_session"
       outcome: "succeeded" | "failed" | "changed_on_disk" | "unsupported"
     }
+  | {
+      kind: "promotionInteraction"
+      campaign: "claude_mod"
+      action:
+        | "announcement_viewed"
+        | "setup_viewed"
+        | "primary_activated"
+        | "learn_more_activated"
+        | "command_copied"
+        | "dismissed"
+      origin: SurfaceOrigin
+    }
   | { kind: "sessionOpened"; agent: string; environment: "native" | "wsl" | "remote" }
   | { kind: "surfaceViewed"; surface: Surface; origin: SurfaceOrigin }
   | {
@@ -355,20 +367,8 @@ export type Interaction =
   | {
       kind: "burnCheckPromptPrepared"
       outcome: PromptPreparationAnalyticsOutcome
-      check?: SmartCheck
     }
-  | { kind: "burnCheckPromptCopied"; check?: SmartCheck }
-  | {
-      kind: "smartCheckObserved"
-      check: SmartCheck
-      observation:
-        "finding_visible" | "evidence_available" | "evidence_unavailable" | "evidence_failed"
-    }
-  | {
-      kind: "ignoredInstructionObserved"
-      stage: "finding" | "evidence" | "prompt"
-      outcome: "visible" | "available" | "unavailable" | "failed" | "copied"
-    }
+  | { kind: "burnCheckPromptCopied" }
   | {
       kind: "burnCheckOutcomeObserved"
       outcome: "verified" | "recurred"
@@ -405,24 +405,6 @@ export type Interaction =
       label: StepSettingsAnalyticsLabel
       detail: StepSettingsDetail
     }
-
-export type SmartCheck =
-  "ignored_instructions" | "scope_creep" | "over_exploring" | "skill_opportunities"
-
-export function smartCheckForDetector(detector: string): SmartCheck | undefined {
-  switch (detector) {
-    case "ignoredInstructions":
-      return "ignored_instructions"
-    case "scopeCreep":
-      return "scope_creep"
-    case "overExploring":
-      return "over_exploring"
-    case "skillOpportunities":
-      return "skill_opportunities"
-    default:
-      return undefined
-  }
-}
 
 export type Surface =
   | "agents"

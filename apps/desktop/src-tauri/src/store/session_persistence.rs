@@ -613,7 +613,6 @@ pub(super) fn delete_session_in(
         )
         .optional()?;
     if removed.is_some() {
-        burn_check::forget_session_usage_in(connection, key)?;
         native_tool_results::delete_session_data_in(connection, key)?;
         Store::delete_burn_check_session_in(connection, key)?;
     }

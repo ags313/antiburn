@@ -47,7 +47,9 @@ fn insert_results(
         .unwrap();
         let publication = tx.last_insert_rowid();
         tx.execute(
-            "INSERT INTO native_tool_result_current VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 0, 0, ?8, ?9, ?10)",
+            "INSERT INTO native_tool_result_current(environment_key, agent, session_id, source_format, native_identity,
+                native_position_json, native_revision, payload_json, complete, is_removed, publication_sequence, source_generation, claim_fence)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 0, 0, ?8, ?9, ?10)",
             params![claim.key.environment_key, claim.key.agent, claim.key.session_id, format,
                 identity, position, payload, publication, claim.source_generation, claim.claim_fence],
         ).unwrap();

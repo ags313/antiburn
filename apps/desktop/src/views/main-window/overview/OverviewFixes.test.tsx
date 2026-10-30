@@ -39,7 +39,7 @@ function progress(overrides: Partial<OverviewProgress> = {}): OverviewProgress {
 
 describe("OverviewFixes", () => {
   it.each([1, 2, undefined])(
-    "shows a provisional pass for an installed check with %s running sessions",
+    "keeps an installed check not assessed with %s running sessions and no saved result",
     (checkingCount) => {
       snapshot = progress({
         categories: [
@@ -52,6 +52,7 @@ describe("OverviewFixes", () => {
             finding: 0,
             clean: 0,
             checking: true,
+            reviewFailed: 1,
             ...(checkingCount == null ? {} : { checkingCount }),
             estimatedBurnBasisPoints: null,
             agents: [],
@@ -59,10 +60,69 @@ describe("OverviewFixes", () => {
         ],
       })
       render(<OverviewFixes onOpenCheck={() => {}} />)
-      const card = screen.getByRole("button", { name: "Failed retry loop, Passed · Checking" })
+      const card = screen.getByRole("button", {
+        name: "Failed retry loop, Not assessed · Checking",
+      })
       expect(within(card).getByText("Checking")).toBeVisible()
-      expect(within(card).getByText("Passed")).toBeVisible()
-      expect(card).not.toHaveTextContent("Not assessed")
+      expect(within(card).getByText("Not assessed")).toBeVisible()
+      expect(card).not.toHaveTextContent("Passed")
+    },
+  )
+
+  it.each([
+    { catchingUp: false, count: 3, waitingForDataCount: 0 },
+    { catchingUp: true, count: 3, waitingForDataCount: 1 },
+  ])("keeps unassessed waiting and catch-up details off the card: %j", (waiting) => {
+    snapshot = progress({
+      categories: [
+        {
+          id: "installed:retry",
+          installedAvailability: { status: "available" },
+          label: "Failed retry loop",
+          status: "waiting",
+          lifecycle: null,
+          finding: 0,
+          clean: 0,
+          hasStarted: true,
+          checking: false,
+          waitingForDataCount: waiting.waitingForDataCount,
+          waitingForEvents: {
+            event: "toolResult",
+            count: waiting.count,
+            catchingUp: waiting.catchingUp,
+          },
+          estimatedBurnBasisPoints: null,
+          agents: [],
+        },
+      ],
+    })
+    render(<OverviewFixes onOpenCheck={() => {}} />)
+    const card = screen.getByRole("button", { name: "Failed retry loop, Not assessed" })
+    expect(card).not.toHaveTextContent(/Passed|Checking|Waiting on|Catching up/)
+  })
+
+  it.each(["paused", "invalid", "unsupported"] as const)(
+    "keeps an installed %s error not assessed without active checking",
+    (availability) => {
+      snapshot = progress({
+        categories: [
+          {
+            id: "installed:retry",
+            installedAvailability: { status: availability },
+            label: "Failed retry loop",
+            status: "error",
+            finding: 0,
+            clean: 0,
+            checking: true,
+            reviewFailed: 1,
+            estimatedBurnBasisPoints: null,
+            agents: [],
+          },
+        ],
+      })
+      render(<OverviewFixes onOpenCheck={() => {}} />)
+      const card = screen.getByRole("button", { name: "Failed retry loop, Not assessed" })
+      expect(card).not.toHaveTextContent(/Connection needed|Could not check|Checking|Passed/)
     },
   )
 
@@ -104,20 +164,20 @@ describe("OverviewFixes", () => {
 
   it.each([
     {
-      text: "Passed · Could not check · Checking",
+      text: "Passed · Checking",
       checking: true,
       reviewFailed: 1,
       waitingForDataCount: 1,
     },
     {
-      text: "Passed · Could not check",
+      text: "Passed",
       checking: false,
       reviewFailed: 1,
       waitingForDataCount: 1,
     },
-    { text: "Passed · Catching up", checking: false, reviewFailed: 0, waitingForDataCount: 1 },
+    { text: "Passed", checking: false, reviewFailed: 0, waitingForDataCount: 1 },
     {
-      text: "Passed · Waiting on 1 tool result",
+      text: "Passed",
       checking: false,
       reviewFailed: 0,
       waitingForDataCount: 0,

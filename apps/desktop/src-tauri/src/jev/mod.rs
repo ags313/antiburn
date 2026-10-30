@@ -4,6 +4,3 @@ pub(crate) mod decision_evaluator;
 pub(crate) mod dispatch;
 pub(crate) mod settings;
 pub(crate) mod worker;
-
-#[cfg(test)]
-pub(crate) mod benchmark;

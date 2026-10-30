@@ -29,7 +29,6 @@
 //! the persisted creation identity of one session row.
 
 mod active_minutes;
-mod burn_check;
 mod check_preferences;
 mod minute_usage;
 pub(crate) use check_preferences::{check_preferences_snapshot_in, enabled_checks_in};
@@ -46,6 +45,7 @@ pub mod model;
 pub(crate) mod provider_limit;
 pub(crate) mod provider_usage_history;
 mod remediation;
+mod retired_checks_migration;
 pub(crate) mod revision_sql;
 mod schema;
 mod selected_content;
@@ -67,7 +67,8 @@ pub enum SessionCommitOutcome {
 mod source_fingerprint;
 pub(crate) use source_fingerprint::PendingSourceFingerprint;
 mod settings;
-pub(crate) use selected_content::{SELECTED_CONTENT_PROGRESS_REVISION, SelectedContentProgress};
+mod usage_accounting;
+pub use usage_accounting::BurnCheckUsageSummary;
 
 #[cfg(test)]
 mod privacy_tests;
@@ -105,11 +106,6 @@ use session_persistence::*;
 pub use session_persistence::{FencedTurnRowStore, HygieneSummaryRow, iso_from_epoch, now_rfc3339};
 use settings::read_settings;
 
-pub use burn_check::{
-    BurnCheckAssessment, BurnCheckCandidate, BurnCheckFailure, BurnCheckHistoryStatus,
-    BurnCheckInput, BurnCheckRequestAdmission, BurnCheckReservation, BurnCheckSampleOrigin,
-    BurnCheckSampledPair, BurnCheckUsageSummary, CachedAssessmentResponse,
-};
 pub use model::{
     ActiveCursor, AnalysisRecord, AppSettings, DisabledAgents, DiskSpaceDisplay, EvidenceClaim,
     EvidenceCompletion, EvidenceFailure, EvidenceRow, EvidenceStatus, HiddenMeters, Incarnation,
@@ -183,6 +179,9 @@ const EVIDENCE_BY_KEY_SQL: &str = "SELECT environment_key, agent, session_id, st
 /// backlog, which is more than an ordinary outage needs and far less than an
 /// unbounded table on a reader's disk.
 const ANALYTICS_QUEUE_LIMIT: u32 = 500;
+/// The marker separates old fork versions from future upstream versions.
+const FORK_TURN_COST_MARKER: &str =
+    "CREATE TABLE IF NOT EXISTS fork_turn_cost_schema (id INTEGER PRIMARY KEY) STRICT;";
 
 /// Maximum activity or session keys bound by one scan-history query.
 ///
@@ -332,6 +331,8 @@ pub struct Store {
     settings_snapshot: Arc<RwLock<AppSettings>>,
     limit_factor_learn: Arc<Mutex<()>>,
     insights_work_turn: Arc<AtomicUsize>,
+    #[cfg(test)]
+    burn_check_test_hooks: burn_checks::test_hooks::Hooks,
     /// The directory the engine's own state files (scan roots, ignored paths)
     /// live in. The engine never chooses this; the shell does.
     state_dir: PathBuf,
@@ -556,7 +557,15 @@ fn remove_native_tool_results_from_other_formats_in(
 impl Store {
     /// Open (creating if absent) and migrate the database under `data_dir`.
     pub fn open(data_dir: &Path) -> Result<Store> {
-        std::fs::create_dir_all(data_dir)
+        let mut directory = std::fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory.mode(0o700);
+        }
+        directory
+            .create(data_dir)
             .with_context(|| format!("failed to create {}", data_dir.display()))?;
         let path = database_path(data_dir);
         let connection = Connection::open(&path)
@@ -587,6 +596,8 @@ impl Store {
             settings_snapshot: Arc::clone(&self.settings_snapshot),
             limit_factor_learn: Arc::clone(&self.limit_factor_learn),
             insights_work_turn: Arc::clone(&self.insights_work_turn),
+            #[cfg(test)]
+            burn_check_test_hooks: Arc::clone(&self.burn_check_test_hooks),
             state_dir: self.state_dir.clone(),
         })
     }
@@ -605,6 +616,8 @@ impl Store {
             settings_snapshot: Arc::new(RwLock::new(AppSettings::default())),
             limit_factor_learn: Arc::new(Mutex::new(())),
             insights_work_turn: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            burn_check_test_hooks: Arc::new(Mutex::new(None)),
             state_dir,
         };
         store.migrate()?;
@@ -652,6 +665,7 @@ impl Store {
     fn migrate_with_migrations(&self, migrations: &[&str]) -> Result<()> {
         let mut guard = self.lock();
         let mut current: i64 = guard.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let is_new_database = current == 0;
         // PR builds used v49 for incarnation before main assigned v49 to remediation.
         if current == 49
             && guard.query_row(
@@ -720,7 +734,6 @@ impl Store {
             tx.commit()?;
             current = 56;
         }
-        current = schema::repair_opencode_branch_version(&mut guard, current)?;
         // The marker separates old fork versions from future upstream versions.
         let turn_cost_reconciled: bool = guard.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master
@@ -740,18 +753,30 @@ impl Store {
             if has_turn_cost && (current == 76 || current == 81) {
                 current = if current == 76 { 75 } else { 80 };
                 tx.pragma_update(None, "user_version", current)?;
+                // Record the remap with it, so that a failed later migration
+                // cannot remap the same version again.
+                tx.execute_batch(FORK_TURN_COST_MARKER)?;
             }
-            tx.execute_batch(
-                "CREATE TABLE fork_turn_cost_schema (id INTEGER PRIMARY KEY) STRICT;",
-            )?;
             tx.commit()?;
         }
+        current = schema::repair_branch_version(&mut guard, current)?;
         for (index, sql) in migrations.iter().enumerate() {
             let version = index as i64 + 1;
             if version <= current {
                 continue;
             }
             let tx = guard.transaction()?;
+            if version == retired_checks_migration::VERSION {
+                retired_checks_migration::prepare(
+                    &tx,
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                )
+                .with_context(|| format!("migration {version} preparation failed"))?;
+            }
+            if version == 85 {
+                schema::prepare_source_metadata(&tx)
+                    .with_context(|| format!("migration {version} preparation failed"))?;
+            }
             // The SQLite error is in the source chain either way, but a caller
             // that formats with `{}` rather than `{:#}` prints this line alone
             // — and tauri's setup hook is such a caller. A bare "migration 4
@@ -761,6 +786,12 @@ impl Store {
             // actionable rather than a trip to this file to guess.
             tx.execute_batch(sql)
                 .map_err(|error| anyhow::anyhow!("migration {version} failed: {error}"))?;
+            if is_new_database && version == 1 {
+                tx.execute(
+                    "INSERT INTO setting (key, value) VALUES (?1, 'true')",
+                    [retired_checks_migration::FRESH_INITIALIZATION_KEY],
+                )?;
+            }
             // `pragma_update` cannot be parameterized, and `version` is derived
             // from the compiled-in migration list, never from input.
             tx.pragma_update(None, "user_version", version)?;
@@ -799,6 +830,9 @@ impl Store {
         guard.execute_batch(cursor_usage::SCHEMA)?;
         active_minutes::ensure_schema(&guard)?;
         minute_usage::ensure_schema(&guard)?;
+        // Write the marker only after all migrations, so that a failed
+        // migration leaves the schema unchanged.
+        guard.execute_batch(FORK_TURN_COST_MARKER)?;
         Ok(())
     }
 
@@ -2199,9 +2233,9 @@ impl Store {
         tx.execute("DELETE FROM session_relation", [])?;
         tx.execute("DELETE FROM remediation_contribution", [])?;
         tx.execute("DELETE FROM remediation", [])?;
-        burn_check::clear_local_burn_check_state(
-            &tx,
-            time::OffsetDateTime::now_utc().unix_timestamp(),
+        tx.execute(
+            "DELETE FROM setting WHERE key = ?1",
+            [usage_accounting::USAGE_LEDGER_KEY],
         )?;
         tx.execute("DELETE FROM burn_check_decision_usage", [])?;
         tx.execute("DELETE FROM session_analysis", [])?;
@@ -2570,7 +2604,10 @@ impl Store {
             cleanup.commit()?;
             return Ok(false);
         }
-        if let Some(batch) = options.batch {
+        // Stored V2 snapshots cannot prove live event continuity or corrections.
+        if let Some(batch) = options.batch.filter(|batch| {
+            batch.source_format != antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
+        }) {
             let source_format = serde_json::to_string(&batch.source_format)?;
             if batch.complete {
                 remove_native_tool_results_from_other_formats_in(
@@ -2674,6 +2711,17 @@ impl Store {
             )?;
         }
         transaction.commit()?;
+        if options.batch.is_some_and(|batch| {
+            batch.source_format == antiburn_local::analysis::SourceFormat::OpenCodeSqliteV2
+        }) {
+            ::tracing::debug!(
+                event = "stored_metrics_committed",
+                publication_origin = "stored_metrics",
+                live_evidence_ownership = "excluded",
+                metrics_claim_fence = completion.claim_fence,
+                metrics_source_generation = record.analyzed_generation,
+            );
+        }
         Ok(true)
     }
 

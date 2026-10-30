@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use antiburn_local::analysis::price_breakdown;
@@ -248,8 +248,6 @@ fn burn_check_payload_keeps_check_samples_diverse_and_target_samples_independent
         });
     }
     let target = BurnCheckTarget {
-        over_exploring_reason: None,
-        decision_proof: None,
         finding_id: "finding".into(),
         action_id: "action".into(),
         finding: FindingDisplay {
@@ -257,8 +255,6 @@ fn burn_check_payload_keeps_check_samples_diverse_and_target_samples_independent
             agent: AgentKind::Claude,
             source_format: SourceFormat::ClaudeJsonl,
             observation: "Long session".into(),
-            certainty: None,
-            instruction_provenance: None,
             facts: DisplayFacts {
                 labels: Vec::new(),
                 omitted: 0,
@@ -308,7 +304,6 @@ fn burn_check_payload_keeps_check_samples_diverse_and_target_samples_independent
             truncated: false,
         },
         1000,
-        false,
     )
     .unwrap();
     assert_eq!(payload.samples.len(), 6);
@@ -798,23 +793,31 @@ fn stored_called_tools_reads_only_the_tools_field() {
 const SYNTHETIC_GENERATION: Option<i64> = Some(1);
 
 #[test]
-fn checks_report_policy_excludes_smart_checks_while_the_master_is_paused() {
+fn checks_report_selection_keeps_only_enabled_deterministic_checks() {
     use antiburn_local::insights::DetectorId;
 
-    let enabled = BTreeSet::from([
-        DetectorId::SessionsOverDepth,
-        DetectorId::IgnoredInstructions,
-    ]);
-    let paused = checks_report_selection(enabled.clone(), false);
-    let running = checks_report_selection(enabled, true);
+    let enabled = BTreeSet::from([DetectorId::SessionsOverDepth, DetectorId::UnusedSkills]);
+    let selection = DetectorSelection::from_enabled(enabled);
 
-    assert!(paused.contains(DetectorId::SessionsOverDepth));
-    assert!(!paused.contains(DetectorId::IgnoredInstructions));
-    assert!(running.contains(DetectorId::IgnoredInstructions));
-    assert_ne!(
-        checks_report_policy_revision(7, false),
-        checks_report_policy_revision(7, true),
-    );
+    assert!(selection.contains(DetectorId::SessionsOverDepth));
+    assert!(selection.contains(DetectorId::UnusedSkills));
+    assert!(!selection.contains(DetectorId::OldModelUsage));
+    assert_eq!(selection.iter().count(), 2);
+}
+
+#[test]
+fn checks_report_rejects_a_yaml_pause_after_its_policy_snapshot() {
+    let store = Store::open_in_memory(Path::new("/workspace/report-policy")).unwrap();
+    let key = "internal:yamlBurnChecksDiscoveryEnabledV1";
+    store.set_internal_value_checked(key, "true").unwrap();
+    let revision = store.check_preferences_revision().unwrap();
+    let yaml_enabled = crate::jev::settings::yaml_discovery_enabled(&store);
+    assert!(ensure_checks_report_policy(&store, revision, yaml_enabled).is_ok());
+
+    store.set_internal_value_checked(key, "false").unwrap();
+    assert_eq!(store.check_preferences_revision().unwrap(), revision);
+    assert!(ensure_checks_report_policy(&store, revision, yaml_enabled).is_err());
+    assert!(ensure_checks_report_policy(&store, revision, false).is_ok());
 }
 
 #[test]

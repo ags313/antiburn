@@ -28,7 +28,6 @@ import {
   checkStatusFacts,
   type CheckStatusFacts,
 } from "../../../lib/presentation/checkRowStatus"
-import { checkHasProvisionalResult } from "../../../lib/presentation/checkStatus"
 import { scanStatusStore } from "../../../lib/scanStatusStore"
 import type { DeferredPermissionDir } from "../../../lib/types/repository"
 import { withViewTransition } from "../../../lib/viewTransition"
@@ -225,13 +224,12 @@ export function advanceLastPass(previous: LastPass, status: ScanStatus | null): 
 
 function toFixCategory(category: CheckRow): FixCategory {
   const facts = checkStatusFacts(category)
-  const status: FixStatus = facts.terminalLabel
-    ? "notChecked"
-    : facts.lifecycle === "failing"
+  const status: FixStatus =
+    facts.lifecycle === "failing"
       ? "needsFix"
       : facts.lifecycle === "awaitingVerification"
         ? "awaitingVerification"
-        : facts.lifecycle === "passing" && !checkHasProvisionalResult(category)
+        : facts.lifecycle === "passing"
           ? "passing"
           : facts.checking
             ? "checking"

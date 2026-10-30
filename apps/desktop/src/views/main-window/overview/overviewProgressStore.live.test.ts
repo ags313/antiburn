@@ -740,6 +740,40 @@ describe("overviewProgressStore's steady mode", () => {
 })
 
 describe("overview progress recovery", () => {
+  it("drops removed installed findings from the sidebar count on the report event", async () => {
+    let report = { ...SETTLED_REPORT, installedChecks: [installedCheckFixture] }
+    const invoke = mocks.invoke.getMockImplementation()!
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "get_checks_report") return report
+      return invoke(command, args)
+    })
+    const store = await import("./overviewProgressStore")
+    const { sidebarProgress } = await import("./sidebarProgress")
+    stops.push(store.subscribeOverviewProgress(() => undefined))
+    await waitForListener("checks:report-changed")
+    await vi.waitFor(() => expect(store.overviewProgress().failingCount).toBe(1))
+    expect(sidebarProgress("burnChecks", store.overviewProgress(), null).status).toBe(
+      "1 to fix",
+    )
+
+    report = { ...report, installedChecks: [] }
+    // After the first run, event-driven reads come at most once per 30 s.
+    const now = Date.now()
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now + 30_000)
+    emit("checks:report-changed", null)
+
+    await vi.waitFor(() => expect(store.overviewProgress().failingCount).toBe(0))
+    clock.mockRestore()
+    expect(sidebarProgress("burnChecks", store.overviewProgress(), null).status).toBe(
+      "0 to fix",
+    )
+    expect(store.overviewProgress().categories).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: installedCheckFixture.effectiveId }),
+      ]),
+    )
+  })
+
   it("refreshes checks when a finished scan snapshot arrives after the first report", async () => {
     runLaunchPass()
     let resolveScan!: (status: ScanStatus) => void

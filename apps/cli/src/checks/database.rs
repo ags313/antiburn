@@ -234,6 +234,19 @@ fn read_assessments(
     connection: &Connection,
     identity: &SessionIdentity,
 ) -> Result<Vec<CheckAssessment>, String> {
+    let object_type = connection
+        .query_row(
+            "SELECT type FROM sqlite_schema WHERE name = 'burn_check_assessment'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("could not inspect legacy assessment schema: {error}"))?;
+    match object_type.as_deref() {
+        None => return Ok(Vec::new()),
+        Some("table") => {}
+        _ => return Err("legacy burn_check_assessment must be a table".to_owned()),
+    }
     let mut statement = connection
         .prepare(
             "SELECT check_id, status, input_revision, evaluator_revision,
@@ -401,7 +414,7 @@ mod tests {
     }
 
     fn create_database(path: &Path) -> Connection {
-        let connection = Connection::open(path).unwrap();
+        let connection = Connection::open(path).expect("open the synthetic test database");
         connection
             .execute_batch(
                 "CREATE TABLE session (
@@ -459,7 +472,7 @@ mod tests {
                     PRIMARY KEY (environment_key, agent, session_id, check_id)
                  );",
             )
-            .unwrap();
+            .expect("create the synthetic database schema");
         connection
     }
 
@@ -475,7 +488,7 @@ mod tests {
             max_request_context_tokens: ReportCatalogs::default().depth_cap_tokens + 1,
             top_depth_examples: Vec::new(),
         });
-        serde_json::to_string(&evidence).unwrap()
+        serde_json::to_string(&evidence).expect("serialize typed test evidence")
     }
 
     fn insert_session(connection: &Connection, environment: &str, agent: &str, id: &str) {
@@ -484,7 +497,7 @@ mod tests {
                 "INSERT INTO session (environment_key, agent, session_id) VALUES (?1, ?2, ?3)",
                 params![environment, agent, id],
             )
-            .unwrap();
+            .expect("insert the synthetic session");
     }
 
     fn database_path(directory: &Path, name: &str) -> PathBuf {
@@ -682,6 +695,74 @@ mod tests {
 
         let error = read_checks_from_paths("session-a", &[path]).unwrap_err();
         assert!(error.contains("invalid session_evidence.evidence_json JSON"));
+    }
+
+    #[test]
+    fn absent_legacy_table_does_not_block_evidence_reads() {
+        let temp = tempdir().unwrap();
+        let path = database_path(temp.path(), "antiburn.sqlite3");
+        let connection = create_database(&path);
+        insert_session(&connection, "native", "pi", "session-a");
+        connection
+            .execute("DROP TABLE burn_check_assessment", [])
+            .unwrap();
+        connection.execute(
+            "INSERT INTO session_evidence (environment_key, agent, session_id, status, evidence_json)
+             VALUES ('native', 'pi', 'session-a', 'ready', ?1)",
+            [session_evidence_json("pi", "session-a")],
+        ).unwrap();
+        drop(connection);
+
+        let before = std::fs::read(&path).unwrap();
+        let response = read_checks_from_paths("session-a", std::slice::from_ref(&path)).unwrap();
+        assert_eq!(response.checks.len(), 6);
+        assert!(
+            response
+                .checks
+                .iter()
+                .all(|check| check.source == CheckAssessmentSource::SessionEvidenceBadge)
+        );
+        assert!(!response.freshness_evaluated);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn present_malformed_legacy_schema_is_an_error() {
+        for replacement in [
+            "CREATE TABLE burn_check_assessment (check_id TEXT)",
+            "CREATE VIEW burn_check_assessment AS SELECT 'synthetic' AS check_id",
+        ] {
+            let temp = tempdir().unwrap();
+            let path = database_path(temp.path(), "antiburn.sqlite3");
+            let connection = create_database(&path);
+            insert_session(&connection, "native", "pi", "session-a");
+            connection
+                .execute("DROP TABLE burn_check_assessment", [])
+                .unwrap();
+            connection.execute_batch(replacement).unwrap();
+            drop(connection);
+            assert!(read_checks_from_paths("session-a", &[path]).is_err());
+        }
+    }
+
+    #[test]
+    fn present_malformed_legacy_json_is_an_error() {
+        for (progress, result) in [("{bad", "{}"), ("{}", "{bad")] {
+            let temp = tempdir().expect("create the test database directory");
+            let path = database_path(temp.path(), "antiburn.sqlite3");
+            let connection = create_database(&path);
+            insert_session(&connection, "native", "pi", "session-a");
+            connection.execute(
+                "INSERT INTO burn_check_assessment
+                    (environment_key, agent, session_id, check_id, incarnation, status,
+                     progress_json, result_json, request_count, created_at_epoch, updated_at_epoch)
+                 VALUES ('native', 'pi', 'session-a', 'synthetic', 1, 'completed', ?1, ?2, 0, 1, 1)",
+                params![progress, result],
+            ).expect("insert the malformed legacy assessment fixture");
+            drop(connection);
+            let error = read_checks_from_paths("session-a", &[path]).unwrap_err();
+            assert!(error.contains("invalid burn_check_assessment."));
+        }
     }
 
     #[test]

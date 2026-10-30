@@ -50,12 +50,14 @@
 //! policy limits the webview to local application and IPC connections.
 
 pub mod agent_config;
+pub mod agent_integrations;
 mod agent_memory;
 mod agents;
 mod analysis;
 mod analytics;
 mod app_presence;
 pub mod check_store;
+pub mod cli_install;
 mod commands;
 mod consent;
 mod diagnostics_export;
@@ -67,7 +69,6 @@ mod global_click;
 mod hud;
 mod hud_commands;
 mod hud_token_map;
-mod ignored_instructions_worker;
 mod insights_ipc;
 mod insights_report;
 mod insights_worker;
@@ -86,7 +87,6 @@ mod memory_probe;
 mod notifications;
 mod nudges;
 mod opencode_live;
-mod over_exploring_worker;
 mod popover;
 mod popover_peek;
 mod provider_accounts;
@@ -107,16 +107,15 @@ mod retention;
 mod runtime_pricing;
 mod runtime_pricing_config;
 mod scan;
-mod scope_creep_worker;
 mod session_lifecycle;
 mod session_projection;
-pub mod session_scope;
 mod settings;
-mod skill_opportunities_worker;
-pub mod smart_check_inputs;
 mod startup_registration;
 mod storage_health;
 mod store;
+#[cfg(test)]
+#[path = "store/burn_checks/trace_capture_tests.rs"]
+mod trace_capture;
 // This bridge keeps the CH-007 evidence readers reachable. The insights
 // commands consume the backlog reader, but `Store::evidence` still has no
 // production caller outside tests, so the re-export stays until CH-013's
@@ -263,18 +262,6 @@ pub fn run() {
         // engine's state helpers as an explicit argument.
         let data_dir = app.path().app_data_dir()?;
         app.manage(store::Store::open(&data_dir)?);
-        // Disclose requests abandoned by an earlier process before Settings
-        // reads usage or the worker can dispatch another request.
-        let (newly_recovered, unresolved_identities) = app
-            .state::<store::Store>()
-            .recover_abandoned_burn_check_usage(time::OffsetDateTime::now_utc().unix_timestamp())?;
-        if newly_recovered > 0 || unresolved_identities > 0 {
-            ::tracing::warn!(
-                event = "burn_check_usage_recovered",
-                newly_recovered,
-                unresolved_identities
-            );
-        }
         app.manage(remediation::RemediationController::new(data_dir.clone()));
         let main_window_state = main_window::MainWindowState::load(&app.state::<store::Store>());
         app.manage(main_window_state);
@@ -426,6 +413,19 @@ pub fn run() {
             usage_alerts::LiveUsage::from_store(&store)
         };
         app.manage(live_usage);
+        cli_install::start(app.handle());
+        agent_integrations::desktop::start(app.handle(), |app, validation| {
+            let runtime = match validation {
+                agent_integrations::desktop::CliValidation::Fresh => cli_install::resolve_cli(app),
+                agent_integrations::desktop::CliValidation::Cached => cli_install::inspect_cli(app),
+            };
+            runtime.map(|runtime| agent_integrations::lifecycle::CliConnection {
+                executable: runtime.executable,
+                version: runtime.version,
+                sha256: runtime.sha256,
+                delivery_protocols: runtime.delivery_protocols,
+            })
+        });
         // Only file metadata, but keep it off the launch path.
         tauri::async_runtime::spawn_blocking(provider_usage::live::sources::log_cli_location);
         let active_minute_store = app.state::<store::Store>().inner().clone();
@@ -457,7 +457,6 @@ pub fn run() {
             schedulers.push(scan::live_poll::spawn_live_poll(app.handle()));
             schedulers.push(retention::spawn_scheduler(app.handle()));
             schedulers.push(insights_worker::spawn(app.handle()));
-            schedulers.push(jev::worker::spawn(app.handle()));
             installed_checks::start(app.handle());
             schedulers.push(updates::spawn_scheduler(app.handle()));
             schedulers.push(usage_alerts::spawn_scheduler(app.handle()));
@@ -949,6 +948,30 @@ mod tests {
             capability.contains("\"settings\""),
             "missing settings window"
         );
+        for command in [
+            "get_system_one_settings",
+            "test_system_one_connection",
+            "save_system_one_connection",
+            "remove_system_one_connection",
+            "retry_system_one_connection_operation",
+            "switch_system_one_connection",
+            "refresh_system_one_limits",
+            "remove_system_one_credential",
+        ] {
+            assert!(include_str!("app_commands.rs").contains(command));
+            assert!(
+                capability.contains(&format!("allow-{}", command.replace('_', "-"))),
+                "missing permission for {command}"
+            );
+        }
+        for command in [
+            "run_check_backfill",
+            "set_check_history_days",
+            "get_burn_check_target_evidence",
+        ] {
+            assert!(!include_str!("app_commands.rs").contains(command));
+            assert!(!capability.contains(&format!("allow-{}", command.replace('_', "-"))));
+        }
     }
 
     #[cfg(target_os = "macos")]

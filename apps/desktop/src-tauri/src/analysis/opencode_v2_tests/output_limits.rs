@@ -67,7 +67,7 @@ async fn unavailable_v2_output_stays_partial_through_desktop_selected_publicatio
             .unwrap();
         assert_eq!(page.coverage.stored_truncated_parts, 1);
         let content = select_session_content(
-            &prepare_session_content("session", SourceFormat::OpenCodeSqliteV2, page, vec![]),
+            &prepare_session_content("session", SourceFormat::OpenCodeSqliteV2, page),
             selection,
         );
         let action = content

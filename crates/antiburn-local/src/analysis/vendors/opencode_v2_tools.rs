@@ -872,7 +872,7 @@ fn read_result(
         },
         kind: JevReadResultKind::Unknown,
         recorded_output_bytes: body.len() as u64,
-        recorded_output_digest: crate::checks::ignored_instructions::sha256_hex(body.as_bytes()),
+        recorded_output_digest: crate::digest::sha256_hex(body.as_bytes()),
         returned_extent: None,
         truncated,
         recorded_file_version: None,

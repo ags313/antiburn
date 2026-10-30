@@ -54,6 +54,114 @@ beforeEach(() => installBurnChecksCommandMocks(commands))
 afterEach(restoreBurnChecksTestWindow)
 
 describe("Burn Check prompt copy", () => {
+  const detectors = [
+    "sessionsOverDepth",
+    "modelOverthinking",
+    "overpoweredSubagents",
+    "unusedMcpServers",
+    "unusedBuiltInTools",
+    "unusedSkills",
+    "oldModelUsage",
+    "overuseOfFastMode",
+    "cacheChurn",
+  ] as const
+
+  it.each(detectors)(
+    "records generic %s prompt outcomes for each retry and repeat copy",
+    async (detector) => {
+      for (const surface of ["check", "target"] as const) {
+        commands.noteInteraction.mockClear()
+        commands.copy.mockClear()
+        commands.copyFallback.mockClear()
+        commands.writeClipboardText.mockClear()
+        commands.writeClipboardText.mockRejectedValueOnce(new Error("Clipboard denied"))
+        const view = render(
+          surface === "check" ? (
+            <CheckPromptAction detector={detector} targets={[]} refresh={vi.fn()} />
+          ) : (
+            <BurnCheckTargetActions
+              target={{ ...target, finding: { ...target.finding, detector } }}
+              refresh={vi.fn()}
+            />
+          ),
+        )
+        fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
+        expect(await screen.findByRole("alert")).toHaveTextContent(
+          "The fix prompt could not be copied. Try again.",
+        )
+        fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
+        fireEvent.click(await screen.findByRole("button", { name: "Copied" }))
+        await screen.findByRole("button", { name: "Copied" })
+
+        expect(commands.writeClipboardText).toHaveBeenCalledTimes(3)
+        const prepare = surface === "check" ? commands.copyFallback : commands.copy
+        expect(prepare).toHaveBeenCalledTimes(3)
+        expect(prepare).toHaveBeenLastCalledWith(
+          ...[detector, ...(surface === "target" ? [target.findingId] : [])],
+        )
+        expect(commands.noteInteraction.mock.calls).toEqual([
+          [{ kind: "burnCheckPromptPrepared", outcome: "ready" }],
+          [{ kind: "burnCheckPromptPrepared", outcome: "ready" }],
+          [{ kind: "burnCheckPromptCopied" }],
+          [{ kind: "burnCheckPromptPrepared", outcome: "ready" }],
+          [{ kind: "burnCheckPromptCopied" }],
+        ])
+        view.unmount()
+      }
+    },
+  )
+
+  it.each(detectors)(
+    "records generic %s preparation failures without copying",
+    async (detector) => {
+      for (const surface of ["check", "target"] as const) {
+        for (const outcome of ["unavailable", "failed"] as const) {
+          commands.noteInteraction.mockClear()
+          commands.writeClipboardText.mockClear()
+          const prepare = surface === "check" ? commands.copyFallback : commands.copy
+          if (outcome === "failed")
+            prepare.mockRejectedValueOnce(new Error("Preparation failed"))
+          else prepare.mockResolvedValueOnce({ outcome: "unavailable" })
+          const view = render(
+            surface === "check" ? (
+              <CheckPromptAction detector={detector} targets={[]} refresh={vi.fn()} />
+            ) : (
+              <BurnCheckTargetActions
+                target={{ ...target, finding: { ...target.finding, detector } }}
+                refresh={vi.fn()}
+              />
+            ),
+          )
+          fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
+          await screen.findByRole("alert")
+          expect(commands.noteInteraction.mock.calls).toEqual([
+            [{ kind: "burnCheckPromptPrepared", outcome }],
+          ])
+          expect(commands.writeClipboardText).not.toHaveBeenCalled()
+          view.unmount()
+        }
+      }
+    },
+  )
+
+  it.each(["stale", "expired"] as const)(
+    "keeps the generic %s target preparation outcome and refreshes",
+    async (outcome) => {
+      commands.copy.mockResolvedValueOnce({ outcome })
+      const refresh = vi.fn()
+      render(<BurnCheckTargetActions target={target} refresh={refresh} />)
+
+      fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("Checking the current change.")
+      expect(commands.noteInteraction.mock.calls).toEqual([
+        [{ kind: "burnCheckPromptPrepared", outcome }],
+      ])
+      expect(refresh).toHaveBeenCalledOnce()
+      expect(commands.writeClipboardText).not.toHaveBeenCalled()
+    },
+  )
+
   it("keeps one pending target copy through handle, watch creation, and recurrence updates", async () => {
     const pending = deferred<InsightsIpcModule.CopyPromptFixBurnCheckTargetOutcome | null>()
     commands.copy.mockReturnValueOnce(pending.promise)
@@ -222,6 +330,35 @@ describe("Burn Check prompt copy", () => {
     expect(screen.getByRole("button", { name: "Copy fix prompt" })).toBeEnabled()
   })
 
+  it.each(["hidden", "unmounted", "replaced"] as const)(
+    "does not write a target prompt after its control is %s",
+    async (state) => {
+      const pending = deferred<InsightsIpcModule.CopyPromptFixBurnCheckTargetOutcome | null>()
+      commands.copy.mockReturnValueOnce(pending.promise)
+      const view = render(<BurnCheckTargetActions target={target} refresh={vi.fn()} />)
+      fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
+      if (state === "unmounted") view.unmount()
+      else
+        view.rerender(
+          <BurnCheckTargetActions
+            target={state === "replaced" ? { ...target, findingId: "other-finding" } : target}
+            refresh={vi.fn()}
+            active={state !== "hidden"}
+          />,
+        )
+      if (state === "hidden") {
+        fireEvent.click(screen.getByRole("button", { name: "Copy fix prompt" }))
+        expect(commands.copy).toHaveBeenCalledOnce()
+      }
+
+      await act(async () =>
+        pending.resolve({ outcome: "promptReady", prompt: "Obsolete prompt", watch: null }),
+      )
+
+      expect(commands.writeClipboardText).not.toHaveBeenCalled()
+    },
+  )
+
   it("does not clear a newer copy when an older native write completes", async () => {
     const oldWrite = deferred<void>()
     const currentPrompt = deferred<InsightsIpcModule.CopyPromptFixBurnCheckOutcome | null>()
@@ -259,10 +396,7 @@ describe("Burn Check prompt copy", () => {
     ).toHaveLength(2)
   })
 
-  it.each([
-    ["waitingForPromptUse", "watching"],
-    ["watching", "verificationUnavailable"],
-  ] as const)("does not show prompt watch status for %s", (lifecycle, status) => {
+  it("does not show unconfirmed prompt watch status before use", () => {
     const view = render(
       <BurnCheckTargetDetail
         target={{
@@ -270,8 +404,8 @@ describe("Burn Check prompt copy", () => {
           watch: {
             watchId: "watch-prompt",
             origin: "action",
-            lifecycle,
-            verification: { status },
+            lifecycle: "waitingForPromptUse",
+            verification: { status: "watching" },
             savings: { status: "pending" },
           },
         }}
@@ -282,5 +416,26 @@ describe("Burn Check prompt copy", () => {
     expect(view.container).not.toHaveTextContent(
       /prompt is ready|could not confirm this change|list was refreshed/i,
     )
+    expect(view.container).not.toHaveTextContent("cannot verify this change automatically")
+  })
+
+  it("shows the saved verification limit after a prompt watch activates", () => {
+    render(
+      <BurnCheckTargetDetail
+        target={{
+          ...target,
+          watch: {
+            watchId: "watch-prompt",
+            origin: "action",
+            lifecycle: "watching",
+            verification: { status: "verificationUnavailable" },
+            savings: { status: "unavailable" },
+          },
+        }}
+        refresh={vi.fn()}
+      />,
+    )
+    expect(screen.getByRole("button", { name: "Copy fix prompt" })).toBeEnabled()
+    expect(screen.getByText("The check cannot verify this change automatically.")).toBeVisible()
   })
 })

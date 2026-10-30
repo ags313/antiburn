@@ -10,7 +10,7 @@
 //! returns an empty success instead, because the views have states for those and
 //! an error banner would be a lie.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -1433,27 +1433,6 @@ fn insights_report_request(now_epoch: i64) -> ReportRequest {
     }
 }
 
-fn checks_report_selection(
-    mut enabled_checks: BTreeSet<antiburn_local::insights::DetectorId>,
-    smart_checks_enabled: bool,
-) -> DetectorSelection {
-    if !smart_checks_enabled {
-        for detector in crate::jev::worker::registered_check_ids() {
-            enabled_checks.remove(&detector);
-        }
-    }
-    DetectorSelection::from_enabled(enabled_checks)
-}
-
-fn checks_report_policy_revision(
-    check_preferences_revision: u64,
-    smart_checks_enabled: bool,
-) -> u64 {
-    check_preferences_revision
-        .saturating_mul(2)
-        .saturating_add(u64::from(smart_checks_enabled))
-}
-
 /// The bounded report data used by the popover All checks summary.
 #[tauri::command]
 pub async fn get_checks_report(
@@ -1478,26 +1457,14 @@ pub async fn get_checks_report(
     let mut report_policy_snapshot = None;
     for _ in 0..3 {
         let policy_app = app.clone();
-        let (enabled_checks, check_preferences_revision, smart_checks_enabled, data_revision) =
-            run_blocking(move || {
-                let store = policy_app.state::<Store>();
-                let (enabled_checks, revision) =
-                    store.check_preferences_snapshot().map_err(fail)?;
-                let smart_checks_enabled = store
-                    .internal_value("internal:burnChecksEnabledAtEpochV1")
-                    .is_some();
-                let data_revision = store.revision().0;
-                Ok((
-                    enabled_checks,
-                    revision,
-                    smart_checks_enabled,
-                    data_revision,
-                ))
-            })
-            .await?;
-        let enabled_selection = checks_report_selection(enabled_checks, smart_checks_enabled);
-        let report_policy_revision =
-            checks_report_policy_revision(check_preferences_revision, smart_checks_enabled);
+        let (enabled_checks, check_preferences_revision, data_revision) = run_blocking(move || {
+            let store = policy_app.state::<Store>();
+            let (enabled_checks, revision) = store.check_preferences_snapshot().map_err(fail)?;
+            let data_revision = store.revision().0;
+            Ok((enabled_checks, revision, data_revision))
+        })
+        .await?;
+        let enabled_selection = DetectorSelection::from_enabled(enabled_checks);
         // Two Checks surfaces ask after the same change. With no write
         // between them, the later one shares the earlier one's run.
         let candidate = app
@@ -1507,36 +1474,31 @@ pub async fn get_checks_report(
                 request.clone(),
                 consumer_id.clone(),
                 enabled_selection,
-                crate::insights_ipc::RunRevision::new(report_policy_revision, data_revision),
+                crate::insights_ipc::RunRevision::new(check_preferences_revision, data_revision),
             )
             .await?;
         let policy_app = app.clone();
         let policy_current = run_blocking(move || {
             let store = policy_app.state::<Store>();
-            Ok(
-                store.check_preferences_revision().map_err(fail)? == check_preferences_revision
-                    && store
-                        .internal_value("internal:burnChecksEnabledAtEpochV1")
-                        .is_some()
-                        == smart_checks_enabled,
-            )
+            Ok(store.check_preferences_revision().map_err(fail)? == check_preferences_revision)
         })
         .await?;
         if policy_current {
             reduced = Some(candidate);
-            report_policy_snapshot = Some((check_preferences_revision, smart_checks_enabled));
+            report_policy_snapshot = Some(check_preferences_revision);
             break;
         }
     }
     let reduced =
         reduced.ok_or_else(|| fail("check preferences changed during report reduction"))?;
-    let (report_preferences_revision, report_smart_checks_enabled) =
+    let report_preferences_revision =
         report_policy_snapshot.ok_or_else(|| fail("check report policy is unavailable"))?;
     let reduction_ms = started_at.elapsed().as_millis() as u64;
     let app = app.clone();
     run_blocking(move || {
         let app = &app;
         let store = app.state::<Store>();
+        let yaml_enabled = crate::jev::settings::yaml_discovery_enabled(&store);
         // The report carries three measurements that no other command reduces:
         // unknown record vocabulary, quota incidents, and provider incidents.
         // Each recorder compares the outcome against the last one it sent, so
@@ -1557,50 +1519,8 @@ pub async fn get_checks_report(
             &store,
             &mut payload.installed_checks,
             epoch_now(),
-            app.state::<crate::jev::worker::WorkerHandle>()
-                .is_available(),
         )
         .map_err(fail)?;
-        payload.smart_checks_available = false;
-        for (id, check_id) in [
-            (
-                BurnCheckDetectorId::SkillOpportunities,
-                "skill_opportunities",
-            ),
-            (BurnCheckDetectorId::OverExploring, "over_exploring"),
-            (BurnCheckDetectorId::ScopeCreep, "scope_creep"),
-            (
-                BurnCheckDetectorId::IgnoredInstructions,
-                "ignored_instructions",
-            ),
-        ] {
-            if let Some(category) = payload
-                .categories
-                .iter_mut()
-                .find(|category| category.id == id)
-            {
-                if id != BurnCheckDetectorId::IgnoredInstructions {
-                    category.sampled = category.finding > 0 || category.clean > 0;
-                }
-                category.checking = Some(false);
-                category.checking_count = Some(0);
-                category.partial_context = Some(false);
-                if let Some(progress) = reduced.check_progress.get(check_id) {
-                    category.checking = Some(progress.checking);
-                    category.checking_count = Some(progress.checking_count);
-                    category.partial_context = Some(progress.partial_context);
-                    category.review_coverage = progress.coverage.clone();
-                }
-                category.update_review_state();
-            }
-        }
-        if let Some(category) = payload
-            .categories
-            .iter_mut()
-            .find(|category| category.id == BurnCheckDetectorId::IgnoredInstructions)
-        {
-            category.sampled = reduced.sampled_instructions;
-        }
         app.state::<RemediationController>()
             .apply_category_lifecycles(
                 &app.state::<Store>(),
@@ -1608,32 +1528,6 @@ pub async fn get_checks_report(
                 &request.environment_key,
             )
             .map_err(fail)?;
-        #[cfg(debug_assertions)]
-        if let Some(category) = payload
-            .categories
-            .iter()
-            .find(|category| category.id == BurnCheckDetectorId::IgnoredInstructions)
-        {
-            ::tracing::debug!(
-                event = "ignored_instruction_report_quality",
-                in_progress_sessions = category.checking_count.unwrap_or(0),
-                finding_sessions = category.finding,
-                clean_sessions = category.clean,
-                unavailable_sessions = category.unavailable,
-                lifecycle = ?category.lifecycle,
-            );
-        }
-        if !payload.smart_checks_available {
-            payload.categories.retain(|category| {
-                !matches!(
-                    category.id,
-                    BurnCheckDetectorId::IgnoredInstructions
-                        | BurnCheckDetectorId::SkillOpportunities
-                        | BurnCheckDetectorId::OverExploring
-                        | BurnCheckDetectorId::ScopeCreep
-                )
-            });
-        }
         let finding_count = payload
             .categories
             .iter()
@@ -1662,19 +1556,23 @@ pub async fn get_checks_report(
             crate::tray::simulate_burn_checks(app, &mut payload);
             payload
         };
-        if store.check_preferences_revision().map_err(fail)? != report_preferences_revision
-            || store
-                .internal_value("internal:burnChecksEnabledAtEpochV1")
-                .is_some()
-                != report_smart_checks_enabled
-        {
-            return Err(fail(
-                "check preferences changed while publishing the report",
-            ));
-        }
+        ensure_checks_report_policy(&store, report_preferences_revision, yaml_enabled)?;
         Ok(payload)
     })
     .await
+}
+
+fn ensure_checks_report_policy(
+    store: &Store,
+    preferences_revision: u64,
+    yaml_enabled: bool,
+) -> CommandResult<()> {
+    if store.check_preferences_revision().map_err(fail)? != preferences_revision
+        || crate::jev::settings::yaml_discovery_enabled(store) != yaml_enabled
+    {
+        return Err(fail("check settings changed while publishing the report"));
+    }
+    Ok(())
 }
 
 fn current_burn_check_snoozes(store: &Store) -> CommandResult<Vec<CheckSnoozePayload>> {
@@ -1766,8 +1664,6 @@ pub async fn list_burn_check_targets(
             &app.state::<Store>(),
             list,
             epoch_now(),
-            app.state::<crate::jev::worker::WorkerHandle>()
-                .is_available(),
         )?;
         ::tracing::debug!(
             event = "burn_check_targets_finished",
@@ -1804,35 +1700,6 @@ pub(crate) async fn get_installed_check_evidence(
 }
 
 #[tauri::command]
-pub async fn get_burn_check_target_evidence(
-    window: tauri::WebviewWindow,
-    action_id: String,
-) -> CommandResult<BurnCheckTargetEvidence> {
-    ensure_checks_window(window.label())?;
-    let app = window.app_handle().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let started_at = Instant::now();
-        let evidence = app
-            .state::<RemediationController>()
-            .burn_check_target_evidence(&app.state::<Store>(), &action_id)
-            .map_err(|_| "unable to load burn check evidence".to_owned())?;
-        ::tracing::debug!(
-            event = "burn_check_evidence_finished",
-            status = if evidence.status == crate::remediation::BurnCheckEvidenceStatus::Available {
-                "available"
-            } else {
-                "unavailable"
-            },
-            items = evidence.items.len(),
-            duration_ms = started_at.elapsed().as_millis() as u64,
-        );
-        Ok(evidence)
-    })
-    .await
-    .map_err(|_| "unable to load burn check evidence".to_owned())?
-}
-
-#[tauri::command]
 pub async fn get_burn_check_remediation_progress(
     window: tauri::WebviewWindow,
 ) -> CommandResult<BurnCheckRemediationProgressPayload> {
@@ -1853,18 +1720,10 @@ fn burn_check_target_list_payload(
     store: &Store,
     list: crate::remediation::BurnCheckTargetList,
     now: i64,
-    smart_checks_available: bool,
 ) -> CommandResult<BurnCheckTargetListPayload> {
     let repositories = store.repositories().map_err(fail)?;
     let enrich = |samples: &[crate::remediation::BurnCheckSampleSession]| {
-        crate::main_window::sample_payloads_from_store(
-            state,
-            store,
-            &repositories,
-            samples,
-            now,
-            smart_checks_available,
-        )
+        crate::main_window::sample_payloads_from_store(state, store, &repositories, samples, now)
     };
     let check_samples = enrich(&list.sample_sessions)?;
     let samples = list
@@ -2249,77 +2108,9 @@ pub async fn get_session_hygiene(
         let (enabled_checks, check_preferences_revision) =
             store.check_preferences_snapshot().map_err(fail)?;
         let enabled_selection = DetectorSelection::from_enabled(enabled_checks.iter().copied());
-        let smart_checks_enabled = store
-            .internal_value("internal:burnChecksEnabledAtEpochV1")
-            .is_some();
-        let ignored_instructions_enabled = enabled_checks
-            .contains(&antiburn_local::insights::DetectorId::IgnoredInstructions)
-            && smart_checks_enabled;
-        let findings = if ignored_instructions_enabled
-            && app
-                .state::<crate::jev::worker::WorkerHandle>()
-                .is_available()
-        {
-            crate::insights_report::ignored_instruction_session_statuses(store.state_dir(), &keys)
-                .map_err(fail)?
-        } else if ignored_instructions_enabled {
-            vec![
-                crate::dto::IgnoredInstructionSessionStatus {
-                    status: crate::dto::SessionHygieneStatus::CouldntCheck,
-                    reason: Some("The TypeSafe API key is unavailable. Replace it in Settings."),
-                };
-                keys.len()
-            ]
-        } else {
-            vec![
-                crate::dto::IgnoredInstructionSessionStatus {
-                    status: crate::dto::SessionHygieneStatus::NotAssessed,
-                    reason: None,
-                };
-                keys.len()
-            ]
-        };
-        let mut payloads =
+        let payloads =
             session_hygiene_payloads_with_selection(rows, source_generations, &enabled_selection);
-        attach_ignored_instruction_statuses(&mut payloads, findings);
-        if smart_checks_enabled {
-            for (detector, id) in [
-                (
-                    antiburn_local::insights::DetectorId::SkillOpportunities,
-                    "skillOpportunities",
-                ),
-                (
-                    antiburn_local::insights::DetectorId::OverExploring,
-                    "overExploring",
-                ),
-                (
-                    antiburn_local::insights::DetectorId::ScopeCreep,
-                    "scopeCreep",
-                ),
-            ] {
-                if !enabled_checks.contains(&detector) {
-                    continue;
-                }
-                attach_smart_check_statuses(
-                    &mut payloads,
-                    crate::insights_report::smart_session_statuses(
-                        store.state_dir(),
-                        &keys,
-                        detector,
-                        app.state::<crate::jev::worker::WorkerHandle>()
-                            .is_available(),
-                    )
-                    .map_err(fail)?,
-                    id,
-                );
-            }
-        }
-        if store.check_preferences_revision().map_err(fail)? != check_preferences_revision
-            || store
-                .internal_value("internal:burnChecksEnabledAtEpochV1")
-                .is_some()
-                != smart_checks_enabled
-        {
+        if store.check_preferences_revision().map_err(fail)? != check_preferences_revision {
             return Err(fail(
                 "check preferences changed while publishing session hygiene",
             ));
@@ -2328,33 +2119,6 @@ pub async fn get_session_hygiene(
     })
     .await
     .map_err(fail)?
-}
-
-pub(crate) fn attach_ignored_instruction_statuses(
-    payloads: &mut [SessionHygienePayload],
-    statuses: impl IntoIterator<Item = crate::dto::IgnoredInstructionSessionStatus>,
-) {
-    attach_smart_check_statuses(payloads, statuses, "ignoredInstructions");
-}
-
-pub(crate) fn attach_smart_check_statuses(
-    payloads: &mut [SessionHygienePayload],
-    statuses: impl IntoIterator<Item = crate::dto::IgnoredInstructionSessionStatus>,
-    id: &'static str,
-) {
-    for (payload, outcome) in payloads.iter_mut().zip(statuses) {
-        payload.badges.retain(|badge| badge.id != id);
-        if outcome.status != crate::dto::SessionHygieneStatus::NotAssessed {
-            payload.badges.push(crate::dto::SessionHygieneBadgePayload {
-                id,
-                status: outcome.status,
-                not_assessed_reason: None,
-                check_reason: outcome.reason,
-                accounting: None,
-                finding_evidence: None,
-            });
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3258,74 +3022,6 @@ mod project_folder_tests {
     }
 
     #[test]
-    fn an_ignored_instruction_result_adds_a_finding_to_the_session_badges() {
-        let mut payloads = [SessionHygienePayload {
-            badges: Vec::new(),
-            evidence_state: "ready",
-            unused_resources: None,
-        }];
-
-        attach_ignored_instruction_statuses(
-            &mut payloads,
-            [crate::dto::IgnoredInstructionSessionStatus {
-                status: crate::dto::SessionHygieneStatus::Finding,
-                reason: None,
-            }],
-        );
-
-        assert_eq!(payloads[0].badges.len(), 1);
-        assert_eq!(payloads[0].badges[0].id, "ignoredInstructions");
-        assert!(matches!(
-            payloads[0].badges[0].status,
-            crate::dto::SessionHygieneStatus::Finding
-        ));
-    }
-
-    #[test]
-    fn every_enabled_instruction_check_gets_a_truthful_session_state() {
-        let statuses = [
-            crate::dto::IgnoredInstructionSessionStatus {
-                status: crate::dto::SessionHygieneStatus::Checking,
-                reason: Some("Waiting for current session evidence."),
-            },
-            crate::dto::IgnoredInstructionSessionStatus {
-                status: crate::dto::SessionHygieneStatus::Clean,
-                reason: None,
-            },
-            crate::dto::IgnoredInstructionSessionStatus {
-                status: crate::dto::SessionHygieneStatus::CouldntCheck,
-                reason: Some("The assessment limit was reached."),
-            },
-        ];
-        let mut payloads = statuses
-            .iter()
-            .map(|_| SessionHygienePayload {
-                badges: Vec::new(),
-                evidence_state: "ready",
-                unused_resources: None,
-            })
-            .collect::<Vec<_>>();
-
-        attach_ignored_instruction_statuses(&mut payloads, statuses);
-
-        assert_eq!(payloads.len(), 3);
-        assert!(payloads.iter().all(|payload| {
-            payload
-                .badges
-                .iter()
-                .any(|badge| badge.id == "ignoredInstructions")
-        }));
-        assert_eq!(
-            payloads[0].badges[0].check_reason,
-            Some("Waiting for current session evidence.")
-        );
-        assert_eq!(
-            payloads[2].badges[0].check_reason,
-            Some("The assessment limit was reached.")
-        );
-    }
-
-    #[test]
     fn checks_report_reads_store_revision_on_the_blocking_worker() {
         let source = include_str!("mod.rs");
         let command = source
@@ -3343,9 +3039,7 @@ mod project_folder_tests {
             .expect("the command awaits the snapshot");
         assert!(snapshot.contains("let data_revision = store.revision().0;"));
         let compact: String = snapshot.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(
-            compact.contains("Ok((enabled_checks,revision,smart_checks_enabled,data_revision,")
-        );
+        assert!(compact.contains("Ok((enabled_checks,revision,data_revision"));
         assert!(!remainder.contains(".revision()"));
     }
 
@@ -3592,8 +3286,6 @@ mod project_folder_tests {
             });
         }
         let target = BurnCheckTarget {
-            over_exploring_reason: None,
-            decision_proof: None,
             finding_id: "finding".into(),
             action_id: "action".into(),
             finding: FindingDisplay {
@@ -3601,8 +3293,6 @@ mod project_folder_tests {
                 agent: AgentKind::Claude,
                 source_format: SourceFormat::ClaudeJsonl,
                 observation: "Long session".into(),
-                certainty: None,
-                instruction_provenance: None,
                 facts: DisplayFacts {
                     labels: Vec::new(),
                     omitted: 0,
@@ -3652,7 +3342,6 @@ mod project_folder_tests {
                 truncated: false,
             },
             1000,
-            false,
         )
         .unwrap();
         assert_eq!(payload.samples.len(), 6);

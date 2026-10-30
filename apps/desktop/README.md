@@ -32,13 +32,40 @@ server, or backend.
   eligibility. See [source coverage](../../docs/session-coverage.md) for limits.
   OpenCode 2 releases are admitted by default. Required data shapes and source
   identity checks, not an exact release allowlist, control reader eligibility.
-- **Model-based Checks:** Settings → Checks controls authored YAML discovery and
-  review of new local session activity. **Decision model** exposes Jev only. The connection
-  uses native credential storage. Requests contain selected tool results and
-  available user-slot text, not full transcripts. Partial fields, truncated text,
-  and source gaps are identified for the model; missing images are not analyzed.
-  Provider usage charges can apply. Built-in smart-check execution and historical
-  enrollment are suspended; saved results, preferences, and implementations remain.
+- **Model-based checks:** A fresh setup without a connection stays off. Settings →
+  Checks preserves the saved master setting. Check cards and navigation
+  appear only for discovered definitions; Settings controls stay available.
+  The connection list under **Model-based checks** supports Jev, Ollama endpoints
+  that support System One, Cloudflare, or Custom. Add and edit use a connection
+  dialog. Inactive rows keep **Use** visible. Each row puts **Edit** and **Remove**
+  in its actions menu.
+  **Use** selects a saved connection. Saving an inactive connection does not select it.
+  Removing the selected connection turns checks off and clears selection, even
+  when other connections remain. Saved results and usage remain available. The app
+  manages supported model limits; unknown Custom limits block execution.
+  Custom supports direct System One and Cloudflare-envelope responses, not arbitrary chat APIs. Credentials use native
+  credential storage or memory. Model requests contain the definition's selected
+  public messages, tool calls/results, response-cycle or session facts, current
+  instruction text, and declared skill descriptions, not automatic full
+  transcripts. Local status checks send no model request. They still require
+  **Run checks** to be on and a configured connection to be selected. The
+  connection's credential and authentication rules, and the source and runtime
+  requirements, still apply. Skill inventory inputs contain declared
+  metadata, not full bodies; selected tool results can still contain file text. Current-file inputs
+  remain frozen for delayed decisions and retries. Partial fields, truncated
+  text, and source gaps are identified for the model; missing images are not analyzed.
+  Native Jev uses the saved TypeSafe credential with `jev-latest` and long
+  context enabled. New Jev releases do not require profile migrations. Requests
+  retain the alias; observed served models and known prices are per attempt.
+  Provider usage charges can apply. Check files shows only enabled folders with
+  confirmed files and reloads when you revisit Checks settings. Model usage shows
+  recorded values and omits absent estimates and unknown counts. The app retains
+  the full local accounting records.
+  With **Run checks** off, the app still reads and parses bounded local YAML
+  definitions and watches their directories, including at cold startup. This
+  supplies names, diagnostics, paused cards, and file counts. It does not restore
+  provider configuration, discover model capabilities, catch up session sources,
+  or run assessments.
 - **Model prices:** The app downloads public prices from models.dev at startup
   and once an hour while it runs. The request contains no session data or
   credentials.
@@ -83,6 +110,11 @@ for the browser matrix, boundary checks, and required native-platform validation
 deliberately not joined with the engine's workspace: the engine resolves under
 its own dependency boundary that keeps it free of any service of ours, and the
 shell's app-framework dependencies must not leak into that resolution.
+
+The desktop build also assembles the existing session-check adapters as a
+separate verified runtime payload. Automatic user-profile registration remains
+behind exact native compatibility gates. See [agent integrations](../../docs/agent-integrations.md)
+for ownership, recovery, runtime requirements, and the native acceptance ledger.
 
 ## Prerequisites
 
@@ -167,19 +199,20 @@ a system SQLite.
 
 ## Debugging
 
-### Smart Check diagnostics
+### Provider and Burn Check diagnostics
 
-The [Rust eval guide](src-tauri/eval/README.md) documents one ignored `live`
-entry point per check and shared environment-only provider selection. Use
-`ANTIBURN_EVAL_SUITE`, exact `ANTIBURN_EVAL_CASES`, and a positive
-`ANTIBURN_EVAL_LIMIT` to select bounded work. Timestamped captures include
-per-case outcomes, citation diagnostics, errors, abstentions, accuracy, usage,
-and latency. Scores do not gate delivery; no strict thresholds, frozen hashes,
-previous passing captures, recipes, or Python tool are required. Production
-protocol and authority validation still apply. Do not select every ignored test.
+The [Rust eval guide](src-tauri/eval/README.md) covers shared provider protocol
+validation and isolated YAML replay. Use exact cases and a positive request
+limit for authorized live replay. Captures retain synthetic inputs, answers,
+errors, usage, and latency. Protocol success does not prove model quality or
+native source support. Do not select every ignored test.
+
+Use the [operator acceptance guide](../../docs/runbooks/burn-check-live-acceptance.md)
+for bounded provider checks and native event probes. These manual checks are
+separate from automated validation.
 
 ```sh
-ANTIBURN_EVAL_PROVIDER=ollama-nimble ANTIBURN_EVAL_LIMIT=3 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --offline --test over_exploring live -- --ignored --exact --nocapture --test-threads=1
+cargo nextest run --manifest-path apps/desktop/src-tauri/Cargo.toml --offline --test provider_validation
 ```
 
 See [`docs/debugging.md`](../../docs/debugging.md) for development modes,
@@ -193,17 +226,50 @@ and IPC. The Rust analytics module tests consent, endpoint injection, and the
 payload schema. `cargo-deny` rejects known telemetry dependencies in the local
 engine. Release and dependency checks run through the required CI gate.
 
-YAML Burn Checks use Jev, separate from analytics. Hosted requests can incur
-charges. The master **Model-based Checks** setting controls discovery and
-activation; **Decision model** configures Jev. Built-in Ignored Instructions,
-Scope Creep, Over-exploring, and Skill Opportunities do not run or enroll history.
-Their saved results and alternative-provider profiles remain; these profiles do
-not add YAML decision routes.
+YAML Burn Checks use the active System One connection, separate from analytics.
+Hosted requests can incur charges. In **Settings → Checks → Model-based checks**,
+turn **Run checks** off while configuring the connection. Choose **Add
+connection**, enter its fields, and select **Add connection** in the dialog.
+The first connection becomes selected without enabling checks. For another saved
+connection, select **Use**, then enable **Run checks** when ready. **Edit** and
+**Save** change its configuration without selecting another connection. Saving a
+change to the selected connection updates that connection; turn checks off first
+to avoid starting work with the saved change. A test sends synthetic input and
+can incur charges. **Remove** deletes a saved connection, not its past results.
+**Check files** and **Model usage** are accordions inside the card. **Check files** lists
+actual container folders with file counts and a native open action. **Model
+usage** shows recorded device-wide requests and estimated cost. See
+[decision connections](../../docs/burn-check/authoring.md#decision-connections)
+for required fields and capability limits.
 
-Terminal results with safe identity and order can enter a live window even when
-optional fields or retained history are partial. Quality fields preserve those
-limits. A missing required expression value can make one candidate not assessable
-without blocking later results. User-slot text can include extension/API input;
+If a connection operation needs recovery, use its explicit retry action. That
+action remains available even when removal has already deleted the connection
+row. Reading settings does not finish a pending operation. Keep typed changes
+until recovery confirms completion or you choose to discard them.
+
+Settings owns decision routing. A YAML decision `model` field is rejected as
+unknown; the app does not rewrite the definition. Observed coding-agent model
+fields remain source facts. A valid definition can wait for a compatible
+connection without losing its source progress or accepted status.
+
+Message windows can select admitted user text, completed public assistant text,
+explicit tool calls, and terminal tool results. Source-specific proof controls
+availability; a call and its result have separate identities. Complete response
+cycles are available only from characterized Codex intervals and continuous
+OpenCode V2 execution periods. Session events record an observation attachment or
+120 seconds without observed source activity, not agent creation or measured work
+time. New activity cancels unfinished idle work.
+
+Cursor Desktop has a separate ordered snapshot tool-result route. Only its
+characterized native inline main-session source with recorded header order,
+exact bubble/call identities, and current ready cached evidence qualifies. It
+does not supply separate public message/call, cycle, or session-observation
+events. Cursor CLI and generic stores do not inherit the route. See the
+[Cursor source contract](../../docs/session-coverage.md#cursor-desktop-yaml-tool-evidence).
+
+Safe identity and order can allow partial optional fields or retained history.
+Quality fields preserve those limits. A missing required expression value can
+make one candidate not assessable without blocking later events. User-slot text can include extension/API input;
 it is not proof of human approval. OpenCode synthetic parts are excluded, mixed
 messages retain real user text, and generated-only replacements leave request
 history partial. Unknown delivery does not
@@ -212,9 +278,7 @@ or clean whole session. See the [Burn Checks guide](../../docs/burn-check/README
 
 The source and result limits are in
 [`session-coverage.md`](../../docs/session-coverage.md) and
-[`check-coverage.md`](../../docs/check-coverage.md). The
-[Smart Burn Checks guide](../../docs/smart-burn-checks.md) records the retained
-built-in implementation and its separate evidence capabilities.
+[`check-coverage.md`](../../docs/check-coverage.md).
 
 Burn Check remediation stays local. After a separate review and confirmation,
 each Auto Fix changes one winning control. It uses the global or user control
@@ -297,8 +361,10 @@ Settings teardown, and the memory rules behind those policies.
   the first run fires the existing notification that identifies the menu-bar
   companion and warms the popover's hidden renderer for the first click.
 - **Settings.** An ordinary decorated window, created on demand and destroyed
-  on close. A source list on the left, one pane on the right; every control
-  writes through immediately. Remote-host connection forms save explicitly after
+  on close. A source list on the left, one pane on the right; ordinary preference
+  controls write through immediately. Decision-provider drafts save explicitly;
+  **Use** selects a saved connection. Saving an inactive connection preserves
+  selection. Testing does not save or select a draft. Remote-host connection forms save explicitly after
   validation; canceling a form preserves the existing host configuration.
   General → Application controls the menu-bar or system-tray icon. macOS also
   controls Dock visibility and always keeps at least one entry point visible.
@@ -359,6 +425,20 @@ Settings teardown, and the memory rules behind those policies.
 Settings and native macOS hover previews have dedicated HTML and
 TypeScript entries. The resident shell uses URL fragments for the nudge and overlay, with the popover
 as its default. Each window owns one surface until the shell releases it.
+
+## CLI runtime
+
+For source development with a prepared host CLI payload, use
+`pnpm --filter @antiburn/desktop dev:cli`; use `dev:bundle:cli` for a debug bundle.
+These commands build the CLI and add its resource mapping. Open Settings → CLI →
+Technical details → Repair to stage it. Ordinary `dev` and `dev:bundle` do not
+prepare the payload and remain unchanged.
+
+Distribution builds package and automatically stage a durable per-user `antiburn-cli`.
+Settings → CLI reports runtime status and offers Test, Repair, and a copyable
+location under Technical details. The app does not publish a terminal command or
+change PATH. See the
+[CLI ownership and acceptance contract](../../docs/cli-installation.md).
 
 ## Known gaps
 
@@ -444,3 +524,131 @@ details only for opened checks. It coalesces refreshes, rejects stale results, a
 after a refresh error. Its snapshot subscription reports bounded visible-state and outcome
 analytics. Actions report only reviewed closed outcomes. They never report work data, target values,
 paths, identifiers, exact tokens, or exact costs.
+
+## Bundled promotions
+
+See the [promotion authoring guide](docs/promotions.md) for the YAML schema,
+actions, media rules, display lifecycle, analytics, and verification workflow.
+
+Promotions appear automatically. An optional YAML `sidebar` block supplies a
+mini panel above Settings. The generic launcher shows one audience-matching,
+non-development promotion: highest priority first, then ascending promotion ID.
+Card copy, optional badge/link label, icon, priority, and audience come from YAML.
+The single optional `icon` string accepts existing agent slugs or `megaphone`
+(the default); artwork and audience are independent. Audiences support everyone
+or any specified detected agent. Clicking opens the enclosing promotion by ID.
+Definitions without `sidebar` create no card. A future eligible promo with higher
+priority replaces the current card without React changes. Sidebar selection does
+not change automatic announcement selection or timing.
+
+The shipped Claude Mod card targets detected Claude users. It uses the same detection as Settings →
+Agents: Claude sessions, installation/sign-in, or Claude Desktop; a Pi-only login does not qualify.
+Agent visibility switches do not hide the action. Unknown or failed detection without
+other evidence keeps it hidden. The action opens the Claude Mod announcement directly,
+even after dismissal or automatic viewing, without changing the selected app view.
+Pointer opening grows the panel from its bottom-left corner over 180ms; keyboard
+opening is immediate. Reduced motion uses a 100ms fade.
+Its **NEW** badge remains visible for as long as the promo card is available, including
+after activation and app restarts. Activation history is still saved separately under
+`antiburn.promotions.launcher-opened.v1`; it does not control the badge.
+The launcher stays available after activation. It is hidden during FTUE and becomes
+available immediately after completion, including the same app session. This deliberate
+opening bypasses the automatic cooldown; automatic display retains its existing timing.
+**What’s new** is reserved for a future recent-changes panel. Add each promotion in `src/promotions/<id>/promo.yaml` with relative assets in that
+folder. The Vite catalog validates the YAML and imports media as hashed assets.
+The Claude Mod definition provides announcement and setup examples.
+
+Definitions support plain-text content, gauge/clock feature icons, image/GIF
+or video media, copyable commands, screen navigation, HTTPS links, and the
+Settings Usage destination. Videos require a poster; image/GIF definitions can
+also supply one. GIFs with a poster show it for reduced motion or an image load failure.
+Videos and GIFs keep looping across window focus changes; focus does not swap
+the image source, pause playback, or reset its position. The optional `media.light` object overrides
+`kind`, `src`, and `poster` in light mode; the base media remains the dark-mode
+and legacy fallback. Video variants require their own poster. Explicit theme
+changes and system appearance changes select the source and poster together,
+resetting playback failure state without changing the display policy.
+Both Claude Mod themes use label-free H.264 MP4s at 800 × 416, 50fps,
+with no audio and fast-start metadata, plus matching PNG posters. No command executes.
+
+Automatic display waits for onboarding and foreground visibility. New users never
+receive a promo during the MAIN-window FTUE or in the same app session. Completion
+of the final guided step starts a 24-hour delay, saved locally under
+`antiburn.promotions.ftue.v1`. A later app session becomes eligible after that delay;
+returning focus checks eligibility again. Existing users without this timing record
+remain eligible immediately. A reset FTUE starts the delay again. Revision bumps
+respect this timing gate too. Seen history
+is local and keyed by ID and revision; increment the revision only when the
+promotion should announce again. An ignored, generated dummy exercises different
+content, a static image, and an app action. Its YAML and assets are never committed and are excluded from
+production builds. Tests generate the local fixture from a synthetic factory. The component tests exercise its manual catalog and app action; the visual tests exercise automatic display.
+
+Run the focused browser checks from `apps/desktop` with
+`node node_modules/@playwright/test/cli.js test --config tests/visual/promotions.config.ts`.
+
+To repeat automatic display in a debug build, open the main window’s developer
+tools (`Command+Option+I` on macOS), run the following in the console, then
+reload the main window or quit and reopen the app:
+
+```js
+localStorage.removeItem("antiburn.promotions.seen.v1")
+```
+
+The sidebar’s NEW badge needs no reset: it remains visible while the promo card
+is available. Launcher activation history does not control its visibility.
+
+The seen-key command clears only promotion history for that app profile. Onboarding must be
+complete and the main window must be in the foreground. App version changes
+do not reset this history. To announce again after a future update, increment
+`revision` in the promotion YAML. The new ID/revision pair is shown once.
+
+### Promotion analytics
+
+The YAML definition opts into a registered campaign:
+
+```yaml
+analytics:
+  campaign: claude_mod
+```
+
+Omit `analytics` to disable promotion events. `campaign` accepts only
+`claude_mod` in schema version 1. The validator rejects unknown campaigns,
+event names, and tracking properties. Development-only fixtures emit nothing,
+even when they include an analytics block. The generated dummy YAML and media
+live under the ignored `.agent-artifacts/promotions/` directory; they are not
+product definitions and are not committed or imported by production builds.
+
+The shared renderer owns interaction timing. The closed event is
+`antiburn.promotion_interaction`. Its existing `detail` field identifies the
+registered campaign; `label` contains one of:
+
+| Label                  | Trigger                                      |
+| ---------------------- | -------------------------------------------- |
+| `announcement_viewed`  | The announcement is actually presented.      |
+| `setup_viewed`         | The setup screen is actually presented.      |
+| `primary_activated`    | The primary action completes successfully.   |
+| `learn_more_activated` | The secondary action completes successfully. |
+| `command_copied`       | The clipboard write succeeds.                |
+| `dismissed`            | The reader closes the panel.                 |
+
+Each screen view is counted at most once per opening. Each action label is counted at most once per opening after a successful
+activation. `origin` preserves how the opening began:
+`automatic` or `user`, including after navigation to setup. Hidden or blocked
+screens do not report views. Failed clipboard/link actions do not report
+success. Async actions retain their original campaign and opening origin.
+Copying an install command does not prove installation or activation.
+
+All events pass through the existing consent/configuration gate. YAML content,
+promotion IDs, revisions, URLs, command text, asset paths, and work data are not
+sent. Rust accepts only the registered campaign, listed actions, and origins.
+The complete payload and measurement contract lives in
+[analytics](../../docs/analytics.md) and
+[analytics measurement](../../docs/analytics-measurement.md).
+
+To register another campaign, update the YAML campaign type and validator,
+the IPC payload type, Rust campaign enum and fixed wire mapping, tests, and
+measurement documentation together. Do not add arbitrary YAML event names or
+free-form tracking properties. External URLs are currently limited to HTTPS
+pages in the antiburn GitHub repository, matching the native opener permission;
+adding another destination requires updating that scope and the shared link
+validator together.
