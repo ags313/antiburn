@@ -41,6 +41,10 @@ CI changes, and documentation that no user acts on stay out — see
 
 ### Fixed
 
+- A remote host with many recent Claude Code sessions no longer hides its Codex
+  sessions. The helper now reads the newest sessions of both agents first, and
+  a Codex session export no longer fails on a host with many recent threads.
+  Update the helper on each host to get this fix.
 - The session scan no longer stops behind a hidden macOS permission dialog
   when a session's project is in Downloads, Documents, or Desktop. Until you
   grant antiburn access to that folder, the scan skips such a session instead

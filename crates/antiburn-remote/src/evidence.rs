@@ -186,6 +186,10 @@ impl RequestBudget {
                     BudgetExhausted("Remote session origin exceeds the preview limit").into(),
                 );
             }
+            // The next read starts again at offset zero, so charge this prefix once.
+            self.preview_bytes = self
+                .preview_bytes
+                .saturating_sub(u64::try_from(read.bytes.len())?);
             limit = (limit * 2).min(MAX_PREVIEW_BYTES_PER_FILE);
         }
     }
@@ -654,6 +658,20 @@ mod tests {
         assert!(budget.inspect_candidate().is_err());
         assert_eq!(budget.read_preview(&file).unwrap().bytes, b"12345");
         assert!(budget.read_preview(&file).is_err());
+    }
+
+    #[test]
+    fn origin_retries_charge_only_the_final_prefix() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(format!("{}\nrest", "x".repeat(3000)).as_bytes())
+            .unwrap();
+        // The retries read 512, 1024, 2048 and 4096 bytes. Only the last read
+        // fits in this budget.
+        let mut budget = RequestBudget::with_limits(BudgetLimits {
+            preview_bytes: 4096,
+            ..BudgetLimits::default()
+        });
+        assert_eq!(budget.read_origin(&file).unwrap().bytes.len(), 3001);
     }
 
     #[test]

@@ -1650,8 +1650,11 @@ unchanged is not seen. Entry, candidate, byte, and elapsed-time budgets can
 truncate discovery before every candidate is examined. A history window longer
 than seven days has four times the entry, candidate, and byte budgets, with the
 same elapsed-time limit. Listings skip expired transcripts before preview reads.
-Codex exports use bounded first-record reads to retain linked children even when
-a child's modification time is older than the parent or the listing window.
+The helper examines Claude Code and Codex transcripts newest first across both
+roots, so an exhausted budget drops the oldest candidates, not a whole agent.
+Codex exports read only bounded first records of other threads, so linked
+children are retained even when a child's modification time is older than the
+parent or the listing window. Other targeted exports stop at the newest match.
 Listing absence does not prove deletion. Exported transcript, child, fork-
 parent, and supported sidecar inputs must pass the helper's association and
 descriptor-relative admission checks. Symlink components and non-regular files

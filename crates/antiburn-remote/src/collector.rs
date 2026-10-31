@@ -186,6 +186,21 @@ fn codex_origin(preview: &str) -> (Option<String>, bool, bool) {
     (parent, subagent, internal)
 }
 
+/// The thread id in a Codex `session_meta` first record. `None` means that the
+/// record does not identify the thread.
+fn codex_origin_id(origin: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(origin.lines().next()?).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = value.get("payload").unwrap_or(&value);
+    payload
+        .get("id")
+        .or_else(|| payload.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 fn modified_epoch(source: &AdmittedFile) -> i64 {
     source
         .stat
@@ -204,15 +219,19 @@ fn inspect_candidate(
     budget.inspect_candidate()?;
     let source = root.root.admit(relative)?;
     let updated_at = modified_epoch(&source);
-    if updated_at < cutoff {
-        let Some(("codex", target_id)) = target else {
-            return Ok(None);
-        };
-        let origin = budget.read_origin(&source.file)?;
-        let (parent, subagent, internal) = codex_origin(&origin.text());
-        if !subagent || internal || parent.as_deref() != Some(target_id) {
+    if let Some(("codex", target_id)) = target {
+        // A Codex export reads only the first record of other threads. A full
+        // preview of each recent thread does not fit the budget on a busy host.
+        let origin = budget.read_origin(&source.file)?.text();
+        let (parent, subagent, internal) = codex_origin(&origin);
+        let child = subagent && !internal && parent.as_deref() == Some(target_id);
+        let possible_target =
+            updated_at >= cutoff && codex_origin_id(&origin).is_none_or(|id| id == target_id);
+        if !child && !possible_target {
             return Ok(None);
         }
+    } else if updated_at < cutoff {
+        return Ok(None);
     }
     let read = budget.read_preview(&source.file)?;
     let head_hash = source_version::head_hash_of(&read.bytes);
@@ -256,7 +275,8 @@ fn enumerate_from_roots(
     let mut skipped = 0;
     let mut truncated = false;
 
-    'roots: for root in roots {
+    let mut pending = Vec::new();
+    'roots: for (root_index, root) in roots.iter().enumerate() {
         if target.is_some_and(|(agent, _)| root.agent_type.to_string() != agent) {
             continue;
         }
@@ -293,18 +313,36 @@ fn enumerate_from_roots(
                 {
                     continue;
                 }
-                match inspect_candidate(root, &relative, budget, target, cutoff) {
-                    Ok(Some(candidate)) => retained.retain(candidate, target, cutoff, &mut skipped),
-                    Ok(None) => {}
-                    Err(error) => {
-                        skipped += 1;
-                        if error.is::<BudgetExhausted>() {
-                            truncated = true;
-                            break 'roots;
-                        }
-                    }
+                let Ok(metadata) = entry.metadata() else {
+                    skipped += 1;
+                    continue;
+                };
+                pending.push((metadata.modified().ok(), root_index, relative));
+            }
+        }
+    }
+
+    // Inspect the newest files first, over all roots. Thus the shared budgets
+    // keep the most recent sessions of each agent, not the files of the first
+    // root.
+    pending.sort_by_key(|(modified, _, _)| std::cmp::Reverse(*modified));
+    let stop_at_first_match = target.is_some_and(|(agent, _)| agent != "codex");
+    for (_, root_index, relative) in pending {
+        match inspect_candidate(&roots[root_index], &relative, budget, target, cutoff) {
+            Ok(Some(candidate)) => retained.retain(candidate, target, cutoff, &mut skipped),
+            Ok(None) => {}
+            Err(error) => {
+                skipped += 1;
+                if error.is::<BudgetExhausted>() {
+                    truncated = true;
+                    break;
                 }
             }
+        }
+        // A later file is not newer, so it cannot replace the match. A Codex
+        // target continues, because it must find all child threads.
+        if stop_at_first_match && !retained.candidates.is_empty() {
+            break;
         }
     }
 
@@ -1094,6 +1132,130 @@ mod tests {
         );
     }
 
+    fn set_age(path: &Path, seconds: u64) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(seconds)),
+        )
+        .unwrap();
+    }
+
+    fn pad_to_one_mib(path: &Path) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+    }
+
+    /// Writes `count` recent 1 MiB Claude sessions that are older than one hour.
+    fn claude_root_with_large_sessions(directory: &Path, count: usize) -> RootSpec {
+        let projects = directory.join(".claude/projects");
+        std::fs::create_dir_all(projects.join("project")).unwrap();
+        for index in 0..count {
+            let path = projects.join(format!("project/claude-{index}.jsonl"));
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"type\":\"user\",\"sessionId\":\"claude-{index}\",\"message\":{{\"role\":\"user\",\"content\":\"fixture\"}}}}\n"
+                ),
+            )
+            .unwrap();
+            pad_to_one_mib(&path);
+            set_age(&path, 3600 + index as u64);
+        }
+        RootSpec {
+            agent_type: AgentKind::Claude,
+            root: TrustedRoot::open(&projects).unwrap(),
+            start: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn listing_keeps_the_newest_sessions_of_a_later_root_when_previews_run_out() {
+        let store = tempfile::tempdir().unwrap();
+        let claude = claude_root_with_large_sessions(store.path(), 4);
+        let codex = codex_root(store.path());
+        write_codex(&codex.root.path().join("sessions/new.jsonl"), "new", None);
+        let mut budget = RequestBudget::with_limits(BudgetLimits {
+            preview_bytes: 2 * 1024 * 1024,
+            ..BudgetLimits::default()
+        });
+
+        let list = enumerate_from_roots(&mut budget, None, &[claude, codex], LOOKBACK_SECS);
+
+        assert!(list.truncated);
+        let ids: Vec<_> = list
+            .entries
+            .iter()
+            .map(|entry| entry.session.session_id.as_str())
+            .collect();
+        assert_eq!(ids, ["new", "claude-0", "claude-1"]);
+    }
+
+    #[test]
+    fn codex_target_reads_only_the_first_record_of_other_threads() {
+        let store = tempfile::tempdir().unwrap();
+        let root = codex_root(store.path());
+        for index in 0..4 {
+            let path = root
+                .root
+                .path()
+                .join(format!("sessions/other-{index}.jsonl"));
+            write_codex(&path, &format!("other-{index}"), None);
+            pad_to_one_mib(&path);
+        }
+        write_codex(
+            &root.root.path().join("sessions/child.jsonl"),
+            "child",
+            Some("parent"),
+        );
+        let parent = root.root.path().join("sessions/parent.jsonl");
+        write_codex(&parent, "parent", None);
+        set_age(&parent, 60);
+        let mut budget = RequestBudget::with_limits(BudgetLimits {
+            preview_bytes: 64 * 1024,
+            ..BudgetLimits::default()
+        });
+
+        let discovery = enumerate_from_roots(
+            &mut budget,
+            Some(("codex", "parent")),
+            &[root],
+            LOOKBACK_SECS,
+        );
+
+        let entry = resolve_matching(discovery).unwrap();
+        assert_eq!(entry.session.session_id, "parent");
+        assert_eq!(entry.codex_companions.len(), 1);
+        assert!(entry.companion_roster_complete);
+    }
+
+    #[test]
+    fn claude_target_stops_at_its_newest_file() {
+        let store = tempfile::tempdir().unwrap();
+        let claude = claude_root_with_large_sessions(store.path(), 3);
+        let mut budget = RequestBudget::with_limits(BudgetLimits {
+            preview_bytes: 1024 * 1024,
+            ..BudgetLimits::default()
+        });
+
+        let discovery = enumerate_from_roots(
+            &mut budget,
+            Some(("claude-code", "claude-0")),
+            &[claude],
+            LOOKBACK_SECS,
+        );
+
+        assert!(!discovery.scan_truncated);
+        assert_eq!(
+            resolve_matching(discovery).unwrap().session.session_id,
+            "claude-0"
+        );
+    }
+
     #[test]
     fn incomplete_old_origin_scan_still_rejects_target_export() {
         let store = tempfile::tempdir().unwrap();
@@ -1152,11 +1314,10 @@ mod tests {
             "parent",
             None,
         );
-        write_codex(
-            &child_root.root.path().join("sessions/child.jsonl"),
-            "child",
-            Some("parent"),
-        );
+        let child = child_root.root.path().join("sessions/child.jsonl");
+        write_codex(&child, "child", Some("parent"));
+        // The scan inspects the newer parent first.
+        age_transcript(&child);
         let mut budget = RequestBudget::with_limits(BudgetLimits {
             candidates: 1,
             ..BudgetLimits::default()
