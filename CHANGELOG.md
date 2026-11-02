@@ -41,6 +41,10 @@ CI changes, and documentation that no user acts on stay out — see
 
 ### Fixed
 
+- After a restart of a Mac, Burn Checks again assess older sessions. Before,
+  each restart made unchanged session files look changed, so antiburn retried
+  them in a loop and then marked them as failed. Codex usage history is also
+  no longer read again from the start after each restart.
 - A remote host with many recent Claude Code sessions no longer hides its Codex
   sessions. The helper now reads the newest sessions of both agents first, and
   a Codex session export no longer fails on a host with many recent threads.

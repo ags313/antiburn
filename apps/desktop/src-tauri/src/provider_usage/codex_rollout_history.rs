@@ -290,7 +290,9 @@ fn source_fingerprint(path: &Path) -> Result<SourceFingerprint> {
 fn source_identity(metadata: &std::fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
 
-    format!("{}:{}", metadata.dev(), metadata.ino())
+    // The device number of a volume can change at reboot, for example on
+    // macOS. A stored checkpoint must not see an unchanged file as replaced.
+    metadata.ino().to_string()
 }
 
 #[cfg(not(unix))]

@@ -34,6 +34,7 @@ mod minute_usage;
 pub(crate) use check_preferences::{check_preferences_snapshot_in, enabled_checks_in};
 pub(crate) mod codex_rollout_checkpoint;
 mod cursor_usage;
+mod legacy_device;
 mod usage_evidence;
 pub use cursor_usage::StoredCursorUsageEvent;
 mod evidence_queue;
@@ -830,6 +831,7 @@ impl Store {
         guard.execute_batch(cursor_usage::SCHEMA)?;
         active_minutes::ensure_schema(&guard)?;
         minute_usage::ensure_schema(&guard)?;
+        legacy_device::drop_legacy_devices(&mut guard)?;
         // Write the marker only after all migrations, so that a failed
         // migration leaves the schema unchanged.
         guard.execute_batch(FORK_TURN_COST_MARKER)?;

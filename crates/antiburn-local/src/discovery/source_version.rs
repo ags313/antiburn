@@ -640,7 +640,10 @@ impl SourceStat {
         use std::os::unix::fs::MetadataExt;
 
         Self {
-            identity: Some(format!("{}:{}", metadata.dev(), metadata.ino())),
+            // The device number of a volume can change at reboot, for example
+            // on macOS. Stored fingerprints must not change for an unchanged
+            // file, thus the identity uses only the inode.
+            identity: Some(format!("ino{}", metadata.ino())),
             size: metadata.len(),
             modified_nanos: metadata.modified().ok().and_then(system_time_nanos),
             changed_nanos: Some(
@@ -670,6 +673,35 @@ impl FingerprintInputs {
                 .unwrap_or_else(|| "-".to_string())
         )
     }
+}
+
+/// Removes the device number from each Unix file fingerprint that older
+/// releases stored as `sv1:<device>:<inode>:`. Returns `None` when `value` has
+/// no such fingerprint.
+pub fn without_legacy_device(value: &str) -> Option<String> {
+    const PREFIX: &str = "sv1:";
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    let mut changed = false;
+    while let Some(start) = rest.find(PREFIX) {
+        let (before, candidate) = rest.split_at(start + PREFIX.len());
+        output.push_str(before);
+        rest = candidate;
+        let device = candidate.bytes().take_while(u8::is_ascii_digit).count();
+        if device == 0 || candidate.as_bytes().get(device) != Some(&b':') {
+            continue;
+        }
+        let after_device = &candidate[device + 1..];
+        let inode = after_device.bytes().take_while(u8::is_ascii_digit).count();
+        if inode == 0 || after_device.as_bytes().get(inode) != Some(&b':') {
+            continue;
+        }
+        output.push_str("ino");
+        rest = after_device;
+        changed = true;
+    }
+    output.push_str(rest);
+    changed.then_some(output)
 }
 
 pub fn head_hash_of(bytes: &[u8]) -> u64 {
@@ -793,6 +825,30 @@ mod tests {
         assert_eq!(inputs.fingerprint(), "sv1:-:12:-:-:-");
     }
 
+    #[test]
+    fn a_legacy_fingerprint_loses_only_its_device_number() {
+        assert_eq!(
+            without_legacy_device("sv1:16777229:372276567:518849:1792628294:1:00ff").as_deref(),
+            Some("sv1:ino372276567:518849:1792628294:1:00ff")
+        );
+        let combined =
+            r#"v2:[["child","/a","sv1:7:11:3:4:5:-"],["parent","/b","sv1:7:12:3:4:5:-"]]"#;
+        assert_eq!(
+            without_legacy_device(combined).as_deref(),
+            Some(r#"v2:[["child","/a","sv1:ino11:3:4:5:-"],["parent","/b","sv1:ino12:3:4:5:-"]]"#)
+        );
+        for current in [
+            "sv1:ino372276567:518849:1792628294:1:00ff",
+            "sv1:-:12:-:-:-",
+            "sv1:db:1793640085:42",
+            "sv1:01a12d44-2e56-7c62-b07f-174a0a71de10",
+            "sv1:12",
+            "",
+        ] {
+            assert_eq!(without_legacy_device(current), None, "{current}");
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_source_stat_reports_identity_and_change_time() {
@@ -822,12 +878,11 @@ mod tests {
             .await
             .expect("other stat");
 
-        assert!(
-            first
-                .identity
-                .as_deref()
-                .is_some_and(|value| value.contains(':'))
-        );
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&first_path).expect("metadata").ino()
+        };
+        assert_eq!(first.identity, Some(format!("ino{inode}")));
         assert!(first.changed_nanos.is_some());
         assert_eq!(first, first_again);
         assert_ne!(first.identity, second.identity);

@@ -27,6 +27,11 @@ version and refuses the release if there is none.
 
 ### Changed
 
+- On Unix, `SourceStat::identity` is now `ino<inode>`, without the device
+  number, so `sv1:` file fingerprints stay the same after a reboot. A volume
+  can get a different device number at reboot, for example on macOS. The new
+  `source_version::without_legacy_device` rewrites a stored `sv1:<device>:<inode>:`
+  fingerprint to the new form.
 - `ModelTokens` and `NormalizedEvent` have an optional `recorded_cost_micros`
   field. Struct literals that list every field must add it.
 - On `ModelTokens`, `recorded_cost_micros` is the cost that the agent recorded.
