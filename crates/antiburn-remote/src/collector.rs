@@ -66,6 +66,8 @@ struct CandidateRetention {
     /// The most candidates that the listing keeps.
     cap: usize,
     target_children: Vec<CompanionEntry>,
+    /// The newest modification time of the Codex child threads of each parent.
+    child_changes: HashMap<String, i64>,
     companion_roster_complete: bool,
     result_limit_truncated: bool,
 }
@@ -76,6 +78,7 @@ impl CandidateRetention {
             candidates: HashMap::new(),
             cap,
             target_children: Vec::new(),
+            child_changes: HashMap::new(),
             companion_roster_complete: true,
             result_limit_truncated: false,
         }
@@ -207,6 +210,47 @@ fn modified_epoch(source: &AdmittedFile) -> i64 {
         .modified_nanos
         .and_then(|value| i64::try_from(value / 1_000_000_000).ok())
         .unwrap_or_default()
+}
+
+/// Returns the newest modification time of the files that an export adds to
+/// a Claude Code session: the subagent transcripts, their sidecars, and the
+/// fork parent. The listing time of a session must change when one of these
+/// files changes, because a scan exports only sessions with a changed listing.
+fn claude_companion_change(candidate: &ParsedCandidate, session_id: &str) -> Option<i64> {
+    let root = candidate.source.root.path();
+    let project = candidate.source.relative.parent()?;
+    let mut newest = None;
+    let mut include = |metadata: std::fs::Metadata| {
+        if metadata.is_file()
+            && let Some(epoch) = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        {
+            newest = newest.max(Some(epoch));
+        }
+    };
+    let subagents = root.join(project).join(session_id).join("subagents");
+    if let Ok(entries) = std::fs::read_dir(subagents) {
+        // An export rejects a session with more files, so a longer list does
+        // not need a time.
+        for entry in entries.take(crate::export::MAX_FILES).flatten() {
+            // On Unix, `DirEntry::metadata` does not follow a symlink.
+            if let Ok(metadata) = entry.metadata() {
+                include(metadata);
+            }
+        }
+    }
+    if let Some(parent) =
+        antiburn_local::discovery::fork::fork_parent_from_content(&candidate.preview)
+            .filter(|parent| crate::export::safe_identity(parent) && parent != session_id)
+        && let Ok(metadata) =
+            std::fs::symlink_metadata(root.join(project).join(format!("{parent}.jsonl")))
+    {
+        include(metadata);
+    }
+    newest
 }
 
 fn inspect_candidate(
@@ -348,11 +392,19 @@ fn enumerate_from_roots(
 
     let scan_truncated = truncated;
     truncated |= retained.result_limit_truncated;
+    let child_changes = std::mem::take(&mut retained.child_changes);
     let mut candidates: Vec<_> = retained.candidates.into_values().collect();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.updated_at));
     let mut entries = Vec::new();
     for candidate in candidates {
         let session_id = candidate.metadata.session_id.as_deref().unwrap_or_default();
+        let companion_change = match candidate.agent_type {
+            AgentKind::Claude => claude_companion_change(&candidate, session_id),
+            _ => child_changes.get(session_id).copied(),
+        };
+        let updated_at = companion_change.map_or(candidate.updated_at, |change| {
+            change.max(candidate.updated_at)
+        });
         let log = SessionLog {
             agent_type: candidate.agent_type,
             source: SessionSource::File(candidate.source.display_path()),
@@ -379,7 +431,7 @@ fn enumerate_from_roots(
                 surface: log
                     .surface_label_with_content(&candidate.preview, &home)
                     .to_owned(),
-                updated_at: Some(candidate.updated_at),
+                updated_at: Some(updated_at),
             },
             agent_type: candidate.agent_type,
             source: candidate.source,
@@ -421,6 +473,14 @@ fn retain_candidate(
     if !crate::export::safe_identity(&session_id) {
         *skipped += 1;
         return;
+    }
+    if candidate.agent_type == AgentKind::Codex
+        && candidate.is_subagent
+        && !candidate.is_internal
+        && let Some(parent) = &candidate.parent_session_id
+    {
+        let change = retained.child_changes.entry(parent.clone()).or_default();
+        *change = (*change).max(candidate.updated_at);
     }
     if let Some((target_agent, target_id)) = target
         && candidate.agent_type == AgentKind::Codex
@@ -1301,6 +1361,80 @@ mod tests {
         if !trusted_roots().is_empty() {
             assert!(discovery.truncated);
         }
+    }
+
+    fn modified(path: &Path) -> i64 {
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn listed_and_exported_times(roots: &[RootSpec], agent: &str, id: &str) -> (i64, i64) {
+        let listed = enumerate_from_roots(&mut RequestBudget::new(), None, roots, LOOKBACK_SECS);
+        let exported = enumerate_from_roots(
+            &mut RequestBudget::new(),
+            Some((agent, id)),
+            roots,
+            LOOKBACK_SECS,
+        );
+        let time = |discovery: Discovery| {
+            discovery
+                .entries
+                .into_iter()
+                .find(|entry| entry.session.session_id == id)
+                .and_then(|entry| entry.session.updated_at)
+                .unwrap()
+        };
+        (time(listed), time(exported))
+    }
+
+    #[test]
+    fn a_claude_listing_time_includes_subagent_changes() {
+        let store = tempfile::tempdir().unwrap();
+        let projects = store.path().join(".claude/projects");
+        let parent = projects.join("project/parent.jsonl");
+        let child = projects.join("project/parent/subagents/agent-child.jsonl");
+        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+        std::fs::write(
+            &parent,
+            "{\"type\":\"user\",\"sessionId\":\"parent\",\"message\":{\"role\":\"user\",\"content\":\"fixture\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(&child, "{}\n").unwrap();
+        set_age(&parent, 7200);
+        set_age(&child, 60);
+        let roots = [RootSpec {
+            agent_type: AgentKind::Claude,
+            root: TrustedRoot::open(&projects).unwrap(),
+            start: PathBuf::new(),
+        }];
+
+        let (listed, exported) = listed_and_exported_times(&roots, "claude-code", "parent");
+
+        assert_eq!(listed, modified(&child));
+        assert_eq!(exported, listed);
+    }
+
+    #[test]
+    fn a_codex_listing_time_includes_child_thread_changes() {
+        let store = tempfile::tempdir().unwrap();
+        let root = codex_root(store.path());
+        let parent = root.root.path().join("sessions/parent.jsonl");
+        let child = root.root.path().join("sessions/child.jsonl");
+        write_codex(&parent, "parent", None);
+        write_codex(&child, "child", Some("parent"));
+        set_age(&parent, 7200);
+        set_age(&child, 60);
+        let roots = [root];
+
+        let (listed, exported) = listed_and_exported_times(&roots, "codex", "parent");
+
+        assert_eq!(listed, modified(&child));
+        assert_eq!(exported, listed);
     }
 
     #[test]

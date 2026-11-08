@@ -672,6 +672,38 @@ async fn an_intact_older_copy_of_the_same_listing_skips_the_export() {
 }
 
 #[tokio::test]
+async fn a_recent_claude_copy_skips_the_export_only_after_a_later_listing() {
+    let updated = 2_000_000_000;
+    let temp = tempfile::tempdir().unwrap();
+    let transcript = b"{}\n";
+    let mut manifest = store_manifest("claude-code", "synthetic", &[(transcript, None)]);
+    manifest.session.updated_at = Some(updated);
+    let (primary, _) = import_store_bundle(temp.path(), &manifest, &[transcript]).await;
+    let generation = temp.path().join("generation");
+    let store = Store::open_in_memory(temp.path()).unwrap();
+    let record = cached_record(&primary);
+    store_cached(&store, &record, &generation, &["claude-code"]);
+    // The age of the session does not matter.
+    let now = updated + 1;
+
+    // A copy without a listing time exports again.
+    assert!(!settled_copy(&store, &record, &manifest.session, now));
+    // A listing in the same second as the last change can miss a later write.
+    confirm_listing(&generation, updated).unwrap();
+    assert!(!settled_copy(&store, &record, &manifest.session, now));
+    confirm_listing(&generation, updated + 1).unwrap();
+    assert!(settled_copy(&store, &record, &manifest.session, now));
+
+    // A new modification time exports again.
+    let mut changed = manifest.session.clone();
+    changed.updated_at = Some(updated + 1);
+    assert!(!settled_copy(&store, &record, &changed, now));
+    // An incomplete copy exports again.
+    fs::write(&primary, b"").unwrap();
+    assert!(!settled_copy(&store, &record, &manifest.session, now));
+}
+
+#[tokio::test]
 async fn an_imported_junie_journal_publishes_its_usage() {
     let temp = tempfile::tempdir().unwrap();
     let session_id = "session-261015-120000-syn1";

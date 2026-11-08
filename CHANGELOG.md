@@ -45,6 +45,12 @@ CI changes, and documentation that no user acts on stay out — see
   each restart made unchanged session files look changed, so antiburn retried
   them in a loop and then marked them as failed. Codex usage history is also
   no longer read again from the start after each restart.
+- A remote host with many recent Claude Code or Codex sessions no longer gets
+  an SSH connection for each of them in every scan. A scan now lists the
+  sessions with their last change and copies only the sessions that changed.
+  Before, a busy host could get tens of thousands of connections a day, and a
+  slow reply made a session fail to sync. Update the helper on each host, so
+  that a change to a subagent alone also syncs.
 - A remote host with many recent Claude Code sessions no longer hides its Codex
   sessions. The helper now reads the newest sessions of both agents first, and
   a Codex session export no longer fails on a host with many recent threads.

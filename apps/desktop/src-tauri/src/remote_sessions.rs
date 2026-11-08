@@ -1205,6 +1205,7 @@ pub(crate) async fn perform_scan(
                             session,
                             lookback_secs,
                             platform,
+                            listed_at: snapshot.collected_at,
                         },
                         store,
                     )

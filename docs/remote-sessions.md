@@ -123,9 +123,18 @@ history-window field triggers the seven-day fallback. Settings retains a host
 warning that the helper lists only seven days and needs an update for longer
 history. A later accepted listing clears the warning. Timeouts, SSH failures,
 and invalid listings remain scan errors and do not retry with seven days. A
-session with no activity in the last seven days is not exported again while its
-cached copy is intact and its listing entry (title, folder, surface, and
-modification time) does not change. Directory-entry, candidate, preview-byte,
+scan has two stages. First it lists the sessions with their last change, then
+it exports only the sessions that differ from the cached copy. For Claude Code
+and Codex, the last change is the newest modification time of the transcript,
+its subagent transcripts and sidecars, its Codex child threads, and its Claude
+Code fork parent. A Claude Code or Codex session is not exported again while its
+cached copy is intact, its listing entry (title, folder, surface, and last
+change) does not change, and the copy comes from a listing that started after
+that change. A session that changes in the same second as its listing is
+exported once more. A helper older than this rule lists only the transcript's
+modification time, so a change to a subagent file alone arrives with the next
+change to the transcript. Other agents are exported again in each scan until
+the session has no activity in the last seven days. Directory-entry, candidate, preview-byte,
 and elapsed-time budgets also bound discovery work, so a crowded store can
 return a truncated result. The helper examines Claude Code and Codex transcripts
 newest first across both agents, so a truncated result drops the oldest

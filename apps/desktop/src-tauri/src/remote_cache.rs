@@ -263,18 +263,52 @@ fn bundle_intact(dir: &Path, manifest: &BundleManifest) -> bool {
     })
 }
 
-/// True when the cache holds an intact copy of a listed session that had no
-/// activity in the default window. A long history window lists many such
-/// sessions, and they seldom change, so a scan does not export them again.
-/// A change to the listing entry, such as a new modification time, still
-/// causes an export.
+/// The file in a cached generation that holds the remote listing time of the
+/// scan that last confirmed the copy.
+const LISTED_AT_FILE: &str = "listed-at";
+
+/// True for agents whose listing time includes each file of the bundle.
+fn listing_covers_bundle(agent: &str) -> bool {
+    matches!(agent, "claude-code" | "codex")
+}
+
+fn confirmed_listing(dir: &Path) -> Option<i64> {
+    fs::read_to_string(dir.join(LISTED_AT_FILE))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn confirm_listing(dir: &Path, listed_at: i64) -> Result<()> {
+    fs::write(dir.join(LISTED_AT_FILE), listed_at.to_string())?;
+    Ok(())
+}
+
+/// True when the cache holds an intact copy of a listed session, so a scan
+/// does not export it again. A change to the listing entry, such as a new
+/// modification time, always causes an export.
+///
+/// For Claude Code and Codex, the listing time includes the subagent files,
+/// so an equal entry is sufficient. The copy must also come from a listing
+/// that started after the last change, because a change in the same second
+/// can come after the read. Other agents export again until the session has
+/// no activity in the default window.
 fn settled_copy(store: &Store, record: &SessionRecord, session: &RemoteSession, now: i64) -> bool {
-    session
-        .updated_at
-        .is_some_and(|updated| updated < now.saturating_sub(antiburn_remote::LOOKBACK_SECS))
-        && manifest_for(store, record).is_ok_and(|(dir, manifest)| {
-            manifest.session == *session && bundle_intact(&dir, &manifest)
-        })
+    let Some(updated) = session.updated_at else {
+        return false;
+    };
+    let Ok((dir, manifest)) = manifest_for(store, record) else {
+        return false;
+    };
+    if manifest.session != *session || !bundle_intact(&dir, &manifest) {
+        return false;
+    }
+    if listing_covers_bundle(&session.agent) {
+        confirmed_listing(&dir).is_some_and(|listed_at| updated < listed_at)
+    } else {
+        updated < now.saturating_sub(antiburn_remote::LOOKBACK_SECS)
+    }
 }
 
 /// One session from a listing, with the history window of that listing.
@@ -283,6 +317,8 @@ pub struct ListedSession<'a> {
     pub platform: &'a str,
     pub session: &'a RemoteSession,
     pub lookback_secs: Option<i64>,
+    /// The remote time of the listing.
+    pub listed_at: i64,
 }
 
 pub async fn sync_session(
@@ -298,6 +334,7 @@ pub async fn sync_session(
         platform,
         session,
         lookback_secs,
+        listed_at,
     } = listed;
     let key = SessionKey::for_origin(&session.agent, &session.session_id, None, Some(host_id))
         .map_err(anyhow::Error::msg)?;
@@ -398,6 +435,7 @@ pub async fn sync_session(
                 bundle_intact(&old_dir, &old_manifest),
                 "Cached transcript is incomplete; remove and re-add the host to resync"
             );
+            confirm_listing(&old_dir, listed_at)?;
             fs::remove_dir_all(&staging)?;
             return Ok(SyncResult::Unchanged);
         }
@@ -405,6 +443,7 @@ pub async fn sync_session(
             crate::remote_sync::is_current(app, host_id, scan_generation),
             "scan cancelled"
         );
+        confirm_listing(&staging, listed_at)?;
         let staged_size = cache_size(&staging)?;
         ensure!(
             staging_before.saturating_add(staged_size) <= STAGING_LIMIT_BYTES,
