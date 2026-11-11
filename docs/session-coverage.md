@@ -18,7 +18,15 @@ not a `LiveUsageSource`: live usage repeats limits only, and the estimate
 payload stays free of limits. Credentials stay in memory, go only to
 `https://api2.cursor.sh`, and are never logged or stored. The reader uses the
 Cursor IDE access token from this Mac's `state.vscdb` (`cursorAuth/accessToken`)
-and never reads or refreshes `cursorAuth/refreshToken`.
+and never reads or refreshes `cursorAuth/refreshToken`. Cursor 3.8.11 stores
+that value encrypted as `cursor-safe-storage:v1:<ciphertext>`, and the reader
+cannot decrypt it. When the IDE token is absent, unreadable, or expired, the
+reader on macOS uses the Cursor CLI access token instead: the login Keychain
+item with service `cursor-access-token` and account `cursor-user`, as written
+by Cursor CLI 2026.11.05. `security find-generic-password` reads the item, so
+macOS can ask the user to allow the read. The reader never reads
+`cursor-refresh-token`. The CLI token must be a JWT with an expiry, like the
+IDE token. Linux and Windows read only the IDE token.
 
 The private, undocumented Connect endpoint
 `POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetFilteredUsageEvents`
@@ -1621,7 +1629,7 @@ that folder. The listing takes the title and CWD from the host's
 `summary.json` or `index.jsonl`; the copy does not include those files. Cursor
 CLI transcripts carry no usage. With **Read Cursor account usage** enabled,
 remote Cursor sessions can still show tokens and recorded cost when this Mac's
-Cursor IDE login returns matching account events for their conversation IDs;
+Cursor login returns matching account events for their conversation IDs;
 see [Cursor account usage](#cursor-account-usage).
 The desktop distinguishes hosts with immutable IDs, analyzes explicitly located
 private cache files, and keeps native and WSL discovery separate. On Windows,
@@ -2050,7 +2058,7 @@ coverage and resume round trips within that ceiling.
 | Pi          | Fork source named by the version 3 header                                                   | Removes inherited usage while retaining explicit policy state; branch links select their own state | Fork ancestry is not delegation. Unresolved ownership remains partial.                                                                                                                                                                        |
 | Pi          | Official example-extension nested `toolResult` messages in the session                      | Passive parsing of actual worker models and native call identity                                   | Finding-only; no installation or execution of the extension, no clean for arbitrary extension output.                                                                                                                                         |
 | Cursor      | Chat metadata, workspace metadata, and paired `state.vscdb` databases                       | Used during synthesis                                                                              | Fingerprint every contributing source and preserve structured data instead of display-only text.                                                                                                                                              |
-| Cursor      | Account usage via this Mac's Cursor IDE login (`GetFilteredUsageEvents`)                    | Opt-in Overview and session attribution of tokens and recorded cost; not session evidence          | Private undocumented endpoint; keep only the reviewed event fields; no cache-write tokens; model `default` for Auto; join on `conversationId`; unmatched rows stay account-level. See [Cursor account usage](#cursor-account-usage).          |
+| Cursor      | Account usage via this Mac's Cursor login (`GetFilteredUsageEvents`)                        | Opt-in Overview and session attribution of tokens and recorded cost; not session evidence          | Private undocumented endpoint; keep only the reviewed event fields; no cache-write tokens; model `default` for Auto; join on `conversationId`; unmatched rows stay account-level. See [Cursor account usage](#cursor-account-usage).          |
 | Antigravity | Sibling brain transcript                                                                    | Paired and fingerprinted with native SQLite                                                        | Preserve its tool facts and define database/transcript ownership rules.                                                                                                                                                                       |
 | Antigravity | History metadata and spawn-edge data                                                        | History enriches discovery; spawn edges do not reach evidence                                      | Prove passive provenance, fingerprinting, delegation meaning, and both models before check use.                                                                                                                                               |
 | Junie       | Session-folder `summary.json` and `~/.junie/sessions/index.jsonl`                           | Discovery metadata only: session CWD and title                                                     | Neither file is part of the source fingerprint or adds usage. `summary.json` totals can lag `events.jsonl` for an interrupted session, so `events.jsonl` stays the usage ledger.                                                              |

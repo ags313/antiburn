@@ -207,7 +207,7 @@ pub(super) mod macos_keychain {
 
     impl KeychainRead {
         /// A fixed name for this outcome. It contains no secret.
-        pub(super) fn outcome(&self) -> &'static str {
+        pub(in crate::provider_usage::live::sources) fn outcome(&self) -> &'static str {
             match self {
                 Self::Absent => "absent",
                 Self::Unreadable => "unreadable",
@@ -229,9 +229,22 @@ pub(super) mod macos_keychain {
         read
     }
 
+    /// Reads the generic-password item of another tool with the same bounds
+    /// as [`read`]. The caller logs the outcome. The outcome never contains
+    /// the secret.
+    pub fn read_item(service: &str, account: &str) -> KeychainRead {
+        item_with_exit_code(&["-s", service, "-a", account]).0
+    }
+
     fn read_with_exit_code() -> (KeychainRead, Option<i32>) {
+        item_with_exit_code(&["-s", SERVICE_NAME])
+    }
+
+    fn item_with_exit_code(selector: &[&str]) -> (KeychainRead, Option<i32>) {
         let mut child = match antiburn_local::platform::process::headless_std_command("security")
-            .args(["find-generic-password", "-s", SERVICE_NAME, "-w"])
+            .arg("find-generic-password")
+            .args(selector)
+            .arg("-w")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

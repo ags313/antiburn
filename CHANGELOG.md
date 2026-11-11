@@ -45,6 +45,10 @@ CI changes, and documentation that no user acts on stay out — see
   each restart made unchanged session files look changed, so antiburn retried
   them in a loop and then marked them as failed. Codex usage history is also
   no longer read again from the start after each restart.
+- With **Read Cursor account usage** on, Cursor usage appears again after
+  Cursor 3.8.11. That release encrypts the login that antiburn read. On a Mac,
+  antiburn now uses the login of the Cursor CLI (`cursor-agent login`) instead,
+  from the Keychain. macOS can ask you once to allow this read.
 - A remote host with many recent Claude Code or Codex sessions no longer gets
   an SSH connection for each of them in every scan. A scan now lists the
   sessions with their last change and copies only the sessions that changed.
