@@ -6,7 +6,11 @@
 //! sessions outside the scan window stay in the `source-changed` retry loop.
 //! The fork rewrites the values in place at open, without a numbered
 //! migration. A rewritten value does not match again, so the step is
-//! idempotent.
+//! idempotent. The step reads each fingerprint column, and in
+//! `source_resume` the column comes after a large snapshot blob, so a cold
+//! read takes many seconds. Thus a marker table records a completed step,
+//! and a later open does not read the columns again. The current build writes
+//! only values without a device number.
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
@@ -24,10 +28,24 @@ const FINGERPRINT_COLUMNS: [(&str, &str); 5] = [
     ("source_resume", "source_fingerprint"),
 ];
 
+/// The table that records a completed step.
+#[cfg(unix)]
+const DONE_MARKER: &str =
+    "CREATE TABLE IF NOT EXISTS fork_legacy_device_done (id INTEGER PRIMARY KEY) STRICT;";
+
 #[cfg(unix)]
 pub(super) fn drop_legacy_devices(connection: &mut Connection) -> Result<()> {
     use antiburn_local::discovery::source_version::without_legacy_device;
 
+    let done: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'fork_legacy_device_done')",
+        [],
+        |row| row.get(0),
+    )?;
+    if done {
+        return Ok(());
+    }
     let transaction = connection.transaction()?;
     for (table, column) in FINGERPRINT_COLUMNS {
         let rows = {
@@ -64,6 +82,7 @@ pub(super) fn drop_legacy_devices(connection: &mut Connection) -> Result<()> {
           WHERE source_identity GLOB '[0-9]*:[0-9]*'",
         [],
     )?;
+    transaction.execute_batch(DONE_MARKER)?;
     transaction.commit()?;
     Ok(())
 }
@@ -150,6 +169,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory(directory.path()).unwrap();
         let mut connection = store.lock();
+        // The store open already ran the step on the empty database.
+        connection
+            .execute_batch("DROP TABLE fork_legacy_device_done")
+            .unwrap();
         insert(&connection, "ready", "ready", None);
         insert(&connection, "stuck", "failed", Some("source-changed"));
         insert(&connection, "missing", "failed", Some("source-missing"));
@@ -166,6 +189,13 @@ mod tests {
 
         drop_legacy_devices(&mut connection).unwrap();
         drop_legacy_devices(&mut connection).unwrap();
+        // The marker stops a later open from reading the columns again.
+        insert(&connection, "later", "ready", None);
+        drop_legacy_devices(&mut connection).unwrap();
+        assert_eq!(
+            row(&connection, "later"),
+            (LEGACY.into(), LEGACY.into(), "ready".into(), 4)
+        );
 
         assert_eq!(
             row(&connection, "ready"),
