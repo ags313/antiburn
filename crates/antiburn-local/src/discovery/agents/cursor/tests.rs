@@ -1067,6 +1067,52 @@ async fn test_cursor_discovers_agent_transcript_and_recovers_metadata() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn cursor_agent_workspace_key_resolves_after_protected_folder_grant() {
+    let home = TempDir::new().unwrap();
+    let repo_root = home.path().join("Documents").join("repo");
+    tokio::fs::create_dir_all(&repo_root).await.unwrap();
+
+    let transcript = home
+        .path()
+        .join(".cursor")
+        .join("projects")
+        .join(encode_cursor_project_workspace_key(&repo_root))
+        .join("agent-transcripts")
+        .join("abc")
+        .join("abc.jsonl");
+    tokio::fs::create_dir_all(transcript.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(
+        &transcript,
+        "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
+    )
+    .await
+    .unwrap();
+    let now = current_unix_epoch_for_tests();
+
+    let no_grants = ProjectAccessSnapshot::new(HashSet::new(), || true);
+    let before_grant =
+        discover_recent_in_with_project_access(home.path(), now, 3600, None, &no_grants).await;
+    let SessionSource::Inline { content, .. } = &before_grant[0].source else {
+        panic!("expected the inline Cursor transcript");
+    };
+    assert_eq!(scanner::parse_session_metadata_str(content).cwd, None);
+
+    let granted = ProjectAccessSnapshot::new(HashSet::from(["Documents".to_owned()]), || true);
+    let after_grant =
+        discover_recent_in_with_project_access(home.path(), now, 3600, None, &granted).await;
+    let SessionSource::Inline { content, .. } = &after_grant[0].source else {
+        panic!("expected the inline Cursor transcript");
+    };
+    assert_eq!(
+        scanner::parse_session_metadata_str(content).cwd.as_deref(),
+        Some(repo_root.to_string_lossy().as_ref())
+    );
+}
+
 #[test]
 fn cursor_agent_subagent_path_proves_parent_session() {
     let child = Path::new(

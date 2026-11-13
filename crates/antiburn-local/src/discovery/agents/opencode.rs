@@ -377,7 +377,7 @@ fn database_paths_for_root_config(
             .collect());
     }
     let mut paths = vec![root.join("opencode.db")];
-    let entries = match std::fs::read_dir(root) {
+    let entries = match crate::discovery::source_fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
         Err(_) => return Err("directory"),
@@ -428,7 +428,11 @@ fn native_database_paths_with_failures() -> (Vec<PathBuf>, bool) {
     let mut failed = false;
     for root in data_roots() {
         match database_paths_for_root(&root) {
-            Ok(found) => paths.extend(found),
+            Ok(found) => {
+                let (admitted, deferred) = admit_database_paths(found);
+                paths.extend(admitted);
+                failed |= deferred;
+            }
             Err(stage) => {
                 tracing::warn!(event = "opencode_sqlite_paths_failed", stage);
                 failed = true;
@@ -436,6 +440,19 @@ fn native_database_paths_with_failures() -> (Vec<PathBuf>, bool) {
         }
     }
     (paths, failed)
+}
+
+fn admit_database_paths(paths: impl IntoIterator<Item = PathBuf>) -> (Vec<PathBuf>, bool) {
+    let mut admitted = Vec::new();
+    let mut failed = false;
+    for path in paths {
+        if crate::discovery::source_path_access(&path).is_allowed() {
+            admitted.push(path);
+        } else {
+            failed = true;
+        }
+    }
+    (admitted, failed)
 }
 
 /// Read recent assistant-message records straight from the OpenCode store,
@@ -454,7 +471,10 @@ pub async fn recent_assistant_message_records(cutoff: i64, limit: usize) -> Vec<
         };
         let mut saw_db = false;
         for db_path in paths {
-            if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
+            if !crate::discovery::source_fs::asynchronous::try_exists(&db_path)
+                .await
+                .unwrap_or(false)
+            {
                 continue;
             }
             saw_db = true;
@@ -504,7 +524,9 @@ async fn recent_assistant_messages_from_json(
 }
 
 fn query_recent_assistant_messages_from_db(path: &Path, cutoff: i64, limit: usize) -> Vec<String> {
-    let Ok(conn) = crate::source_database::open(path) else {
+    let Ok(conn) = crate::discovery::source_fs::admit_native_database(path)
+        .and_then(|_| crate::source_database::open(path))
+    else {
         return Vec::new();
     };
     let Ok(mut statement) = conn.prepare(
@@ -705,7 +727,7 @@ fn cli_session_metadata_query(cutoff: i64) -> String {
 /// Paths are built in the Linux namespace and never interpolated through a shell.
 async fn opencode_executable(info: &WslEnvironmentInfo) -> String {
     for relative in [".opencode/bin/opencode", ".local/bin/opencode"] {
-        if tokio::fs::metadata(info.context.home.join(relative))
+        if crate::discovery::source_fs::asynchronous::metadata(info.context.home.join(relative))
             .await
             .is_ok()
         {
@@ -2469,7 +2491,7 @@ async fn collect_recent_json_files(root: &Path, cutoff: i64) -> Vec<JsonCandidat
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
-        let mut entries = match tokio::fs::read_dir(&dir).await {
+        let mut entries = match crate::discovery::source_fs::asynchronous::read_dir(&dir).await {
             Ok(entries) => entries,
             Err(_) => continue,
         };
@@ -2502,7 +2524,9 @@ async fn find_session_json_file(root: &Path, session_id: &str) -> Option<PathBuf
     let expected_file_name = format!("{session_id}.json");
 
     while let Some(dir) = stack.pop() {
-        let mut entries = tokio::fs::read_dir(&dir).await.ok()?;
+        let mut entries = crate::discovery::source_fs::asynchronous::read_dir(&dir)
+            .await
+            .ok()?;
 
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
@@ -2528,12 +2552,16 @@ async fn find_session_json_file(root: &Path, session_id: &str) -> Option<PathBuf
 }
 
 async fn read_json(path: &Path) -> Option<Value> {
-    let content = tokio::fs::read_to_string(path).await.ok()?;
+    let content = crate::discovery::source_fs::asynchronous::read_to_string(path)
+        .await
+        .ok()?;
     serde_json::from_str::<Value>(&content).ok()
 }
 
 async fn file_mtime_epoch(path: &Path) -> Option<i64> {
-    let metadata = tokio::fs::metadata(path).await.ok()?;
+    let metadata = crate::discovery::source_fs::asynchronous::metadata(path)
+        .await
+        .ok()?;
     let modified = metadata.modified().ok()?;
     let duration = modified.duration_since(UNIX_EPOCH).ok()?;
     Some(duration.as_secs() as i64)

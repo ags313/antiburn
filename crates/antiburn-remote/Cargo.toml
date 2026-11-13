@@ -30,3 +30,6 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 async-trait = "0.1"
 tempfile = "3"
 time = "0.3"
+
+[patch.crates-io]
+libsqlite3-sys = { path = "../antiburn-local/vendor/libsqlite3-sys" }

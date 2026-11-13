@@ -1,12 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
-use antiburn_local::discovery::DiscoveryBatch;
+use antiburn_local::discovery::{DiscoveryBatch, ProjectAccessSnapshot};
 use tokio::sync::mpsc;
 use tokio::task::Id;
 
-use super::prepare::{PreparationOutcome, PreparedDescription, prepare_description_with_read};
+use super::prepare::{
+    PreparationOutcome, PreparationPolicy, PreparedDescription, prepare_description_with_read,
+};
 use super::queue::{QueueInput, ScanQueue, WorkOrigin};
 use super::*;
+use crate::store::{RepositoryPolicyPublishOutcome, RepositoryPolicySnapshot};
 
 const BATCH_SIZE: usize = 64;
 const PASS_PENDING_LIMIT: usize = 1024;
@@ -35,14 +38,10 @@ pub(super) async fn recover_fingerprints(app: &AppHandle) -> anyhow::Result<bool
 
 struct OwnerPolicy {
     home: PathBuf,
-    ignored: HashSet<String>,
+    repository_policy: RepositoryPolicySnapshot,
     cutoff: Option<i64>,
-    gate_settings: Arc<RepoGateSettings>,
-    /// True when the pass moves the progress fields of the scan status.
+    include_non_repo_folders: bool,
     progress: bool,
-    /// True for a full pass over the current window. Its held CWDs replace
-    /// the stored set. See [`ScanController::record_consent_held`].
-    full_current_window: bool,
     refresh_repositories: bool,
     #[cfg(test)]
     hooks: Option<Arc<prepare::PreparationHooks>>,
@@ -74,10 +73,9 @@ pub(super) struct PassInputs {
     pub since_secs: i64,
     pub history: bool,
     pub progress: bool,
-    pub full_current_window: bool,
     pub home: PathBuf,
-    pub ignored: HashSet<String>,
-    pub gate_settings: RepoGateSettings,
+    pub repository_policy: RepositoryPolicySnapshot,
+    pub include_non_repo_folders: bool,
     pub refresh_repositories: bool,
 }
 
@@ -136,11 +134,10 @@ pub(super) async fn refresh_titles(
     let (_live_sender, live) = mpsc::channel(1);
     let policy = OwnerPolicy {
         home: home_dir().unwrap_or_default(),
-        ignored: HashSet::new(),
+        repository_policy: store.repository_policy_snapshot()?,
         cutoff: None,
-        gate_settings: Arc::new(RepoGateSettings::from_store(&store)),
+        include_non_repo_folders: store.settings_snapshot().include_non_repo_folders,
         progress: false,
-        full_current_window: false,
         refresh_repositories: false,
         #[cfg(test)]
         hooks: None,
@@ -167,29 +164,32 @@ pub(super) async fn discover_and_run(
         since_secs,
         history,
         progress,
-        full_current_window,
         home,
-        ignored,
-        gate_settings,
+        repository_policy,
+        include_non_repo_folders,
         refresh_repositories,
     } = inputs;
     let (sender, receiver) = mpsc::channel(2);
     let scope = scope.clone();
     let mut discovery = JoinSet::new();
+    let access = project_access_snapshot(writer.store, &repository_policy);
     discovery.spawn(async move {
         match scope {
             PassScope::Full => {
                 Explorers::DISK
-                    .discover_recent_batches(now, since_secs, BATCH_SIZE, sender)
+                    .discover_recent_batches_with_project_access(
+                        now, since_secs, BATCH_SIZE, access, sender,
+                    )
                     .await
             }
             PassScope::Agents(agents) => {
                 Explorers::DISK
-                    .discover_recent_batches_for_agents(
+                    .discover_recent_batches_for_agents_with_project_access(
                         &agents.into_iter().collect::<Vec<_>>(),
                         now,
                         since_secs,
                         BATCH_SIZE,
+                        access,
                         sender,
                     )
                     .await
@@ -199,11 +199,10 @@ pub(super) async fn discover_and_run(
     let (_live_sender, live_receiver) = mpsc::channel(2);
     let policy = OwnerPolicy {
         home,
-        ignored,
+        repository_policy,
         cutoff: (!history).then_some(now - CURRENT_WINDOW_SECS),
-        gate_settings: Arc::new(gate_settings),
+        include_non_repo_folders,
         progress,
-        full_current_window,
         refresh_repositories,
         #[cfg(test)]
         hooks: None,
@@ -223,11 +222,10 @@ pub(super) async fn refresh_logs(
     let store = app.state::<Store>();
     let policy = OwnerPolicy {
         home: home_dir().unwrap_or_default(),
-        ignored: store.repository_policy_snapshot()?.ignored_paths,
+        repository_policy: store.repository_policy_snapshot()?,
         cutoff: Some(unix_now() - CURRENT_WINDOW_SECS),
-        gate_settings: Arc::new(RepoGateSettings::from_store(&store)),
+        include_non_repo_folders: store.settings_snapshot().include_non_repo_folders,
         progress: false,
-        full_current_window: false,
         refresh_repositories: false,
         #[cfg(test)]
         hooks: None,
@@ -310,7 +308,9 @@ async fn run_with_titles(
     let mut finite_keys = HashSet::new();
     let mut selected: HashMap<SessionKey, (Option<i64>, String, bool)> = HashMap::new();
     let mut gate = GateCounts::default();
-    let mut consent_held = BTreeSet::new();
+    let repository_policy = Arc::new(policy.repository_policy.clone());
+    let mut project_deferrals = HashMap::new();
+    let project_access = project_access_snapshot(writer.store, &repository_policy);
     let mut probes = JoinSet::new();
     let mut hints = JoinSet::new();
     let mut probing = BTreeSet::new();
@@ -391,85 +391,71 @@ async fn run_with_titles(
                 Err(error) => writer.fail(error),
             }
         }
-        let can_read = app.is_none_or(|app| {
-            !policy.progress || app.state::<FirstRunGate>().stage() >= FirstRunStage::Sessions
-        });
-        if can_read {
-            while let Some(dispatch) = queue.dispatch() {
-                let work = dispatch.work;
-                ::tracing::trace!(event = "scan_preparation_dispatched", lane = ?dispatch.lane,
+        while let Some(dispatch) = queue.dispatch() {
+            let work = dispatch.work;
+            ::tracing::trace!(event = "scan_preparation_dispatched", lane = ?dispatch.lane,
                     generation = work.generation, ticket = work.ticket,
                     queue_wait_ms = work.enqueued_at.elapsed().as_millis() as u64,
                     dirty_wait_ms = work.dirtied_at.elapsed().as_millis() as u64,
                      activity = work.activity);
-                ::tracing::debug!(
-                    event = "scan_admission_dispatched",
-                    agent = work.payload.agent_type.slug(),
-                    queue_wait_ms = work.enqueued_at.elapsed().as_millis() as u64,
-                    activity_age_secs =
-                        work.activity.map(|at| unix_now().saturating_sub(at).max(0))
-                );
-                let activity_key = SessionActivityKey::new(
-                    work.payload.environment.key(),
-                    work.payload.agent_type.slug(),
-                    work.payload.source_label(),
-                );
-                let previous = match writer
-                    .store
-                    .session_records_for_activity_keys(std::slice::from_ref(&activity_key))
-                {
-                    Ok(records) => records.get(&activity_key).cloned(),
-                    Err(error) => {
-                        writer.fail(error);
-                        queue.release(&work.key, work.generation);
-                        continue;
-                    }
-                };
-                let previous_map = previous
-                    .iter()
-                    .map(|record| (activity_key.clone(), record.clone()))
-                    .collect();
+            ::tracing::debug!(
+                event = "scan_admission_dispatched",
+                agent = work.payload.agent_type.slug(),
+                queue_wait_ms = work.enqueued_at.elapsed().as_millis() as u64,
+                activity_age_secs = work.activity.map(|at| unix_now().saturating_sub(at).max(0))
+            );
+            let activity_key = SessionActivityKey::new(
+                work.payload.environment.key(),
+                work.payload.agent_type.slug(),
+                work.payload.source_label(),
+            );
+            let previous = match writer
+                .store
+                .session_records_for_activity_keys(std::slice::from_ref(&activity_key))
+            {
+                Ok(records) => records.get(&activity_key).cloned(),
+                Err(error) => {
+                    writer.fail(error);
+                    queue.release(&work.key, work.generation);
+                    continue;
+                }
+            };
+            let previous_map = previous
+                .iter()
+                .map(|record| (activity_key.clone(), record.clone()))
+                .collect();
+            #[cfg(test)]
+            let hooks = policy.hooks.clone();
+            let handle = tasks.spawn(async move {
                 #[cfg(test)]
-                let hooks = policy.hooks.clone();
-                let handle = tasks.spawn(async move {
-                    #[cfg(test)]
-                    if let Some(hooks) = hooks {
-                        hooks
-                            .wait(&work.payload, prepare::PreparationStage::Identity)
-                            .await;
-                    }
-                    let description = prepare_description_logs(vec![work.payload], &previous_map)
-                        .await
-                        .expect("identity preparation has no store writes")
-                        .pop();
-                    PreparedTask::Identity(description, previous)
-                });
-                owners.insert(
-                    handle.id(),
-                    TaskOwner {
-                        key: work.key,
-                        generation: work.generation,
-                        origin: work.origin,
-                        activity: work.activity,
-                        session_key: None,
-                    },
-                );
-            }
+                if let Some(hooks) = hooks {
+                    hooks
+                        .wait(&work.payload, prepare::PreparationStage::Identity)
+                        .await;
+                }
+                let description = prepare_description_logs(vec![work.payload], &previous_map)
+                    .await
+                    .expect("identity preparation has no store writes")
+                    .pop();
+                PreparedTask::Identity(description, previous)
+            });
+            owners.insert(
+                handle.id(),
+                TaskOwner {
+                    key: work.key,
+                    generation: work.generation,
+                    origin: work.origin,
+                    activity: work.activity,
+                    session_key: None,
+                },
+            );
         }
         if finite_closed && !queue.has_pass_work() && titles.is_closed() && titles.is_empty() {
             if !finalizing {
                 finalizing = true;
-                // A session held in an ungranted protected folder adds no
-                // row, so `list_changed` does not see it. The refresh puts its
-                // folder on the list that asks for access, so a change in the
-                // held CWDs refreshes too.
-                let consent_held_changed = app.is_some_and(|app| {
-                    app.state::<ScanController>()
-                        .record_consent_held(&consent_held, policy.full_current_window)
-                });
-                if let Some(app) = app.filter(|_| {
-                    policy.refresh_repositories || writer.list_changed || consent_held_changed
-                }) {
+                if let Some(app) =
+                    app.filter(|_| policy.refresh_repositories || writer.list_changed)
+                {
                     let app = app.clone();
                     finalizers.spawn(async move { repositories::refresh(&app).await });
                 }
@@ -555,7 +541,7 @@ async fn run_with_titles(
                     _ => {}
                 }
             }
-            batch = finite.recv(), if !finite_closed && (queue.pending_len() <= PASS_PENDING_LIMIT - BATCH_SIZE || !can_read) => {
+            batch = finite.recv(), if !finite_closed && queue.pending_len() <= PASS_PENDING_LIMIT - BATCH_SIZE => {
                 match batch {
                     Some(batch) => {
                         found += batch.candidates.len();
@@ -614,7 +600,7 @@ async fn run_with_titles(
                 match result {
                     Ok(_) => {
                         if dirty_agents.remove(&agent) {
-                            spawn_agent_probe(&mut probes, &mut probing, &mut probe_agents, agent, probe_sender.clone());
+                            spawn_agent_probe(&mut probes, &mut probing, &mut probe_agents, agent, project_access.clone(), probe_sender.clone());
                         }
                     }
                     Err(error) => {
@@ -627,7 +613,7 @@ async fn run_with_titles(
                 match result {
                     Some(Ok(agents)) => for agent in agents {
                         if probing.contains(&agent) { dirty_agents.insert(agent); }
-                        else { spawn_agent_probe(&mut probes, &mut probing, &mut probe_agents, agent, probe_sender.clone()); }
+                        else { spawn_agent_probe(&mut probes, &mut probing, &mut probe_agents, agent, project_access.clone(), probe_sender.clone()); }
                     },
                     Some(Err(error)) => {
                         ::tracing::warn!(event = "scan_live_hint_failed", error = %error);
@@ -673,19 +659,25 @@ async fn run_with_titles(
                             writer.outcomes.insert(description.key.clone(), AttemptOutcome::Failed);
                         }
                         let home = policy.home.clone();
-                        let ignored = policy.ignored.clone();
+                        let repository_policy = repository_policy.clone();
+                        let store = writer.store.clone();
                         let cutoff = match owner.origin {
                             WorkOrigin::Pass => policy.cutoff,
                             WorkOrigin::Live => Some(unix_now() - CURRENT_WINDOW_SECS),
                             WorkOrigin::Recovery => None,
                         };
-                        let gate_settings = policy.gate_settings.clone();
+                        let include = policy.include_non_repo_folders;
                         let key = description.key.clone();
                         owner.session_key = Some(key.clone());
                         #[cfg(test)]
                         let hooks = policy.hooks.clone();
                         let handle = tasks.spawn(async move {
-                            PreparedTask::Ready(prepare_description_with_read(description, home, ignored, previous, cutoff, gate_settings,
+                            let policy = PreparationPolicy {
+                                store: &store,
+                                repository: &repository_policy,
+                                include_non_repo_folders: include,
+                            };
+                            PreparedTask::Ready(prepare_description_with_read(description, home, previous, cutoff, policy,
                                 #[cfg(test)] hooks,
                             ).await, guard, key)
                         });
@@ -704,7 +696,15 @@ async fn run_with_titles(
                         if let Some(previous) = prepared.previous {
                             writer.previous_records.insert(SessionActivityKey::new(previous.key.environment_key.clone(), previous.key.agent.clone(), previous.source_label.clone()), previous);
                         }
-                        let parsed_key = match &prepared.outcome {
+                        let (outcome, deferral) = match prepared.outcome {
+                            PreparationOutcome::ProjectDeferred { record, changed, path, access } => (
+                                PreparationOutcome::Accepted { record, changed },
+                                repositories::reportable_project_deferral(&path, access).map(Some),
+                            ),
+                            outcome @ PreparationOutcome::Accepted { .. } => (outcome, Some(None)),
+                            outcome => (outcome, None),
+                        };
+                        let parsed_key = match &outcome {
                             PreparationOutcome::Accepted { record, .. } => Some(&record.key),
                             PreparationOutcome::Rejected(key) => Some(key),
                             _ => None,
@@ -713,23 +713,29 @@ async fn run_with_titles(
                             writer.fail(anyhow::anyhow!("Session identity changed during preparation"));
                         } else {
                             if owner.origin == WorkOrigin::Pass {
-                                gate += prepared.gate;
+                                gate.missing_cwd += prepared.gate.missing_cwd;
+                                gate.ignored += prepared.gate.ignored;
+                                gate.subagent += prepared.gate.subagent;
+                                gate.no_repo += prepared.gate.no_repo;
+                                gate.folder += prepared.gate.folder;
                             }
-                            match prepared.outcome {
+                            match outcome {
                                 PreparationOutcome::Accepted { record, changed } => {
                                     writer.evidence_agents = agents::evidence_cohort().iter().copied().filter(|agent| *agent == record.key.agent).collect();
                                     let started = Instant::now();
-                                    let committed = writer.commit(&guard, &record, changed).await;
+                                    let committed = writer.commit_with_incarnation(&guard, &record, changed).await;
+                                    if let (Some(incarnation), Some(deferral)) = (committed, deferral)
+                                        && record.key.environment_key == "native"
+                                    {
+                                        project_deferrals.insert(record.key.clone(), (incarnation, deferral));
+                                    }
                                     ::tracing::debug!(event = "scan_metadata_commit_finished", agent = record.key.agent,
-                                        elapsed_ms = started.elapsed().as_millis() as u64, committed,
+                                        elapsed_ms = started.elapsed().as_millis() as u64, committed = committed.is_some(),
                                         activity_age_secs = record.updated_at_epoch.map(|at| unix_now().saturating_sub(at).max(0)));
                                 }
                                 PreparationOutcome::Rejected(key) => { writer.delete_rejected(&guard, &key).await; }
                                 PreparationOutcome::Deferred(error) => writer.fail(anyhow::anyhow!(error)),
-                                PreparationOutcome::Held { consent_cwd } => {
-                                    consent_held.extend(consent_cwd);
-                                    if owner.origin == WorkOrigin::Pass { writer.outcomes.remove(&key); }
-                                }
+                                PreparationOutcome::ProjectDeferred { .. } => unreachable!(),
                                 PreparationOutcome::OutsideWindow | PreparationOutcome::Skipped => {
                                     if owner.origin == WorkOrigin::Pass { writer.outcomes.remove(&key); }
                                 }
@@ -760,13 +766,13 @@ async fn run_with_titles(
                         if now >= next_probe {
                             next_probe = now + Duration::from_secs(10);
                             if !probing.contains(&AgentKind::OpenCode) {
-                                spawn_agent_probe(&mut probes, &mut probing, &mut probe_agents, AgentKind::OpenCode, probe_sender.clone());
+                                spawn_agent_probe(&mut probes, &mut probing, &mut probe_agents, AgentKind::OpenCode, project_access.clone(), probe_sender.clone());
                             }
                         }
                     }
                     if policy.progress && last_progress.elapsed() >= READ_PROGRESS_THROTTLE {
                         let status = app.state::<ScanController>().update(|status| {
-                            if can_read { status.phase = ScanPhase::Reading; }
+                            status.phase = ScanPhase::Reading;
                             status.read = ReadProgress { completed, total: found.max(completed) };
                         });
                         let _ = app.emit(EVENT_PROGRESS, status);
@@ -811,6 +817,28 @@ async fn run_with_titles(
     for (_, owner) in owners {
         queue.release(&owner.key, owner.generation);
     }
+    #[cfg(test)]
+    if let (Some(hooks), Some(key)) = (policy.hooks.as_ref(), project_deferrals.keys().next()) {
+        hooks
+            .wait_for_label(
+                &key.session_id,
+                prepare::PreparationStage::DeferralPublication,
+            )
+            .await;
+    }
+    let mut project_deferrals_superseded = false;
+    if !project_deferrals.is_empty() && !writer.io.cancelled() {
+        match writer
+            .store
+            .publish_session_project_deferrals(repository_policy.generation, project_deferrals)
+        {
+            Ok(RepositoryPolicyPublishOutcome::Published) => {}
+            Ok(RepositoryPolicyPublishOutcome::Superseded) => {
+                project_deferrals_superseded = true;
+            }
+            Err(error) => writer.fail(error),
+        }
+    }
     let mut records = Vec::new();
     let mut changed = Vec::new();
     let mut rejected = Vec::new();
@@ -838,6 +866,7 @@ async fn run_with_titles(
         changed,
         list_changed: writer.list_changed,
         gate,
+        project_deferrals_superseded,
     }
 }
 
@@ -882,9 +911,13 @@ fn spawn_live_hints(
             let Some(agent) = AgentKind::from_slug(&record.key.agent) else {
                 continue;
             };
+            let path = PathBuf::from(record.source_label);
+            if !watch::source_path_allowed(&path) {
+                continue;
+            }
             let log = SessionLog {
                 agent_type: agent,
-                source: SessionSource::File(PathBuf::from(record.source_label)),
+                source: SessionSource::File(path),
                 updated_at: record.updated_at_epoch,
                 environment: DiscoveryEnvironment::Native,
             };
@@ -924,21 +957,36 @@ fn spawn_live_hints(
     });
 }
 
+fn project_access_snapshot(
+    store: &Store,
+    policy: &RepositoryPolicySnapshot,
+) -> ProjectAccessSnapshot {
+    let store = store.clone();
+    let generation = policy.generation;
+    ProjectAccessSnapshot::new(policy.granted_dirs.clone(), move || {
+        store
+            .repository_policy_is_current(generation)
+            .unwrap_or(false)
+    })
+}
+
 fn spawn_agent_probe(
     probes: &mut JoinSet<AgentKind>,
     probing: &mut BTreeSet<AgentKind>,
     probe_agents: &mut HashMap<Id, AgentKind>,
     agent: AgentKind,
+    access: ProjectAccessSnapshot,
     sender: mpsc::Sender<DiscoveryBatch>,
 ) {
     probing.insert(agent);
     let handle = probes.spawn(async move {
         Explorers::DISK
-            .discover_recent_batches_for_agents(
+            .discover_recent_batches_for_agents_with_project_access(
                 &[agent],
                 unix_now(),
                 CURRENT_WINDOW_SECS,
                 BATCH_SIZE,
+                access,
                 sender,
             )
             .await;

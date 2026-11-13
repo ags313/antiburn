@@ -61,10 +61,12 @@ CI changes, and documentation that no user acts on stay out — see
   Update the helper on each host to get this fix.
 - The session scan no longer stops behind a hidden macOS permission dialog
   when a session's project is in Downloads, Documents, or Desktop. Until you
-  grant antiburn access to that folder, the scan skips such a session instead
-  of asking macOS in the background. Overview and the Sessions settings then
-  ask you to allow access to that folder, also when no earlier scan saved one
-  of its sessions.
+  grant antiburn access to that folder, the scan indexes the session and waits
+  to read its project. The Sessions settings ask you to allow access to that
+  folder.
+- A session whose project folder was removed, or that recorded no folder,
+  keeps its history. With **Include folders without Git** on, it shows as a
+  folder session.
 
 ## [0.10.0] - 2026-10-14
 

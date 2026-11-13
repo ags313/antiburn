@@ -86,6 +86,7 @@
 //! the process.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -98,7 +99,10 @@ use antiburn_local::discovery::{
     session_log_read, session_source_preview, session_source_tail,
 };
 use antiburn_local::model::AgentKind;
-use antiburn_local::paths::{home_dir, ignored_paths, protected};
+use antiburn_local::paths::home_dir;
+#[cfg(test)]
+use antiburn_local::paths::ignored_paths;
+use antiburn_local::paths::protected::ProjectAccessDecision;
 use antiburn_local::platform::environment::{self, DiscoveryEnvironment};
 use antiburn_local::platform::git;
 use tauri::{AppHandle, Emitter, Manager};
@@ -108,7 +112,6 @@ use tokio::task::JoinSet;
 use crate::agents;
 use crate::analysis;
 use crate::dto::{AgentFoundCount, ReadGateCounts, ReadProgress, ScanPhase, ScanStatus};
-use crate::first_run_gate::{FirstRunGate, FirstRunStage};
 use crate::repositories;
 use crate::session_lifecycle::{self, AnonymousCover, AnonymousGen};
 use crate::storage_health::{self, checked};
@@ -174,7 +177,7 @@ pub enum ScanTrigger {
     /// A burst reached [`watch::MAX_BURST_PATHS`] and may have dropped
     /// paths, so only a full pass can be sure to cover it.
     WatcherOverflow,
-    /// A settings save that finished onboarding, widened the activity
+    /// A settings save that widened the activity
     /// window, or resumed discovery.
     SettingsTransition,
     /// A repository was included or ignored.
@@ -252,6 +255,23 @@ fn uses_history_window(trigger: &ScanTrigger) -> bool {
         trigger,
         ScanTrigger::HistoricalScan | ScanTrigger::SourceRefresh { .. }
     )
+}
+
+fn retry_superseded_project_deferrals(controller: &ScanController, trigger: &ScanTrigger) {
+    controller.request(if uses_history_window(trigger) {
+        ScanTrigger::HistoricalScan
+    } else {
+        ScanTrigger::WatcherOverflow
+    });
+}
+
+fn pass_covers_work(
+    succeeded: bool,
+    cancelled: bool,
+    project_deferrals_superseded: bool,
+    index_generation_unchanged: bool,
+) -> bool {
+    succeeded && !cancelled && !project_deferrals_superseded && index_generation_unchanged
 }
 
 /// What one pass discovers: every agent, or only a burst-named subset.
@@ -354,6 +374,7 @@ pub struct ScanController {
     /// rather than queued, because the waiting request already covers
     /// "scan again soon".
     pending_trigger: Mutex<Option<ScanTrigger>>,
+    history_dispatching: AtomicBool,
     /// The one watcher burst waiting for the scheduler loop. New bursts merge
     /// into its fixed path budgets while a pass is running.
     pending_burst: Mutex<Option<watch::WatchBurst>>,
@@ -375,11 +396,6 @@ pub struct ScanController {
     history_auto_requested_for: Mutex<Option<i32>>,
     /// True while a historical pass runs its discovery or describe phase.
     history_pass_running: AtomicBool,
-    /// The CWDs of sessions that the repository gate holds in ungranted
-    /// protected folders. A held session has no stored row, so the
-    /// repository refresh reads this set to ask for the folder. See
-    /// [`ScanController::record_consent_held`].
-    consent_held_cwds: Mutex<BTreeSet<String>>,
 }
 
 impl ScanController {
@@ -448,11 +464,39 @@ impl ScanController {
     }
 
     /// Take the pending trigger, if any, for the scheduler to run next.
-    fn take_pending_trigger(&self) -> Option<ScanTrigger> {
-        self.pending_trigger
+    fn take_pending_trigger(&self) -> (Option<ScanTrigger>, Option<HistoryDispatch<'_>>) {
+        let mut pending = self
+            .pending_trigger
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let trigger = pending.take();
+        let dispatch = matches!(trigger, Some(ScanTrigger::HistoricalScan)).then(|| {
+            self.history_dispatching.store(true, Ordering::SeqCst);
+            HistoryDispatch(self)
+        });
+        (trigger, dispatch)
+    }
+
+    fn history_discovery_active(&self) -> bool {
+        let pending = self
+            .pending_trigger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        matches!(*pending, Some(ScanTrigger::HistoricalScan))
+            || self.history_dispatching.load(Ordering::SeqCst)
+            || self.history_pass_running()
+    }
+
+    fn start_history_pass(&self) -> bool {
+        let _pending = self
+            .pending_trigger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !on_demand_start(self) {
+            return false;
+        }
+        self.history_pass_running.store(true, Ordering::SeqCst);
+        true
     }
 
     /// Hand the scheduler loop a debounced burst, and wake it. Called from
@@ -533,6 +577,11 @@ impl ScanController {
         self.history_pass_running.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn invalidate_current_pass(&self) {
+        self.first_current_pass_done.store(false, Ordering::SeqCst);
+        self.request_cancel();
+    }
+
     pub(crate) fn mark_current_pass_done(&self) {
         self.first_current_pass_done.store(true, Ordering::SeqCst);
     }
@@ -549,44 +598,6 @@ impl ScanController {
         }
         *requested = Some(retention_days);
         true
-    }
-
-    /// Record the CWDs that one pass held in ungranted protected folders.
-    /// Returns true when the stored set changed.
-    ///
-    /// `current_window` is true for a full pass over the current window. That
-    /// pass reads every current session, so its set replaces the stored set.
-    /// A scoped pass or a history pass reads a different set of sessions, so
-    /// its CWDs go into the stored set.
-    pub(crate) fn record_consent_held(
-        &self,
-        cwds: &BTreeSet<String>,
-        current_window: bool,
-    ) -> bool {
-        let mut held = self
-            .consent_held_cwds
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if current_window {
-            if *held == *cwds {
-                return false;
-            }
-            held.clone_from(cwds);
-            return true;
-        }
-        let before = held.len();
-        held.extend(cwds.iter().cloned());
-        held.len() != before
-    }
-
-    /// The CWDs that the repository gate holds in ungranted protected folders.
-    pub(crate) fn consent_held_cwds(&self) -> Vec<String> {
-        self.consent_held_cwds
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .cloned()
-            .collect()
     }
 
     /// Lets the automatic historical pass ask again, for a fresh index.
@@ -621,6 +632,15 @@ pub(crate) fn on_demand_start(controller: &ScanController) -> bool {
     }
     controller.cancel.store(false, Ordering::SeqCst);
     true
+}
+
+/// Keep history active between dequeue and admission.
+struct HistoryDispatch<'a>(&'a ScanController);
+
+impl Drop for HistoryDispatch<'_> {
+    fn drop(&mut self) {
+        self.0.history_dispatching.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Release the scan slot if the caller drops an in-flight future.
@@ -680,7 +700,14 @@ pub fn spawn_scheduler(app: &AppHandle) -> tauri::async_runtime::JoinHandle<()> 
         // A fresh install runs this pass too: the first-run Overview follows
         // it, rather than waiting for an explicit scan request.
         if scheduled_scanning_allowed(&app) {
-            run_covered_pass(&app, &mut ledger, ScanTrigger::Launch, PassScope::Full).await;
+            run_covered_pass(
+                &app,
+                &mut ledger,
+                ScanTrigger::Launch,
+                PassScope::Full,
+                None,
+            )
+            .await;
         }
 
         // T1-T7: the backlog a watcher burst can answer without a full
@@ -821,6 +848,7 @@ pub fn spawn_scheduler(app: &AppHandle) -> tauri::async_runtime::JoinHandle<()> 
                     &mut ledger,
                     trigger,
                     source_refresh_scope(&source_refreshes),
+                    None,
                 )
                 .await
                 .is_none()
@@ -830,14 +858,21 @@ pub fn spawn_scheduler(app: &AppHandle) -> tauri::async_runtime::JoinHandle<()> 
                     continue;
                 }
             }
-            let full_trigger = controller.take_pending_trigger();
+            let (full_trigger, history_dispatch) = controller.take_pending_trigger();
             if full_trigger.is_some() || overflowed || matches!(woke, Wake::Tick) {
                 let trigger = full_trigger.unwrap_or(if overflowed {
                     ScanTrigger::WatcherOverflow
                 } else {
                     ScanTrigger::Tick
                 });
-                run_covered_pass(&app, &mut ledger, trigger, PassScope::Full).await;
+                run_covered_pass(
+                    &app,
+                    &mut ledger,
+                    trigger,
+                    PassScope::Full,
+                    history_dispatch,
+                )
+                .await;
                 let now = tokio::time::Instant::now();
                 last_full_pass = now;
                 floors.stamp(&pending_work, now);
@@ -898,9 +933,10 @@ async fn run_covered_pass(
     ledger: &mut AnonymousLedger,
     trigger: ScanTrigger,
     scope: PassScope,
+    history_dispatch: Option<HistoryDispatch<'_>>,
 ) -> Option<ScanStatus> {
     let covers = ledger.capture(&scope);
-    let status = try_run_pass(app, None, trigger, scope).await?;
+    let status = try_run_pass(app, None, trigger, scope, history_dispatch).await?;
     if pass_covers(&status) {
         ledger.settle(&covers);
         report_covered(app, covers).await;
@@ -961,7 +997,7 @@ async fn run_admitted_work(
         let trigger = ScanTrigger::WatcherAgents { agents: labels };
         // T3, T5: rediscover exactly these agents, reusing the pass so
         // `scan:started` / `scan:finished` and its log lines come for free.
-        if run_covered_pass(app, ledger, trigger, PassScope::Agents(rediscover))
+        if run_covered_pass(app, ledger, trigger, PassScope::Agents(rediscover), None)
             .await
             .is_none()
         {
@@ -1012,7 +1048,7 @@ pub async fn run_pass(
     trigger: ScanTrigger,
     scope: PassScope,
 ) -> ScanStatus {
-    try_run_pass(app, activity_window_days, trigger, scope)
+    try_run_pass(app, activity_window_days, trigger, scope, None)
         .await
         .unwrap_or_else(|| app.state::<ScanController>().status())
 }
@@ -1022,16 +1058,23 @@ pub async fn run_pass(
 /// `scoped.rs` use this directly to tell "ran" from "skipped, retry soon"
 /// (T7) — a distinction [`run_pass`]'s callers do not need, since they always
 /// treat "already running" as "nothing more to do here".
-pub(crate) async fn try_run_pass(
+async fn try_run_pass(
     app: &AppHandle,
     activity_window_days: Option<u32>,
     trigger: ScanTrigger,
     scope: PassScope,
+    history_dispatch: Option<HistoryDispatch<'_>>,
 ) -> Option<ScanStatus> {
     log_scan_pass_requested(&trigger);
     {
         let controller = app.state::<ScanController>();
-        if !on_demand_start(&controller) {
+        let historical = matches!(trigger, ScanTrigger::HistoricalScan);
+        let started = if historical {
+            controller.start_history_pass()
+        } else {
+            on_demand_start(&controller)
+        };
+        if !started {
             // W4: a request dropped here is otherwise silent, and a hidden
             // feedback loop then shows up only as a wall of full passes on
             // the tick. Logging the trigger turns that into a visible stream
@@ -1042,11 +1085,12 @@ pub(crate) async fn try_run_pass(
             // the only request that widens discovery past the current
             // window, so no later routine pass would cover the same ground.
             // Queue it for the scheduler instead of losing it.
-            if matches!(trigger, ScanTrigger::HistoricalScan) {
+            if historical {
                 controller.request(ScanTrigger::HistoricalScan);
             }
             return None;
         }
+        drop(history_dispatch);
         let full_pass = progress_pass(&trigger, &scope);
         let started = controller.update(|status| {
             status.running = true;
@@ -1057,11 +1101,7 @@ pub(crate) async fn try_run_pass(
             status.re_described = 0;
             status.error = None;
             status.cancelled = false;
-            // FTUE's first-run steps read `phase`/`found_by_agent`/`read`/
-            // `gate` as one full pass's outcome (see `pass`'s own `full_pass`
-            // gate). A scoped pass (T3/T5) must not blank them either: a
-            // reader who looks up only after such a pass started would
-            // otherwise see a finished full pass's result go blank.
+            // Scoped passes preserve the last full scan progress.
             if full_pass {
                 status.phase = ScanPhase::Finding;
                 // Every agent this pass searches, in a fixed order, so a
@@ -1081,17 +1121,35 @@ pub(crate) async fn try_run_pass(
         let _ = app.emit(EVENT_STARTED, started);
     }
     let mut ownership = ScanOwnership::new(app.state::<ScanController>());
-    app.state::<ScanController>().history_pass_running.store(
-        matches!(trigger, ScanTrigger::HistoricalScan),
-        Ordering::SeqCst,
-    );
     history::push_progress(app, true);
     ::tracing::debug!(event = "scan_pass_started", trigger = trigger.label());
     let pass_started_at = Instant::now();
+    let index_generation = app
+        .state::<crate::insights_worker::WorkerHandle>()
+        .index_generation();
 
-    let outcome = pass(app, activity_window_days, &trigger, &scope).await;
+    let history_retention = uses_history_window(&trigger).then(|| {
+        app.state::<Store>()
+            .settings_snapshot()
+            .session_data_retention_days
+    });
+    let outcome = pass(
+        app,
+        activity_window_days,
+        &trigger,
+        &scope,
+        history_retention,
+    )
+    .await;
 
     let controller = app.state::<ScanController>();
+    let project_deferrals_superseded = outcome
+        .as_ref()
+        .is_ok_and(|summary| summary.project_deferrals_superseded);
+    if project_deferrals_superseded {
+        retry_superseded_project_deferrals(&controller, &trigger);
+    }
+
     let cancelled = controller.cancelled();
     controller.update(|status| {
         status.running = false;
@@ -1116,13 +1174,20 @@ pub(crate) async fn try_run_pass(
             }
         }
     });
-    ownership.release();
     // A pass that got all the way through wrote to the store several times, so
     // it is also the proof that a previously reported storage failure is over.
     if outcome.is_ok() {
         storage_health::note_ok(app);
     }
-    let covered = outcome.is_ok() && !cancelled;
+    let covered = pass_covers_work(
+        outcome.is_ok(),
+        cancelled,
+        project_deferrals_superseded,
+        index_generation
+            == app
+                .state::<crate::insights_worker::WorkerHandle>()
+                .index_generation(),
+    );
     if covered {
         match (&trigger, &scope) {
             // The first current-window pass to cover everything clears the
@@ -1131,20 +1196,25 @@ pub(crate) async fn try_run_pass(
                 controller.mark_current_pass_done();
             }
             (ScanTrigger::HistoricalScan, _) => {
-                let store = app.state::<Store>();
-                let retention_days = store.settings_snapshot().session_data_retention_days;
-                if history::window_secs(retention_days, unix_now()).is_some() {
-                    history::mark_done(&store, retention_days);
+                if let Some(retention_days) = history_retention
+                    .filter(|days| history::window_secs(*days, unix_now()).is_some())
+                {
+                    history::mark_done(&app.state::<Store>(), retention_days);
                 }
             }
             _ => {}
         }
     }
-    controller
-        .history_pass_running
-        .store(false, Ordering::SeqCst);
+    ownership.release();
     history::push_progress(app, true);
     history::maybe_start_automatic_pass(app);
+    if !project_deferrals_superseded {
+        crate::usage_alerts::learn_after_data_settles(
+            app,
+            app.state::<crate::insights_worker::WorkerHandle>()
+                .index_generation(),
+        );
+    }
     let finished = controller.status();
     let duration_ms = pass_started_at.elapsed().as_millis() as u64;
     match &outcome {
@@ -1239,6 +1309,8 @@ struct PassSummary {
     list_changed: bool,
     /// [`Described::changed`]'s length: new or refreshed rows.
     re_described: usize,
+    /// A newer repository policy rejected this pass's deferred-project snapshot.
+    project_deferrals_superseded: bool,
 }
 
 /// The age limit discovery applies to a routine pass, in seconds.
@@ -1260,38 +1332,6 @@ fn progress_pass(trigger: &ScanTrigger, scope: &PassScope) -> bool {
     matches!(scope, PassScope::Full) && !matches!(trigger, ScanTrigger::HistoricalScan)
 }
 
-/// The first-run takeover's own gate on a full pass: wait for `stage`
-/// before letting the pass continue. A pass [`progress_pass`] says is not
-/// gated (a scoped watcher pass, or the dedicated historical pass) returns
-/// `true` at once.
-///
-/// While the first run is still at an earlier stage, this is also what the
-/// launch pass holds the scan slot on: no other full pass can start until
-/// it returns, which keeps a scoped watcher pass (T3/T5) from writing
-/// sessions before the reader's own Sessions step starts.
-///
-/// Returns `false` only when the wait is itself cancelled first, which the
-/// caller must treat as an ordinary cancel: end the pass with no writes.
-async fn wait_for_first_run_stage(app: &AppHandle, full_pass: bool, stage: FirstRunStage) -> bool {
-    if !full_pass {
-        return true;
-    }
-    let controller = app.state::<ScanController>();
-    let gate = app.state::<FirstRunGate>();
-    gate.wait_until(stage, || controller.cancelled()).await
-}
-
-/// The summary [`pass`] returns when a first-run gate wait ends as
-/// cancelled: the same empty, uncovering outcome a plain scan cancel gives
-/// today, because nothing has been discovered or written yet.
-fn gate_cancelled_summary() -> PassSummary {
-    PassSummary {
-        sessions: 0,
-        list_changed: false,
-        re_described: 0,
-    }
-}
-
 /// The body of one pass. Split out so [`run_pass`] owns only the in-flight
 /// bookkeeping and the events.
 ///
@@ -1305,10 +1345,10 @@ async fn pass(
     _activity_window_days: Option<u32>,
     trigger: &ScanTrigger,
     scope: &PassScope,
+    history_retention: Option<i32>,
 ) -> anyhow::Result<PassSummary> {
     let store = app.state::<Store>();
     let now = unix_now();
-    let is_history_pass = uses_history_window(trigger);
     // The Overview progress row reads `phase`, `found_by_agent`, `read`, and
     // `gate` as the outcome of one full pass over the current window. A
     // scoped pass (T3/T5) must not move them: it can start and finish while
@@ -1318,22 +1358,13 @@ async fn pass(
     // window than the row shows.
     let full_pass = progress_pass(trigger, scope);
     let write_fence = store.capture_destructive_write_epoch();
-    let since_secs = if is_history_pass {
-        let retention_days = store.settings_snapshot().session_data_retention_days;
-        history::window_secs(retention_days, now).unwrap_or(CURRENT_WINDOW_SECS)
-    } else {
-        CURRENT_WINDOW_SECS
-    };
+    let since_secs = history_retention
+        .and_then(|days| history::window_secs(days, now))
+        .unwrap_or(CURRENT_WINDOW_SECS);
 
-    let ignored = store.repository_policy_snapshot()?.ignored_paths;
-    let gate_settings = RepoGateSettings::from_store(&store);
+    let repository_policy = store.repository_policy_snapshot()?;
+    let include_non_repo_folders = store.settings_snapshot().include_non_repo_folders;
     let home = home_dir().unwrap_or_default();
-
-    // The first-run takeover's "Agents" step: discovery does not
-    // start until the reader leaves the welcome step.
-    if !wait_for_first_run_stage(app, full_pass, FirstRunStage::Agents).await {
-        return Ok(gate_cancelled_summary());
-    }
 
     let mut incremental = IncrementalAdmission {
         io: AdmissionIo::App(app.clone()),
@@ -1351,13 +1382,11 @@ async fn pass(
         owner::PassInputs {
             now,
             since_secs,
-            history: is_history_pass,
+            history: history_retention.is_some(),
             progress: full_pass,
-            // A full pass reads every session in the current window.
-            full_current_window: full_pass,
             home,
-            ignored,
-            gate_settings,
+            repository_policy,
+            include_non_repo_folders,
             refresh_repositories: trigger.refreshes_repositories(),
         },
         &mut incremental,
@@ -1369,6 +1398,7 @@ async fn pass(
         changed,
         list_changed,
         gate,
+        project_deferrals_superseded,
     } = &described;
     ::tracing::debug!(
         event = "scan_admission_finished",
@@ -1406,6 +1436,7 @@ async fn pass(
             sessions: records.len(),
             list_changed: *list_changed,
             re_described: changed.len(),
+            project_deferrals_superseded: *project_deferrals_superseded,
         });
     }
 
@@ -1413,6 +1444,7 @@ async fn pass(
         sessions: records.len(),
         list_changed: *list_changed,
         re_described: changed.len(),
+        project_deferrals_superseded: *project_deferrals_superseded,
     })
 }
 
@@ -1641,6 +1673,8 @@ struct Described {
     list_changed: bool,
     /// How the repository gate resolved every read session.
     gate: GateCounts,
+    /// A newer repository policy rejected this pass's deferred-project snapshot.
+    project_deferrals_superseded: bool,
 }
 
 enum AdmissionIo {
@@ -1751,23 +1785,35 @@ impl IncrementalAdmission<'_> {
         self.error.get_or_insert(error);
     }
 
+    #[cfg(test)]
     async fn commit(
         &mut self,
         guard: &SessionWriteGuard,
         record: &SessionRecord,
         changed: bool,
     ) -> bool {
+        self.commit_with_incarnation(guard, record, changed)
+            .await
+            .is_some()
+    }
+
+    async fn commit_with_incarnation(
+        &mut self,
+        guard: &SessionWriteGuard,
+        record: &SessionRecord,
+        changed: bool,
+    ) -> Option<crate::store::Incarnation> {
         self.outcomes
             .insert(record.key.clone(), AttemptOutcome::Failed);
         if self.io.cancelled() || self.store.capture_destructive_write_epoch() != self.write_fence {
-            return false;
+            return None;
         }
         let keys = [record.key.clone()];
         let returned = match self.store.sessions_with_missing_source_for(&keys) {
             Ok(returned) => returned,
             Err(error) => {
                 self.fail(error);
-                return false;
+                return None;
             }
         };
         if !changed && !returned.contains(&record.key) {
@@ -1777,12 +1823,12 @@ impl IncrementalAdmission<'_> {
                         record.key.clone(),
                         AttemptOutcome::Accepted(Box::new(record.clone()), false),
                     );
-                    true
+                    guard.stored_incarnation()
                 }
-                Ok(false) => false,
+                Ok(false) => None,
                 Err(error) => {
                     self.fail(error);
-                    false
+                    None
                 }
             };
         }
@@ -1790,7 +1836,7 @@ impl IncrementalAdmission<'_> {
             Ok((presence, _)) => presence.is_empty(),
             Err(error) => {
                 self.fail(error);
-                return false;
+                return None;
             }
         };
         let Some((incarnations, revision)) = (match self.io.checked(
@@ -1802,14 +1848,14 @@ impl IncrementalAdmission<'_> {
             Ok(SessionCommitOutcome::Rejected(_)) => None,
             Err(error) => {
                 self.fail(error);
-                return false;
+                return None;
             }
         }) else {
             ::tracing::warn!(
                 event = "scan_incremental_commit_stale",
                 session_id = %record.key.session_id,
             );
-            return false;
+            return None;
         };
         self.io.wake_workers();
         for observation in discovery_report(
@@ -1838,7 +1884,7 @@ impl IncrementalAdmission<'_> {
             ),
             record.clone(),
         );
-        true
+        Some(incarnations[0].1)
     }
 
     async fn delete_rejected(&mut self, guard: &SessionWriteGuard, key: &SessionKey) -> bool {
@@ -2147,11 +2193,9 @@ async fn describe_with_gate(
         incremental,
     } = inputs;
     // Scan unit fixtures skip the repository gate. The `repo_admission` tests
-    // cover its settings.
-    let gate_settings = RepoGateSettings {
-        include_non_repo_folders,
-        granted_dirs: std::collections::HashSet::new(),
-    };
+    // cover the setting.
+    #[cfg(test)]
+    let _ = include_non_repo_folders;
     let mut logs = match prepare_description_logs(logs, previous_records).await {
         Ok(logs) => logs,
         Err(error) => {
@@ -2164,6 +2208,7 @@ async fn describe_with_gate(
                 changed: Vec::new(),
                 list_changed: false,
                 gate: GateCounts::default(),
+                project_deferrals_superseded: false,
             };
         }
     };
@@ -2333,27 +2378,8 @@ async fn describe_with_gate(
                         records.push(*record);
                         continue;
                     }
-                    let decision = missing_cwd_decision(&gate_settings);
-                    gate.count_missing_cwd(&decision);
-                    if let GateDecision::Admit(_) = decision
-                        && let Some(writer) = incremental.as_deref_mut()
                     {
-                        if changed_record {
-                            changed.push(record.key.clone());
-                        }
-                        if writer
-                            .commit(
-                                guard.as_ref().expect("a dispatched write has a guard"),
-                                &record,
-                                changed_record,
-                            )
-                            .await
-                        {
-                            records.push(*record);
-                        }
-                        continue;
-                    }
-                    {
+                        gate.missing_cwd += 1;
                         if let Some(writer) = incremental.as_deref_mut() {
                             writer
                                 .delete_rejected(
@@ -2394,32 +2420,26 @@ async fn describe_with_gate(
                     let cwd = cwd.to_string();
                     let mut record = record;
                     let mut changed_record = changed_record;
-                    let admission = repo_admission(&record, &cwd, home, &gate_settings).await;
-                    let decision =
-                        apply_repo_admission(admission, &mut record, &mut changed_record);
-                    gate.count_repo(&decision);
-                    let root = match decision {
-                        GateDecision::Admit(root) => root,
-                        GateDecision::Reject => {
-                            if let Some(writer) = incremental.as_deref_mut() {
-                                writer
-                                    .delete_rejected(
-                                        guard.as_ref().expect("a dispatched write has a guard"),
-                                        &record.key,
-                                    )
-                                    .await;
-                            }
-                            rejected.push(record.key.clone());
-                            continue;
+                    let admission = repo_admission(&record, &cwd, include_non_repo_folders).await;
+                    let ControlFlow::Continue(root) = apply_repo_admission(
+                        admission,
+                        &mut record,
+                        &mut changed_record,
+                        &mut gate,
+                        &mut rejected,
+                        &mut git_hold,
+                    ) else {
+                        if rejected.contains(&record.key)
+                            && let Some(writer) = incremental.as_deref_mut()
+                        {
+                            writer
+                                .delete_rejected(
+                                    guard.as_ref().expect("a dispatched write has a guard"),
+                                    &record.key,
+                                )
+                                .await;
                         }
-                        GateDecision::Hold(HoldReason::Git(error)) => {
-                            git_hold.sessions += 1;
-                            git_hold.error.get_or_insert(error);
-                            continue;
-                        }
-                        GateDecision::Hold(HoldReason::Consent(_) | HoldReason::FolderGone) => {
-                            continue;
-                        }
+                        continue;
                     };
                     if let Some(root) = root {
                         let root = git::canonical_main_repo_root(&root).await;
@@ -2498,8 +2518,6 @@ async fn describe_with_gate(
             subagent = gate.subagent,
             no_repo = gate.no_repo,
             folder = gate.folder,
-            consent_required = gate.consent_required,
-            folder_gone = gate.folder_gone,
         );
     }
     // Fixtures without a writer still expose the gate's membership decision.
@@ -2537,6 +2555,7 @@ async fn describe_with_gate(
         changed,
         list_changed,
         gate,
+        project_deferrals_superseded: false,
     }
 }
 
@@ -2555,9 +2574,7 @@ fn describe_loop_has_work<T, U>(
 fn read_gate_counts(gate: &GateCounts, kept: usize) -> ReadGateCounts {
     ReadGateCounts {
         kept,
-        // A removed folder that the settings do not keep is outside every
-        // repository that the scan can see.
-        outside_repository: gate.no_repo + gate.folder_gone,
+        outside_repository: gate.no_repo,
         excluded: gate.ignored,
         unreadable: gate.missing_cwd,
     }
@@ -2572,73 +2589,6 @@ struct GateCounts {
     subagent: usize,
     no_repo: usize,
     folder: usize,
-    /// Sessions held because their CWD is in an ungranted protected folder.
-    consent_required: usize,
-    /// Sessions held because their CWD was removed and the folder setting is
-    /// off. The scan keeps their stored rows.
-    folder_gone: usize,
-}
-
-impl GateCounts {
-    /// Count one decision of the repository gate.
-    fn count_repo(&mut self, decision: &GateDecision) {
-        match decision {
-            GateDecision::Admit(Some(_)) | GateDecision::Hold(HoldReason::Git(_)) => {}
-            GateDecision::Admit(None) => self.folder += 1,
-            GateDecision::Reject => self.no_repo += 1,
-            GateDecision::Hold(HoldReason::Consent(_)) => self.consent_required += 1,
-            GateDecision::Hold(HoldReason::FolderGone) => self.folder_gone += 1,
-        }
-    }
-
-    /// Count one [`missing_cwd_decision`].
-    fn count_missing_cwd(&mut self, decision: &GateDecision) {
-        match decision {
-            GateDecision::Admit(_) => self.folder += 1,
-            GateDecision::Reject | GateDecision::Hold(_) => self.missing_cwd += 1,
-        }
-    }
-}
-
-impl std::ops::AddAssign for GateCounts {
-    fn add_assign(&mut self, other: Self) {
-        let Self {
-            missing_cwd,
-            ignored,
-            subagent,
-            no_repo,
-            folder,
-            consent_required,
-            folder_gone,
-        } = other;
-        self.missing_cwd += missing_cwd;
-        self.ignored += ignored;
-        self.subagent += subagent;
-        self.no_repo += no_repo;
-        self.folder += folder;
-        self.consent_required += consent_required;
-        self.folder_gone += folder_gone;
-    }
-}
-
-/// The inputs that decide which sessions the repository gate admits.
-#[derive(Debug, Default)]
-struct RepoGateSettings {
-    /// Keep a session whose CWD has no repository, under that CWD.
-    include_non_repo_folders: bool,
-    /// The consent-protected folders that the user granted. See
-    /// [`antiburn_local::paths::protected`].
-    granted_dirs: std::collections::HashSet<String>,
-}
-
-impl RepoGateSettings {
-    fn from_store(store: &Store) -> Self {
-        Self {
-            include_non_repo_folders: store.settings_snapshot().include_non_repo_folders,
-            // A failed read grants no folder, so the gate opens no dialog.
-            granted_dirs: store.granted_dirs().unwrap_or_default(),
-        }
-    }
 }
 
 /// How the repository scan gate files a session.
@@ -2655,37 +2605,52 @@ enum RepoAdmission {
     Rejected,
     /// Git cannot run, so the gate cannot decide. The string holds the error.
     GitUnavailable(String),
-    /// The CWD no longer exists, as a removed worktree does, and the settings
-    /// keep only repositories. The gate holds the session: it keeps a stored
-    /// row with its history and adds no new row.
-    FolderGone,
-    /// The CWD is in a consent-protected folder that the user did not grant.
-    /// The string names the folder. The gate does not run Git there or read
-    /// it: that access opens a system consent dialog, and the scan waits
-    /// until the user answers it.
-    ConsentRequired(String),
+    /// Project access is unavailable. The transcript can still be indexed.
+    DeferredProject(PathBuf, ProjectAccessDecision),
 }
 
 /// Apply the repository scan gate to one session with the CWD `cwd`.
+#[cfg(test)]
 async fn repo_admission(
     record: &SessionRecord,
     cwd: &str,
-    home: &std::path::Path,
-    settings: &RepoGateSettings,
+    include_non_repo_folders: bool,
+) -> RepoAdmission {
+    let grants = std::collections::HashSet::new();
+    guarded_repo_admission(
+        record,
+        cwd,
+        include_non_repo_folders,
+        &|path| antiburn_local::paths::protected::git_project_access(path, &grants),
+        &|path| antiburn_local::paths::protected::project_path_access(path, &grants),
+    )
+    .await
+}
+
+async fn guarded_repo_admission(
+    record: &SessionRecord,
+    cwd: &str,
+    include_non_repo_folders: bool,
+    git_access: &(impl Fn(&std::path::Path) -> ProjectAccessDecision + Sync + ?Sized),
+    path_access: &(impl Fn(&std::path::Path) -> ProjectAccessDecision + Sync + ?Sized),
 ) -> RepoAdmission {
     let cwd = std::path::Path::new(cwd);
-    if let Some(dir) = protected::protected_dir_name_in(home, cwd)
-        && !settings.granted_dirs.contains(&dir)
-    {
-        return RepoAdmission::ConsentRequired(dir);
+    let access = git_access(cwd);
+    if access != ProjectAccessDecision::Allowed {
+        return RepoAdmission::DeferredProject(cwd.to_path_buf(), access);
     }
-    // Git fails for a removed folder. That says nothing about the session,
-    // and rejecting it would delete its history.
+    // Git fails for a removed folder, for example a finished temporary
+    // worktree. That says nothing about the session, and a rejection deletes
+    // its history. The folder setting keeps the session as a folder.
+    // Otherwise the project is deferred, and the transcript stays indexed.
     if native_folder_is_gone(record, cwd).await {
-        return if settings.include_non_repo_folders {
+        return if include_non_repo_folders {
             RepoAdmission::Folder
         } else {
-            RepoAdmission::FolderGone
+            RepoAdmission::DeferredProject(
+                cwd.to_path_buf(),
+                ProjectAccessDecision::DeferredUncertain,
+            )
         };
     }
     match git::repo_root_if_any_at(cwd).await {
@@ -2693,23 +2658,86 @@ async fn repo_admission(
         // Only a CWD that Git reports as outside every repository can move
         // to a repository below it or stay as a folder.
         Ok(None) => {}
-        Err(error) => return git_error_admission(&error, git_runs(cwd).await),
+        Err(error) => {
+            let access = path_access(cwd);
+            if access != ProjectAccessDecision::Allowed {
+                return RepoAdmission::DeferredProject(cwd.to_path_buf(), access);
+            }
+            if is_git_project_permission_error(&error) {
+                return RepoAdmission::DeferredProject(
+                    cwd.to_path_buf(),
+                    ProjectAccessDecision::DeferredUncertain,
+                );
+            }
+            return git_error_admission(&error, git_runs(cwd).await);
+        }
     }
-    if record.source_kind == "file"
-        && let Some(root) = scanner::infer_repo_root_below_cwd(
+    if record.source_kind == "file" {
+        match scanner::infer_repo_root_below_cwd_with_policy(
             std::path::Path::new(&record.source_label),
             cwd,
-            home,
-            &settings.granted_dirs,
+            git_access,
         )
         .await
-    {
-        return RepoAdmission::InferredRepository(root);
+        {
+            Ok(Some(root)) => return RepoAdmission::InferredRepository(root),
+            Ok(None) => {}
+            Err((path, access)) => return RepoAdmission::DeferredProject(path, access),
+        }
     }
-    if settings.include_non_repo_folders {
+    if include_non_repo_folders {
         RepoAdmission::Folder
     } else {
         RepoAdmission::Rejected
+    }
+}
+
+/// Sessions that the repository gate holds because Git cannot run.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GitHold {
+    sessions: usize,
+    /// The first Git error of the pass.
+    error: Option<String>,
+}
+
+/// Apply one [`RepoAdmission`] to `record`.
+///
+/// `Continue` keeps the record, with the repository root to check against the
+/// opt-out list, if any. `Break` drops the record from this pass. A rejected
+/// record also goes into `rejected`, and the scan deletes its stored row. A
+/// held record does not: the scan keeps its stored row, if any, adds no new
+/// row, and admits the session on a later pass when Git runs again.
+fn apply_repo_admission(
+    admission: RepoAdmission,
+    record: &mut SessionRecord,
+    changed_record: &mut bool,
+    gate: &mut GateCounts,
+    rejected: &mut Vec<SessionKey>,
+    git_hold: &mut GitHold,
+) -> ControlFlow<(), Option<std::path::PathBuf>> {
+    match admission {
+        RepoAdmission::Repository(root) => ControlFlow::Continue(Some(root)),
+        RepoAdmission::InferredRepository(root) => {
+            record.cwd = Some(root.to_string_lossy().into_owned());
+            // Persist the new CWD, also for a reused record.
+            *changed_record = true;
+            ControlFlow::Continue(Some(root))
+        }
+        RepoAdmission::DeferredProject(..) => ControlFlow::Continue(None),
+        RepoAdmission::Folder => {
+            gate.folder += 1;
+            ControlFlow::Continue(None)
+        }
+        RepoAdmission::Rejected => {
+            gate.no_repo += 1;
+            rejected.push(record.key.clone());
+            ControlFlow::Break(())
+        }
+        RepoAdmission::GitUnavailable(error) => {
+            git_hold.sessions += 1;
+            git_hold.error.get_or_insert(error);
+            ControlFlow::Break(())
+        }
     }
 }
 
@@ -2722,79 +2750,10 @@ async fn native_folder_is_gone(record: &SessionRecord, cwd: &std::path::Path) ->
         && matches!(tokio::fs::try_exists(cwd).await, Ok(false))
 }
 
-/// Sessions that the repository gate holds because Git cannot run.
-#[cfg(test)]
-#[derive(Debug, Default)]
-struct GitHold {
-    sessions: usize,
-    /// The first Git error of the pass.
-    error: Option<String>,
-}
-
-/// What the scan gate decides for one session.
-#[derive(Debug, PartialEq, Eq)]
-enum GateDecision {
-    /// Keep the session, with the repository root to check against the
-    /// opt-out list, if any.
-    Admit(Option<std::path::PathBuf>),
-    /// Drop the session. The scan deletes its stored row.
-    Reject,
-    /// Drop the session from this pass. The scan keeps its stored row, if
-    /// any, adds no new row, and admits the session on a later pass when the
-    /// reason goes away.
-    Hold(HoldReason),
-}
-
-/// Why the scan gate holds a session.
-#[derive(Debug, PartialEq, Eq)]
-enum HoldReason {
-    /// Git cannot run. The string holds the error.
-    Git(String),
-    /// The CWD is in an ungranted protected folder. The value holds the CWD,
-    /// which the repository refresh reads to ask for the folder.
-    Consent(Option<String>),
-    /// The CWD no longer exists, and the settings keep only repositories.
-    FolderGone,
-}
-
-/// Apply the folder setting to a session with no recorded folder. Such a
-/// session still holds usage, so the folder setting keeps it, as it keeps a
-/// session outside a repository.
-fn missing_cwd_decision(settings: &RepoGateSettings) -> GateDecision {
-    if settings.include_non_repo_folders {
-        GateDecision::Admit(None)
-    } else {
-        GateDecision::Reject
-    }
-}
-
-/// Turn one [`RepoAdmission`] into a [`GateDecision`] for `record`.
-///
-/// An inferred repository moves the record to that repository and sets
-/// `changed_record`, so the scan persists the new CWD.
-fn apply_repo_admission(
-    admission: RepoAdmission,
-    record: &mut SessionRecord,
-    changed_record: &mut bool,
-) -> GateDecision {
-    match admission {
-        RepoAdmission::Repository(root) => GateDecision::Admit(Some(root)),
-        RepoAdmission::InferredRepository(root) => {
-            record.cwd = Some(root.to_string_lossy().into_owned());
-            // Persist the new CWD, also for a reused record.
-            *changed_record = true;
-            GateDecision::Admit(Some(root))
-        }
-        RepoAdmission::Folder => GateDecision::Admit(None),
-        RepoAdmission::Rejected => GateDecision::Reject,
-        RepoAdmission::GitUnavailable(error) => GateDecision::Hold(HoldReason::Git(error)),
-        // Held like a Git outage: a grant admits the session on a later pass.
-        RepoAdmission::ConsentRequired(_) => {
-            GateDecision::Hold(HoldReason::Consent(record.cwd.clone()))
-        }
-        // Held, not rejected, so the stored history stays.
-        RepoAdmission::FolderGone => GateDecision::Hold(HoldReason::FolderGone),
-    }
+fn is_git_project_permission_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.starts_with("git rev-parse --show-toplevel failed:")
+        && (message.contains("Permission denied") || message.contains("Operation not permitted"))
 }
 
 /// File a session when Git fails for its CWD. A Git that cannot run at all

@@ -2251,7 +2251,7 @@ fn source_refreshes_merge_separately_from_one_shot_triggers() {
     controller.request_source_refresh(AgentKind::OpenCode);
     controller.request(ScanTrigger::ManualRescan);
     assert!(matches!(
-        controller.take_pending_trigger(),
+        controller.take_pending_trigger().0,
         Some(ScanTrigger::ManualRescan)
     ));
     assert_eq!(
@@ -2943,7 +2943,7 @@ fn assert_scheduler_source_contract(source: &str) {
         .find("ledger.capture(&scope)")
         .expect("captures at start");
     let run = covered
-        .find("try_run_pass(app, None, trigger, scope).await?")
+        .find("try_run_pass(app, None, trigger, scope, history_dispatch).await?")
         .expect("runs the pass");
     let gate = covered
         .find("if pass_covers(&status) {")
@@ -3012,21 +3012,13 @@ fn folder_of_repos(dir: &std::path::Path) -> (std::path::PathBuf, SessionRecord)
     (workspace, session)
 }
 
-fn gate(include_non_repo_folders: bool) -> RepoGateSettings {
-    RepoGateSettings {
-        include_non_repo_folders,
-        granted_dirs: HashSet::new(),
-    }
-}
-
 #[tokio::test]
 async fn repo_admission_uses_the_repository_that_holds_the_cwd() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (workspace, session) = folder_of_repos(dir.path());
     let app = workspace.join("app");
 
-    let admission =
-        repo_admission(&session, &app.to_string_lossy(), dir.path(), &gate(false)).await;
+    let admission = repo_admission(&session, &app.to_string_lossy(), false).await;
 
     let RepoAdmission::Repository(root) = admission else {
         panic!("expected the CWD repository, got {admission:?}");
@@ -3042,55 +3034,10 @@ async fn repo_admission_files_a_parent_folder_session_under_the_repo_it_touched(
     let dir = tempfile::tempdir().expect("tempdir");
     let (workspace, session) = folder_of_repos(dir.path());
 
-    let admission = repo_admission(
-        &session,
-        &workspace.to_string_lossy(),
-        dir.path(),
-        &gate(false),
-    )
-    .await;
+    let admission = repo_admission(&session, &workspace.to_string_lossy(), false).await;
 
     let expected = workspace.join("app").canonicalize().expect("canonical app");
     assert_eq!(admission, RepoAdmission::InferredRepository(expected));
-}
-
-#[tokio::test]
-async fn repo_admission_never_rejects_a_session_whose_folder_was_removed() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (workspace, session) = folder_of_repos(dir.path());
-    // A finished worktree that its tool removed.
-    let removed = workspace
-        .join("worktree-removed")
-        .to_string_lossy()
-        .into_owned();
-
-    assert_eq!(
-        repo_admission(&session, &removed, dir.path(), &gate(true)).await,
-        RepoAdmission::Folder
-    );
-    assert_eq!(
-        repo_admission(&session, &removed, dir.path(), &gate(false)).await,
-        RepoAdmission::FolderGone
-    );
-}
-
-#[test]
-fn a_removed_folder_holds_the_stored_row_instead_of_deleting_it() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (_, mut session) = folder_of_repos(dir.path());
-    let mut changed = false;
-    let mut gate = GateCounts::default();
-    let decision = apply_repo_admission(RepoAdmission::FolderGone, &mut session, &mut changed);
-    gate.count_repo(&decision);
-    // A removed folder needs no grant, so it asks for no folder access.
-    assert_eq!(decision, GateDecision::Hold(HoldReason::FolderGone));
-    assert_eq!(
-        gate,
-        GateCounts {
-            folder_gone: 1,
-            ..GateCounts::default()
-        }
-    );
 }
 
 #[tokio::test]
@@ -3100,145 +3047,31 @@ async fn repo_admission_keeps_a_folder_without_git_only_when_the_setting_is_on()
     let notes = workspace.join("notes").to_string_lossy().into_owned();
 
     assert_eq!(
-        repo_admission(&session, &notes, dir.path(), &gate(false)).await,
+        repo_admission(&session, &notes, false).await,
         RepoAdmission::Rejected
     );
     assert_eq!(
-        repo_admission(&session, &notes, dir.path(), &gate(true)).await,
+        repo_admission(&session, &notes, true).await,
         RepoAdmission::Folder
     );
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn repo_admission_rejects_a_cwd_that_git_cannot_read() {
-    use std::os::unix::fs::PermissionsExt;
-
+async fn repo_admission_never_rejects_a_session_whose_folder_was_removed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (workspace, session) = folder_of_repos(dir.path());
-    let locked = workspace.join("locked");
-    std::fs::create_dir(&locked).expect("locked folder");
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
-        .expect("lock the folder");
+    let removed = workspace.join("deleted");
 
-    // The folder exists, and Git fails for a reason other than "not a git
-    // repository", so the setting does not keep the session as a folder.
-    let admission =
-        repo_admission(&session, &locked.to_string_lossy(), dir.path(), &gate(true)).await;
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
-        .expect("unlock the folder");
-    assert_eq!(admission, RepoAdmission::Rejected);
-}
-
-/// The session that stalled the scan: its CWD is a repository in an
-/// ungranted protected folder. A Git process there opens a consent dialog
-/// and blocks the pass until the user answers it.
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn repo_admission_runs_no_git_in_an_ungranted_protected_folder() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = dir.path().join("home");
-    let (workspace, session) = folder_of_repos(&home.join("Downloads"));
-    let app = workspace.join("app").to_string_lossy().into_owned();
-
+    // Git fails in a removed folder, for example a finished temporary
+    // worktree. The folder setting keeps the session. Otherwise the project
+    // is deferred, so the stored history stays.
     assert_eq!(
-        repo_admission(&session, &app, &home, &gate(true)).await,
-        RepoAdmission::ConsentRequired("Downloads".into())
-    );
-
-    let granted = RepoGateSettings {
-        granted_dirs: HashSet::from(["Downloads".to_owned()]),
-        ..gate(false)
-    };
-    assert!(matches!(
-        repo_admission(&session, &app, &home, &granted).await,
-        RepoAdmission::Repository(_)
-    ));
-}
-
-/// A parent-folder CWD outside the protected folders must not reach a
-/// repository inside one through the transcript's paths.
-#[cfg(target_os = "macos")]
-#[tokio::test]
-async fn repo_admission_infers_no_repository_in_an_ungranted_protected_folder() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let home = dir.path().join("home");
-    let (_, session) = folder_of_repos(&home.join("Documents"));
-    let home_cwd = home.to_string_lossy().into_owned();
-
-    assert_eq!(
-        repo_admission(&session, &home_cwd, &home, &gate(false)).await,
-        RepoAdmission::Rejected
-    );
-}
-
-#[test]
-fn a_consent_hold_keeps_the_stored_row_and_records_its_cwd() {
-    let mut session = record("junie", "protected-session", Some(1_000));
-    session.cwd = Some("/Users/avery/Downloads/held-project".into());
-    let mut changed_record = true;
-    let mut gate = GateCounts::default();
-
-    let decision = apply_repo_admission(
-        RepoAdmission::ConsentRequired("Downloads".into()),
-        &mut session,
-        &mut changed_record,
-    );
-    gate.count_repo(&decision);
-
-    // The repository refresh reads this CWD to ask for the folder.
-    assert_eq!(
-        decision,
-        GateDecision::Hold(HoldReason::Consent(Some(
-            "/Users/avery/Downloads/held-project".to_owned()
-        )))
+        repo_admission(&session, &removed.to_string_lossy(), true).await,
+        RepoAdmission::Folder
     );
     assert_eq!(
-        gate,
-        GateCounts {
-            consent_required: 1,
-            ..GateCounts::default()
-        }
-    );
-}
-
-#[test]
-fn a_full_current_window_pass_replaces_the_consent_held_cwds() {
-    let controller = ScanController::default();
-    let downloads = BTreeSet::from(["/Users/avery/Downloads/app".to_owned()]);
-    let documents = BTreeSet::from(["/Users/avery/Documents/notes".to_owned()]);
-
-    assert!(controller.record_consent_held(&downloads, true));
-    // The same set is no change, so the pass does not refresh again.
-    assert!(!controller.record_consent_held(&downloads, true));
-    assert!(controller.record_consent_held(&documents, true));
-    assert_eq!(
-        controller.consent_held_cwds(),
-        vec!["/Users/avery/Documents/notes".to_owned()]
-    );
-
-    // A grant admits the session, and the next full pass holds nothing.
-    assert!(controller.record_consent_held(&BTreeSet::new(), true));
-    assert!(controller.consent_held_cwds().is_empty());
-}
-
-#[test]
-fn a_scoped_pass_adds_to_the_consent_held_cwds() {
-    let controller = ScanController::default();
-    let downloads = BTreeSet::from(["/Users/avery/Downloads/app".to_owned()]);
-    let desktop = BTreeSet::from(["/Users/avery/Desktop/scratch".to_owned()]);
-    assert!(controller.record_consent_held(&downloads, true));
-
-    // A scoped pass reads only some sessions, so it removes no CWD.
-    assert!(!controller.record_consent_held(&BTreeSet::new(), false));
-    assert!(!controller.record_consent_held(&downloads, false));
-    assert!(controller.record_consent_held(&desktop, false));
-    assert_eq!(
-        controller.consent_held_cwds(),
-        vec![
-            "/Users/avery/Desktop/scratch".to_owned(),
-            "/Users/avery/Downloads/app".to_owned(),
-        ]
+        repo_admission(&session, &removed.to_string_lossy(), false).await,
+        RepoAdmission::DeferredProject(removed, ProjectAccessDecision::DeferredUncertain)
     );
 }
 
@@ -3276,21 +3109,33 @@ fn a_git_outage_holds_a_stored_session_instead_of_rejecting_it() {
     let mut stored = record("claude", "stored-session", Some(1_000));
     let mut fresh = record("claude", "fresh-session", Some(2_000));
     let mut gate = GateCounts::default();
+    let mut rejected = Vec::new();
+    let mut git_hold = GitHold::default();
 
     for (session, error) in [(&mut stored, "first error"), (&mut fresh, "second error")] {
         let mut changed_record = true;
-        let decision = apply_repo_admission(
+        let flow = apply_repo_admission(
             RepoAdmission::GitUnavailable(error.into()),
             session,
             &mut changed_record,
+            &mut gate,
+            &mut rejected,
+            &mut git_hold,
         );
-        gate.count_repo(&decision);
-        // A hold keeps the record out of the rows that the pass writes, and
-        // the pass deletes only rejected rows, so the stored row stays.
-        assert_eq!(decision, GateDecision::Hold(HoldReason::Git(error.into())));
+        // `Break` keeps the record out of the rows that the pass writes.
+        assert_eq!(flow, ControlFlow::Break(()));
     }
 
+    // The pass deletes only rejected rows, so the stored row stays.
+    assert!(rejected.is_empty());
     assert_eq!(gate, GateCounts::default());
+    assert_eq!(
+        git_hold,
+        GitHold {
+            sessions: 2,
+            error: Some("first error".into()),
+        }
+    );
 }
 
 #[test]
@@ -3298,96 +3143,22 @@ fn a_rejected_session_goes_to_the_rejected_rows() {
     let mut session = record("claude", "no-repo-session", Some(1_000));
     let mut changed_record = false;
     let mut gate = GateCounts::default();
+    let mut rejected = Vec::new();
+    let mut git_hold = GitHold::default();
 
-    let decision = apply_repo_admission(RepoAdmission::Rejected, &mut session, &mut changed_record);
-    gate.count_repo(&decision);
-
-    assert_eq!(decision, GateDecision::Reject);
-    assert_eq!(
-        gate,
-        GateCounts {
-            no_repo: 1,
-            ..GateCounts::default()
-        }
-    );
-}
-
-#[test]
-fn an_inferred_repository_moves_the_session_and_admits_it() {
-    let mut session = record("claude", "parent-folder-session", Some(1_000));
-    session.cwd = Some("/Users/avery/code".into());
-    let mut changed_record = false;
-    let mut gate = GateCounts::default();
-    let root = std::path::PathBuf::from("/Users/avery/code/app");
-
-    let decision = apply_repo_admission(
-        RepoAdmission::InferredRepository(root.clone()),
+    let flow = apply_repo_admission(
+        RepoAdmission::Rejected,
         &mut session,
         &mut changed_record,
+        &mut gate,
+        &mut rejected,
+        &mut git_hold,
     );
-    gate.count_repo(&decision);
 
-    assert_eq!(decision, GateDecision::Admit(Some(root)));
-    assert_eq!(session.cwd.as_deref(), Some("/Users/avery/code/app"));
-    assert!(changed_record);
-    assert_eq!(gate, GateCounts::default());
-}
-
-#[test]
-fn the_folder_setting_decides_a_session_with_no_cwd() {
-    let mut counts = GateCounts::default();
-    for include_non_repo_folders in [true, false] {
-        let decision = missing_cwd_decision(&gate(include_non_repo_folders));
-        counts.count_missing_cwd(&decision);
-        let expected = if include_non_repo_folders {
-            GateDecision::Admit(None)
-        } else {
-            GateDecision::Reject
-        };
-        assert_eq!(decision, expected);
-    }
-    assert_eq!(
-        counts,
-        GateCounts {
-            folder: 1,
-            missing_cwd: 1,
-            ..GateCounts::default()
-        }
-    );
-}
-
-#[test]
-fn gate_counts_add_every_field() {
-    let mut total = GateCounts {
-        missing_cwd: 1,
-        ignored: 2,
-        subagent: 3,
-        no_repo: 4,
-        folder: 5,
-        consent_required: 6,
-        folder_gone: 7,
-    };
-    total += GateCounts {
-        missing_cwd: 10,
-        ignored: 20,
-        subagent: 30,
-        no_repo: 40,
-        folder: 50,
-        consent_required: 60,
-        folder_gone: 70,
-    };
-    assert_eq!(
-        total,
-        GateCounts {
-            missing_cwd: 11,
-            ignored: 22,
-            subagent: 33,
-            no_repo: 44,
-            folder: 55,
-            consent_required: 66,
-            folder_gone: 77,
-        }
-    );
+    assert_eq!(flow, ControlFlow::Break(()));
+    assert_eq!(rejected, vec![session.key.clone()]);
+    assert_eq!(gate.no_repo, 1);
+    assert_eq!(git_hold, GitHold::default());
 }
 
 #[tokio::test]
@@ -3397,13 +3168,7 @@ async fn repo_admission_reads_only_file_transcripts() {
     session.source_kind = "providerDb".into();
 
     assert_eq!(
-        repo_admission(
-            &session,
-            &workspace.to_string_lossy(),
-            dir.path(),
-            &gate(false)
-        )
-        .await,
+        repo_admission(&session, &workspace.to_string_lossy(), false).await,
         RepoAdmission::Rejected
     );
 }
@@ -3416,8 +3181,6 @@ fn read_gate_counts_maps_exclusions_and_keeps_kept_separate() {
         subagent: 5,
         no_repo: 7,
         folder: 1,
-        consent_required: 0,
-        folder_gone: 4,
     };
 
     let payload = read_gate_counts(&gate, 41);
@@ -3426,7 +3189,7 @@ fn read_gate_counts_maps_exclusions_and_keeps_kept_separate() {
         payload,
         ReadGateCounts {
             kept: 41,
-            outside_repository: 11,
+            outside_repository: 7,
             excluded: 3,
             unreadable: 2,
         },

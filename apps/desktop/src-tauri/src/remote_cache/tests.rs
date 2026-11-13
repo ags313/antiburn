@@ -200,6 +200,7 @@ async fn imported_transcript_uses_full_analysis_and_retains_tools_and_billable_u
         crate::agents::kind_from_slug("claude-code").unwrap(),
         "synthetic",
         analysis::ClaimedSource {
+            path: None,
             fingerprint: Some(parent_fingerprint(&path).unwrap()),
             generation: 0,
         },
@@ -313,6 +314,7 @@ async fn inferred_forks_exclude_inherited_usage_from_the_same_host_only() {
             crate::agents::kind_from_slug("claude-code").unwrap(),
             "synthetic",
             analysis::ClaimedSource {
+                path: None,
                 fingerprint: record.source_fingerprint.clone(),
                 generation: 0,
             },
@@ -472,6 +474,7 @@ async fn analyze_store_copy(
         kind,
         session_id,
         analysis::ClaimedSource {
+            path: None,
             fingerprint: Some(fingerprint),
             generation: 0,
         },

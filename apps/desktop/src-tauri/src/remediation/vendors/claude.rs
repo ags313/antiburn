@@ -64,21 +64,18 @@ impl VendorRemediationPolicy for ClaudePolicy {
     }
 
     fn managed_configuration_present(&self, home: &Path) -> bool {
-        if home
-            .join(".claude/managed-settings.json")
-            .try_exists()
-            .unwrap_or(true)
-        {
+        if super::managed_file_present(&home.join(".claude/managed-settings.json")) {
             return true;
         }
-        #[cfg(not(test))]
+        // Tests do not read the managed settings of the test machine.
+        #[cfg(all(unix, not(test)))]
         return [
             Path::new("/etc/claude-code/managed-settings.json"),
             Path::new("/Library/Application Support/ClaudeCode/managed-settings.json"),
         ]
         .iter()
-        .any(|path| path.try_exists().unwrap_or(true));
-        #[cfg(test)]
+        .any(|path| super::managed_file_present(path));
+        #[cfg(any(test, not(unix)))]
         false
     }
 

@@ -266,7 +266,7 @@ async fn refresh_rejects_an_unreadable_ignored_path_file_without_publishing() {
     std::fs::create_dir(ignored_paths::state_path(store.state_dir())).unwrap();
     let before = store.repository_policy_snapshot().unwrap().generation;
 
-    let error = refresh_from_store(&store, &[]).await.unwrap_err();
+    let error = refresh_from_store(&store).await.unwrap_err();
 
     assert!(error.to_string().contains("failed to read"));
     assert_eq!(

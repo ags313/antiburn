@@ -34,7 +34,6 @@
 //!    the primary session source. `GEMINI_HOME` overrides all three roots.
 
 use std::collections::{BTreeSet, HashSet, VecDeque};
-use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 
@@ -374,7 +373,9 @@ fn gemini_subroots_in(home: &Path) -> Vec<PathBuf> {
 async fn conversation_databases_in(home: &Path, cutoff: i64) -> Vec<(PathBuf, String, i64)> {
     let mut databases = Vec::new();
     for root in gemini_subroots_in(home) {
-        let Ok(mut entries) = tokio::fs::read_dir(root.join("conversations")).await else {
+        let Ok(mut entries) =
+            crate::discovery::source_fs::asynchronous::read_dir(root.join("conversations")).await
+        else {
             continue;
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -432,7 +433,7 @@ fn is_safe_session_id(session_id: &str) -> bool {
 
 async fn database_mtime_epoch(path: &Path) -> Option<i64> {
     async fn mtime(path: &Path) -> Option<i64> {
-        tokio::fs::metadata(path)
+        crate::discovery::source_fs::asynchronous::metadata(path)
             .await
             .ok()?
             .modified()
@@ -465,6 +466,7 @@ pub async fn db_session_updated_at(db_path: PathBuf, session_id: String) -> Opti
 }
 
 fn open_database(path: &Path) -> rusqlite::Result<Connection> {
+    crate::discovery::source_fs::admit_native_database(path)?;
     crate::source_database::open(path)
 }
 
@@ -567,7 +569,7 @@ fn file_fingerprint(path: &Path) -> Option<String> {
         FINGERPRINT_HEAD_BYTES, FingerprintInputs, SourceStat, head_hash_of,
     };
 
-    let mut file = File::open(path).ok()?;
+    let mut file = crate::discovery::source_fs::open(path).ok()?;
     let stat = SourceStat::from_open_std_file(&file)?;
     let mut head = Vec::new();
     file.by_ref()
@@ -927,7 +929,7 @@ async fn read_cli_history(gemini_root: &Path) -> Option<Vec<CliHistoryEntry>> {
     const HISTORY_FIELD_MAX_BYTES: usize = 4 * 1024;
     let path = gemini_root.join("antigravity-cli").join("history.jsonl");
     tokio::task::spawn_blocking(move || {
-        let file = File::open(path).ok()?;
+        let file = crate::discovery::source_fs::open(path).ok()?;
         let mut reader = BoundedJsonlReader::with_max_record_bytes(
             BufReader::new(file),
             HISTORY_MAX_RECORD_BYTES,

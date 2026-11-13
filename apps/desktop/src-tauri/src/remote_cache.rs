@@ -747,6 +747,7 @@ pub fn run_pass(
                     agent,
                     &record.key.session_id,
                     analysis::ClaimedSource {
+                        path: None,
                         fingerprint: record.source_fingerprint,
                         generation: 0,
                     },

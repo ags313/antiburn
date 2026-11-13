@@ -133,7 +133,7 @@ pub async fn parse_session_metadata(file: &Path) -> SessionMetadata {
 /// [`parse_session_metadata`] against a specific adapter set, used when the
 /// agent must be inferred and the caller has configured adapters.
 pub async fn parse_session_metadata_with(explorers: Explorers, file: &Path) -> SessionMetadata {
-    let content = match tokio::fs::read_to_string(file).await {
+    let content = match crate::discovery::source_fs::asynchronous::read_to_string(file).await {
         Ok(c) => c,
         Err(error) => {
             ::tracing::debug!(
@@ -287,7 +287,7 @@ async fn apply_metadata_from_path(
     }
 }
 
-fn claude_project_dir<'a>(file: &'a Path, agent_type: &AgentKind) -> Option<&'a Path> {
+pub fn claude_project_dir<'a>(file: &'a Path, agent_type: &AgentKind) -> Option<&'a Path> {
     if *agent_type != AgentKind::Claude {
         return None;
     }
@@ -308,6 +308,48 @@ fn claude_project_dir<'a>(file: &'a Path, agent_type: &AgentKind) -> Option<&'a 
     }
 
     Some(project_dir)
+}
+
+/// Resolve a Claude workspace key with the caller's current project policy.
+pub async fn resolve_claude_project_cwd_with_policy(
+    file: &Path,
+    agent_type: &AgentKind,
+    access: impl FnMut(&Path) -> crate::paths::protected::ProjectAccessDecision,
+) -> Result<
+    Option<std::path::PathBuf>,
+    (
+        std::path::PathBuf,
+        crate::paths::protected::ProjectAccessDecision,
+    ),
+> {
+    let Some(project_dir) = claude_project_dir(file, agent_type) else {
+        return Ok(None);
+    };
+    let Some(encoded) = project_dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(None);
+    };
+    let Some(home) = project_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    else {
+        return Ok(None);
+    };
+    super::agents::path_codec::decode_hyphenated_with_policy(encoded, home, access).await
+}
+
+/// Return deferred directory evidence when a Claude workspace key cannot be decoded safely.
+pub async fn claude_project_cwd_access_deferral(
+    file: &Path,
+    agent_type: &AgentKind,
+) -> Option<(
+    std::path::PathBuf,
+    crate::paths::protected::ProjectAccessDecision,
+)> {
+    let project_dir = claude_project_dir(file, agent_type)?;
+    let encoded = project_dir.file_name()?.to_str()?;
+    let home = project_dir.parent()?.parent()?.parent()?;
+    super::agents::path_codec::hyphenated_path_access_deferral(encoded, home).await
 }
 
 async fn infer_claude_project_cwd(project_dir: &Path) -> Option<String> {
@@ -993,47 +1035,77 @@ const REPO_INFERENCE_MAX_PROBES: usize = 8;
 /// folders. The count is folders, not edits. On a
 /// tie, the repository that the transcript touched first wins. Returns `None`
 /// when no candidate resolves to a repository.
-///
-/// `home` and `granted` follow [`crate::paths::protected`]: the function reads
-/// no folder and runs no `git` process inside a consent-protected folder that
-/// is not in `granted`, because that access opens a system consent dialog and
-/// blocks until the user answers it.
 pub async fn infer_repo_root_below_cwd(
     transcript: &Path,
     cwd: &Path,
-    home: &Path,
-    granted: &std::collections::HashSet<String>,
 ) -> Option<std::path::PathBuf> {
-    use crate::paths::protected::cwd_resolution_blocked_in;
+    infer_repo_root_below_cwd_with_policy(transcript, cwd, |path| {
+        crate::paths::protected::git_project_access(path, &Default::default())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Preserve deferred project evidence while resolving inferred repository candidates.
+pub async fn infer_repo_root_below_cwd_with_policy(
+    transcript: &Path,
+    cwd: &Path,
+    mut access: impl FnMut(&Path) -> crate::paths::protected::ProjectAccessDecision,
+) -> Result<
+    Option<std::path::PathBuf>,
+    (
+        std::path::PathBuf,
+        crate::paths::protected::ProjectAccessDecision,
+    ),
+> {
     use tokio::io::AsyncReadExt;
 
-    if cwd_resolution_blocked_in(home, cwd, granted) {
-        return None;
+    let decision = access(cwd);
+    if !decision.is_allowed() {
+        return Err((cwd.to_path_buf(), decision));
     }
-    let file = tokio::fs::File::open(transcript).await.ok()?;
+    let Ok(file) = crate::discovery::source_fs::asynchronous::open(transcript).await else {
+        return Ok(None);
+    };
     let mut head = Vec::new();
-    file.take(REPO_INFERENCE_HEAD_BYTES)
+    if file
+        .take(REPO_INFERENCE_HEAD_BYTES)
         .read_to_end(&mut head)
         .await
-        .ok()?;
+        .is_err()
+    {
+        return Ok(None);
+    }
     let content = String::from_utf8_lossy(&head);
     // Compare canonical paths: Git reports canonical roots, and a symlink
     // below the CWD must not take a candidate outside it.
-    let cwd = tokio::fs::canonicalize(cwd).await.ok()?;
+    let decision = access(cwd);
+    if !decision.is_allowed() {
+        return Err((cwd.to_path_buf(), decision));
+    }
+    let lexical_cwd = cwd.to_path_buf();
+    let Ok(cwd) = tokio::fs::canonicalize(cwd).await else {
+        return Ok(None);
+    };
 
     let mut roots: Vec<(std::path::PathBuf, usize)> = Vec::new();
     let mut probes = 0;
     for candidate in extract_candidate_cwds_from_transcript(&content) {
-        if cwd_resolution_blocked_in(home, Path::new(&candidate), granted) {
+        let candidate = std::path::PathBuf::from(candidate);
+        if candidate == lexical_cwd
+            || (!candidate.starts_with(&lexical_cwd) && !candidate.starts_with(&cwd))
+        {
             continue;
+        }
+        let decision = access(&candidate);
+        if !decision.is_allowed() {
+            return Err((candidate, decision));
         }
         let Ok(candidate) = tokio::fs::canonicalize(&candidate).await else {
             continue;
         };
-        if candidate == cwd
-            || !candidate.starts_with(&cwd)
-            || cwd_resolution_blocked_in(home, &candidate, granted)
-        {
+        if candidate == cwd || !candidate.starts_with(&cwd) {
             continue;
         }
         if let Some((_, count)) = roots
@@ -1047,7 +1119,15 @@ pub async fn infer_repo_root_below_cwd(
             continue;
         }
         probes += 1;
+        let decision = access(&candidate);
+        if !decision.is_allowed() {
+            return Err((candidate, decision));
+        }
         if let Ok(root) = crate::platform::git::repo_root_at(&candidate).await {
+            let decision = access(&root);
+            if !decision.is_allowed() {
+                return Err((root, decision));
+            }
             let root = tokio::fs::canonicalize(&root).await.unwrap_or(root);
             roots.push((root, 1));
         }
@@ -1062,7 +1142,7 @@ pub async fn infer_repo_root_below_cwd(
             best = Some((root, count));
         }
     }
-    best.map(|(root, _)| root)
+    Ok(best.map(|(root, _)| root))
 }
 
 /// Maximum recursion depth when walking nested JSON structures.
@@ -1328,7 +1408,6 @@ pub fn max_activity_event_epoch(content: &str, agent: AgentKind) -> Option<i64> 
 mod tests {
     use super::*;
 
-    use std::collections::HashSet;
     use tempfile::TempDir;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
@@ -2875,8 +2954,7 @@ also not json {{{{
         let dir = TempDir::new().unwrap();
         let (workspace, transcript) = workspace_of_repos(&dir).await;
 
-        let root =
-            infer_repo_root_below_cwd(&transcript, &workspace, dir.path(), &HashSet::new()).await;
+        let root = infer_repo_root_below_cwd(&transcript, &workspace).await;
 
         let expected = std::fs::canonicalize(workspace.join("busy")).unwrap();
         assert_eq!(root, Some(expected));
@@ -2887,13 +2965,7 @@ also not json {{{{
         let dir = TempDir::new().unwrap();
         let (workspace, transcript) = workspace_of_repos(&dir).await;
 
-        let root = infer_repo_root_below_cwd(
-            &transcript,
-            &workspace.join("quiet/src"),
-            dir.path(),
-            &HashSet::new(),
-        )
-        .await;
+        let root = infer_repo_root_below_cwd(&transcript, &workspace.join("quiet/src")).await;
 
         assert_eq!(root, None);
     }
@@ -2914,49 +2986,8 @@ also not json {{{{
         .await;
 
         assert_eq!(
-            infer_repo_root_below_cwd(&transcript, &workspace, dir.path(), &HashSet::new()).await,
+            infer_repo_root_below_cwd(&transcript, &workspace).await,
             None
-        );
-    }
-
-    /// A home folder whose `Documents` folder holds a repository, and a
-    /// transcript that edits a file in it.
-    #[cfg(target_os = "macos")]
-    async fn home_with_protected_repo(dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
-        let home = dir.path().join("home");
-        git_init(&home.join("Documents").join("app"));
-        let transcript = write_temp_file(
-            dir.path(),
-            "session.jsonl",
-            &tool_use_line(&home.join("Documents/app/README.md")),
-        )
-        .await;
-        (home, transcript)
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn infer_repo_root_probes_no_ungranted_protected_folder() {
-        let dir = TempDir::new().unwrap();
-        let (home, transcript) = home_with_protected_repo(&dir).await;
-        let documents = home.join("Documents");
-
-        // A probe would find the repository, so `None` shows that the
-        // inference skipped the candidate and the protected CWD.
-        assert_eq!(
-            infer_repo_root_below_cwd(&transcript, &home, &home, &HashSet::new()).await,
-            None
-        );
-        assert_eq!(
-            infer_repo_root_below_cwd(&transcript, &documents, &home, &HashSet::new()).await,
-            None
-        );
-
-        let granted = HashSet::from(["Documents".to_owned()]);
-        let expected = std::fs::canonicalize(documents.join("app")).unwrap();
-        assert_eq!(
-            infer_repo_root_below_cwd(&transcript, &home, &home, &granted).await,
-            Some(expected)
         );
     }
 
@@ -2973,17 +3004,11 @@ also not json {{{{
         .await;
 
         assert_eq!(
-            infer_repo_root_below_cwd(&transcript, &workspace, dir.path(), &HashSet::new()).await,
+            infer_repo_root_below_cwd(&transcript, &workspace).await,
             None
         );
         assert_eq!(
-            infer_repo_root_below_cwd(
-                &dir.path().join("missing.jsonl"),
-                &workspace,
-                dir.path(),
-                &HashSet::new(),
-            )
-            .await,
+            infer_repo_root_below_cwd(&dir.path().join("missing.jsonl"), &workspace).await,
             None
         );
     }
