@@ -1379,6 +1379,8 @@ The event carries only the closed unit label. No figure, cost, token count,
 agent, account, or date reaches it. The Rust boundary rejects an unlisted unit
 and any extra field (`overview_unit_selected_uses_closed_vocabulary`).
 
-The [FTUE removal](#ftue-removal-2026-11-11) removed the Overview page. No
-reachable surface reports this event now. Keep the catalog row as historical
-evidence, and do not read the end of the series as a change in unit choice.
+The [FTUE removal](#ftue-removal-2026-11-11) removed the Overview page and its
+first-run takeover. This fork restores the steady Overview page without the
+takeover, so the event is reachable again. The automatic first choice still
+reports nothing. Builds between the removal and the restore send no events;
+do not read that gap as a change in unit choice.

@@ -1,9 +1,9 @@
 # Main-window navigation and local search
 
 The retained main renderer owns a bounded history of 100 destinations. A destination is
-Agents, Limits, Memories, Sessions with its contextual filters and optional session identity, or
-Checks with an optional check ID. Sessions opens by default. Legacy native Overview requests
-open Sessions and preserve its current filters. Explicit navigation appends; Back and Forward restore; automatic initial
+Overview, Agents, Limits, Memories, Sessions with its contextual filters and optional session identity, or
+Checks with an optional check ID. Sessions opens by default. Native Overview requests open
+Overview and leave the Sessions filters unchanged. Explicit navigation appends; Back and Forward restore; automatic initial
 selection replaces. Selecting the same destination can reveal it again without appending.
 New navigation after Back removes the forward branch. Deleted session targets are pruned.
 History lives for the renderer lifetime. The sidebar stays visible above the 720 CSS pixel

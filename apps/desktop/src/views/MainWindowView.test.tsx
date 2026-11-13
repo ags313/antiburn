@@ -433,10 +433,10 @@ describe("MainWindowView", () => {
     expect(screen.getByRole("button", { name: "Close window" })).toBeVisible()
   })
 
-  it("opens Sessions by default with only Sessions and Checks in the sidebar", () => {
+  it("opens Sessions by default with Overview, Sessions, and Checks in the sidebar", () => {
     setWindowWidth(1000)
     render(<MainWindowView />)
-    expect(screen.getAllByRole("tab")).toHaveLength(2)
+    expect(screen.getAllByRole("tab")).toHaveLength(3)
     expect(screen.getByRole("tab", { name: "Sessions" })).toHaveAttribute(
       "aria-selected",
       "true",
@@ -455,7 +455,7 @@ describe("MainWindowView", () => {
     expect(screen.queryByRole("button", { name: "Open navigation" })).toBeNull()
     expect(activityMocks.listSubscriptions).toBe(2)
   })
-  it("redirects a legacy Overview request to Sessions", async () => {
+  it("opens the Overview for a native Overview request", async () => {
     render(<MainWindowView />)
     fireEvent.click(tab("Checks"))
     await vi.waitFor(() => expect(ipcMocks.sectionTarget).not.toBeNull())
@@ -465,24 +465,24 @@ describe("MainWindowView", () => {
         destination: { section: "overview", target: null },
       }),
     )
-    expect(screen.getByRole("tabpanel", { name: "Sessions" })).toBeVisible()
-    expect(screen.queryByRole("tab", { name: "Overview" })).toBeNull()
-    expect(searchApp("Overview").some((result) => result.target.kind === "view")).toBe(false)
+    expect(screen.getByRole("tabpanel", { name: "Overview" })).toBeVisible()
+    expect(tab("Overview")).toHaveAttribute("aria-selected", "true")
+    expect(searchApp("Overview").some((result) => result.target.kind === "view")).toBe(true)
   })
 
   it("keeps the sidebar keyboard accessible when a view has no tab", async () => {
     render(<MainWindowView />)
     await openView("Agents")
 
-    expect(tab("Sessions")).toHaveAttribute("aria-selected", "false")
-    expect(tab("Sessions")).toHaveAttribute("tabindex", "0")
-    expect(tab("Checks")).toHaveAttribute("tabindex", "-1")
-    tab("Sessions").focus()
-    fireEvent.keyDown(tab("Sessions"), { key: "ArrowDown" })
+    expect(tab("Overview")).toHaveAttribute("aria-selected", "false")
+    expect(tab("Overview")).toHaveAttribute("tabindex", "0")
+    expect(tab("Sessions")).toHaveAttribute("tabindex", "-1")
+    tab("Overview").focus()
+    fireEvent.keyDown(tab("Overview"), { key: "ArrowDown" })
 
-    expect(tab("Checks")).toHaveFocus()
-    expect(tab("Checks")).toHaveAttribute("tabindex", "0")
-    expect(screen.getByRole("tabpanel", { name: "Checks" })).toBeVisible()
+    expect(tab("Sessions")).toHaveFocus()
+    expect(tab("Sessions")).toHaveAttribute("tabindex", "0")
+    expect(screen.getByRole("tabpanel", { name: "Sessions" })).toBeVisible()
   })
 
   it("opens the existing Settings window without changing the selected section", () => {
@@ -605,7 +605,7 @@ describe("MainWindowView", () => {
   describe("Sessions navigation", () => {
     it("keeps filters out of the sidebar before and after entries load", async () => {
       render(<MainWindowView />)
-      const expected = ["Sessions", "Checks"]
+      const expected = ["Overview", "Sessions", "Checks"]
       expect(
         screen
           .getAllByRole("tab")
@@ -777,7 +777,6 @@ describe("MainWindowView", () => {
       render(<MainWindowView />)
       expect(screen.getByRole("tabpanel", { name: "Sessions" })).toBeVisible()
       expect(screen.queryByRole("tabpanel", { name: "Setup" })).toBeNull()
-      expect(screen.queryByRole("tab", { name: "Overview" })).toBeNull()
       expect(tab("Checks")).not.toHaveAttribute("aria-disabled", "true")
       expect(screen.getByRole("button", { name: "Search antiburn" })).toBeEnabled()
       expect(screen.getByRole("button", { name: "Settings" })).toBeEnabled()

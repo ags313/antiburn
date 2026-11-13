@@ -454,7 +454,7 @@ describe("MainWindowNavigationSession", () => {
     stop()
   })
 
-  it("keeps Sessions filters when a legacy Overview request opens Sessions", async () => {
+  it("opens the Overview for a native Overview request and keeps Sessions filters", async () => {
     const { activity, session } = setup()
     const filters: SessionFilters = { agents: ["codex"], result: "failing", spend: "notable" }
     activity.filter(filters)
@@ -464,7 +464,7 @@ describe("MainWindowNavigationSession", () => {
 
     mocks.handler!({ revision: 1, destination: { section: "overview", target: null } })
 
-    expect(session.getSnapshot().destination).toMatchObject({ section: "activity", filters })
+    expect(session.getSnapshot().destination).toEqual({ section: "overview" })
     expect(activity.getSnapshot().filters).toEqual(filters)
     expect(mocks.acknowledge).toHaveBeenCalledWith(7, 1)
     stop()
@@ -497,7 +497,7 @@ describe("MainWindowNavigationSession", () => {
     const changed = vi.fn()
     const unsubscribe = session.subscribe(changed)
     await vi.waitFor(() => expect(mocks.peek).toHaveBeenCalledOnce())
-    mocks.handler!({ revision: 2, destination: { section: "overview", target: null } })
+    mocks.handler!({ revision: 2, destination: { section: "activity", target: null } })
     expect(session.getSnapshot()).toMatchObject({ selected: "activity", requests: 1 })
     expect(changed).toHaveBeenCalledTimes(1)
     mocks.handler!({ revision: 1, destination: { section: "burnChecks", target: null } })

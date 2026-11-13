@@ -79,9 +79,9 @@ server, or backend.
 
 ## Sessions navigation and Cloud preference
 
-The main window opens Sessions immediately. Its sidebar contains Sessions,
-Checks, and Settings. Overview is no longer a navigation or search destination;
-legacy native Overview requests open Sessions. The new introduction opens in a separate native window until its local
+The main window opens Sessions immediately. Its sidebar contains Overview,
+Sessions, Checks, and Settings. Overview is a navigation and search
+destination, and native Overview requests open it. The new introduction opens in a separate native window until its local
 completion is saved. It resumes the last saved screen after closing and opens
 Sessions on completion. Checks, search, Settings, discovery, CLI installation,
 and integration startup remain independent of this introduction. Supported HUDs
@@ -537,6 +537,22 @@ menu-bar callers retain their defaults. Session removal reports a typed lifecycl
 observation; the projection bridge emits `session:index-changed` with cause
 `removed` so both windows refresh their local views. See the
 [session lifecycle contract](../../docs/session-lifecycle-events.md).
+
+Overview uses the same main-window session list for its recent sessions. Its
+Subscription chart and utilization figures use the Limits account lanes,
+resolved periods, shared meter allocation, and learned estimates through the
+same quota query. The overview summarizes account-wide weekly and five-hour
+lanes; model-specific lanes remain available in Limits. Utilization covers
+periods overlapping the latest 60 calendar days, including an incomplete
+current period. Unknown periods do not count as zero. The daily chart shows
+30 days and compares them with the preceding 30 days. Limit hits use separate
+provider-refusal evidence; a full meter alone does not establish a refusal.
+
+The spend chart and its today, week, and month figures come from
+`get_provider_usage`. That command sums each session's published billable turn
+rows by the reader's local day, so a session counts on every day its turns ran.
+A session without such rows, and a turn row without a timestamp, count on the
+session's last-activity day.
 
 Burn checks uses `BurnChecksSession`, a second independent external store. It owns a distinct
 Checks report consumer, combines section activity with main-window visibility, and loads target

@@ -39,24 +39,19 @@ export type MainWindowNavigationSnapshot = {
   requests: number
 }
 
-function normalizeDestination(
-  destination: MainDestination,
-  activeFilters?: SessionFilters,
-): MainDestination {
-  if (destination.section === "overview" || destination.section === "activity") {
-    const legacyOverview = destination.section === "overview"
-    const filters = legacyOverview ? activeFilters : destination.filters
+function normalizeDestination(destination: MainDestination): MainDestination {
+  if (destination.section === "activity") {
     return {
       section: "activity",
       filters: normalizeSessionFilters(
-        filters ?? {
+        destination.filters ?? {
           source: { kind: "all" },
           agents: [],
           result: "all",
           spend: "all",
         },
       ),
-      subject: legacyOverview ? null : (destination.subject ?? null),
+      subject: destination.subject ?? null,
     }
   }
   if (destination.section === "burnChecks") {
@@ -177,7 +172,7 @@ export class MainWindowNavigationSession {
     replace: boolean,
     origin: "user" | "automatic",
   ): void {
-    const normalized = normalizeDestination(destination, this.activity?.getSnapshot().filters)
+    const normalized = normalizeDestination(destination)
     if (destinationKey(normalized) === destinationKey(this.history[this.index]!)) {
       if (!replace) this.publish()
       return

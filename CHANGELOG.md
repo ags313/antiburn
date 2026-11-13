@@ -64,6 +64,9 @@ CI changes, and documentation that no user acts on stay out — see
   grant antiburn access to that folder, the scan indexes the session and waits
   to read its project. The Sessions settings ask you to allow access to that
   folder.
+- The Overview page is back in the sidebar, above Sessions. It shows the Cost,
+  Tokens, and Subscription usage chart, the checks to fix, recent sessions, and
+  provider limits. Sessions still opens first.
 - A session whose project folder was removed, or that recorded no folder,
   keeps its history. With **Include folders without Git** on, it shows as a
   folder session.

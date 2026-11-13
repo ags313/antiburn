@@ -1,5 +1,5 @@
 import { SidebarUsage } from "../components/providerUsage/SidebarUsageLimits"
-import { Bot, Brain, Flame, Gauge, MessagesSquare, Settings } from "lucide-react"
+import { Bot, Brain, Flame, Gauge, House, MessagesSquare, Settings } from "lucide-react"
 import { useRef, useState, useSyncExternalStore, type ReactNode } from "react"
 import { flushSync } from "react-dom"
 
@@ -10,6 +10,7 @@ import { PromotionLauncher } from "../components/promotions/PromotionLauncher"
 import { PromotionHost } from "../components/promotions/PromotionHost"
 
 import { SidebarNav, type SidebarNavItem } from "../components/ui/SidebarNav"
+import type { CheckId } from "../lib/insightsIpc"
 import { noteInteraction, openSettingsWindow } from "../lib/ipc"
 import { memoryCountStore } from "../lib/memoryCountStore"
 import {
@@ -21,7 +22,7 @@ import {
 import { useGlobalKeydown } from "../lib/useGlobalKeydown"
 import { sessionHygieneIdentities, useSessionHygiene } from "../lib/useSessionHygiene"
 import { MainActivityView } from "./main-window/MainActivityView"
-import { MainActivitySession } from "./main-window/MainActivitySession"
+import { MainActivitySession, subjectForEntry } from "./main-window/MainActivitySession"
 import { BurnChecksView } from "./main-window/BurnChecksView"
 import { BurnChecksController } from "./main-window/burn-checks/BurnChecksController"
 import { AppSearch } from "./main-window/AppSearch"
@@ -29,6 +30,7 @@ import { resolveSettingsSearchTarget, type AppSearchResult } from "../lib/appSea
 import { MainWindowLayout } from "./main-window/MainWindowLayout"
 import { MainWindowNavigationSession } from "./main-window/MainWindowNavigationSession"
 import { MainOverviewSession } from "./main-window/MainOverviewSession"
+import { OverviewView } from "./main-window/OverviewView"
 import { AgentsView } from "./main-window/AgentsView"
 import { useOverviewProgress } from "./main-window/overview/useOverviewProgress"
 import { sidebarProgress } from "./main-window/overview/sidebarProgress"
@@ -112,7 +114,30 @@ export function MainWindowView({ sections }: { sections?: readonly MainWindowSec
     overviewSession.getSnapshot,
     overviewSession.getSnapshot,
   )
-  const viewBindings: Record<Exclude<MainViewId, "overview">, ViewBinding> = {
+  const openChecks = (check: CheckId | undefined) =>
+    navigationSession.navigate(
+      check ? { section: "burnChecks", check } : { section: "burnChecks" },
+    )
+  const viewBindings: Record<MainViewId, ViewBinding> = {
+    overview: {
+      icon: House,
+      render: ({ active }) => (
+        <OverviewView
+          active={active}
+          session={overviewSession}
+          onOpenSessions={() => selectSection("activity")}
+          onOpenChecks={openChecks}
+          onSelectSession={(entry) => {
+            if (!entry.sessionId) return
+            navigationSession.navigate({
+              section: "activity",
+              filters: { agents: [], result: "all", spend: "all" },
+              subject: subjectForEntry(entry),
+            })
+          }}
+        />
+      ),
+    },
     agents: {
       icon: Bot,
       render: ({ active }) => (
