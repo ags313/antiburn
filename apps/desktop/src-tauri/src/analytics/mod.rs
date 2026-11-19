@@ -185,6 +185,7 @@ pub fn record_interaction(_app: &tauri::AppHandle, interaction: event::Interacti
     }
 }
 
+#[cfg(feature = "cloud")]
 pub(crate) fn record_cloud_status(app: &tauri::AppHandle, status: event::OnboardingCloudStatus) {
     #[cfg(feature = "analytics")]
     record(

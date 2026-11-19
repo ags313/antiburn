@@ -11,6 +11,16 @@ beforeEach(() => {
 })
 afterEach(() => vi.unstubAllGlobals())
 
+it("finishes ordinary onboarding without showing a Cloud entry point", () => {
+  const onComplete = vi.fn()
+  const onStepChange = vi.fn()
+  render(<OnboardingView step="checks" onStepChange={onStepChange} onComplete={onComplete} />)
+  fireEvent.click(screen.getByRole("button", { name: "Done" }))
+  expect(onComplete).toHaveBeenCalledOnce()
+  expect(onStepChange).not.toHaveBeenCalled()
+  expect(screen.queryByRole("button", { name: /cloud/i })).not.toBeInTheDocument()
+})
+
 it("navigates from welcome and offers local completion without a Cloud operation", () => {
   const onStepChange = vi.fn()
   const onComplete = vi.fn()
@@ -20,7 +30,12 @@ it("navigates from welcome and offers local completion without a Cloud operation
   fireEvent.click(screen.getByRole("button", { name: /get started/i }))
   expect(onStepChange).toHaveBeenCalledWith("sessions")
   view.rerender(
-    <OnboardingView step="cloud" onStepChange={onStepChange} onComplete={onComplete} />,
+    <OnboardingView
+      cloudEnabled
+      step="cloud"
+      onStepChange={onStepChange}
+      onComplete={onComplete}
+    />,
   )
   fireEvent.click(screen.getByRole("button", { name: /set up cloud/i }))
   expect(onStepChange).toHaveBeenCalledWith("cloudUnavailable")
@@ -160,7 +175,7 @@ it("reports an unresponsive example without blocking navigation", () => {
   vi.useRealTimers()
 })
 
-it("pauses the demo when the host document hides and respects native visibility on return", () => {
+it("pauses the demo when the host document hides and respects desktop visibility on return", () => {
   const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false)
   const view = render(
     <OnboardingView step="sessions" onStepChange={vi.fn()} onComplete={vi.fn()} />,
@@ -234,7 +249,7 @@ it("does not consume animation time before the demo is ready", () => {
   vi.useRealTimers()
 })
 
-it("does not time out a demo while its native window is hidden", () => {
+it("does not time out a demo while its desktop window is hidden", () => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
   const props = { step: "sessions" as const, onStepChange: vi.fn(), onComplete: vi.fn() }
   const view = render(<OnboardingView {...props} visible={false} />)

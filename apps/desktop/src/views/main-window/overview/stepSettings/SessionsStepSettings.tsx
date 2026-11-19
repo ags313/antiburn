@@ -1,4 +1,4 @@
-import { CloudSession } from "../../../../onboarding/CloudSession"
+import { CloudSession, cloudUploadStatusUnknown } from "../../../../onboarding/CloudSession"
 import { CloudAccount } from "../../../settings/CloudAccount"
 import { confirm } from "@tauri-apps/plugin-dialog"
 import { useCallback, useState, useSyncExternalStore } from "react"
@@ -153,13 +153,15 @@ function RetentionSection({
 
 export function SessionsStepSettings() {
   const { settings, update, loaded } = useAppSettings()
-  const [cloudSession] = useState(() => new CloudSession(undefined, false))
+  const [cloudSession] = useState(() => new CloudSession(undefined, false, true))
   const cloud = useSyncExternalStore(
     cloudSession.subscribe,
     cloudSession.getSnapshot,
     cloudSession.getSnapshot,
   )
-  const cloudUnavailable = !cloud.cloud.authEnabled
+  const cloudUnavailable = !cloud.cloud.authEnabled || !cloud.cloud.captureEnabled
+  const cloudConsent = cloud.ongoing?.consentVersion === "desktop-project-sync-v1"
+  const cloudStorageUnknown = cloudUploadStatusUnknown(cloud.ongoing)
   const info = useSyncExternalStore(appInfoStore.subscribe, appInfoStore.getSnapshot)
   const [session] = useState(() => new SourcesSession())
   const { repositories, scanRoots, permissions, scanning, remote } = useSyncExternalStore(
@@ -194,39 +196,53 @@ export function SessionsStepSettings() {
 
   const sections = (
     <>
-      <SectionGroup title="Antiburn Cloud">
-        <Card>
-          <CloudAccount session={cloudSession} value={cloud} />
-          <SettingsToggleRow
-            searchId="cloudUpload"
-            description={
-              cloudUnavailable
-                ? "Available when Antiburn Cloud launches."
-                : "Saved preference only. Folder choices and upload consent will be reviewed separately."
-            }
-            checked={!cloudUnavailable && settings.cloudUploadEnabled}
-            disabled={!loaded || !cloud.loaded || cloudUnavailable}
-            dimmed={cloudUnavailable}
-            disabledTooltip={
-              !cloud.loaded
-                ? "Checking Cloud availability…"
-                : cloudUnavailable
-                  ? "Uploads are unavailable in this build. You can turn this on when Antiburn Cloud becomes available."
-                  : undefined
-            }
-            onChange={(next) => {
-              if (loaded && cloud.loaded && !cloudUnavailable) {
-                void update({ cloudUploadEnabled: next })
-              }
-            }}
-          />
-          <p className="border-t border-separator px-4 py-3 type-footnote text-label-secondary">
-            {cloudUnavailable
-              ? "Your sessions stay on this device. No sessions are uploaded."
-              : "Uploads are not available in this build. This preference is saved on this device; no sessions are uploaded."}
-          </p>
-        </Card>
-      </SectionGroup>
+      {info?.cloudEnabled && (
+        <SectionGroup title="Antiburn Cloud">
+          <Card divided={false}>
+            <CloudAccount session={cloudSession} value={cloud}>
+              <SettingsToggleRow
+                searchId="cloudUpload"
+                checked={
+                  (!cloudUnavailable || cloudStorageUnknown) &&
+                  cloudConsent &&
+                  !cloud.ongoing?.paused
+                }
+                disabled={
+                  !loaded ||
+                  !cloud.loaded ||
+                  cloud.busy ||
+                  cloudStorageUnknown ||
+                  cloudUnavailable ||
+                  !cloudConsent
+                }
+                dimmed={cloudUnavailable}
+                disabledTooltip={
+                  !cloud.loaded
+                    ? "Checking Cloud availability…"
+                    : cloudStorageUnknown
+                      ? "Check disk space and file permissions, then retry saved uploads."
+                      : cloudUnavailable
+                        ? "Uploads are unavailable in this build. You can turn this on when Antiburn Cloud becomes available."
+                        : !cloudConsent
+                          ? "Choose projects and confirm full-content sync below."
+                          : undefined
+                }
+                onChange={(next) => {
+                  if (
+                    loaded &&
+                    cloud.loaded &&
+                    !cloudUnavailable &&
+                    !cloudStorageUnknown &&
+                    cloudConsent
+                  ) {
+                    void cloudSession.controlSync(!next)
+                  }
+                }}
+              />
+            </CloudAccount>
+          </Card>
+        </SectionGroup>
+      )}
 
       <RepositoriesSection
         repositories={repositories}

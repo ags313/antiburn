@@ -163,10 +163,27 @@ export interface AppSettings {
   workingWeek: "five" | "six" | "seven"
 }
 
+/** Read-only CLI and skill setup. Ready does not prove host discovery or callbacks. */
+export interface LocalToolsStatus {
+  /** Ordering within the current desktop process. Keep this value in memory only. */
+  revision: number
+  phase: "pending" | "ready" | "unavailable" | "failed"
+  /** The desktop resolved its receipt-validated CLI runtime. */
+  cliInstalled: boolean
+  /** That runtime passed the bounded CLI capability test. */
+  cliTested: boolean
+  /** The generated skill and bound config match their ownership receipts. */
+  skillInstalled: boolean
+  /** A setup failure class, not a raw error or filesystem path. */
+  reason: string | null
+}
+
 /** Where the app came from. Mirrors Rust `AppInfo`. */
 export interface AppInfo {
   cursorLoginState?: "signedIn" | "signedOut" | "expired" | "unreadable"
   appVersion: string
+  /** Native Rust build feature, independent of service or upload availability. */
+  cloudEnabled?: boolean
   /** True when the binary enables Rust debug assertions. */
   debugBuild: boolean
   /** CPU architecture this binary was compiled for, e.g. `aarch64`. */
@@ -174,6 +191,8 @@ export interface AppInfo {
   pricingCatalogVersion: string
   schemaVersion: number
   dataDir: string
+  /** Current user's home, for display only. Never replace an actionable path with "~". */
+  homeDirectory?: string | null
   /** Sessions currently in the local index. */
   indexedSessions: number
   /** Size of the local database on disk, in bytes. */

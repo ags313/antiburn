@@ -4,6 +4,7 @@
   "app": {
     "security": {
       "capabilities": [
+        "local-tools",
         "default",
         "main-window",
         "onboarding",
@@ -12,20 +13,11 @@
         "checks-remediation",
         "checks-settings",
         "cli-settings",
-        "agent-integrations-settings",
-        "cloud-account",
-        "cloud-dev"
+        "agent-integrations-settings"
       ]
     }
   },
   "bundle": {
     "createUpdaterArtifacts": false
-  },
-  "plugins": {
-    "deep-link": {
-      "desktop": {
-        "schemes": ["ai-antiburn-desktop-debug"]
-      }
-    }
   }
 }

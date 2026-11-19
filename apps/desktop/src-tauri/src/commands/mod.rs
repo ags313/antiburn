@@ -319,10 +319,12 @@ pub async fn app_info(app: tauri::AppHandle) -> CommandResult<AppInfo> {
                 .cursor_login_state(),
             app_version: app.package_info().version.to_string(),
             debug_build: cfg!(debug_assertions),
+            cloud_enabled: cfg!(feature = "cloud"),
             arch: std::env::consts::ARCH.to_string(),
             pricing_catalog_version: crate::runtime_pricing::catalog_version(&app),
             schema_version: store.schema_version().map_err(fail)?,
             data_dir: store.state_dir().to_string_lossy().to_string(),
+            home_directory: home_dir().and_then(|path| path.to_str().map(str::to_owned)),
             indexed_sessions: store.session_count().map_err(fail)?,
             database_bytes: store.database_bytes(),
             // Real registration state, not a compile-time guess: a release build
@@ -411,15 +413,16 @@ pub async fn get_promotion_readiness(
     .await
 }
 
+/// Save local onboarding progress off the runtime thread. Leaving Cloud setup
+/// attempts browser cancellation, but Cloud failures must not block the local save.
 #[tauri::command]
 pub async fn set_onboarding_state(
     app: tauri::AppHandle,
     state: OnboardingState,
 ) -> CommandResult<OnboardingState> {
     let store = app.state::<Store>().inner().clone();
-    if state != OnboardingState::CloudUnavailable
-        && store.onboarding_state().map_err(fail)? == OnboardingState::CloudUnavailable
-    {
+    #[cfg(feature = "cloud")]
+    if let Ok(true) = crate::cloud::onboarding_requires_cancel(app.clone(), state).await {
         let _ = crate::cloud::cloud_cancel(app.clone()).await;
     }
     let record_app = app.clone();

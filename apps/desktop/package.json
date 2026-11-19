@@ -1,13 +1,13 @@
 {
   "name": "@antiburn/desktop",
-  "version": "0.10.0",
+  "version": "0.11.1",
   "private": true,
   "type": "module",
   "license": "MIT",
   "description": "antiburn desktop application for local coding-agent session analysis.",
   "scripts": {
-    "dev": "node scripts/run-tauri.mjs dev --config src-tauri/tauri.debug.conf.json",
-    "dev:bundle": "node scripts/run-tauri.mjs build --debug --config src-tauri/tauri.debug.conf.json",
+    "dev": "node scripts/run-tauri.mjs dev --with-cli --config src-tauri/tauri.debug.conf.json",
+    "dev:bundle": "node scripts/run-tauri.mjs build --debug --with-cli --config src-tauri/tauri.debug.conf.json",
     "dev:cli": "node scripts/run-tauri.mjs dev --with-cli --config src-tauri/tauri.debug.conf.json",
     "dev:bundle:cli": "node scripts/run-tauri.mjs build --debug --with-cli --config src-tauri/tauri.debug.conf.json",
     "dev:web": "pnpm build:demo && vite",
