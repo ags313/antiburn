@@ -50,6 +50,14 @@ version and refuses the release if there is none.
   the granted protected folders. It reads no folder and runs no `git` process
   inside a consent-protected folder that is not granted.
 
+## [0.15.2] - 2026-11-19
+
+### Fixed
+
+- Decode numeric Jev answers when consumers enable precise JSON number
+  handling. Answer fields still reject missing, null, duplicate, unknown,
+  or mismatched values.
+
 ## [0.15.1] - 2026-11-16
 
 ### Added
