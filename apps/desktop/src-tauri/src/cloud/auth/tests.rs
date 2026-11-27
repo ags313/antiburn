@@ -1,6 +1,7 @@
 use super::{
     AccountSession, Config, Credential, EligibleWorkspace, Failure, HttpTransport, TokenRequest,
-    Tokens, Transport, Vault, Workspace, WorkspaceKind, WorkspaceResponse, short_hostname,
+    Tokens, Transport, Vault, Workspace, WorkspaceKind, WorkspaceResponse, canonical_origin,
+    short_hostname,
 };
 use crate::cloud::{engine::Engine, state::StateStore};
 use std::{
@@ -49,29 +50,23 @@ fn cloud_device_label_uses_only_a_safe_short_hostname() {
 
 #[test]
 fn cloud_auth_build_origins_default_only_when_both_are_absent() {
-    let default = Config::from_origins(None, None);
-    if cfg!(debug_assertions) {
-        let config = default.unwrap();
-        assert_eq!(config.issuer, "http://localhost:3000");
-        assert_eq!(config.resource, "http://localhost:3000");
-        assert_eq!(
-            config.authorization.as_str(),
-            "http://localhost:3000/devices/authorize/account"
-        );
-        assert_eq!(
-            config.token.as_str(),
-            "http://localhost:3000/v1/devices/token"
-        );
-        assert_eq!(
-            config.session.as_str(),
-            "http://localhost:3000/v1/devices/session"
-        );
-        assert_eq!(
-            config.revocation.as_str(),
-            "http://localhost:3000/v1/devices/logout"
-        );
+    let config = Config::from_origins(None, None).unwrap();
+    let origin = if cfg!(debug_assertions) {
+        "http://localhost:3000"
     } else {
-        assert!(default.is_none());
+        "https://api.antiburn.com"
+    };
+    assert_eq!(config.issuer, origin);
+    assert_eq!(config.resource, origin);
+    assert!(config.dashboard.is_none());
+    for (url, path) in [
+        (config.authorization, "/devices/authorize/account"),
+        (config.token, "/v1/devices/token"),
+        (config.session, "/v1/devices/grants/current"),
+        (config.revocation, "/v1/devices/grants/current/revoke"),
+        (config.workspaces, "/v1/captures/destinations"),
+    ] {
+        assert_eq!(url.as_str(), format!("{origin}{path}"));
     }
 
     for (issuer, resource) in [
@@ -97,6 +92,29 @@ fn cloud_auth_build_origins_default_only_when_both_are_absent() {
         explicit.token.as_str(),
         "https://resource.example/v1/devices/token"
     );
+}
+
+#[test]
+fn cloud_auth_dashboard_uses_only_a_canonical_browser_origin() {
+    assert_eq!(
+        canonical_origin("https://dashboard.example")
+            .unwrap()
+            .as_str(),
+        "https://dashboard.example/"
+    );
+    assert_eq!(
+        canonical_origin("http://127.0.0.1:4174").is_some(),
+        cfg!(debug_assertions)
+    );
+    for value in [
+        "http://dashboard.example",
+        "https://user:proof@dashboard.example",
+        "https://dashboard.example/join",
+        "https://dashboard.example?code=proof",
+        "https://dashboard.example#invite",
+    ] {
+        assert!(canonical_origin(value).is_none(), "{value}");
+    }
 }
 
 #[test]
@@ -217,7 +235,8 @@ fn cloud_legacy_keyring_record_can_revoke_but_never_refresh() {
     assert_eq!(engine.refresh(100, || true), Err(Failure::ReauthRequired));
     assert!(engine.session().is_none());
     assert!(revoked.lock().unwrap().is_empty());
-    engine.sign_out().unwrap();
+    let logout = engine.sign_out().unwrap().unwrap();
+    assert!(logout.send(engine.transport.as_ref()));
     assert_eq!(*revoked.lock().unwrap(), ["synthetic-legacy-refresh"]);
     assert!(engine.vault.read().unwrap().is_none());
 }
@@ -330,16 +349,18 @@ fn cloud_account_approval_requires_one_personal_anchor_and_rotation_cannot_chang
             assert!(engine.vault.read().unwrap().unwrap().account_grant);
             *script.eligible.lock().unwrap() = Ok(vec![changed.clone()]);
             assert_eq!(engine.refresh(131, || true), Err(Failure::ReauthRequired));
+            engine.wait_remote_logout();
             assert_eq!(
                 *script.revoked.lock().unwrap(),
                 ["synthetic-refresh-0", "synthetic-refresh-1"]
             );
         } else {
             assert_eq!(callback, Err(Failure::ReauthRequired));
+            engine.wait_remote_logout();
             assert_eq!(*script.revoked.lock().unwrap(), ["synthetic-refresh-0"]);
         }
         assert!(engine.session().is_none());
-        assert!(engine.vault.read().unwrap().is_none());
+        assert!(engine.vault.read().unwrap().unwrap().session.is_none());
     }
 }
 
@@ -441,8 +462,7 @@ fn cloud_auth_transport_checks_every_url_before_sending_proof() {
 
 #[cfg(not(debug_assertions))]
 #[test]
-fn cloud_auth_release_disables_defaults_and_loopback_http_transport() {
-    assert!(Config::from_origins(None, None).is_none());
+fn cloud_auth_release_disables_loopback_http_transport() {
     for origin in [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
@@ -453,8 +473,8 @@ fn cloud_auth_release_disables_defaults_and_loopback_http_transport() {
         let mut config = Config::parse("https://api.example", "https://api.example").unwrap();
         let url = Url::parse(origin).unwrap();
         config.token = url.join("v1/devices/token").unwrap();
-        config.session = url.join("v1/devices/session").unwrap();
-        config.revocation = url.join("v1/devices/logout").unwrap();
+        config.session = url.join("v1/devices/grants/current").unwrap();
+        config.revocation = url.join("v1/devices/grants/current/revoke").unwrap();
         assert!(matches!(
             HttpTransport.exchange(
                 &config,
@@ -492,6 +512,7 @@ mod debug_http {
         let (release, wait) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
@@ -627,6 +648,7 @@ mod debug_http {
                 cleanup_refresh_tokens: cleanup_refresh_tokens.clone(),
                 account_grant: true,
                 session: Some(session),
+                replacement: None,
             };
             let mut engine = Engine::new(
                 Config::from_origins(None, None),
@@ -637,7 +659,7 @@ mod debug_http {
             if cleanup_refresh_tokens.is_empty() {
                 assert_eq!(engine.refresh(100, || true), Err(Failure::ReauthRequired));
             }
-            assert_eq!(engine.sign_out(), Err(Failure::CredentialFailed));
+            assert_eq!(engine.sign_out().err(), Some(Failure::CredentialFailed));
             assert!(engine.session().is_none());
             let retained = engine.vault.read().unwrap().unwrap();
             assert_eq!(retained.issuer, old.issuer);
@@ -818,7 +840,7 @@ mod debug_http {
         assert!(tokens.matches_session(&session));
         let request = worker.join().unwrap();
         request.native_only();
-        assert_eq!(request.line, "GET /v1/devices/session HTTP/1.1");
+        assert_eq!(request.line, "GET /v1/devices/grants/current HTTP/1.1");
         assert_eq!(
             request.header("authorization"),
             Some("Bearer synthetic-access")
@@ -829,7 +851,10 @@ mod debug_http {
         HttpTransport.revoke(&config, "synthetic-refresh").unwrap();
         let request = worker.join().unwrap();
         request.native_only();
-        assert_eq!(request.line, "POST /v1/devices/logout HTTP/1.1");
+        assert_eq!(
+            request.line,
+            "POST /v1/devices/grants/current/revoke HTTP/1.1"
+        );
         assert!(request.header("authorization").is_none());
         assert_eq!(
             request.body,

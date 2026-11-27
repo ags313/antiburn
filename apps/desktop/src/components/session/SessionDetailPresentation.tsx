@@ -1,3 +1,7 @@
+import type {
+  SessionDetailAction,
+  SessionDetailTab as AnalyticsTab,
+} from "../../lib/sessionAnalytics"
 import { isMacOS } from "../../lib/platform"
 import {
   snoozedDetectorIds,
@@ -202,6 +206,9 @@ export interface SessionDetailPresentationProps {
   onCopySourcePath?: () => Promise<void>
   /** Copy a discussion prompt built from the loaded session evidence. */
   onCopyDiscussionPrompt?: () => Promise<void>
+  /** The main-window visit owns analytics for explicit detail controls. */
+  onDetailAction?: ((action: SessionDetailAction) => void) | undefined
+  onDetailTab?: ((tab: AnalyticsTab) => void) | undefined
   projectFolder?: { path: string; onOpen: () => Promise<void>; onCopy: () => Promise<void> }
   renderAgentIcon: AgentIconRenderer
   /** Remove the popover surface when a host supplies the surrounding pane. */
@@ -216,8 +223,10 @@ export interface SessionDetailPresentationProps {
 function RelationControl({
   relations,
   onOpen,
+  onDetailAction,
 }: {
   relations: LocalSessionRelations
+  onDetailAction?: ((action: SessionDetailAction) => void) | undefined
   onOpen: (target: LocalSessionRelation, title: string) => void
 }) {
   const titleFor = (target: LocalSessionRelation) => {
@@ -233,7 +242,10 @@ function RelationControl({
         <Tooltip label={`Open parent: ${titleFor(parent)}`}>
           <button
             type="button"
-            onClick={() => onOpen(parent, titleFor(parent))}
+            onClick={() => {
+              onDetailAction?.("open_parent")
+              onOpen(parent, titleFor(parent))
+            }}
             className="rounded-control p-1 text-label-tertiary hover:bg-surface-tertiary hover:text-label-secondary"
             aria-label="Open fork parent"
           >
@@ -256,7 +268,10 @@ function RelationControl({
         <Tooltip label={`Open fork: ${titleFor(soleChild)}`}>
           <button
             type="button"
-            onClick={() => onOpen(soleChild, titleFor(soleChild))}
+            onClick={() => {
+              onDetailAction?.("open_child")
+              onOpen(soleChild, titleFor(soleChild))
+            }}
             className="rounded-control p-1 text-label-tertiary hover:bg-surface-tertiary hover:text-label-secondary"
             aria-label="Open forked child"
           >
@@ -266,7 +281,11 @@ function RelationControl({
       )}
 
       {children.length > 0 && !(soleChild && soleChild.available) && (
-        <DropdownMenu.Root>
+        <DropdownMenu.Root
+          onOpenChange={(open) => {
+            if (open) onDetailAction?.("fork_menu_opened")
+          }}
+        >
           <DropdownMenu.Trigger asChild>
             <button
               type="button"
@@ -293,7 +312,11 @@ function RelationControl({
                     key={sessionIdentityKey(child.identity)}
                     className="ui-menu-item truncate"
                     disabled={!child.available}
-                    onSelect={() => child.available && onOpen(child, title)}
+                    onSelect={() => {
+                      if (!child.available) return
+                      onDetailAction?.("open_child")
+                      onOpen(child, title)
+                    }}
                   >
                     {title}
                     {!child.available && (
@@ -439,6 +462,7 @@ function HostActions({
   relations,
   refreshing = false,
   onOpenRelatedSession,
+  onDetailAction,
   onRevealSource,
   onCopySourcePath,
   onCopyDiscussionPrompt,
@@ -449,6 +473,7 @@ function HostActions({
   sessionKey: string
   relations: LocalSessionRelations | null
   refreshing?: boolean
+  onDetailAction?: ((action: SessionDetailAction) => void) | undefined
   onOpenRelatedSession: (target: LocalSessionRelation, title: string) => void
   onRevealSource: (() => void) | undefined
   onCopySourcePath: (() => Promise<void>) | undefined
@@ -462,7 +487,11 @@ function HostActions({
     <div className={cn("flex shrink-0 items-center gap-1", className)}>
       {refreshing && <RefreshingIndicator />}
       {hasRelations && relations && (
-        <RelationControl relations={relations} onOpen={onOpenRelatedSession} />
+        <RelationControl
+          relations={relations}
+          onOpen={onOpenRelatedSession}
+          onDetailAction={onDetailAction}
+        />
       )}
       <Tooltip label="Delete this session">
         <button
@@ -733,6 +762,8 @@ export function SessionDetailPresentation({
   onCopyDiscussionPrompt,
   renderAgentIcon,
   projectFolder,
+  onDetailAction,
+  onDetailTab,
   embedded = false,
   active = true,
 }: SessionDetailPresentationProps) {
@@ -919,6 +950,7 @@ export function SessionDetailPresentation({
       relations={relations}
       refreshing={refreshing}
       onOpenRelatedSession={onOpenRelatedSession}
+      onDetailAction={onDetailAction}
       onRevealSource={onRevealSource}
       onCopySourcePath={onCopySourcePath}
       onCopyDiscussionPrompt={onCopyDiscussionPrompt}
@@ -1058,7 +1090,14 @@ export function SessionDetailPresentation({
     <section className="shrink-0">
       <TabSectionHeading>Cost</TabSectionHeading>
       {cost && tokensCard ? (
-        <CostBreakdown cost={cost} split={tokensCard.split} onOpenSubagent={onOpenSubagent} />
+        <CostBreakdown
+          cost={cost}
+          split={tokensCard.split}
+          onOpenSubagent={(id, label) => {
+            onDetailAction?.("open_subagent")
+            onOpenSubagent(id, label)
+          }}
+        />
       ) : (
         <p className="type-callout text-label-tertiary">
           {summary?.sessions[0]?.accounting
@@ -1078,7 +1117,11 @@ export function SessionDetailPresentation({
 
   const quotaSection = onOpenQuota && (
     <div className="shrink-0">
-      <SessionQuotaSection sessionQuota={sessionQuota} onOpenQuota={onOpenQuota} />
+      <SessionQuotaSection
+        sessionQuota={sessionQuota}
+        onOpenQuota={onOpenQuota}
+        onExpand={() => onDetailAction?.("limits_expanded")}
+      />
     </div>
   )
 
@@ -1185,7 +1228,10 @@ export function SessionDetailPresentation({
               <SubagentBadge
                 parentAgent={session.agent}
                 {...(subagent.parentTitle ? { parentTitle: subagent.parentTitle } : {})}
-                onOpenOrchestrator={onOpenOrchestrator}
+                onOpenOrchestrator={() => {
+                  onDetailAction?.("open_orchestrator")
+                  onOpenOrchestrator()
+                }}
                 renderAgentIcon={renderAgentIcon}
               />
             )}
@@ -1247,7 +1293,10 @@ export function SessionDetailPresentation({
                       stats={costKeyStats}
                       pinned={costPinned}
                       onHighlight={setCostHovered}
-                      onPin={toggleCostPin}
+                      onPin={(series) => {
+                        if (series !== costPinned) onDetailAction?.("pin_cost_series")
+                        toggleCostPin(series)
+                      }}
                       swatchClass={COST_SERIES_SWATCH_CLASS}
                     />
                   </section>
@@ -1342,7 +1391,11 @@ export function SessionDetailPresentation({
                 className="ui-segmented-solid session-detail-tabs session-detail-floating-tabs pointer-events-auto type-callout shrink-0 rounded-full! bg-surface/80! shadow-raised [&_button]:rounded-full!"
                 options={DETAIL_TABS}
                 value={tab}
-                onChange={setTab}
+                onChange={(next) => {
+                  if (next === tab) return
+                  onDetailTab?.(next === "overview" ? "context" : next)
+                  setTab(next)
+                }}
                 ariaLabel="Session detail sections"
                 semantics="tabs"
                 variant="native-tabs"

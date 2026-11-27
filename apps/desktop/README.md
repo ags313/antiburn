@@ -20,6 +20,8 @@ no Antiburn account, server, or backend.
   account attribution; stored events remain subject to local retention. A request
   already sent can finish, but no further page is requested after opt-out.
 
+- **Local database storage:** Cleanup removes expired data and superseded analysis
+  rows. SQLite can reuse the space, and the database file may retain its size.
 - **OpenCode V2 sessions:** Native stored analysis reads a bounded, read-only SQLite
   snapshot. Live YAML Checks can observe the existing registered local service
   over authenticated HTTP after Antiburn proves that its process has the selected
@@ -88,13 +90,16 @@ and integration startup remain independent of this introduction. Supported HUDs
 appear after completion unless an existing preference disables them.
 
 The introduction uses isolated example data to demonstrate Sessions, provider
-limits, the HUD, notifications, and Checks. Ordinary builds finish after Checks.
-Antiburn Cloud is waitlisted. [Sign up for the waiting list](https://antiburn.com/cloud/).
+limits, the HUD, notifications, and Checks. After Checks, standard builds show
+the Cloud information screen. Select **Learn more** to open the public Cloud page
+or **Done** to open Sessions.
+Antiburn Cloud is waitlisted. [Sign up for the waiting list](https://antiburn.com/cloud/?utm_source=github&utm_medium=readme&utm_campaign=github_readme&utm_content=desktop_waitlist).
 Standard public builds keep Cloud disabled. Development requires the explicit,
 non-default Rust feature `cloud`.
 The desktop `dev` and `dev:bundle` launchers select it for debug development.
-Environment values cannot enable the feature. Builds without `cloud` register no
-Cloud commands, capabilities, account controls, callback scheme, or Cloud Dev menu.
+Environment values cannot enable the feature. Builds without `cloud` omit Cloud
+account commands, account permissions, account controls, the callback scheme, and
+the Cloud Dev menu.
 When both build-time origins are absent, debug Cloud builds use
 `http://localhost:3000` for both issuer and resource. Standard release Cloud builds
 require explicit HTTPS origins. The desktop build capability enables the existing Cloud
@@ -131,8 +136,10 @@ The project list uses bounded cached metadata from all discovered agents.
 Current local Git metadata can group a repository and its worktrees for display.
 Suggestions do not imply upload support. Desktop uploads only formats the service
 advertises for Claude Code, OpenCode V2, Codex, and Pi. Draft choices do not save
-consent or enable uploads. **Start syncing** approves only the loaded selected
-folders and their current paths. New worktrees outside those paths need approval.
+consent or enable uploads. **Start syncing** approves the selected repositories
+and exact folders. Exact-folder approval does not extend to new worktrees
+outside those folders. Repository approval can cover later checkouts with the
+same verified Git origin.
 
 Sessions match when any proved source-owned project or working directory (CWD)
 falls inside an approved folder or its descendants. CWD changes are valid.
@@ -160,10 +167,8 @@ Automatic spool release requires verified integrity acceptance, not a successful
 transfer or progress count. Interrupted captures need recovery rather than
 automatic recapture.
 
-Legacy **Save capture request** commands remain discovery-only and report
-**Upload unavailable**. They do not grant ongoing upload consent or start the
-background sync policy. Local sessions and model-based Checks keep their separate
-controls.
+Old one-time capture requests do not grant upload permission. Approve folders
+to enable uploads. Local sessions and model-based Checks keep their separate controls.
 
 ## Layout
 
@@ -253,7 +258,7 @@ not running, local sessions still work and Cloud requests report offline.
 The Cloud Dev menu offers separate simulated previews without a service.
 
 These launchers use the debug app identifier and its own data directory.
-Debug settings, source selections, saved requests, and Cloud state stay separate
+Debug settings, folder consent, and Cloud state stay separate
 from the release app. Selections remain reusable within each app profile.
 
 To override the local service, set both `ANTIBURN_CLOUD_ISSUER` and
@@ -282,9 +287,9 @@ change it.
 
 Cargo defaults and release commands do not enable Cloud. `tauri build`,
 `tauri dev --release`, and custom Cargo profiles do not receive the launcher's
-debug feature selection. A manually enabled Cloud build without debug assertions
-has no local default and accepts only explicit HTTPS origins. These development
-commands do not authorize production use.
+debug feature selection. If you enable `cloud` in a build without debug
+assertions, both origins default to `https://api.antiburn.com`. Set both
+build-time origins to use a different HTTPS service.
 
 And for the shell:
 

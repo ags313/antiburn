@@ -1,6 +1,9 @@
 use super::*;
 use antiburn_remote::export::{BundleCompanion, BundleFile};
 
+#[path = "tests/restored_snapshot_integration_tests.rs"]
+mod restored_snapshot;
+
 fn manifest(data: &[u8]) -> BundleManifest {
     BundleManifest {
         session: RemoteSession {

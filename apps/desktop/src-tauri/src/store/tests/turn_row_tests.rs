@@ -11,7 +11,7 @@ use super::*;
 #[test]
 fn the_migration_ladder_reaches_the_turn_row_schema() {
     // Pin the count so each new migration requires an explicit test update.
-    assert_eq!(super::schema::MIGRATIONS.len(), 94);
+    assert_eq!(super::schema::MIGRATIONS.len(), 95);
 
     let store = store();
     assert_eq!(

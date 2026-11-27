@@ -18,16 +18,65 @@ fn anchor(directory: &std::path::Path) -> Engine {
     )
 }
 
+#[test]
+fn cloud_sync_turn_distinguishes_closed_local_admission_from_an_account_change() {
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path().canonicalize().unwrap();
+    let store = Store::open_in_memory(&base).unwrap();
+    store.initialize_cloud_setup().unwrap();
+    let mut runner = Runner::default();
+    let mut engine = anchor(&base);
+    let mut host = capture::Host::new(&base);
+    let mut cache = super::super::projects::Cache::default();
+    for (account_is_current, expected) in [(true, State::Paused), (false, State::ReauthRequired)] {
+        runner
+            .turn(
+                &store,
+                &mut host,
+                &mut engine,
+                &|| {
+                    assert!(account_is_current);
+                    false
+                },
+                (&|| account_is_current, None),
+                &mut cache,
+            )
+            .unwrap();
+        assert_eq!(runner.state, expected);
+    }
+}
+
 fn policy(store: &Store, account: &str, workspace: &str, resource: &str, issuer: &str) -> Policy {
+    policy_with_paths(
+        store,
+        account,
+        workspace,
+        resource,
+        issuer,
+        &[FIRST, SECOND],
+    )
+}
+
+fn policy_with_paths(
+    store: &Store,
+    account: &str,
+    workspace: &str,
+    resource: &str,
+    issuer: &str,
+    paths: &[&str],
+) -> Policy {
     let root = SourceSelection {
         source_kind: SourceKind::ClaudeJsonl,
         path: "/Example/Provider".into(),
     };
-    let mut projects = [FIRST, SECOND].map(|path| ProjectSelection {
-        source_kind: root.source_kind,
-        source_path: root.path.clone(),
-        project_path: path.into(),
-    });
+    let mut projects = paths
+        .iter()
+        .map(|path| ProjectSelection {
+            source_kind: root.source_kind,
+            source_path: root.path.clone(),
+            project_path: (*path).into(),
+        })
+        .collect::<Vec<_>>();
     projects.sort();
     store
         .save_cloud_sync_policy_for_grant(
@@ -63,7 +112,262 @@ fn off(policy: &Policy, path: &str) -> ProjectChange {
         projects: Vec::new(),
         folder_paths: vec![path.into()],
         expected_policy_revision: policy.revision.clone(),
+        expected_removals: None,
+        move_from: None,
     }
+}
+
+#[test]
+fn cloud_move_requires_exact_native_removals_before_writing_the_source_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory(directory.path()).unwrap();
+    store.initialize_cloud_setup().unwrap();
+    let team = policy(&store, ACCOUNT, TEAM, RESOURCE, ISSUER);
+    let mut change = off(&team, FIRST);
+    change.group_id = super::super::projects::group_id("native", FIRST);
+    change.folder_paths.push(SECOND.into());
+    change.expected_removals = Some(vec![team.projects[0].clone()]);
+
+    // Group removal covers more than the renderer approved.
+    assert!(project_removals(&team, &change).is_err());
+    assert!(disable_team_folder(&store, &team, &change, &|| true).is_err());
+    assert_eq!(
+        store
+            .cloud_sync_policy_for_origins(ACCOUNT, TEAM, RESOURCE, ISSUER)
+            .unwrap(),
+        Some(team.clone())
+    );
+    assert!(
+        project_removals(
+            &Policy {
+                membership_generation: None,
+                team_grant_id: None,
+                workspace_name: None,
+                ..team.clone()
+            },
+            &change
+        )
+        .is_err()
+    );
+
+    change.expected_removals = Some(team.projects.iter().rev().cloned().collect());
+    let saved = disable_team_folder(&store, &team, &change, &|| true).unwrap();
+    assert!(saved.projects.is_empty());
+    assert_ne!(saved.revision, team.revision);
+}
+
+#[test]
+fn cloud_move_checks_the_saved_source_revision_after_removal() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory(directory.path()).unwrap();
+    store.initialize_cloud_setup().unwrap();
+    let team = policy(&store, ACCOUNT, TEAM, RESOURCE, ISSUER);
+    let moved = team
+        .projects
+        .iter()
+        .filter(|project| project.project_path == FIRST)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut remove = off(&team, FIRST);
+    remove.expected_removals = Some(moved.iter().cloned().collect());
+    let removed = disable_team_folder(&store, &team, &remove, &|| true).unwrap();
+    let mut expected = MoveFrom {
+        destination_id: TEAM.into(),
+        policy_revision: removed.revision.clone(),
+    };
+    let session = personal();
+    assert!(
+        verify_project_move(
+            &store,
+            &session,
+            PERSONAL,
+            &expected,
+            &moved,
+            &BTreeMap::new()
+        )
+        .is_ok()
+    );
+    assert!(
+        verify_project_move(&store, &session, TEAM, &expected, &moved, &BTreeMap::new()).is_err()
+    );
+    let mut wrong_origin = session.clone();
+    wrong_origin.iss = "https://other-issuer.example".into();
+    assert!(
+        verify_project_move(
+            &store,
+            &wrong_origin,
+            PERSONAL,
+            &expected,
+            &moved,
+            &BTreeMap::new()
+        )
+        .is_err()
+    );
+
+    // A second window restores the source before the target write.
+    let restored = store
+        .renew_cloud_team_sync_policy(
+            (
+                ACCOUNT,
+                TEAM,
+                RESOURCE,
+                ISSUER,
+                Some(("current-member", "Example Team")),
+            ),
+            &removed.revision,
+            &[SECOND.into()].into(),
+            Some((&moved, &BTreeMap::new())),
+            || true,
+        )
+        .unwrap();
+    assert!(
+        verify_project_move(
+            &store,
+            &session,
+            PERSONAL,
+            &expected,
+            &moved,
+            &BTreeMap::new()
+        )
+        .is_err()
+    );
+    expected.policy_revision = restored.revision;
+    assert!(
+        verify_project_move(
+            &store,
+            &session,
+            PERSONAL,
+            &expected,
+            &moved,
+            &BTreeMap::new()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn cloud_move_create_rejects_a_target_policy_saved_by_another_window() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory(directory.path()).unwrap();
+    store.initialize_cloud_setup().unwrap();
+    let source = policy(&store, ACCOUNT, TEAM, RESOURCE, ISSUER);
+    let removed = disable_team_folder(&store, &source, &off(&source, FIRST), &|| true).unwrap();
+    let expected = MoveFrom {
+        destination_id: TEAM.into(),
+        policy_revision: removed.revision,
+    };
+    let moved = source
+        .projects
+        .into_iter()
+        .filter(|project| project.project_path == FIRST)
+        .collect::<Vec<_>>();
+    let session = personal();
+    let target_id = "new-team";
+    assert!(
+        verify_project_move_to_new_policy(
+            &store,
+            &session,
+            target_id,
+            &expected,
+            &moved,
+            &BTreeMap::new()
+        )
+        .is_ok()
+    );
+    let origins = BTreeMap::from([(FIRST.into(), "github.com/example/repository".into())]);
+    assert!(
+        verify_project_move_to_new_policy(&store, &session, target_id, &expected, &moved, &origins)
+            .is_err()
+    );
+
+    let target = policy_with_paths(&store, ACCOUNT, target_id, RESOURCE, ISSUER, &[SECOND]);
+
+    assert!(
+        verify_project_move(
+            &store,
+            &session,
+            target_id,
+            &expected,
+            &moved,
+            &BTreeMap::new()
+        )
+        .is_ok()
+    );
+    assert!(
+        verify_project_move_to_new_policy(
+            &store,
+            &session,
+            target_id,
+            &expected,
+            &moved,
+            &BTreeMap::new()
+        )
+        .is_err()
+    );
+    assert_eq!(
+        store
+            .cloud_sync_policy_for_origins(ACCOUNT, target_id, RESOURCE, ISSUER)
+            .unwrap(),
+        Some(target)
+    );
+}
+
+#[test]
+fn cloud_move_rejects_an_overlapping_grant_in_another_saved_workspace() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_in_memory(directory.path()).unwrap();
+    store.initialize_cloud_setup().unwrap();
+    let team = policy(&store, ACCOUNT, TEAM, RESOURCE, ISSUER);
+    let removed = disable_team_folder(&store, &team, &off(&team, FIRST), &|| true).unwrap();
+    let expected = MoveFrom {
+        destination_id: TEAM.into(),
+        policy_revision: removed.revision,
+    };
+    let session = personal();
+    let added = team
+        .projects
+        .iter()
+        .filter(|project| project.project_path == FIRST);
+    let target = "new-team";
+    policy_with_paths(&store, ACCOUNT, target, RESOURCE, ISSUER, &[FIRST]);
+    policy_with_paths(
+        &store,
+        ACCOUNT,
+        "different-origin",
+        RESOURCE,
+        "https://other-issuer.example",
+        &[FIRST],
+    );
+    policy_with_paths(
+        &store,
+        ACCOUNT,
+        "third-team",
+        RESOURCE,
+        ISSUER,
+        &["/Example/Saved Folder Other"],
+    );
+    assert!(
+        verify_project_move(
+            &store,
+            &session,
+            target,
+            &expected,
+            added.clone(),
+            &BTreeMap::new()
+        )
+        .is_ok()
+    );
+    policy_with_paths(
+        &store,
+        ACCOUNT,
+        "third-team",
+        RESOURCE,
+        ISSUER,
+        &["/Example/Saved Folder/child"],
+    );
+    assert!(
+        verify_project_move(&store, &session, target, &expected, added, &BTreeMap::new()).is_err()
+    );
 }
 
 #[test]
@@ -241,8 +545,10 @@ fn cloud_team_folder_confirmation_requires_current_eligibility_and_stale_consent
 fn cloud_retry_availability_is_false_when_device_upload_is_off() {
     let status = Status {
         retry_available: true,
+        automatic_recovery_count: Some(1),
         team_statuses: vec![Status {
             retry_available: true,
+            automatic_recovery_count: Some(1),
             ..Status::default()
         }],
         ..Status::default()
@@ -250,6 +556,12 @@ fn cloud_retry_availability_is_false_when_device_upload_is_off() {
     let value = serde_json::to_value(status.with_device_upload_enabled(false)).unwrap();
     assert_eq!(value["retryAvailable"], false);
     assert_eq!(value["teamStatuses"][0]["retryAvailable"], false);
+    assert!(value.get("automaticRecoveryCount").is_none());
+    assert!(
+        value["teamStatuses"][0]
+            .get("automaticRecoveryCount")
+            .is_none()
+    );
 }
 
 #[test]
@@ -266,22 +578,35 @@ fn cloud_scheduler_keeps_unverified_team_work_without_running_it() {
     let cursor = DiscoveryCursor {
         root: 0,
         after: Some("kept-page".into()),
+        ..DiscoveryCursor::default()
     };
     let mut runners = BTreeMap::from([(
         key.clone(),
         Runner {
             team: Some((TEAM.into(), "synthetic-membership".into())),
             last_status: Some(Status {
+                status: State::Syncing,
+                storage_known: true,
                 account_id: Some(ACCOUNT.into()),
                 destination_id: Some(TEAM.into()),
                 policy_revision: Some(policy.revision.clone()),
                 retry_available: true,
                 recovery_required_count: 2,
+                automatic_recovery_count: Some(1),
+                backfill_in_progress: true,
+                full_sync_in_progress: true,
+                background_sync_in_progress: true,
                 ..Status::default()
             }),
             last_status_origin: Some(RESOURCE.into()),
-            retry_grant_id: Some(session.grant_id.clone()),
+            retry_grant: Some(RetryGrant {
+                account_id: ACCOUNT.into(),
+                destination_id: TEAM.into(),
+                grant_id: session.grant_id.clone(),
+            }),
             backfill_revision: Some(policy.revision.clone()),
+            backfill_progress: Some(BackfillProgress::new(&policy, &session.grant_id)),
+            full_sync_pending: true,
             discovery_cursor: Some(cursor.clone()),
             retry_deadlines: BTreeMap::from([(
                 "saved".into(),
@@ -292,6 +617,14 @@ fn cloud_scheduler_keeps_unverified_team_work_without_running_it() {
             ..Runner::default()
         },
     )]);
+    let read_failure = team_lookup_failed(
+        &policy,
+        runners[&key].last_status.clone(),
+        auth::Failure::Offline,
+    );
+    assert!(!read_failure.backfill_in_progress);
+    assert!(!read_failure.full_sync_in_progress);
+    assert!(!read_failure.background_sync_in_progress);
     let policies = [policy];
     let mut observed = Vec::new();
     assert!(
@@ -305,9 +638,12 @@ fn cloud_scheduler_keeps_unverified_team_work_without_running_it() {
         .is_empty()
     );
     assert_eq!(observed[0].status, State::Offline);
-    assert!(observed[0].backfill_in_progress);
+    assert!(!observed[0].backfill_in_progress);
+    assert!(!observed[0].full_sync_in_progress);
+    assert!(!observed[0].background_sync_in_progress);
     assert_eq!(observed[0].recovery_required_count, 2);
     assert!(!observed[0].retry_available);
+    assert_eq!(observed[0].automatic_recovery_count, None);
     assert_eq!(runners[&key].discovery_cursor.as_ref(), Some(&cursor));
     assert_eq!(runners[&key].retry_deadlines["saved"].0, deadline);
     assert_eq!(runners[&key].conflict_attempts["saved"], 2);

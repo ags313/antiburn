@@ -1,5 +1,5 @@
 import type { SessionListEntry } from "../../components/session/SessionList"
-import { activityDayAge } from "../../components/activity/activityWindow"
+import { activityDayAge, isWithinActivityDays } from "../../components/activity/activityWindow"
 import { groupActivityByDay } from "../../components/activity/activityFeedGrouping"
 import { toActivityEntries, toActivityEntry } from "../../lib/activityEntries"
 import {
@@ -8,7 +8,8 @@ import {
   EMPTY_SESSION_LIMIT_ALLOCATIONS,
   getSettings,
   setSettings,
-  listRecentSessions,
+  openSessionActivityStream,
+  type SessionActivityStream,
   listOverviewSessions,
   getLiveUsage,
   getSessionLimitAllocations,
@@ -20,6 +21,7 @@ import {
   onSessionIndexChanged,
   onSessionUpdated,
   onLiveUsageChanged,
+  type ActivityEntryPayload,
   type AppSettings,
   type SessionAnalysisPayload,
   type LiveUsageSummaryPayload,
@@ -47,14 +49,29 @@ import {
 } from "../../lib/sessionFilters"
 import { remoteHosts, type RemoteHost } from "../../lib/remoteHosts"
 import { sessionKey, loadSessionAnalysis, type SessionSubject } from "../../lib/sessionSubject"
+import {
+  newSessionVisitId,
+  type SessionContext,
+  type SessionDetailAction,
+  type SessionDetailTab,
+  type SessionFilterResult,
+  type SessionNavigationHint,
+} from "../../lib/sessionAnalytics"
 import { SurfaceExposureTracker } from "../../lib/surfaceExposure"
 
 export interface MainActivitySnapshot {
   active: boolean
-  /** The collection applies filters to this full list at render time. */
+  /** The collection applies filters to all rows received from the stream. */
   entries: SessionListEntry[] | null
+  /** The last total for the current date range and enabled agents. */
+  sessionTotal: number | null
   localEntries: SessionListEntry[] | null
+  localEntriesError: boolean
+  availableAgents: readonly string[]
   listError: boolean
+  hasMoreSessions: boolean
+  loadingMoreSessions: boolean
+  loadMoreSessionsError: boolean
   settings: AppSettings
   settingsError: boolean
   subject: SessionSubject | null
@@ -86,6 +103,15 @@ export function subjectForEntry(entry: SessionListEntry): SessionSubject {
     ...(entry.remoteHostId ? { remoteHostId: entry.remoteHostId } : {}),
     title: entry.title,
   }
+}
+
+function activityEntryKey(entry: SessionListEntry | ActivityEntryPayload): string {
+  return localSessionKey(
+    entry.agent,
+    entry.sessionId ?? "",
+    entry.wslDistro,
+    entry.remoteHostId,
+  )
 }
 
 export function orderedActivityEntries(snapshot: MainActivitySnapshot): SessionListEntry[] {
@@ -131,13 +157,18 @@ export class MainActivitySession {
   onNavigation?: (origin: SurfaceOrigin) => void
   onDeleted?: (subject: SessionSubject) => void
   onSessionInventoryInvalidated?: () => void
+  /** Apply pending native navigation before a newly visible detail can report a visit. */
+  beforeWindowVisible?: () => Promise<void>
   private restoringNavigation = false
 
+  /** Restore filters and detail. Explicit empty selection cancels late default selection. */
   restoreNavigation(
     filters: SessionFilters,
     subject: SessionSubject | null,
     origin: SurfaceOrigin = "automatic",
     reportFilterSelection = false,
+    clearDefaultSelection = false,
+    hint?: SessionNavigationHint,
   ): void {
     this.restoringNavigation = true
     try {
@@ -182,10 +213,15 @@ export class MainActivitySession {
         subject &&
         (!this.snapshot.subject || sessionKey(subject) !== sessionKey(this.snapshot.subject))
       )
-        this.open(subject, [], origin)
-      else if (
+        this.open(subject, [], origin, hint)
+      else if (subject && hint && (hint.route === "popover" || !this.visit)) {
+        this.pendingVisit = { key: sessionKey(subject), hint }
+        this.exposureOrigin = origin
+      } else if (
         !subject &&
-        (this.snapshot.subject || (reportFilterSelection && next.source?.kind === "selected"))
+        (this.snapshot.subject ||
+          clearDefaultSelection ||
+          (reportFilterSelection && next.source?.kind === "selected"))
       )
         this.clearSelection()
     } finally {
@@ -197,7 +233,13 @@ export class MainActivitySession {
     active: false,
     entries: null,
     localEntries: null,
+    localEntriesError: false,
+    availableAgents: [],
     listError: false,
+    sessionTotal: null,
+    hasMoreSessions: false,
+    loadingMoreSessions: false,
+    loadMoreSessionsError: false,
     settings: DEFAULT_SETTINGS,
     settingsError: false,
     subject: null,
@@ -218,6 +260,7 @@ export class MainActivitySession {
   private listeners = new Set<() => void>()
   private activeListeners = new Set<() => void>()
   private listListeners = new Set<() => void>()
+  private localEntriesListeners = new Set<() => void>()
   private settingsWrite: Promise<void> | null = null
   private stops: (() => void)[] = []
   private generation = 0
@@ -230,9 +273,21 @@ export class MainActivitySession {
   private visible = false
   private initialized = false
   private listRunning = false
+  private localEntriesRunning = false
   private defaultSelectionPending = true
   private timer: ReturnType<typeof setInterval> | null = null
+  private sessionTotalDay: string | null = null
+  private activityStream: SessionActivityStream | null = null
+  private reconcileOnResume = false
+  private appendedHistory = false
+  private tailTimestamp: string | undefined
+  private listPatches: Map<string, ActivityEntryPayload> | null = null
+  private appendPatches: Map<string, ActivityEntryPayload> | null = null
+  private localPatches: Map<string, ActivityEntryPayload> | null = null
+  private overviewTask: Promise<void> | null = null
+  private overviewDirty = false
   private listTask: Promise<void> | null = null
+  private appendTask: Promise<void> | null = null
   private listDirty = false
   private invalidated = false
   private analysisTask: Promise<void> | null = null
@@ -250,12 +305,113 @@ export class MainActivitySession {
   private usageRevision = 0
   private readonly exposure = new SurfaceExposureTracker()
   private exposureOrigin: SurfaceOrigin = "automatic"
+  private pendingVisit: { key: string; hint: SessionNavigationHint } | null = null
+  private visit: {
+    key: string
+    id?: string
+    context: SessionContext
+    origin: SurfaceOrigin
+    limitsExpanded: boolean
+  } | null = null
+  private filterVisit: { key: string; seen: Set<SessionFilterResult> } | null = null
+
+  /** Observe a filter result only after the deliberate filter is rendered and visible. */
+  presentFilterResult(key: string, result: SessionFilterResult | null): void {
+    const visit = this.filterVisit
+    if (
+      !this.snapshot.active ||
+      !visit ||
+      visit.key !== key ||
+      !result ||
+      visit.seen.has(result)
+    )
+      return
+    visit.seen.add(result)
+    noteInteraction({ kind: "sessionFilterResultsObserved", result })
+  }
+
+  /** Commit the subject shown by the detail slot and synchronize its visible visit. */
+  presentDetail(key: string | null, context?: SessionContext): void {
+    if (
+      !key ||
+      !context ||
+      !this.snapshot.active ||
+      !this.snapshot.subject ||
+      !this.snapshot.settings.analyticsEnabled
+    ) {
+      this.concealDetail()
+      return
+    }
+    if (key !== sessionKey(this.snapshot.subject)) return
+    const hint = this.pendingVisit?.key === key ? this.pendingVisit.hint : undefined
+    const existing = this.visit
+    if (existing?.key === key && !hint) {
+      existing.context = { ...context, entryRoute: existing.context.entryRoute }
+    } else {
+      this.exposure.conceal("session_detail")
+      this.pendingVisit = null
+      const id = hint?.visit ?? newSessionVisitId()
+      const scoped = { ...context, entryRoute: hint?.route ?? ("return" as const) }
+      this.visit = {
+        key,
+        ...(id ? { id } : {}),
+        context: scoped,
+        origin: this.exposureOrigin,
+        limitsExpanded: false,
+      }
+      noteInteraction({
+        kind: "sessionDetailViewed",
+        context: scoped,
+        ...(id ? { visit: id } : {}),
+        origin: this.exposureOrigin,
+      })
+    }
+    this.syncExposure(true)
+  }
+
+  /** End the visit when its committed detail pane is removed or concealed. */
+  concealDetail = (): void => {
+    this.visit = null
+    this.exposure.conceal("session_detail")
+  }
+
+  /** Record an explicit action only for the detail visit that owns the control. */
+  noteDetailAction(
+    key: string,
+    interaction:
+      | { kind: "sessionDetailTabSelected"; tab: SessionDetailTab }
+      | { kind: "sessionDetailInteraction"; action: SessionDetailAction },
+    checkBadge?: SessionContext["checkBadge"],
+  ): void {
+    const visit = this.visit
+    if (
+      !this.snapshot.active ||
+      visit?.key !== key ||
+      !this.snapshot.subject ||
+      sessionKey(this.snapshot.subject) !== key
+    )
+      return
+    if (
+      interaction.kind === "sessionDetailInteraction" &&
+      interaction.action === "limits_expanded"
+    ) {
+      if (visit.limitsExpanded) return
+      visit.limitsExpanded = true
+    }
+    noteInteraction({
+      ...interaction,
+      context: checkBadge === undefined ? visit.context : { ...visit.context, checkBadge },
+      ...(visit.id ? { visit: visit.id } : {}),
+    })
+  }
 
   getSnapshot = (): MainActivitySnapshot => this.snapshot
-  subscribe = (listener: () => void): (() => void) => this.attach(listener, true)
+  subscribe = (listener: () => void): (() => void) => this.attach(listener, "detail")
   /** Subscribe to the shared session list without starting session detail work. */
-  subscribeList = (listener: () => void): (() => void) => this.attach(listener, false, true)
-  subscribeInactive = (listener: () => void): (() => void) => this.attach(listener, false)
+  subscribeList = (listener: () => void): (() => void) => this.attach(listener, "list")
+  /** Request the local projection only while a visible consumer needs it. */
+  subscribeLocalEntries = (listener: () => void): (() => void) => this.attach(listener, "local")
+  subscribeInactive = (listener: () => void): (() => void) => this.attach(listener)
 
   private update(patch: Partial<MainActivitySnapshot>): void {
     this.snapshot = { ...this.snapshot, ...patch }
@@ -263,31 +419,37 @@ export class MainActivitySession {
     for (const listener of this.listeners) listener()
   }
 
-  private syncExposure(): void {
-    const subject = this.snapshot.subject
-    if (!this.snapshot.active || !subject) {
+  private syncExposure(committed = false): void {
+    const { subject, active, analysis } = this.snapshot
+    const visit = this.visit
+    if (!active || !subject || !visit || visit.key !== sessionKey(subject)) {
+      if (!active || !subject) this.visit = null
       this.exposure.conceal("session_detail")
       return
     }
-    const generation = this.exposure.expose({
+    if (!committed) return
+    const state = analysisSurfaceState(subject, analysis)
+    this.exposure.expose({
       surface: "session_detail",
-      origin: this.exposureOrigin,
-      identity: sessionKey(subject),
+      origin: visit.origin,
+      identity: visit.key,
+      ...(visit.id ? { sessionVisit: visit.id } : {}),
+      state,
     })
-    const state = analysisSurfaceState(subject, this.snapshot.analysis)
-    if (state) this.exposure.observe(state, generation)
   }
 
-  private attach(listener: () => void, active: boolean, list = false): () => void {
+  private attach(listener: () => void, scope?: "detail" | "list" | "local"): () => void {
     this.listeners.add(listener)
-    if (active) this.activeListeners.add(listener)
-    if (list) this.listListeners.add(listener)
+    if (scope === "detail") this.activeListeners.add(listener)
+    if (scope === "list" || scope === "local") this.listListeners.add(listener)
+    if (scope === "local") this.localEntriesListeners.add(listener)
     if (this.listeners.size === 1) void this.start()
     this.syncActive()
     return () => {
       this.listeners.delete(listener)
       this.activeListeners.delete(listener)
       this.listListeners.delete(listener)
+      this.localEntriesListeners.delete(listener)
       this.syncActive()
       if (this.listeners.size === 0) this.dispose()
     }
@@ -303,14 +465,22 @@ export class MainActivitySession {
   private async start(): Promise<void> {
     const generation = ++this.generation
     let visibilityRevision = 0
+    const applyVisibility = (visible: boolean, revision: number) => {
+      const commit = () => {
+        if (generation !== this.generation || revision !== visibilityRevision) return
+        this.visible = visible
+        this.syncActive()
+      }
+      if (visible && !this.visible && this.beforeWindowVisible)
+        void this.beforeWindowVisible().then(commit, commit)
+      else commit()
+    }
     await Promise.all([
       this.listen(
         generation,
         onMainWindowVisibilityChanged((visible) => {
           if (generation !== this.generation) return
-          visibilityRevision += 1
-          this.visible = visible
-          this.syncActive()
+          applyVisibility(visible, ++visibilityRevision)
         }),
       ),
       this.listen(
@@ -387,14 +557,13 @@ export class MainActivitySession {
     ])
     if (generation !== this.generation) return
     if (settingsVersion === this.settingsVersion) this.applySettings(settings)
-    if (revision === visibilityRevision) this.visible = visible
+    if (revision === visibilityRevision) applyVisibility(visible, revision)
     this.initialized = true
     this.syncActive()
   }
 
   private applySessionUpdate(update: SessionUpdatedPayload): void {
     const entry = update.entry
-    this.listVersion += 1
     const entries = this.snapshot.entries
     const key = localSessionKey(
       entry.agent,
@@ -402,6 +571,9 @@ export class MainActivitySession {
       entry.wslDistro,
       entry.remoteHostId,
     )
+    this.listPatches?.set(key, entry)
+    this.appendPatches?.set(key, entry)
+    if (!entry.remoteHostId) this.localPatches?.set(key, entry)
     const localEntries = this.snapshot.localEntries
     if (!entry.remoteHostId && localEntries) {
       const hasLocal = localEntries.some(
@@ -430,17 +602,10 @@ export class MainActivitySession {
         })
       }
     }
-    if (
-      entries?.some(
-        (item) =>
-          localSessionKey(
-            item.agent,
-            item.sessionId ?? "",
-            item.wslDistro,
-            item.remoteHostId,
-          ) === key,
-      )
-    ) {
+    const loaded = entries?.find((item) => activityEntryKey(item) === key)
+    const days = this.snapshot.settings.activityWindowDays
+    const now = new Date()
+    if (entries && loaded) {
       const replaced = entries.map((item) =>
         localSessionKey(item.agent, item.sessionId ?? "", item.wslDistro, item.remoteHostId) ===
         key
@@ -458,7 +623,25 @@ export class MainActivitySession {
           : { ...item, cost: { ...item.cost, isHighCost } }
       })
       this.update({ entries: this.withRegistryActivity(classified) })
+      if (
+        loaded.timestamp !== entry.timestamp &&
+        isWithinActivityDays(loaded.timestamp, days, now) !==
+          isWithinActivityDays(entry.timestamp, days, now)
+      )
+        this.refreshActivityStream()
       if (this.snapshot.active) this.selectDefaultEntry()
+    } else if (
+      this.appendedHistory &&
+      this.tailTimestamp &&
+      entry.timestamp >= this.tailTimestamp &&
+      !this.snapshot.settings.disabledAgents.includes(entry.agent)
+    ) {
+      // A live row can move ahead of the native scan position between reads.
+      this.update({ entries: this.mergeActivityRows([entry], new Map(), true) })
+      this.updateListInterests()
+      // The cached rows do not show whether the session was already counted.
+      if (isWithinActivityDays(entry.timestamp, days, now)) this.refreshActivityStream()
+      if (!entry.remoteHostId) this.retryLocalEntries()
     } else if (this.listRunning) this.refreshList()
     const subject = this.snapshot.subject
     // The analysis surface reloads only when the change touched what it
@@ -511,18 +694,40 @@ export class MainActivitySession {
       : parseSessionFilters(next.sessionFilter)
     const filterChanged =
       serializeSessionFilters(filters) !== serializeSessionFilters(this.snapshot.filters)
+    const scopeChanged =
+      next.activityWindowDays !== previous.activityWindowDays ||
+      next.disabledAgents.join() !== previous.disabledAgents.join()
+    if (next.analyticsEnabled !== previous.analyticsEnabled) {
+      this.pendingVisit = null
+      this.concealDetail()
+    }
+    if (scopeChanged) {
+      this.closeActivityStream()
+      this.sessionTotalDay = null
+    }
     this.update({
       settings: next,
       settingsError: false,
       filters,
+      ...(scopeChanged
+        ? {
+            entries: null,
+            sessionTotal: null,
+            localEntries: null,
+            availableAgents: [],
+            hasMoreSessions: false,
+            listError: false,
+            localEntriesError: false,
+            loadMoreSessionsError: false,
+          }
+        : {}),
     })
     if (filterChanged && !this.restoringNavigation) this.onNavigation?.("automatic")
     this.reconcileRemoteSource()
-    if (
-      settings.activityWindowDays !== previous.activityWindowDays ||
-      settings.disabledAgents.join() !== previous.disabledAgents.join()
-    )
+    if (scopeChanged) {
+      if (this.listRunning) this.updateListInterests()
       this.refreshList()
+    }
   }
 
   private syncActive(): void {
@@ -533,6 +738,10 @@ export class MainActivitySession {
     const detailActive = this.initialized && this.visible && this.activeListeners.size > 0
     const listChanged = listActive !== this.listRunning
     const detailChanged = detailActive !== this.snapshot.active
+    const localEntriesActive = listActive && this.localEntriesListeners.size > 0
+    const startLocalEntries = localEntriesActive && !this.localEntriesRunning
+    this.localEntriesRunning = localEntriesActive
+    if (startLocalEntries && !listChanged) this.retryLocalEntries()
     if (!listChanged && !detailChanged) return
     this.workVersion += 1
     if (listChanged) this.listWorkVersion += 1
@@ -541,6 +750,7 @@ export class MainActivitySession {
     if (this.timer) clearInterval(this.timer)
     this.timer = null
     if (!listActive) {
+      if (listChanged) this.reconcileOnResume = true
       liveSessions.clearInterest(this)
     }
     if (!detailActive) {
@@ -563,7 +773,16 @@ export class MainActivitySession {
       if (listChanged) this.refreshList()
     }
     if (detailActive) {
-      this.timer = setInterval(() => this.update({ now: Date.now() }), 30_000)
+      this.timer = setInterval(() => {
+        const now = Date.now()
+        this.update({ now })
+        if (
+          this.sessionTotalDay !== null &&
+          this.sessionTotalDay !== new Date(now).toDateString() &&
+          !this.listTask
+        )
+          this.refreshList()
+      }, 30_000)
       if (detailChanged) {
         const hadSubject = this.snapshot.subject !== null
         if (this.snapshot.entries && !hadSubject) this.selectDefaultEntry()
@@ -593,6 +812,8 @@ export class MainActivitySession {
     this.initialized = false
     this.visible = false
     this.listRunning = false
+    this.localEntriesRunning = false
+    this.closeActivityStream()
     for (const stop of this.stops.splice(0)) stop()
     liveSessions.clearInterest(this)
     if (this.timer) clearInterval(this.timer)
@@ -601,13 +822,150 @@ export class MainActivitySession {
   }
 
   refreshList = (): void => {
+    this.retryLocalEntries()
+    this.refreshActivityStream()
+  }
+
+  private refreshActivityStream(): void {
     this.listVersion += 1
     this.listDirty = true
-    if (!this.listRunning || this.listTask) return
+    this.startListRefresh()
+  }
+
+  private startListRefresh(): void {
+    if (
+      !this.listDirty ||
+      !this.listRunning ||
+      this.listTask ||
+      this.snapshot.loadingMoreSessions
+    )
+      return
     this.listTask = this.loadList().finally(() => {
       this.listTask = null
-      if (this.listDirty && this.listRunning) this.refreshList()
+      this.startListRefresh()
     })
+  }
+
+  /** Refresh the local-only list independently of the Sessions stream. */
+  retryLocalEntries = (): void => {
+    if (!this.localEntriesRunning) return
+    this.overviewDirty = true
+    if (this.overviewTask) return
+    this.overviewTask = this.loadLocalEntries().finally(() => {
+      this.overviewTask = null
+      if (this.overviewDirty) this.retryLocalEntries()
+    })
+  }
+
+  private async loadLocalEntries(): Promise<void> {
+    while (this.overviewDirty && this.localEntriesRunning) {
+      this.overviewDirty = false
+      const version = this.listWorkVersion
+      const days = this.snapshot.settings.activityWindowDays
+      const patches = new Map<string, ActivityEntryPayload>()
+      this.localPatches = patches
+      try {
+        const rows = await listOverviewSessions(days)
+        if (!this.localEntriesRunning || version !== this.listWorkVersion || this.overviewDirty)
+          continue
+        const localRows = rows.map((row) => patches.get(activityEntryKey(row)) ?? row)
+        this.update({
+          localEntries: this.withRegistryActivity(toActivityEntries(localRows)),
+          localEntriesError: false,
+        })
+        this.updateListInterests()
+      } catch {
+        if (this.localEntriesRunning && version === this.listWorkVersion && !this.overviewDirty)
+          this.update({ localEntriesError: true })
+      } finally {
+        this.localPatches = null
+      }
+    }
+  }
+
+  private closeActivityStream(): void {
+    const stream = this.activityStream
+    this.activityStream = null
+    this.appendPatches = null
+    this.appendedHistory = false
+    this.tailTimestamp = undefined
+    stream?.close()
+  }
+
+  private updateListInterests(): void {
+    const { entries, localEntries } = this.snapshot
+    liveSessions.setInterest(this, listInterests([...(entries ?? []), ...(localEntries ?? [])]))
+  }
+
+  /** Request more rows for the current stream. Keep the list visible on failure. */
+  loadMoreSessions = (): Promise<void> => {
+    this.appendTask ??= this.appendActivity().finally(() => {
+      this.appendTask = null
+    })
+    return this.appendTask
+  }
+
+  private async appendActivity(): Promise<void> {
+    if (this.snapshot.listError && this.activityStream && !this.listTask)
+      this.refreshActivityStream()
+    while (this.listTask) await this.listTask
+    if (
+      !this.snapshot.active ||
+      this.snapshot.listError ||
+      !this.snapshot.hasMoreSessions ||
+      this.snapshot.loadingMoreSessions
+    )
+      return
+    const stream = this.activityStream
+    if (!stream) {
+      this.refreshList()
+      return
+    }
+    const version = this.listWorkVersion
+    const patches = (this.appendPatches ??= new Map<string, ActivityEntryPayload>())
+    this.update({ loadingMoreSessions: true, loadMoreSessionsError: false })
+    try {
+      const batch = await stream.read()
+      if (stream !== this.activityStream) return
+      this.appendPatches = null
+      // Account for an append that settles while the window is hidden. The native
+      // stream has advanced, so publish these rows before the next visible refresh.
+      this.appendedHistory = true
+      this.tailTimestamp = batch.entries.at(-1)?.timestamp ?? this.tailTimestamp
+      const rows = new Map(batch.entries.map((row) => [activityEntryKey(row), row]))
+      const tail = this.tailTimestamp
+      if (tail) {
+        // Include updates that moved into the range after the native read.
+        const { disabledAgents } = this.snapshot.settings
+        for (const [key, row] of patches) {
+          if (row.timestamp >= tail && !disabledAgents.includes(row.agent)) rows.set(key, row)
+        }
+      }
+      const entries = this.mergeActivityRows([...rows.values()], patches, true)
+      this.update({ entries, hasMoreSessions: !batch.exhausted, now: Date.now() })
+      if (version === this.listWorkVersion && this.listRunning) this.updateListInterests()
+    } catch {
+      if (stream === this.activityStream) this.update({ loadMoreSessionsError: true })
+    } finally {
+      this.update({ loadingMoreSessions: false })
+      this.startListRefresh()
+    }
+  }
+
+  private mergeActivityRows(
+    rows: ActivityEntryPayload[],
+    patches: ReadonlyMap<string, ActivityEntryPayload>,
+    keepHistory: boolean,
+  ): SessionListEntry[] {
+    const entries = new Map<string, SessionListEntry>()
+    if (keepHistory)
+      for (const entry of this.snapshot.entries ?? [])
+        entries.set(activityEntryKey(entry), entry)
+    for (const entry of toActivityEntries(
+      rows.map((row) => patches.get(activityEntryKey(row)) ?? row),
+    ))
+      entries.set(activityEntryKey(entry), entry)
+    return this.withRegistryActivity([...entries.values()])
   }
 
   private async loadList(): Promise<void> {
@@ -615,29 +973,65 @@ export class MainActivitySession {
       this.listDirty = false
       const version = this.listWorkVersion
       const listVersion = this.listVersion
-      const days = this.snapshot.settings.activityWindowDays
+      const { activityWindowDays: days } = this.snapshot.settings
+      const appendFailed = this.snapshot.loadMoreSessionsError
+      const reset =
+        !this.activityStream || (!this.appendedHistory && !appendFailed) || this.invalidated
       const invalidated = this.invalidated
       this.invalidated = false
+      if (reset) {
+        this.closeActivityStream()
+        this.activityStream = openSessionActivityStream(days)
+      }
+      const stream = this.activityStream!
+      const patches = new Map<string, ActivityEntryPayload>()
+      this.listPatches = patches
+      const isCurrent = () =>
+        version === this.listWorkVersion && listVersion === this.listVersion
       try {
-        const [allRows, localRows] = await Promise.all([
-          listRecentSessions(days),
-          listOverviewSessions(days),
-        ])
-        const entries = this.withRegistryActivity(toActivityEntries(allRows))
-        const localEntries = this.withRegistryActivity(toActivityEntries(localRows))
-        if (version !== this.listWorkVersion || listVersion !== this.listVersion) {
-          this.invalidated ||= invalidated
+        const totalDay = new Date().toDateString()
+        const batch = await (reset ? stream.read() : stream.refresh(this.reconcileOnResume))
+        if (batch.replayedRefresh && stream === this.activityStream) {
+          // Read the head again before publication. A replay can contain old rows
+          // or predate a reconciliation request.
+          this.invalidated ||= !!batch.reset
+          this.listDirty = true
           continue
         }
-        this.update({ entries, localEntries, listError: false, now: Date.now() })
-        // The listed rows are this surface's interest: the registry names
-        // any of them the bounded snapshot omitted.
-        liveSessions.setInterest(this, listInterests([...entries, ...localEntries]))
+        if (!isCurrent()) {
+          this.invalidated ||= invalidated || !!batch.reset
+          continue
+        }
+        this.reconcileOnResume = false
+        if (batch.reset) {
+          this.appendedHistory = false
+          this.appendPatches = null
+        }
+        if (!this.appendedHistory) this.tailTimestamp = batch.entries.at(-1)?.timestamp
+        // A failed append can still have a replayable batch beyond the displayed rows.
+        const retryAppend = appendFailed && !reset && !batch.reset
+        this.sessionTotalDay = batch.total == null ? null : totalDay
+        this.update({
+          entries: this.mergeActivityRows(
+            batch.entries,
+            patches,
+            !reset && this.appendedHistory,
+          ),
+          availableAgents: batch.agents ?? [],
+          sessionTotal: batch.total ?? null,
+          hasMoreSessions: retryAppend || !batch.exhausted,
+          loadMoreSessionsError: retryAppend,
+          listError: false,
+          now: Date.now(),
+        })
+        this.updateListInterests()
         if (this.snapshot.active) this.selectDefaultEntry()
       } catch {
-        if (version === this.listWorkVersion && listVersion === this.listVersion)
-          this.update({ listError: true })
+        if (reset && stream === this.activityStream) this.closeActivityStream()
+        if (isCurrent()) this.update({ listError: true })
         this.invalidated ||= invalidated
+      } finally {
+        this.listPatches = null
       }
     }
   }
@@ -648,15 +1042,26 @@ export class MainActivitySession {
     const entry = orderedActivityEntries(this.snapshot).find(
       (item) => item.sessionId && (item.isActive || activityDayAge(item.timestamp, now) === 0),
     )
-    if (entry) this.open(subjectForEntry(entry), [], "automatic")
+    if (entry) this.open(subjectForEntry(entry), [], "automatic", { route: "automatic" })
   }
 
-  selectEntry = (entry: SessionListEntry): void => {
+  selectEntry = (entry: SessionListEntry, adjacent = false): void => {
     if (!entry.sessionId) return
     const subject = subjectForEntry(entry)
-    if (this.snapshot.subject && sessionKey(this.snapshot.subject) === sessionKey(subject))
+    const key = sessionKey(subject)
+    const { agents, result, spend } = this.snapshot.filters
+    const filtered = agents.length > 0 || result !== "all" || spend !== "all"
+    const hint: SessionNavigationHint = {
+      route: adjacent ? "adjacent" : filtered ? "filtered_list" : "session_list",
+    }
+    if (this.snapshot.subject && sessionKey(this.snapshot.subject) === key) {
+      if (this.visit?.key !== key) {
+        this.pendingVisit = { key, hint }
+        this.exposureOrigin = "user"
+      }
       return
-    this.open(subject, [], "user")
+    }
+    this.open(subject, [], "user", hint)
   }
 
   revealDetail(): void {
@@ -668,20 +1073,25 @@ export class MainActivitySession {
   openRelated = (subject: SessionSubject): void => {
     const current = this.snapshot.subject
     if (current && sessionKey(current) === sessionKey(subject)) return
-    this.open(subject, current ? [...this.snapshot.history, current] : [], "user")
+    this.open(subject, current ? [...this.snapshot.history, current] : [], "user", {
+      route: "related",
+    })
   }
 
   goBack = (): void => {
     const previous = this.snapshot.history.at(-1)
-    if (previous) this.open(previous, this.snapshot.history.slice(0, -1), "user")
+    if (previous)
+      this.open(previous, this.snapshot.history.slice(0, -1), "user", { route: "history" })
   }
 
   private open(
     subject: SessionSubject,
     history: SessionSubject[],
     origin: SurfaceOrigin,
+    hint: SessionNavigationHint = { route: "return" },
   ): void {
     this.exposureOrigin = origin
+    this.pendingVisit = { key: sessionKey(subject), hint }
     this.defaultSelectionPending = false
     this.analysisVersion += 1
     this.analysisRun += 1
@@ -708,6 +1118,7 @@ export class MainActivitySession {
   }
 
   clearSelection = (): void => {
+    this.pendingVisit = null
     this.defaultSelectionPending = false
     this.analysisVersion += 1
     this.analysisRun += 1
@@ -1079,6 +1490,14 @@ export class MainActivitySession {
     const normalized = normalizeSessionFilters(filters)
     const id = serializeSessionFilters(normalized)
     if (serializeSessionFilters(this.snapshot.filters) === id) return
+    this.filterVisit =
+      action &&
+      action !== "cleared_all" &&
+      (normalized.agents.length > 0 ||
+        normalized.result !== "all" ||
+        normalized.spend !== "all")
+        ? { key: id, seen: new Set() }
+        : null
     this.settingsVersion += 1
     this.update({
       settings: { ...this.snapshot.settings, sessionFilter: id },

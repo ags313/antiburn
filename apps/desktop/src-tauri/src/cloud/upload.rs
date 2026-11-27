@@ -33,14 +33,25 @@ impl Route {
     fn path(self, capture: &str) -> String {
         match self {
             Self::Capabilities => "/v1/captures/capabilities".into(),
-            Self::Reserve => "/v1/captures/reserve".into(),
+            Self::Reserve => "/v1/captures".into(),
             Self::Manifest => format!("/v1/captures/{capture}/manifest"),
-            Self::Status => format!("/v1/captures/{capture}/status"),
-            Self::Parts => format!("/v1/captures/{capture}/parts"),
+            Self::Status => format!("/v1/captures/{capture}"),
+            Self::Parts => format!("/v1/captures/{capture}/part-urls"),
             Self::Finalize => format!("/v1/captures/{capture}/finalize"),
-            Self::Renew => format!("/v1/captures/{capture}/renew"),
+            Self::Renew => format!("/v1/captures/{capture}/renew-lease"),
         }
     }
+}
+
+/// Build the exact status target for the frozen plan, both to poll and to
+/// check the finalization response. Never use a response URL to send a request.
+fn status_target(capture: &str, plan: &str, manifest: &str) -> String {
+    let path = Route::Status.path(capture);
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("plan_id", plan)
+        .append_pair("manifest_sha256", manifest)
+        .finish();
+    format!("{path}?{query}")
 }
 
 /// A bounded response without request URLs, headers, or credentials.
@@ -59,17 +70,14 @@ pub(super) fn api_request(
     route: Route,
     body: &impl Serialize,
 ) -> Result<ApiResponse, TransportError> {
-    if !super::capture::valid_request_id(&identity.capture_id) {
+    if !super::capture::valid_capture_id(&identity.capture_id) {
         return Err(TransportError::Rejected);
     }
-    let mut url = url::Url::parse(&config.resource)
-        .and_then(|origin| origin.join(&route.path(&identity.capture_id)))
-        .map_err(|_| TransportError::Rejected)?;
     let bytes = serde_json::to_vec(body).map_err(|_| TransportError::Rejected)?;
     if bytes.len() as u64 > MAX_API_BYTES {
         return Err(TransportError::Rejected);
     }
-    if matches!(route, Route::Status) {
+    let target = if matches!(route, Route::Status) {
         let context: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| TransportError::Rejected)?;
         let plan = context["plan_id"]
@@ -78,10 +86,13 @@ pub(super) fn api_request(
         let manifest = context["manifest_sha256"]
             .as_str()
             .ok_or(TransportError::Rejected)?;
-        url.query_pairs_mut()
-            .append_pair("plan_id", plan)
-            .append_pair("manifest_sha256", manifest);
-    }
+        status_target(&identity.capture_id, plan, manifest)
+    } else {
+        route.path(&identity.capture_id)
+    };
+    let url = url::Url::parse(&config.resource)
+        .and_then(|origin| origin.join(&target))
+        .map_err(|_| TransportError::Rejected)?;
     let client = auth::client(&url).map_err(|_| TransportError::Offline)?;
     let request = if matches!(route, Route::Status | Route::Capabilities) {
         client.get(url)
@@ -102,12 +113,14 @@ pub(super) fn api_request(
         .and_then(|value| value.to_str().ok())
         .and_then(retry_delay);
     let mut body = Vec::new();
-    response
-        .take(MAX_API_BYTES + 1)
-        .read_to_end(&mut body)
-        .map_err(|_| TransportError::Offline)?;
-    if body.len() as u64 > MAX_API_BYTES {
-        return Err(TransportError::Rejected);
+    if !matches!(status, 401 | 403) {
+        response
+            .take(MAX_API_BYTES + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| TransportError::Offline)?;
+        if body.len() as u64 > MAX_API_BYTES {
+            return Err(TransportError::Rejected);
+        }
     }
     Ok(ApiResponse {
         status,
@@ -137,6 +150,7 @@ pub(super) enum Failure {
     Backpressure,
     Offline,
     Unauthorized,
+    RouteDenied,
     Conflict,
     SourceSuppressed,
     Unavailable,
@@ -183,6 +197,8 @@ impl Capabilities {
                 SourceKind::OpenCodeSqliteV2,
                 SourceKind::CodexJsonl,
                 SourceKind::PiJsonl,
+                SourceKind::CursorIdeComposer,
+                SourceKind::CursorCliAgentJsonl,
             ]
             .iter()
             .any(|kind| formats.contains(kind.upload_names().1))
@@ -274,6 +290,8 @@ pub(super) struct HttpTransport<'a> {
     source: Option<Source>,
     resource_origin: String,
     membership_generation: Option<String>,
+    expected_file_generation: Option<&'a str>,
+    source_authority: Option<&'a dyn Fn() -> bool>,
     pub failure: Option<Failure>,
     pub retry_after: Option<Duration>,
     /// Status and renewal both refused the exact frozen binding with a conflict.
@@ -298,6 +316,8 @@ impl<'a> HttpTransport<'a> {
             source,
             resource_origin: resource_origin.into(),
             membership_generation: None,
+            expected_file_generation: None,
+            source_authority: None,
             failure: None,
             retry_after: None,
             status_renewal_conflict: false,
@@ -310,12 +330,47 @@ impl<'a> HttpTransport<'a> {
         self
     }
 
+    /// Bind the local job observation to the file handles the spool pins.
+    pub(super) fn with_expected_file_generation(mut self, observation: &'a str) -> Self {
+        self.expected_file_generation = observation
+            .starts_with(antiburn_cloud_capture::FILE_GENERATION_PREFIX)
+            .then_some(observation);
+        self
+    }
+
+    /// Recheck a live repository rule before reading content, sending a PUT, or finalizing.
+    pub(super) fn with_source_authority(mut self, check: &'a dyn Fn() -> bool) -> Self {
+        self.source_authority = Some(check);
+        self
+    }
+
+    /// Keep a local pause or policy change separate from loss of account access.
+    fn check_current_authority(&self) -> Result<(), TransportError> {
+        if !(self.account_current)() || self.engine.session().is_none() {
+            return Err(TransportError::Unauthorized);
+        }
+        if !(self.current)() {
+            return Err(TransportError::Rejected);
+        }
+        Ok(())
+    }
+
     fn request(
         &mut self,
         identity: &CaptureIdentity,
         route: Route,
         body: &impl Serialize,
     ) -> Result<ApiResponse, TransportError> {
+        if matches!(route, Route::Finalize)
+            && let Err(error) = self.check_source_authority()
+        {
+            self.failure = Some(if error == TransportError::Unauthorized {
+                Failure::Unauthorized
+            } else {
+                Failure::Rejected
+            });
+            return Err(error);
+        }
         match self.engine.capture_request(
             identity,
             (&self.resource_origin, self.membership_generation.as_deref()),
@@ -331,7 +386,8 @@ impl<'a> HttpTransport<'a> {
                         self.failure = None;
                         return Ok(response);
                     }
-                    401 | 403 => (Failure::Unauthorized, TransportError::Unauthorized),
+                    401 => (Failure::Unauthorized, TransportError::Unauthorized),
+                    403 => (Failure::RouteDenied, TransportError::Rejected),
                     409 if matches!(route, Route::Reserve) && source_suppressed(&response.body) => {
                         (Failure::SourceSuppressed, TransportError::Conflict)
                     }
@@ -447,7 +503,29 @@ impl<'a> HttpTransport<'a> {
     ) -> Result<(), TransportError> {
         let binding = Context::new(reservation, plan);
         let response = self.request(&manifest.identity, Route::Finalize, &binding)?;
-        check_finalization_response(&response)
+        self.check_finalization_response(&response, &manifest.identity.capture_id, &binding)
+    }
+
+    fn check_finalization_response(
+        &mut self,
+        response: &ApiResponse,
+        capture: &str,
+        binding: &Context<'_>,
+    ) -> Result<(), TransportError> {
+        #[derive(Deserialize)]
+        struct Finalization {
+            status_url: String,
+        }
+
+        if response.status == 202
+            && let Ok(finalization) = serde_json::from_slice::<Finalization>(&response.body)
+            && finalization.status_url
+                == status_target(capture, binding.plan_id, binding.manifest_sha256)
+        {
+            return Ok(());
+        }
+        self.failure = Some(Failure::Rejected);
+        Err(TransportError::Rejected)
     }
 }
 
@@ -465,7 +543,7 @@ fn api_error_is(body: &[u8], code: &str, retryable: bool) -> bool {
         retryable: bool,
         #[serde(rename = "message")]
         _message: String,
-        #[serde(rename = "requestId")]
+        #[serde(rename = "request_id")]
         _request_id: String,
     }
     serde_json::from_slice::<ApiError>(body)
@@ -592,6 +670,22 @@ fn signed_request(
 }
 
 impl Transport for HttpTransport<'_> {
+    fn check_source_authority(&self) -> Result<(), TransportError> {
+        self.check_current_authority()?;
+        if let Some(check) = self.source_authority {
+            let allowed = check();
+            self.check_current_authority()?;
+            if !allowed {
+                return Err(TransportError::Rejected);
+            }
+        }
+        Ok(())
+    }
+
+    fn expected_file_generation(&self) -> Option<&str> {
+        self.expected_file_generation
+    }
+
     fn reserve(
         &mut self,
         identity: &CaptureIdentity,
@@ -667,6 +761,7 @@ impl Transport for HttpTransport<'_> {
         )?;
         let part: Part = self.decode(response)?;
         let (url, headers) = signed_request(part, chunk)?;
+        self.check_source_authority()?;
         let mut bytes = Vec::with_capacity(chunk.compressed_bytes as usize);
         body.take(chunk.compressed_bytes + 1)
             .read_to_end(&mut bytes)
@@ -674,20 +769,15 @@ impl Transport for HttpTransport<'_> {
         if bytes.len() as u64 != chunk.compressed_bytes {
             return Err(TransportError::Rejected);
         }
-        if !(self.current)() || self.engine.session().is_none() {
-            return Err(TransportError::Unauthorized);
-        }
         // This client has no default bearer or cookie storage.
-        let response = auth::client(&url)
+        let request = auth::client(&url)
             .map_err(|_| TransportError::Rejected)?
             .put(url)
             .headers(headers)
-            .body(bytes)
-            .send()
-            .map_err(|_| TransportError::Offline)?;
-        if !(self.current)() {
-            return Err(TransportError::Unauthorized);
-        }
+            .body(bytes);
+        self.check_source_authority()?;
+        let response = request.send().map_err(|_| TransportError::Offline)?;
+        self.check_current_authority()?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -704,14 +794,6 @@ impl Transport for HttpTransport<'_> {
         let binding = Context::new(reservation_id, plan);
         let response =
             self.request_with_renewal(&manifest.identity, Route::Finalize, &binding, &binding)?;
-        check_finalization_response(&response)
-    }
-}
-
-fn check_finalization_response(response: &ApiResponse) -> Result<(), TransportError> {
-    if response.status == 202 {
-        Ok(())
-    } else {
-        Err(TransportError::Rejected)
+        self.check_finalization_response(&response, &manifest.identity.capture_id, &binding)
     }
 }

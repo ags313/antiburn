@@ -9,6 +9,8 @@ macro_rules! with_app_commands {
             cloud::cloud_workspaces => "cloud_workspaces",
             #[cfg(feature = "cloud")]
             #[cfg(feature = "cloud")]
+            cloud::cloud_open_dashboard => "cloud_open_dashboard",
+            #[cfg(feature = "cloud")]
             cloud::workspace_grants::cloud_reset_workspace => "cloud_reset_workspace",
             #[cfg(feature = "cloud")]
             cloud::cloud_begin => "cloud_begin",
@@ -21,19 +23,7 @@ macro_rules! with_app_commands {
             #[cfg(feature = "cloud")]
             cloud::cloud_save_draft => "cloud_save_draft",
             #[cfg(feature = "cloud")]
-            cloud::cloud_source_picker_directory => "cloud_source_picker_directory",
-            #[cfg(feature = "cloud")]
-            cloud::cloud_start_sync => "cloud_start_sync",
-            #[cfg(feature = "cloud")]
-            cloud::cloud_prepare_sync => "cloud_prepare_sync",
-            #[cfg(feature = "cloud")]
-            cloud::cloud_reconcile_sync => "cloud_reconcile_sync",
-            #[cfg(feature = "cloud")]
-            cloud::cloud_cancel_sync => "cloud_cancel_sync",
-            #[cfg(feature = "cloud")]
             cloud::projects::cloud_project_groups => "cloud_project_groups",
-            #[cfg(feature = "cloud")]
-            cloud::sync::cloud_sync_projects => "cloud_sync_projects",
             #[cfg(feature = "cloud")]
             cloud::sync::cloud_sync_status => "cloud_sync_status",
             #[cfg(feature = "cloud")]
@@ -132,6 +122,7 @@ macro_rules! with_app_commands {
             commands::list_burn_check_targets => "list_burn_check_targets",
             commands::list_burn_check_snoozes => "list_burn_check_snoozes",
             commands::list_recent_sessions => "list_recent_sessions",
+            commands::session_stream::session_activity_stream => "session_activity_stream",
             commands::list_repositories => "list_repositories",
             installed_checks::directories::list_installed_check_directories => "list_installed_check_directories",
             commands::list_scan_roots => "list_scan_roots",

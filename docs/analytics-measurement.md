@@ -624,15 +624,14 @@ Authentication rejection and invalid responses both emit `failed`; do not count 
 outcome as a sync failure. Measure Start syncing among installations viewing folders
 and Done among installations viewing completion. **Continue locally** from
 handoff, identity, or folders uses `use_locally` on that screen. It does not
-imply content consent or a saved request. Start syncing opens completion
-immediately; background preparation, submission, and reconciliation do not block Done.
+imply content consent. After Start syncing, onboarding opens completion only
+when Desktop confirms the selected folders for each workspace. If confirmation
+fails, onboarding stays on the folders screen. Background uploads do not block Done.
 There is no separate sync screen, Check status action, or Cancel sync action in
 onboarding. Background status updates do not create another screen view. Production
 sync outcomes are not recorded until the separately gated backend is implemented.
-Manual native capture preparation uses **Save capture request** with the existing
-`start_sync` action value. Count it as intent, not a stored-request or upload
-outcome. Its screen label is the screen where the action occurred, including
-completion for an explicit source-listing retry. The displayed **Upload unavailable** state emits no success event.
+**Start syncing** emits `start_sync`. Count it as intent, not saved folder
+consent or an upload outcome.
 Settings preparation is an intentional measurement gap until a separate closed
 outcome contract is reviewed. Keep request IDs, source scopes, roots, account
 details, and content out of analytics.
@@ -1075,6 +1074,36 @@ Each interaction emits at most one event of its type. Closing or canceling searc
 These events measure navigation, not execution, time spent, successful data loading, or changed
 settings. Test user paths, rejected navigation, boundary no-ops, and strict Rust
 property validation. Queries and session data never enter the analytics payload.
+
+## Session visits and controls
+
+| Product question                                          | Measurement                                                                                                                                                                                                                        |
+| --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Do popover clicks reach session detail?                   | Popover clicks with a matching visible detail visit divided by popover clicks with a visit ID. Match on the ID and deduplicate delivery by message ID.                                                                             |
+| What do people inspect after opening a session?           | First explicit detail action and any-action rate per visible visit, grouped by entry route and context at view time. Include visits without an action. Use ready, empty, error, and timeout states to show the opportunity to act. |
+| Where do Sessions searches or filters run out of results? | Edited dismissals with confirmed no results divided by edited dismissals with results or confirmed no results. Report unavailable search results, pending filters, and confirmed no-match filters separately.                     |
+| Which usage figures do people look for?                   | Explicit badge metric switches grouped by surface, and visits with an explicit Limits expansion or quota drill-through among visible detail visits.                                                                                |
+| Do reminders help people defer check work?                | Successful explicit snoozes and unsnoozes among settled reminder attempts, grouped by preset and outcome.                                                                                                                          |
+
+Treat the first shipping version as the reporting boundary. The visit begins
+when the selected main-window detail is visible and ends on concealment or
+subject change. Refreshes and hydrated data share the current visit. A help
+request, pill switch, or menu action identifies behavior that can support a
+hypothesis about the reader's goal. An unclassified visit has no observed
+explicit action. A subagent or orchestrator click belongs to the originating
+visit. Reopening a selected session from the list starts a user visit with
+the list route. Missing delivery or unavailable data can reduce observation.
+
+Search open and accepted result events retain their original meaning. Record
+Sessions result attempts before navigation and accepted results after success.
+Record explicit no-op filter selections as control activations. The existing
+filter-change event continues to require a canonical change. For a displayed
+deliberate filter, a pending result may be followed by a confirmed no-match
+result. Confirmed no matches requires exhausted pagination and resolved check
+evidence. Automatic loading, restorations, and hover produce no interaction
+event. Use the existing surface readiness event for detail. Its optional
+visit ID identifies the visible visit without introducing another readiness
+event. Retain at most one observation of each state per visit.
 
 ## Legacy first-run Overview funnel
 

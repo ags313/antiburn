@@ -778,7 +778,7 @@ fn a_returned_source_requeues_with_an_unchanged_fingerprint() {
     returned.source_fingerprint = Some(record.source_fingerprint);
 
     store
-        .upsert_sessions(&[returned], &crate::agents::evidence_cohort())
+        .upsert_confirmed_session(&returned, &crate::agents::evidence_cohort())
         .unwrap();
 
     let evidence = store.evidence(&claim.key).unwrap().unwrap();
@@ -915,7 +915,7 @@ fn a_stale_generation_rejects_a_session_evidence_lease_renewal() {
         .unwrap();
     let before = store.evidence(&record.key).unwrap().unwrap();
 
-    assert!(!store.renew_evidence_lease(&claim, 110, 60).unwrap());
+    assert!(!store.renew_evidence_lease(&claim, || 110, 60).unwrap());
     assert_eq!(store.evidence(&record.key).unwrap().unwrap(), before);
 }
 

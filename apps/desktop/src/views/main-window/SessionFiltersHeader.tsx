@@ -1,3 +1,4 @@
+import { noteSessionFilter, type SessionFilterControl } from "../../lib/sessionAnalytics"
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu"
 import * as TooltipPrimitive from "@radix-ui/react-tooltip"
 import { Check, ListFilter, Monitor, Minus, X } from "lucide-react"
@@ -26,6 +27,12 @@ import { remoteHostLabel, type RemoteHost } from "../../lib/remoteHosts"
 export interface SessionFiltersHeaderProps {
   filters: SessionFilters
   counts: SessionFilterCounts
+  /** Indexed sessions in the date range before the viewer applies collection filters. */
+  sessionTotal?: number | null
+  /** True while the stream can supply more rows for these counts. */
+  hasMoreSessions?: boolean
+  /** True while loaded sessions still need results for the selected filter. */
+  awaitingResultFilter?: boolean
   agents: string[]
   remoteHosts?: readonly RemoteHost[]
   onResetSources?: () => void
@@ -123,13 +130,17 @@ function FilterRadioGroup<T extends SessionResultFilter | SessionSpendFilter>({
   value,
   options,
   counts,
+  hasMoreSessions,
   onChange,
+  onActivate,
 }: {
   label: string
   value: T
   options: ReadonlyArray<FilterOption<T>>
   counts: Record<T, number>
+  hasMoreSessions: boolean
   onChange: (value: T) => void
+  onActivate: (value: T) => void
 }) {
   return (
     <DropdownMenu.Group>
@@ -144,12 +155,18 @@ function FilterRadioGroup<T extends SessionResultFilter | SessionSpendFilter>({
               key={option.value}
               value={option.value}
               disabled={
-                counts[option.value] === 0 && option.value !== value && option.value !== "all"
+                !hasMoreSessions &&
+                counts[option.value] === 0 &&
+                option.value !== value &&
+                option.value !== "all"
               }
               textValue={option.accessibleLabel ?? option.label}
               aria-label={`${option.accessibleLabel ?? option.label}${option.description ? `, ${option.description}` : ""}, ${sessionCountLabel(counts[option.value])}`}
               className="ui-menu-item"
-              onSelect={(event) => event.preventDefault()}
+              onSelect={(event) => {
+                event.preventDefault()
+                onActivate(option.value)
+              }}
             >
               <Indicator />
               {Mark ? (
@@ -230,6 +247,9 @@ function FilterChip({
 export function SessionFiltersHeader({
   filters,
   counts,
+  sessionTotal = null,
+  hasMoreSessions = false,
+  awaitingResultFilter = false,
   agents,
   remoteHosts = [],
   onResetSources = () => undefined,
@@ -254,6 +274,7 @@ export function SessionFiltersHeader({
   const [filterTooltipOpen, setFilterTooltipOpen] = useState(false)
   const pointerOpened = useRef(false)
   const pointerDismissed = useRef(false)
+  const closingAfterSelection = useRef(false)
   const observeMenu = useCallback(
     (content: HTMLDivElement | null) => {
       if (!content) return
@@ -269,6 +290,9 @@ export function SessionFiltersHeader({
     },
     [filterButtonRef],
   )
+  const highCostExplanation = hasMoreSessions
+    ? "Based on loaded sessions: 3× the median session cost, with a $2 minimum."
+    : HIGH_COST_EXPLANATION
   const highCostDescription =
     highCostThresholdUsd === undefined
       ? undefined
@@ -279,7 +303,7 @@ export function SessionFiltersHeader({
       value: "notable",
       label: "High cost",
       description: highCostDescription,
-      tooltip: HIGH_COST_EXPLANATION,
+      tooltip: highCostExplanation,
     },
     { value: "material", label: "$1 or more" },
   ]
@@ -369,7 +393,7 @@ export function SessionFiltersHeader({
             accessibleLabel: filters.spend === "notable" ? "High cost" : "$1 or more",
             tooltip:
               filters.spend === "notable"
-                ? [highCostDescription, HIGH_COST_EXPLANATION].filter(Boolean).join(". ")
+                ? [highCostDescription, highCostExplanation].filter(Boolean).join(". ")
                 : undefined,
             remove: () => onSpendChange("all"),
           },
@@ -386,9 +410,22 @@ export function SessionFiltersHeader({
   function removeChip(chip: ActiveChip, event: MouseEvent<HTMLButtonElement>) {
     const index = chips.findIndex((candidate) => candidate.id === chip.id)
     const focusTarget = chips[index + 1]?.id ?? chips[index - 1]?.id
+    const action: SessionFilterControl = chip.agent
+      ? "remove_agent_chip"
+      : chip.id.startsWith("result:")
+        ? "remove_result_chip"
+        : "remove_spend_chip"
+    noteSessionFilter(action)
     chip.remove()
     if (event.detail === 0) restoreFocus(focusTarget)
   }
+
+  const hasFilters =
+    filters.agents.length > 0 || filters.result !== "all" || filters.spend !== "all"
+  const totalIsPartial = sessionTotal === null && hasMoreSessions
+  const displayTotal = sessionTotal ?? counts.all
+  const matchesArePartial = hasMoreSessions || awaitingResultFilter
+  const matchLabel = sessionCountLabel(counts.matching)
 
   return (
     <CollectionHeader
@@ -396,19 +433,47 @@ export function SessionFiltersHeader({
       dragRegion={isMacOS()}
       summary={
         <>
-          <CountPill count={counts.all} size="regular" aria-hidden="true" />
-          <span className="sr-only" aria-live="polite" aria-atomic="true">
-            {`${counts.all} total sessions, ${counts.matching} matching`}
-          </span>
-          {chips.length > 0 ? (
-            <span
-              className="whitespace-nowrap type-caption text-label-secondary tabular-nums"
-              aria-hidden="true"
-            >
-              <span className="me-2 text-label-tertiary">·</span>
-              Showing {counts.matching}
+          <Tooltip
+            label={
+              totalIsPartial
+                ? "Sessions loaded so far, before list filters."
+                : "All sessions in the selected date range, before list filters."
+            }
+          >
+            <span tabIndex={0} className="inline-flex shrink-0 rounded-full">
+              <CountPill count={displayTotal} size="regular" aria-hidden="true" />
+              <span className="sr-only">
+                {totalIsPartial
+                  ? `${displayTotal} sessions loaded`
+                  : `${displayTotal} sessions in selected date range`}
+              </span>
             </span>
-          ) : null}
+          </Tooltip>
+          {hasFilters && (
+            <Tooltip
+              label={
+                matchesArePartial
+                  ? "Matches among loaded sessions. The count can change as more sessions load or checks finish."
+                  : "Sessions in the selected date range that match all active filters."
+              }
+            >
+              <span
+                tabIndex={0}
+                className="whitespace-nowrap rounded-control type-caption tabular-nums text-label-secondary"
+              >
+                <span className="me-2 text-label-tertiary" aria-hidden="true">
+                  ·
+                </span>
+                <span aria-hidden="true">Showing {counts.matching}</span>
+                <span className="sr-only">
+                  {matchesArePartial ? `${matchLabel} among loaded sessions` : matchLabel}
+                </span>
+              </span>
+            </Tooltip>
+          )}
+          <span className="sr-only" aria-live="polite" aria-atomic="true">
+            {`${counts.all} ${hasMoreSessions ? "loaded" : "total"} sessions, ${counts.matching} matching`}
+          </span>
         </>
       }
       actions={
@@ -427,6 +492,10 @@ export function SessionFiltersHeader({
             modal={false}
             open={menuOpen}
             onOpenChange={(open) => {
+              if (open) noteSessionFilter("filter_menu_opened")
+              else if (!closingAfterSelection.current)
+                noteSessionFilter("filter_menu_dismissed")
+              closingAfterSelection.current = false
               pointerDismissed.current = false
               setFilterTooltipOpen(false)
               setMenuOpen(open)
@@ -562,7 +631,10 @@ export function SessionFiltersHeader({
                     className="ui-menu-item"
                     textValue="All agents"
                     aria-label={`All agents, ${sessionCountLabel(counts.agentsAll)}`}
-                    onSelect={(event) => event.preventDefault()}
+                    onSelect={(event) => {
+                      event.preventDefault()
+                      noteSessionFilter("all_agents")
+                    }}
                     onCheckedChange={onResetAgents}
                   >
                     <Indicator checkbox />
@@ -576,11 +648,16 @@ export function SessionFiltersHeader({
                       <DropdownMenu.CheckboxItem
                         key={agent}
                         checked={filters.agents.includes(agent)}
-                        disabled={count === 0 && !filters.agents.includes(agent)}
+                        disabled={
+                          !hasMoreSessions && count === 0 && !filters.agents.includes(agent)
+                        }
                         className="ui-menu-item"
                         textValue={label}
                         aria-label={`${label}, ${sessionCountLabel(count)}`}
-                        onSelect={(event) => event.preventDefault()}
+                        onSelect={(event) => {
+                          event.preventDefault()
+                          noteSessionFilter("agent_option")
+                        }}
                         onCheckedChange={() => onToggleAgent(agent)}
                       >
                         <Indicator checkbox />
@@ -597,7 +674,9 @@ export function SessionFiltersHeader({
                   value={filters.result}
                   options={RESULT_OPTIONS}
                   counts={counts.result}
+                  hasMoreSessions={hasMoreSessions}
                   onChange={onResultChange}
+                  onActivate={(value) => noteSessionFilter(`result_${value}`)}
                 />
                 <DropdownMenu.Separator className="ui-menu-separator" />
                 <FilterRadioGroup
@@ -605,12 +684,21 @@ export function SessionFiltersHeader({
                   value={filters.spend}
                   options={spendOptions}
                   counts={counts.spend}
+                  hasMoreSessions={hasMoreSessions}
                   onChange={onSpendChange}
+                  onActivate={(value) => noteSessionFilter(`spend_${value}`)}
                 />
                 {chips.length > 0 ? (
                   <>
                     <DropdownMenu.Separator className="ui-menu-separator" />
-                    <DropdownMenu.Item className="ui-menu-item" onSelect={onClear}>
+                    <DropdownMenu.Item
+                      className="ui-menu-item"
+                      onSelect={() => {
+                        closingAfterSelection.current = true
+                        noteSessionFilter("clear_filters")
+                        onClear()
+                      }}
+                    >
                       <span className="size-4 shrink-0" aria-hidden="true" />
                       Clear filters
                     </DropdownMenu.Item>

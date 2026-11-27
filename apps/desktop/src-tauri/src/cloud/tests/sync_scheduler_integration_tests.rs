@@ -50,6 +50,28 @@ const STATUS_FINALIZE_REPLAY: usize = 24;
 const STATUS_REPLAY_REJECTED: usize = 25;
 const STATUS_REPLAY_OFFLINE: usize = 26;
 const STATUS_REPLAY_CAPACITY: usize = 27;
+const PART_DENIED: usize = 28;
+const PART_UNAUTHORIZED: usize = 29;
+const CAPS_DENIED: usize = 30;
+const RESERVE_DENIED: usize = 31;
+const STATUS_REPLAY_DENIED: usize = 32;
+const CAPS_SMALL: usize = 33;
+const CURSOR_IDE: usize = 34;
+
+#[path = "sync_background_integration_tests.rs"]
+mod background_tests;
+#[path = "sync_runtime_activity_integration_tests.rs"]
+mod runtime_activity_tests;
+#[path = "sync_transfer_integration_tests.rs"]
+mod transfer_tests;
+
+fn session_progress(status: &Status) -> serde_json::Value {
+    let mut progress = serde_json::to_value(status).unwrap()["uploadProgress"].clone();
+    let progress_fields = progress.as_object_mut().unwrap();
+    progress_fields.remove("transfer");
+    progress_fields.remove("folderFound");
+    progress
+}
 
 struct Service {
     origin: String,
@@ -128,9 +150,16 @@ impl Service {
                 } else {
                     serde_json::from_slice(&body).unwrap()
                 };
-                if (line.contains("/parts ")
-                    || line.contains("/finalize ")
-                    || line.contains("/manifest "))
+                let status_request = line.starts_with("GET ")
+                    && manifest.as_ref().is_some_and(|saved| {
+                        line == format!(
+                            "GET /v1/captures/{}?plan_id=plan&manifest_sha256={} HTTP/1.1",
+                            saved.identity.capture_id,
+                            saved.sha256().unwrap()
+                        )
+                    });
+                let part_url_request = line.contains("/part-urls ");
+                if (part_url_request || line.contains("/finalize ") || line.contains("/manifest "))
                     && let Some(previous) = conflicted_request.take()
                 {
                     assert_eq!((line.clone(), body.clone()), previous);
@@ -141,6 +170,8 @@ impl Service {
                     }
                     if mode == CAPS_CAPACITY {
                         (429, serde_json::json!({}))
+                    } else if mode == CAPS_DENIED {
+                        (403, serde_json::json!({}))
                     } else if mode == CAPS_MISSING {
                         (404, serde_json::json!({}))
                     } else {
@@ -148,16 +179,24 @@ impl Service {
                         if mode == CODEX_AND_PI {
                             formats.extend(["CodexJsonl", "PiJsonl"]);
                         }
+                        if mode == CURSOR_IDE {
+                            formats.push("CursorIdeComposer");
+                        }
                         (
                             200,
                             serde_json::json!({
-                                "enabled": true, "max_expanded_bytes": 256 * 1024 * 1024,
+                                "enabled": true,
+                                "max_expanded_bytes": if mode == CAPS_SMALL {
+                                    256 * 1024
+                                } else {
+                                    256 * 1024 * 1024
+                                },
                                 "chunk_expanded_bytes": 8 * 1024 * 1024,
                                 "source_formats": formats,
                             }),
                         )
                     }
-                } else if line.contains("/reserve ") {
+                } else if line == "POST /v1/captures HTTP/1.1" {
                     worker_reserves.fetch_add(1, Ordering::AcqRel);
                     let identity: CaptureIdentity =
                         serde_json::from_value(input["identity"].clone()).unwrap();
@@ -171,6 +210,11 @@ impl Service {
                         assert!(identity.source_id.ends_with(&format!("/{agent}/{id}")));
                         assert_eq!(input["agent"], agent);
                         assert_eq!(input["source_format"], format);
+                    }
+                    if mode == CURSOR_IDE {
+                        assert_eq!(input["agent"], "cursor");
+                        assert_eq!(input["source_format"], "CursorIdeComposer");
+                        assert_eq!(input["native_session_id"], "synthetic-chunked");
                     }
                     if let Some(path) = worker_reserve_database.lock().unwrap().as_ref() {
                         let connection = rusqlite::Connection::open_with_flags(
@@ -195,12 +239,14 @@ impl Service {
                     if mode == RESERVE_OFFLINE {
                         continue;
                     }
-                    if mode == UNKNOWN_CAPACITY {
+                    if mode == RESERVE_DENIED {
+                        (403, serde_json::json!({}))
+                    } else if mode == UNKNOWN_CAPACITY {
                         (
                             429,
                             serde_json::json!({
                                 "code":"unknown_limit", "retryable":true,
-                                "message":"Synthetic limit.", "requestId": "synthetic-request",
+                                "message":"Synthetic limit.", "request_id": "synthetic-request",
                             }),
                         )
                     } else if mode == RESERVE_CAPACITY
@@ -211,7 +257,7 @@ impl Service {
                             429,
                             serde_json::json!({
                                 "code": "capture_limit", "retryable": true,
-                                "message": "Capture capacity is full.", "requestId": "synthetic-request",
+                                "message": "Capture capacity is full.", "request_id": "synthetic-request",
                             }),
                         )
                     } else if mode == SUPPRESSED
@@ -225,13 +271,13 @@ impl Service {
                             serde_json::json!({
                                 "code": "source_suppressed", "retryable": false,
                                 "message": "This session was deleted from Cloud. It will not upload again automatically.",
-                                "requestId": "synthetic-request",
+                                "request_id": "synthetic-request",
                             }),
                         )
                     } else if mode == CONFLICT {
                         (
                             409,
-                            serde_json::json!({"code": "capture_conflict", "retryable": false, "message": "Conflict.", "requestId": "synthetic-request"}),
+                            serde_json::json!({"code": "capture_conflict", "retryable": false, "message": "Conflict.", "request_id": "synthetic-request"}),
                         )
                     } else {
                         manifest = None;
@@ -246,7 +292,7 @@ impl Service {
                     conflicted_request = Some((line.clone(), body.clone()));
                     (
                         409,
-                        serde_json::json!({"code": "capture_conflict", "retryable": false, "message": "Conflict.", "requestId": "synthetic-request"}),
+                        serde_json::json!({"code": "capture_conflict", "retryable": false, "message": "Conflict.", "request_id": "synthetic-request"}),
                     )
                 } else if line.contains("/manifest ") {
                     let incoming: CaptureManifest =
@@ -274,19 +320,21 @@ impl Service {
                     };
                     manifest = Some(incoming);
                     (200, serde_json::to_value(plan).unwrap())
-                } else if line.starts_with("GET ")
-                    && line.contains("/status?")
+                } else if status_request
                     && (matches!(
                         mode,
-                        STATUS_REPLAY_REJECTED | STATUS_REPLAY_OFFLINE | STATUS_REPLAY_CAPACITY
+                        STATUS_REPLAY_REJECTED
+                            | STATUS_REPLAY_OFFLINE
+                            | STATUS_REPLAY_CAPACITY
+                            | STATUS_REPLAY_DENIED
                     ) || (mode == STATUS_FINALIZE_REPLAY
                         && worker_finalizations.load(Ordering::Acquire) < 2))
                 {
                     (
                         409,
-                        serde_json::json!({"code": "capture_conflict", "retryable": false, "message": "Conflict.", "requestId": "synthetic-request"}),
+                        serde_json::json!({"code": "capture_conflict", "retryable": false, "message": "Conflict.", "request_id": "synthetic-request"}),
                     )
-                } else if line.starts_with("GET ") && line.contains("/status?") {
+                } else if status_request {
                     let saved = manifest.as_ref().unwrap();
                     if mode == REPLACED_PART && !replaced {
                         receipts.retain(|receipt| {
@@ -312,7 +360,7 @@ impl Service {
                         })
                         .unwrap(),
                     )
-                } else if line.contains("/renew ") {
+                } else if line.contains("/renew-lease ") {
                     worker_renewals.fetch_add(1, Ordering::AcqRel);
                     assert_eq!(input["reservation_id"], "reservation");
                     if let Some(saved) = &manifest {
@@ -336,29 +384,33 @@ impl Service {
                     } else {
                         (
                             409,
-                            serde_json::json!({"code": "capture_conflict", "retryable": false, "message": "Conflict.", "requestId": "synthetic-request"}),
+                            serde_json::json!({"code": "capture_conflict", "retryable": false, "message": "Conflict.", "request_id": "synthetic-request"}),
                         )
                     }
-                } else if line.contains("/parts ") && mode == PART_OFFLINE {
+                } else if part_url_request && mode == PART_OFFLINE {
                     (503, serde_json::json!({}))
-                } else if line.contains("/parts ") && mode == PART_CAPACITY {
+                } else if part_url_request && mode == PART_CAPACITY {
                     (429, serde_json::json!({}))
-                } else if line.contains("/parts ") && mode == PART_REJECTED {
+                } else if part_url_request && mode == PART_REJECTED {
                     (422, serde_json::json!({}))
-                } else if (mode == PART_CONFLICT && line.contains("/parts "))
+                } else if part_url_request && mode == PART_DENIED {
+                    (403, serde_json::json!({}))
+                } else if part_url_request && mode == PART_UNAUTHORIZED {
+                    (401, serde_json::json!({}))
+                } else if (mode == PART_CONFLICT && part_url_request)
                     || (mode == FINALIZE_CONFLICT && line.contains("/finalize "))
-                    || (mode == RENEWED_PART_CONFLICT && line.contains("/parts "))
+                    || (mode == RENEWED_PART_CONFLICT && part_url_request)
                     || (mode == RENEWED_FINALIZE_CONFLICT && line.contains("/finalize "))
-                    || (!renewed && mode == IDLE_PART && line.contains("/parts "))
+                    || (!renewed && mode == IDLE_PART && part_url_request)
                     || (!renewed && mode == IDLE_FINALIZE && line.contains("/finalize "))
                 {
                     worker_conflicts.fetch_add(1, Ordering::AcqRel);
                     conflicted_request = Some((line.clone(), body.clone()));
                     (
                         409,
-                        serde_json::json!({"code": "capture_conflict", "retryable": false, "message": "Conflict.", "requestId": "synthetic-request"}),
+                        serde_json::json!({"code": "capture_conflict", "retryable": false, "message": "Conflict.", "request_id": "synthetic-request"}),
                     )
-                } else if line.contains("/parts ") {
+                } else if part_url_request {
                     let key: ChunkKey = serde_json::from_value(input["key"].clone()).unwrap();
                     worker_part_keys.lock().unwrap().push(key.clone());
                     let chunk = manifest.as_ref().unwrap().chunk(&key).unwrap();
@@ -397,19 +449,32 @@ impl Service {
                     } else {
                         finalized_request = Some((line.clone(), body.clone()));
                     }
-                    assert_eq!(receipts.len(), manifest.as_ref().unwrap().chunks().count());
+                    let saved = manifest.as_ref().unwrap();
+                    assert_eq!(receipts.len(), saved.chunks().count());
                     if mode == STATUS_REPLAY_OFFLINE {
                         (503, serde_json::json!({}))
                     } else if mode == STATUS_REPLAY_CAPACITY {
                         (429, serde_json::json!({}))
+                    } else if mode == STATUS_REPLAY_DENIED {
+                        (403, serde_json::json!({}))
                     } else if mode == STATUS_REPLAY_REJECTED {
                         (
                             409,
-                            serde_json::json!({"code": "capture_conflict", "retryable": false, "message": "Conflict.", "requestId": "synthetic-request"}),
+                            serde_json::json!({"code": "capture_conflict", "retryable": false, "message": "Conflict.", "request_id": "synthetic-request"}),
                         )
                     } else {
                         finalized = true;
-                        (202, serde_json::Value::Null)
+                        (
+                            202,
+                            serde_json::json!({
+                                "operation_id": "synthetic-operation",
+                                "status_url": format!(
+                                    "/v1/captures/{}?plan_id=plan&manifest_sha256={}",
+                                    saved.identity.capture_id,
+                                    saved.sha256().unwrap()
+                                ),
+                            }),
+                        )
                     }
                 } else {
                     panic!("unexpected test service route");
@@ -421,6 +486,8 @@ impl Service {
                 };
                 let retry_after = if status == 429 || status == 503 {
                     "Retry-After: 90\r\n"
+                } else if status == 403 && mode == PART_DENIED {
+                    "Retry-After: 3600\r\n"
                 } else {
                     ""
                 };
@@ -488,6 +555,7 @@ fn read_request(stream: &mut std::net::TcpStream) -> (String, BTreeMap<String, S
 struct Authority {
     other_team: AtomicBool,
     workspaces_unavailable: AtomicBool,
+    workspace_lookups: AtomicUsize,
     origin: String,
     workspace: Workspace,
     membership: AtomicUsize,
@@ -562,6 +630,7 @@ impl AuthTransport for Arc<Authority> {
         _: &Config,
         _: &str,
     ) -> Result<Vec<auth::EligibleWorkspace>, auth::Failure> {
+        self.workspace_lookups.fetch_add(1, Ordering::AcqRel);
         if self.workspaces_unavailable.load(Ordering::Acquire) {
             return Err(auth::Failure::Offline);
         }
@@ -851,8 +920,17 @@ fn codex_and_pi_scheduler_requires_folder_consent_and_advertised_formats() {
         )
         .unwrap();
 
-    fixture.turn();
-    assert_eq!(fixture.runner.state, State::UploadUnavailable);
+    fixture.schedule_backfill();
+    let mut unsupported = Vec::new();
+    fixture.turn_published(&mut unsupported);
+    assert_eq!(unsupported[0].status, State::UploadUnavailable);
+    assert_eq!(
+        session_progress(&unsupported[0]),
+        serde_json::json!({
+            "uploaded": 0, "total": 2, "blocked": 0, "unsupported": 2,
+            "scanIncomplete": false
+        })
+    );
     assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 0);
     assert!(fixture.host.spool().unwrap().entries().unwrap().is_empty());
 
@@ -863,11 +941,41 @@ fn codex_and_pi_scheduler_requires_folder_consent_and_advertised_formats() {
     assert_eq!(entries.len(), 1);
     assert!(entries[0].manifest.is_some());
     assert!(entries[0].upload_plan.is_none());
+    let job = fixture
+        .store
+        .cloud_sync_job(&entries[0].identity.capture_id)
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .set_cloud_sync_job_state(&job, JobState::Fenced)
+        .unwrap();
+
+    fixture.restart_scheduler();
+    fixture.service.mode.store(CAPS_MISSING, Ordering::Release);
+    fixture.schedule_backfill();
+    let mut unavailable = Vec::new();
+    fixture.turn_published(&mut unavailable);
+    fixture.turn_published(&mut unavailable);
+    assert_eq!(
+        session_progress(&unavailable[1]),
+        serde_json::json!({
+            "uploaded": 0, "total": null, "blocked": 1, "unsupported": 0,
+            "scanIncomplete": true
+        })
+    );
 
     fixture.service.mode.store(READY, Ordering::Release);
+    fixture.runner.retry_deadlines.clear();
+    fixture.schedule_backfill();
     let requests = fixture.service.requests.load(Ordering::Acquire);
-    fixture.turn();
-    assert_eq!(fixture.runner.state, State::UploadUnavailable);
+    let mut observed = Vec::new();
+    fixture.turn_published(&mut observed);
+    assert_eq!(observed[0].status, State::UploadUnavailable);
+    assert_eq!(
+        serde_json::to_value(&observed[0]).unwrap()["uploadProgress"]["unsupported"],
+        0
+    );
     assert_eq!(
         fixture.service.requests.load(Ordering::Acquire),
         requests + 1
@@ -876,9 +984,18 @@ fn codex_and_pi_scheduler_requires_folder_consent_and_advertised_formats() {
     assert_eq!(saved[0].identity, entries[0].identity);
     assert_eq!(saved[0].manifest, entries[0].manifest);
     assert!(saved[0].upload_plan.is_none());
+    fixture.turn_published(&mut observed);
+    assert_eq!(
+        session_progress(&observed[1]),
+        serde_json::json!({
+            "uploaded": 0, "total": 2, "blocked": 0, "unsupported": 2,
+            "scanIncomplete": false
+        })
+    );
 
     fixture.service.mode.store(CODEX_AND_PI, Ordering::Release);
     fixture.runner.retry_deadlines.clear();
+    fixture.runner.next_reconcile = None;
     for _ in 0..30 {
         fixture.turn();
     }
@@ -892,6 +1009,7 @@ fn codex_and_pi_scheduler_requires_folder_consent_and_advertised_formats() {
         ids.iter()
             .any(|id| id.source_id.ends_with(&format!("/pi/{pi_id}")))
     );
+    drop(ids);
     assert_eq!(
         fixture
             .store
@@ -900,6 +1018,29 @@ fn codex_and_pi_scheduler_requires_folder_consent_and_advertised_formats() {
             .0,
         2
     );
+    let malformed_id = "deadbeef-1234-1234-1234-123456789abc";
+    for malformed in [
+        codex_day.join(format!("rollout-2026-11-19T12-00-00-{malformed_id}.jsonl")),
+        pi_folder.join(format!("2026-11-19T12-00-00Z_{malformed_id}.jsonl")),
+    ] {
+        fs::write(&malformed, b"{\"type\":\n").unwrap();
+        fixture.schedule_backfill();
+        let mut observed = Vec::new();
+        for _ in 0..10 {
+            fixture.runner.next_integrity_poll = None;
+            fixture.turn_published(&mut observed);
+        }
+        let result = observed.last().unwrap();
+        assert!(!result.backfill_in_progress);
+        assert_eq!(
+            session_progress(result),
+            serde_json::json!({
+                "uploaded": 2, "total": null, "blocked": 0, "unsupported": 0,
+                "scanIncomplete": true
+            })
+        );
+        fs::remove_file(malformed).unwrap();
+    }
 }
 
 impl Fixture {
@@ -953,6 +1094,7 @@ impl Fixture {
         let authority = Arc::new(Authority {
             other_team: AtomicBool::new(false),
             workspaces_unavailable: AtomicBool::new(false),
+            workspace_lookups: AtomicUsize::new(0),
             origin: service.origin.clone(),
             workspace: workspace.clone(),
             membership: AtomicUsize::new(0),
@@ -1010,7 +1152,7 @@ impl Fixture {
                 &mut self.host,
                 &mut self.engine,
                 &current,
-                &|| true,
+                (&|| true, None),
                 &mut self.cache,
             )
             .unwrap();
@@ -1026,7 +1168,7 @@ impl Fixture {
                 &mut self.host,
                 &mut self.engine,
                 &current,
-                &|| true,
+                (&|| true, None),
                 &mut self.cache,
             )
             .is_err();
@@ -1042,7 +1184,22 @@ impl Fixture {
         }
     }
 
+    fn published_status(&mut self) -> Status {
+        self.runner.report_status(
+            &self.store,
+            &mut self.host,
+            &self.engine,
+            false,
+            &|| true,
+            |_| {},
+        )
+    }
+
     fn accept_first(&mut self) {
+        self.accept_count(1);
+    }
+
+    fn accept_count(&mut self, expected: u32) {
         for _ in 0..10 {
             self.runner.next_integrity_poll = None;
             self.turn();
@@ -1055,12 +1212,12 @@ impl Fixture {
                 )
                 .unwrap()
                 .0
-                == 1
+                == expected
             {
                 return;
             }
         }
-        panic!("test capture did not become accepted");
+        panic!("test did not reach {expected} accepted sources");
     }
 
     /// Advance only synthetic capacity deadlines without sleeping or changing IDs.
@@ -1099,6 +1256,13 @@ impl Fixture {
                 || true,
             )
             .unwrap();
+    }
+
+    fn schedule_backfill(&mut self) {
+        let session = self.engine.session().unwrap();
+        self.runner.observe_retry_grant(session);
+        self.runner
+            .schedule_backfill(&self.policy, &session.grant_id);
     }
 
     /// Select only the final synthetic OpenCode ID; earlier IDs stay unapproved.
@@ -1157,6 +1321,67 @@ impl Fixture {
 }
 
 #[test]
+fn cloud_team_scheduler_reuses_current_turn_proof_and_rechecks_after_grant_change() {
+    let workspace = Workspace {
+        id: "team".into(),
+        name: "Example Team".into(),
+        kind: WorkspaceKind::Team,
+    };
+    for changed_grant in [false, true] {
+        let mut fixture = Fixture::for_workspace(READY, 0, workspace.clone());
+        fs::remove_file(fixture.root.join("session.jsonl")).unwrap();
+        let session = fixture.engine.session().unwrap().clone();
+        let binding = DestinationBinding {
+            account_id: session.user.id.clone(),
+            destination_id: session.workspace.id.clone(),
+        };
+        let before = fixture.authority.workspace_lookups.load(Ordering::Acquire);
+        let engine_generation = fixture.engine.generation;
+        let entries = fixture
+            .engine
+            .eligible_workspaces(&binding, &|| true)
+            .unwrap();
+        let selected_policy = fixture.policy.clone();
+        let proof =
+            TeamTurnProof::for_policy(&session, engine_generation, &selected_policy, &entries)
+                .unwrap();
+        assert_eq!(
+            fixture.authority.workspace_lookups.load(Ordering::Acquire),
+            before + 1
+        );
+        if changed_grant {
+            fixture.sign_in_again();
+            fixture.authority.membership.store(1, Ordering::Release);
+        }
+        let before_turn = fixture.authority.workspace_lookups.load(Ordering::Acquire);
+        fixture
+            .runner
+            .turn(
+                &fixture.store,
+                &mut fixture.host,
+                &mut fixture.engine,
+                &|| true,
+                (&|| true, Some(proof)),
+                &mut fixture.cache,
+            )
+            .unwrap();
+        assert_eq!(
+            fixture.authority.workspace_lookups.load(Ordering::Acquire),
+            before_turn + usize::from(changed_grant)
+        );
+        assert_eq!(
+            fixture.runner.state,
+            if changed_grant {
+                State::ReauthRequired
+            } else {
+                State::Ready
+            }
+        );
+        assert_eq!(fixture.service.requests.load(Ordering::Acquire), 0);
+    }
+}
+
+#[test]
 fn cloud_team_scheduler_blocks_changed_membership_even_after_fresh_account_approval() {
     let workspace = Workspace {
         id: "team".into(),
@@ -1179,6 +1404,60 @@ fn cloud_team_scheduler_blocks_changed_membership_even_after_fresh_account_appro
     assert_eq!(replaced.runner.state, State::ReauthRequired);
     assert_eq!(replaced.service.requests.load(Ordering::Acquire), requests);
     assert_eq!(replaced.host.spool().unwrap().entries().unwrap().len(), 1);
+}
+
+#[test]
+fn cloud_team_scheduler_retries_interrupted_upload_after_membership_lookup_recovers() {
+    let mut fixture = Fixture::for_workspace(
+        PART_REJECTED,
+        0,
+        Workspace {
+            id: "team".into(),
+            name: "Example Team".into(),
+            kind: WorkspaceKind::Team,
+        },
+    );
+    fixture.turn();
+    let saved = fixture.host.spool().unwrap().entries().unwrap().remove(0);
+    fixture.turn();
+    let job = || {
+        fixture
+            .store
+            .cloud_sync_job(&saved.identity.capture_id)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(job().state, JobState::Interrupted);
+
+    fixture.sign_in_again();
+    fixture
+        .authority
+        .workspaces_unavailable
+        .store(true, Ordering::Release);
+    let requests = fixture.service.requests.load(Ordering::Acquire);
+    fixture.turn();
+    assert_eq!(fixture.runner.state, State::ReauthRequired);
+    assert_eq!(fixture.service.requests.load(Ordering::Acquire), requests);
+
+    fixture
+        .authority
+        .workspaces_unavailable
+        .store(false, Ordering::Release);
+    fixture.service.mode.store(READY, Ordering::Release);
+    fs::remove_file(fixture.root.join("session.jsonl")).unwrap();
+    fixture.turn();
+    assert_eq!(
+        fixture
+            .store
+            .cloud_sync_job(&saved.identity.capture_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        JobState::Queued
+    );
+    assert!(fixture.service.requests.load(Ordering::Acquire) > requests);
+    fixture.accept_first();
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -1370,9 +1649,36 @@ fn cloud_scheduler_replays_bound_finalization_once_after_status_and_renewal_conf
             vec![saved.clone()]
         );
         if mode == STATUS_FINALIZE_REPLAY {
+            fixture
+                .service
+                .mode
+                .store(VERIFY_PENDING, Ordering::Release);
             fixture.runner.retry_deadlines.get_mut(id).unwrap().0 = Instant::now();
+            fixture.turn();
+            let pending = fixture.host.spool().unwrap().entries().unwrap().remove(0);
+            assert_eq!(pending.state, CaptureState::AwaitingIntegrity);
+            assert_eq!(pending.identity, saved.identity);
+            assert_eq!(pending.manifest, saved.manifest);
+            assert!(!pending.server_status.unwrap().integrity_accepted);
+            let observed = fixture.published_status();
+            assert_eq!(observed.automatic_recovery_count, Some(1));
+            assert_eq!(observed.queued_count, 1);
+            assert_eq!(observed.fenced_count, 0);
+            assert!(!observed.retry_available);
+            assert_eq!(
+                fixture.store.cloud_sync_job(id).unwrap().unwrap().state,
+                JobState::Queued
+            );
+            assert_eq!(fixture.service.finalizations.load(Ordering::Acquire), 2);
+            assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
+
+            fixture.service.mode.store(READY, Ordering::Release);
             fixture.accept_first();
             assert!(fixture.host.spool().unwrap().entries().unwrap().is_empty());
+            assert_eq!(
+                fixture.store.cloud_sync_job(id).unwrap().unwrap().state,
+                JobState::Accepted
+            );
         } else {
             for _ in 0..3 {
                 fixture.runner.retry_deadlines.get_mut(id).unwrap().0 = Instant::now();
@@ -1438,8 +1744,15 @@ fn cloud_scheduler_transient_part_errors_wait_and_keep_capacity_backoff_across_s
     for mode in [PART_OFFLINE, PART_CAPACITY] {
         let mut fixture = Fixture::new(mode, 0);
         fixture.turn();
+        let queued = fixture.published_status();
+        assert_eq!(queued.automatic_recovery_count, Some(0));
+        assert_eq!(queued.queued_count, 1);
         let saved = fixture.host.spool().unwrap().entries().unwrap().remove(0);
         fixture.turn();
+        let delayed = fixture.published_status();
+        assert_eq!(delayed.automatic_recovery_count, Some(1));
+        assert_eq!(delayed.queued_count, 1);
+        assert!(!delayed.retry_available);
         let deadline = fixture.runner.retry_deadlines[&saved.identity.capture_id];
         assert!(deadline.0.saturating_duration_since(Instant::now()) > Duration::from_secs(85));
         let requests = fixture.service.requests.load(Ordering::Acquire);
@@ -1505,6 +1818,139 @@ fn cloud_device_upload_fence_blocks_older_work_until_off_is_saved() {
 }
 
 #[test]
+fn cloud_device_upload_resume_requires_the_current_personal_binding() {
+    let fixture = Fixture::for_workspace(
+        READY,
+        0,
+        Workspace {
+            id: "team".into(),
+            name: "Team".into(),
+            kind: WorkspaceKind::Team,
+        },
+    );
+    fixture
+        .store
+        .set_cloud_device_upload_enabled(false)
+        .unwrap();
+    let scheduler = Scheduler::default();
+    let expected_pause = scheduler.fence_device_uploads();
+    let resume = |account: &str, workspace: &str, generation, current| {
+        device_upload::resume(
+            &scheduler,
+            &fixture.store,
+            &fixture.engine,
+            &DestinationBinding {
+                account_id: account.into(),
+                destination_id: workspace.into(),
+            },
+            expected_pause,
+            generation,
+            || current,
+        )
+    };
+    for (account, workspace, generation, current) in [
+        ("other", "personal", 0, true),
+        ("account", "team", 0, true),
+        ("account", "personal", 1, true),
+        ("account", "personal", 0, false),
+    ] {
+        assert!(resume(account, workspace, generation, current).is_err());
+        assert!(!fixture.store.cloud_device_upload_enabled().unwrap());
+        assert!(!scheduler.device_admission_open());
+    }
+
+    resume("account", "personal", 0, true).unwrap();
+    assert!(scheduler.device_upload_enabled(&fixture.store).unwrap());
+}
+
+#[test]
+fn cloud_device_upload_resume_rolls_back_if_sign_out_races_the_device_cas() {
+    let fixture = Fixture::new(READY, 0);
+    fixture
+        .store
+        .set_cloud_device_upload_enabled(false)
+        .unwrap();
+    let scheduler = Scheduler::default();
+    let expected_pause = scheduler.fence_device_uploads();
+    let checks = std::cell::Cell::new(0);
+    let generation = AtomicU64::new(0);
+    let result = device_upload::resume(
+        &scheduler,
+        &fixture.store,
+        &fixture.engine,
+        &DestinationBinding {
+            account_id: "account".into(),
+            destination_id: "personal".into(),
+        },
+        expected_pause,
+        0,
+        || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 3 {
+                generation.fetch_add(1, Ordering::AcqRel);
+            }
+            generation.load(Ordering::Acquire) == 0
+        },
+    );
+    assert_eq!(checks.get(), 3);
+    assert!(result.is_err());
+    assert!(!fixture.store.cloud_device_upload_enabled().unwrap());
+    assert_eq!(
+        scheduler.device_pause.load(Ordering::Acquire),
+        expected_pause
+    );
+    assert!(!scheduler.device_admission_open());
+}
+
+#[test]
+fn cloud_device_upload_resume_orders_new_off_requests_against_the_device_cas() {
+    let fixture = Fixture::new(READY, 0);
+    let binding = DestinationBinding {
+        account_id: "account".into(),
+        destination_id: "personal".into(),
+    };
+    for (fence_at_check, resume_accepted) in [(2, false), (3, true)] {
+        fixture
+            .store
+            .set_cloud_device_upload_enabled(false)
+            .unwrap();
+        let scheduler = Scheduler::default();
+        let expected_pause = scheduler.fence_device_uploads();
+        let checks = std::cell::Cell::new(0);
+        let off = std::cell::Cell::new(None);
+        let result = device_upload::resume(
+            &scheduler,
+            &fixture.store,
+            &fixture.engine,
+            &binding,
+            expected_pause,
+            0,
+            || {
+                let check = checks.get() + 1;
+                checks.set(check);
+                if check == fence_at_check {
+                    off.set(Some(scheduler.fence_device_uploads()));
+                }
+                true
+            },
+        );
+        assert_eq!(result.is_ok(), resume_accepted);
+        assert_eq!(
+            fixture.store.cloud_device_upload_enabled().unwrap(),
+            resume_accepted
+        );
+        assert!(!scheduler.device_admission_open());
+
+        fixture
+            .store
+            .set_cloud_device_upload_enabled(false)
+            .unwrap();
+        scheduler.finish_device_change(off.get().unwrap()).unwrap();
+        assert!(!scheduler.device_upload_enabled(&fixture.store).unwrap());
+    }
+}
+
+#[test]
 fn cloud_device_upload_pause_preserves_personal_and_team_capture_ids() {
     for (id, kind) in [
         ("personal", WorkspaceKind::Personal),
@@ -1538,6 +1984,211 @@ fn cloud_device_upload_pause_preserves_personal_and_team_capture_ids() {
         let reserves = fixture.service.reserve_identities.lock().unwrap();
         assert_eq!(reserves.as_slice(), &[saved.identity]);
     }
+}
+
+#[test]
+fn cloud_scheduler_route_denial_keeps_account_and_saved_upload() {
+    for (id, kind) in [
+        ("personal", WorkspaceKind::Personal),
+        ("team", WorkspaceKind::Team),
+    ] {
+        let mut fixture = Fixture::for_workspace(
+            PART_DENIED,
+            0,
+            Workspace {
+                id: id.into(),
+                name: id.into(),
+                kind,
+            },
+        );
+        fixture.turn();
+        let saved = fixture.host.spool().unwrap().entries().unwrap().remove(0);
+        let start = Instant::now();
+        let mut observed = Vec::new();
+        fixture.turn_published(&mut observed);
+        assert_eq!(observed[0].status, State::RouteDenied);
+        assert!(observed[0].retry_available);
+        assert_eq!(observed[0].destination_id.as_deref(), Some(id));
+        assert!(fixture.engine.status == AuthStatus::SignedIn);
+        assert!(fixture.engine.session().is_some());
+        assert!(fixture.store.cloud_device_upload_enabled().unwrap());
+        let deadline = fixture.runner.route_denied_until.unwrap();
+        assert!(deadline >= start + Duration::from_secs(300));
+        assert!(deadline <= Instant::now() + Duration::from_secs(300));
+        let requests = fixture.service.requests.load(Ordering::Acquire);
+        fixture.turn();
+        fixture.turn();
+        assert_eq!(fixture.runner.state, State::RouteDenied);
+        assert_eq!(fixture.service.requests.load(Ordering::Acquire), requests);
+        assert_eq!(fixture.authority.exchanges.load(Ordering::Acquire), 1);
+
+        fs::remove_file(fixture.root.join("session.jsonl")).unwrap();
+        fixture.service.mode.store(READY, Ordering::Release);
+        fixture.runner.route_denied_until = Some(Instant::now());
+        fixture.accept_first();
+        assert_eq!(
+            fixture
+                .service
+                .reserve_identities
+                .lock()
+                .unwrap()
+                .as_slice(),
+            &[saved.identity]
+        );
+    }
+}
+
+#[test]
+fn cloud_scheduler_does_not_continue_discovery_early_during_route_backoff() {
+    let mut fixture = Fixture::new(READY, 0);
+    let cursor = DiscoveryCursor {
+        after: Some("unread-source".into()),
+        ..DiscoveryCursor::default()
+    };
+    fixture.runner.discovery_cursor = Some(cursor.clone());
+    fixture.runner.continue_discovery = true;
+    assert!(fixture.runner.discovery_continuation_due());
+    fixture.runner.route_denied_until = Some(Instant::now() + Duration::from_secs(60));
+
+    fixture.turn();
+
+    assert_eq!(fixture.runner.state, State::RouteDenied);
+    assert_eq!(fixture.runner.discovery_cursor, Some(cursor));
+    assert!(!fixture.runner.discovery_continuation_due());
+}
+
+#[test]
+fn cloud_scheduler_capability_denial_waits_before_retrying() {
+    let mut fixture = Fixture::new(CAPS_DENIED, 0);
+    let start = Instant::now();
+    fixture.turn();
+    assert_eq!(fixture.runner.state, State::RouteDenied);
+    assert!(fixture.runner.route_denied_until.unwrap() >= start + ROUTE_DENIAL_RETRY_DELAY);
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 0);
+    fixture.turn();
+    assert_eq!(fixture.service.requests.load(Ordering::Acquire), 1);
+    fixture.service.mode.store(READY, Ordering::Release);
+    fixture.runner.route_denied_until = Some(Instant::now());
+    fixture.accept_first();
+}
+
+#[test]
+fn cloud_scheduler_personal_denial_leaves_team_upload_eligible() {
+    let mut fixture = Fixture::new(CAPS_DENIED, 0);
+    fixture.authority.other_team.store(true, Ordering::Release);
+    fixture
+        .store
+        .save_cloud_sync_policy_for_membership(
+            (
+                "account",
+                "team",
+                &fixture.service.origin,
+                &fixture.service.origin,
+                Some(("membership-0", "Team")),
+            ),
+            &[SourceSelection {
+                source_kind: SourceKind::ClaudeJsonl,
+                path: fixture.root.to_str().unwrap().into(),
+            }],
+            &fixture.policy.projects,
+            &BTreeMap::new(),
+            || true,
+        )
+        .unwrap();
+    fixture.turn();
+    assert_eq!(fixture.runner.state, State::RouteDenied);
+    let personal = std::mem::replace(
+        &mut fixture.runner,
+        Runner {
+            team: Some(("team".into(), "membership-0".into())),
+            ..Runner::default()
+        },
+    );
+    fixture.service.mode.store(READY, Ordering::Release);
+    fixture.turn();
+    let saved = fixture.host.spool().unwrap().entries().unwrap().remove(0);
+    assert_eq!(saved.identity.destination_id, "team");
+    fixture.runner = personal;
+    let requests = fixture.service.requests.load(Ordering::Acquire);
+    fixture.turn();
+    assert_eq!(fixture.runner.state, State::RouteDenied);
+    assert_eq!(fixture.service.requests.load(Ordering::Acquire), requests);
+}
+
+#[test]
+fn cloud_scheduler_retries_denied_finalization_replay_when_status_returns_to_pending() {
+    let mut fixture = Fixture::new(VERIFY_PENDING, 0);
+    for _ in 0..8 {
+        fixture.turn();
+        if fixture.service.finalizations.load(Ordering::Acquire) == 1 {
+            break;
+        }
+    }
+    let saved = fixture.host.spool().unwrap().entries().unwrap().remove(0);
+    assert!(saved.completion_submitted);
+    fixture
+        .service
+        .mode
+        .store(STATUS_REPLAY_DENIED, Ordering::Release);
+    fixture.runner.next_integrity_poll = None;
+    fixture.turn();
+    assert_eq!(fixture.runner.state, State::RouteDenied);
+    assert_eq!(fixture.service.renewals.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.service.finalizations.load(Ordering::Acquire), 2);
+    assert_eq!(
+        fixture.host.spool().unwrap().entries().unwrap(),
+        vec![saved.clone()]
+    );
+    assert!(fixture.engine.status == AuthStatus::SignedIn);
+
+    fixture
+        .service
+        .mode
+        .store(VERIFY_PENDING, Ordering::Release);
+    fixture.turn();
+    assert_eq!(fixture.service.finalizations.load(Ordering::Acquire), 2);
+    fixture.runner.route_denied_until = Some(Instant::now());
+    fixture.turn();
+    assert_eq!(fixture.service.finalizations.load(Ordering::Acquire), 3);
+    assert_eq!(fixture.service.renewals.load(Ordering::Acquire), 1);
+    assert_eq!(
+        fixture.host.spool().unwrap().entries().unwrap(),
+        vec![saved]
+    );
+
+    fixture.runner.next_integrity_poll = None;
+    fixture.turn();
+    assert_eq!(fixture.service.finalizations.load(Ordering::Acquire), 3);
+}
+
+#[test]
+fn cloud_scheduler_reservation_denial_does_not_retry_source_capture() {
+    let mut fixture = Fixture::new(RESERVE_DENIED, 0);
+    fixture.turn();
+    let saved = fixture.host.spool().unwrap().entries().unwrap().remove(0);
+    assert_eq!(fixture.runner.state, State::RouteDenied);
+    assert_eq!(saved.state, CaptureState::Preparing);
+    assert!(saved.reservation_id.is_none());
+    assert!(saved.manifest.is_none());
+    fixture.service.mode.store(READY, Ordering::Release);
+    fixture.runner.route_denied_until = Some(Instant::now());
+    fixture.turn();
+    let entries = fixture.host.spool().unwrap().entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].identity, saved.identity);
+    assert!(entries[0].manifest.is_none());
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn cloud_scheduler_unauthorized_capture_invalidates_account_access() {
+    let mut fixture = Fixture::new(PART_UNAUTHORIZED, 0);
+    fixture.turn();
+    fixture.turn();
+    assert_eq!(fixture.runner.state, State::ReauthRequired);
+    assert!(fixture.engine.status == AuthStatus::ReauthRequired);
+    assert!(fixture.engine.session().is_none());
+    assert!(fixture.runner.route_denied_until.is_none());
 }
 
 #[test]
@@ -1681,6 +2332,7 @@ fn cloud_scheduler_local_capacity_wait_survives_restart_and_reuses_the_same_id()
         .unwrap()
         .remove(0);
     assert_eq!(waiting.state, JobState::WaitingForLocalCapacity);
+    assert_eq!(fixture.published_status().automatic_recovery_count, Some(1));
     assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 0);
     fixture.host.spool().unwrap().cancel(&occupant).unwrap();
     fixture
@@ -1776,10 +2428,24 @@ fn cloud_scheduler_accepted_opencode_observation_matches_captured_bytes_not_disc
     fixture
         .runner
         .refresh_candidates(&fixture.policy, &|| true, &mut fixture.cache);
+    fixture.schedule_backfill();
+    fixture.runner.next_reservation = Some(Instant::now() + Duration::from_secs(60));
+    let mut observed = Vec::new();
+    fixture.turn_published(&mut observed);
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 0);
     let original = fixture.runner.candidates[0].observation.clone();
     let connection = rusqlite::Connection::open(&database).unwrap();
     connection.execute("INSERT INTO session_message VALUES ('message','session-0000','user',1,'{\"text\":\"new content\"}')", []).unwrap();
+    fixture.runner.next_reservation = None;
     fixture.accept_first();
+    fixture.turn_published(&mut observed);
+    assert_eq!(
+        session_progress(observed.last().unwrap()),
+        serde_json::json!({
+            "uploaded": 1, "total": 1, "blocked": 0, "unsupported": 0,
+            "scanIncomplete": false
+        })
+    );
     let identity = fixture.service.reserve_identities.lock().unwrap()[0].clone();
     let source = fixture
         .store
@@ -1792,7 +2458,6 @@ fn cloud_scheduler_accepted_opencode_observation_matches_captured_bytes_not_disc
         .unwrap()
         .unwrap();
     assert_ne!(source.observation_key.as_deref(), Some(original.as_str()));
-    fixture.runner.next_reconcile = None;
     fixture.turn();
     assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
     connection
@@ -1801,6 +2466,188 @@ fn cloud_scheduler_accepted_opencode_observation_matches_captured_bytes_not_disc
     fixture.runner.next_reconcile = None;
     fixture.turn();
     assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 2);
+}
+
+#[test]
+fn cloud_scheduler_closes_refresh_when_a_previously_uploaded_source_disappears() {
+    let mut fixture = Fixture::new(READY, 0);
+    let database = fixture.select_opencode(1);
+    fixture.accept_first();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection.execute("INSERT INTO session_message VALUES ('message','session-0000','user',1,'{\"text\":\"changed before scan\"}')", []).unwrap();
+    fixture.schedule_backfill();
+    fixture.runner.next_reservation = Some(Instant::now() + Duration::from_secs(60));
+    let mut observed = Vec::new();
+    fixture.turn_published(&mut observed);
+    let before = serde_json::to_value(observed.last().unwrap()).unwrap();
+    assert_eq!(before["uploadProgress"]["uploaded"], 0);
+
+    connection.execute("UPDATE session_message SET data = '{\"text\":\"changed after scan\"}' WHERE id = 'message'", []).unwrap();
+    fixture.runner.next_reservation = None;
+    fixture.turn();
+    let identity = fixture.service.reserve_identities.lock().unwrap()[1].clone();
+    drop(connection);
+    fs::remove_file(database).unwrap();
+
+    for _ in 0..10 {
+        fixture.runner.next_integrity_poll = None;
+        fixture.turn_published(&mut observed);
+    }
+    assert_eq!(
+        fixture
+            .store
+            .cloud_sync_job(&identity.capture_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        JobState::Accepted
+    );
+    assert!(
+        !fixture
+            .runner
+            .backfill_progress
+            .as_ref()
+            .unwrap()
+            .needs_refresh()
+    );
+    assert_eq!(
+        session_progress(observed.last().unwrap()),
+        serde_json::json!({
+            "uploaded": 0, "total": null, "blocked": 1, "unsupported": 0,
+            "scanIncomplete": true
+        })
+    );
+}
+
+#[cfg(unix)]
+fn select_cursor_chunked_composer(fixture: &mut Fixture) -> rusqlite::Connection {
+    let base = fixture._directory.path().canonicalize().unwrap();
+    let user = base.join("Cursor/User");
+    let workspace = user.join("workspaceStorage/synthetic-workspace");
+    let global = user.join("globalStorage");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&global).unwrap();
+    fs::write(
+        workspace.join("workspace.json"),
+        serde_json::json!({ "folder": format!("file://{}", fixture.project.display()) })
+            .to_string(),
+    )
+    .unwrap();
+    rusqlite::Connection::open(workspace.join("state.vscdb"))
+        .unwrap()
+        .execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value BLOB);")
+        .unwrap();
+    let db = rusqlite::Connection::open(global.join("state.vscdb")).unwrap();
+    db.execute_batch("CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value BLOB);")
+        .unwrap();
+    db.execute_batch(include_str!(
+        "../../../../../../fixtures/cloud/cursor/ide-chunked.sql"
+    ))
+    .unwrap();
+    let source_kind = SourceKind::CursorIdeComposer;
+    let source_path = workspace.to_str().unwrap();
+    fixture.policy = fixture
+        .store
+        .save_cloud_sync_policy(
+            "account",
+            "personal",
+            &fixture.service.origin,
+            &[SourceSelection {
+                source_kind,
+                path: source_path.into(),
+            }],
+            &[ProjectSelection {
+                source_kind,
+                source_path: source_path.into(),
+                project_path: fixture.project.to_str().unwrap().into(),
+            }],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    db
+}
+
+#[cfg(unix)]
+#[test]
+fn cloud_scheduler_cursor_chunked_capture_counts_after_integrity_acceptance() {
+    let mut fixture = Fixture::new(CURSOR_IDE, 0);
+    select_cursor_chunked_composer(&mut fixture);
+    fixture.schedule_backfill();
+    let mut observed = Vec::new();
+    fixture.turn_published(&mut observed);
+    let queued = fixture.host.spool().unwrap().entries().unwrap().remove(0);
+    assert_eq!(queued.state, CaptureState::Queued);
+    let manifest = queued.manifest.unwrap();
+    assert_eq!(manifest.streams[0].stream_id, "cursor-ide-rows");
+    let status = serde_json::to_value(observed.last().unwrap()).unwrap();
+    assert_eq!(status["uploadProgress"]["uploaded"], 0);
+    assert!(status["uploadTransfer"].is_null());
+
+    fixture.turn_published(&mut observed);
+    let transferring = fixture.host.spool().unwrap().entries().unwrap().remove(0);
+    let progress = transferring.progress().unwrap();
+    assert!(progress.confirmed_upload_bytes > 0);
+    assert_eq!(
+        serde_json::to_value(observed.last().unwrap()).unwrap()["uploadTransfer"],
+        serde_json::json!({
+            "sentBytes": progress.confirmed_upload_bytes,
+            "totalBytes": progress.required_transfer_bytes,
+        })
+    );
+    for _ in 0..10 {
+        fixture.runner.next_integrity_poll = None;
+        fixture.turn_published(&mut observed);
+    }
+    let result = observed.last().unwrap();
+    assert!(!result.backfill_in_progress);
+    assert_eq!(
+        session_progress(result),
+        serde_json::json!({
+            "uploaded": 1, "total": 1, "blocked": 0, "unsupported": 0,
+            "scanIncomplete": false
+        })
+    );
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn cloud_scheduler_accepted_cursor_ide_observation_matches_captured_rows() {
+    let mut fixture = Fixture::new(CURSOR_IDE, 0);
+    let database = select_cursor_chunked_composer(&mut fixture);
+    fixture
+        .runner
+        .refresh_candidates(&fixture.policy, &|| true, &mut fixture.cache);
+    let discovered = fixture.runner.candidates[0].observation.clone();
+    database
+        .execute(
+            "UPDATE cursorDiskKV SET value=?1 WHERE key='bubbleId:synthetic-chunked:z-user'",
+            [r#"{"bubbleId":"z-user","type":1,"text":"changed synthetic prompt"}"#],
+        )
+        .unwrap();
+    fixture.turn();
+    let queued = fixture.host.spool().unwrap().entries().unwrap().remove(0);
+    let stream = &queued.manifest.as_ref().unwrap().streams[0];
+    assert_eq!(stream.stream_id, "cursor-ide-rows");
+    let captured = format!("cursor-ide-native-v1:{}", stream.expanded_sha256);
+    assert_ne!(captured, discovered);
+
+    fixture.accept_first();
+    let receipt = fixture
+        .store
+        .cloud_sync_source(
+            "account",
+            "personal",
+            &fixture.service.origin,
+            &queued.identity.source_id,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.observation_key.as_deref(), Some(captured.as_str()));
+
+    fixture.runner.next_reconcile = None;
+    fixture.turn();
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -1994,9 +2841,14 @@ fn cloud_scheduler_stops_probing_persistent_conflicts_until_explicit_retry() {
     fixture.turn();
     let saved = fixture.host.spool().unwrap().entries().unwrap().remove(0);
     let id = &saved.identity.capture_id;
-    for _ in 0..3 {
+    for attempt in 1..=3 {
         fixture.turn();
         assert_eq!(fixture.runner.state, State::Fenced);
+        let observed = fixture.published_status();
+        let automatic = u32::from(attempt < 3);
+        assert_eq!(observed.automatic_recovery_count, Some(automatic));
+        assert_eq!(observed.fenced_count, 1 - automatic);
+        assert_eq!(observed.retry_available, attempt == 3);
         fixture.runner.retry_deadlines.get_mut(id).unwrap().0 = Instant::now();
     }
     fixture.turn();
@@ -2051,6 +2903,46 @@ fn cloud_scheduler_new_sign_in_retries_saved_uploads_without_waiting_or_recaptur
             .as_slice(),
         std::slice::from_ref(&saved.identity),
     );
+}
+
+#[test]
+fn cloud_scheduler_observes_first_grant_while_policy_is_held() {
+    let mut fixture = Fixture::new(PART_REJECTED, 0);
+    fixture.turn();
+    let saved = fixture.host.spool().unwrap().entries().unwrap().remove(0);
+    fixture.turn();
+    let id = &saved.identity.capture_id;
+    assert_eq!(
+        fixture.store.cloud_sync_job(id).unwrap().unwrap().state,
+        JobState::Interrupted
+    );
+    fixture.restart_scheduler();
+    let held_policy = fixture
+        .store
+        .set_cloud_sync_paused(&fixture.policy, true)
+        .unwrap();
+    let requests = fixture.service.requests.load(Ordering::Acquire);
+    fixture.turn();
+    assert_eq!(fixture.runner.state, State::Paused);
+    fixture.sign_in_again();
+    fixture.turn();
+    assert_eq!(fixture.runner.state, State::Paused);
+    assert_eq!(fixture.service.requests.load(Ordering::Acquire), requests);
+
+    fixture
+        .store
+        .set_cloud_sync_paused(&held_policy, false)
+        .unwrap();
+    fixture.service.mode.store(READY, Ordering::Release);
+    fs::remove_file(fixture.root.join("session.jsonl")).unwrap();
+    fixture.turn();
+    assert_eq!(
+        fixture.store.cloud_sync_job(id).unwrap().unwrap().state,
+        JobState::Queued
+    );
+    assert!(fixture.service.requests.load(Ordering::Acquire) > requests);
+    fixture.accept_first();
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -2171,6 +3063,14 @@ fn cloud_scheduler_drains_each_capture_before_admitting_a_backfill_larger_than_s
 #[test]
 fn cloud_scheduler_reservation_capacity_is_backpressure_not_a_permanent_fence() {
     let mut fixture = Fixture::new(RESERVE_CAPACITY, 0);
+    let candidate = discover_policy(&fixture.policy, &|| true)
+        .unwrap()
+        .remove(0)
+        .candidate;
+    let evidence = candidate
+        .project_evidence_with_limits(&metadata_limits())
+        .unwrap();
+    let legacy_observation = legacy_file_observation(&candidate, &evidence).unwrap();
     *fixture.service.reserve_database.lock().unwrap() =
         Some(fixture._directory.path().join("antiburn-debug.sqlite3"));
     fixture.turn();
@@ -2191,6 +3091,17 @@ fn cloud_scheduler_reservation_capacity_is_backpressure_not_a_permanent_fence() 
     assert!(fixture.runner.next_reservation.unwrap() > Instant::now());
     fixture.turn();
     assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
+    // Simulate a capacity wait saved by a build that did not pin its observation.
+    fixture
+        .store
+        .lock()
+        .execute(
+            "UPDATE cloud_sync_job
+         SET record_json=json_set(record_json, '$.observation_key', ?1)
+         WHERE capture_id=?2",
+            [&legacy_observation, &entry.identity.capture_id],
+        )
+        .unwrap();
     fixture.runner = Runner::default();
     fixture.turn();
     assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
@@ -2200,6 +3111,15 @@ fn cloud_scheduler_reservation_capacity_is_backpressure_not_a_permanent_fence() 
     let saved = fixture.host.spool().unwrap().entries().unwrap().remove(0);
     assert_eq!(saved.identity, entry.identity);
     assert_eq!(saved.state, CaptureState::Queued);
+    assert!(
+        fixture
+            .store
+            .cloud_sync_job(&entry.identity.capture_id)
+            .unwrap()
+            .unwrap()
+            .observation_key
+            .starts_with(antiburn_cloud_capture::FILE_GENERATION_PREFIX)
+    );
     assert_eq!(
         *fixture.service.reserve_identities.lock().unwrap(),
         vec![entry.identity.clone(), entry.identity.clone()]
@@ -2563,7 +3483,7 @@ fn cloud_scheduler_allows_backfill_between_integrity_polls_even_when_the_deadlin
     assert!(!before.is_empty());
     assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
     write_source(&fixture.root, &fixture.project, "another", "synthetic");
-    fixture.runner.schedule_backfill(&fixture.policy);
+    fixture.schedule_backfill();
     assert!(fixture.runner.next_integrity_poll.unwrap() > Instant::now());
     fixture.runner.next_integrity_poll = Some(Instant::now() - Duration::from_secs(1));
     fixture.turn();
@@ -2902,16 +3822,404 @@ fn cloud_scheduler_generic_conflict_and_offline_reserve_do_not_suppress_sources(
 #[test]
 fn cloud_scheduler_backfill_stops_when_upload_capabilities_are_unavailable() {
     let mut fixture = Fixture::new(CAPS_MISSING, 0);
-    fixture.runner.schedule_backfill(&fixture.policy);
+    fixture.schedule_backfill();
     let mut observed = Vec::new();
     fixture.turn_published(&mut observed);
     assert_eq!(observed[0].status, State::UploadUnavailable);
     assert!(!observed[0].backfill_in_progress);
+    assert_eq!(
+        session_progress(&observed[0]),
+        serde_json::json!({
+            "uploaded": 0, "total": null, "blocked": 0, "unsupported": 0,
+            "scanIncomplete": true
+        })
+    );
     assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 0);
 }
 
 #[test]
-fn cloud_scheduler_backfill_reoffers_accepted_sources_but_respects_pause_and_deletion() {
+fn cloud_scheduler_backfill_keeps_total_unknown_with_incomplete_project_evidence() {
+    let mut fixture = Fixture::new(READY, 0);
+    fixture.accept_first();
+    let outside = fixture.root.clone();
+    write_source(
+        &fixture.root,
+        &outside,
+        "partial",
+        "outside the saved folder",
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.root.join("partial.jsonl"))
+        .unwrap()
+        .write_all(b"{\"type\":\n")
+        .unwrap();
+    fixture.schedule_backfill();
+
+    let mut observed = Vec::new();
+    for _ in 0..10 {
+        fixture.runner.next_integrity_poll = None;
+        fixture.turn_published(&mut observed);
+    }
+    let result = observed.last().unwrap();
+    assert!(!result.backfill_in_progress);
+    assert_eq!(
+        session_progress(result),
+        serde_json::json!({
+            "uploaded": 1, "total": null, "blocked": 0, "unsupported": 0,
+            "scanIncomplete": true
+        })
+    );
+}
+
+#[test]
+fn cloud_scheduler_backfill_reports_blocked_sources_and_drains_healthy_work() {
+    use crate::store::burn_checks::trace_capture::LogCapture;
+
+    let mut fixture = Fixture::new(CAPS_SMALL, 0);
+    write_source(
+        &fixture.root,
+        &fixture.project,
+        "a-oversized",
+        &"x".repeat(256 * 1024),
+    );
+    write_source(
+        &fixture.root,
+        &fixture.project,
+        "b-missing-spool",
+        "PRIVATE_SYNTHETIC_SESSION_BODY",
+    );
+    let scope = &fixture.policy.roots[0].source_scope_id;
+    let missing = fixture
+        .store
+        .enqueue_cloud_sync(
+            &fixture.policy,
+            scope,
+            fixture.project.to_str().unwrap(),
+            &format!("{scope}/b-missing-spool"),
+            "PRIVATE_SYNTHETIC_SOURCE_OBSERVATION",
+        )
+        .unwrap()
+        .unwrap();
+    fixture.schedule_backfill();
+    let mut observed = Vec::new();
+    let trace = LogCapture::default();
+    tracing::subscriber::with_default(trace.clone(), || {
+        for _ in 0..12 {
+            fixture.runner.next_integrity_poll = None;
+            fixture.turn_published(&mut observed);
+        }
+    });
+    let result = observed.last().unwrap();
+    assert!(result.storage_known);
+    assert!(!result.backfill_in_progress);
+    assert_eq!(result.recovery_required_count, 1);
+    assert_eq!(
+        session_progress(result),
+        serde_json::json!({
+            "uploaded": 1, "total": 3, "blocked": 2, "unsupported": 0,
+            "scanIncomplete": false
+        })
+    );
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
+    let saved = fixture
+        .store
+        .cloud_sync_job(&missing.identity.capture_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.identity, missing.identity);
+    assert_eq!(saved.state, JobState::Interrupted);
+    assert_eq!(trace.events("cloud_backfill_saved_job_decision").len(), 1);
+    assert_eq!(trace.events("cloud_backfill_receipt_outcome").len(), 1);
+    let events: Vec<_> = trace
+        .events("cloud_backfill_scan_summary")
+        .into_iter()
+        .filter(|event| event.fields["outcome"] == "\"finished\"")
+        .collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].level, tracing::Level::INFO);
+    assert_eq!(events[0].fields["discovered"], "3");
+    assert_eq!(events[0].fields["blocked"], "2");
+    assert!(events[0].fields["decisions"].contains("saved_job_blocked"));
+    let output = trace.text();
+    for private in [
+        "PRIVATE_SYNTHETIC_SESSION_BODY",
+        "PRIVATE_SYNTHETIC_SOURCE_OBSERVATION",
+        "b-missing-spool",
+        fixture.root.to_str().unwrap(),
+        &missing.identity.capture_id,
+    ] {
+        assert!(!output.contains(private));
+    }
+}
+
+#[test]
+fn cloud_scheduler_backfill_uses_healthy_paths_in_the_same_source_root() {
+    let mut fixture = Fixture::new(READY, 0);
+    let unavailable = fixture.project.join("unavailable");
+    fs::create_dir(&unavailable).unwrap();
+    let stale = ProjectSelection {
+        project_path: unavailable.to_str().unwrap().into(),
+        ..fixture.policy.projects[0].clone()
+    };
+    fixture.policy = fixture
+        .store
+        .save_cloud_sync_policy(
+            "account",
+            "personal",
+            &fixture.service.origin,
+            &[SourceSelection {
+                source_kind: SourceKind::ClaudeJsonl,
+                path: fixture.root.to_str().unwrap().into(),
+            }],
+            &[fixture.policy.projects[0].clone(), stale],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    fs::remove_dir(unavailable).unwrap();
+    fixture.schedule_backfill();
+    let mut observed = Vec::new();
+    for _ in 0..10 {
+        fixture.runner.next_integrity_poll = None;
+        fixture.turn_published(&mut observed);
+    }
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
+    assert_eq!(
+        session_progress(observed.last().unwrap()),
+        serde_json::json!({
+            "uploaded": 1, "total": null, "blocked": 0, "unsupported": 0,
+            "scanIncomplete": true
+        })
+    );
+}
+
+#[test]
+fn cloud_scheduler_backfill_removes_a_source_that_moves_outside_consent() {
+    let mut fixture = Fixture::new(READY, 0);
+    fixture
+        .runner
+        .refresh_candidates(&fixture.policy, &|| true, &mut fixture.cache);
+    fixture.schedule_backfill();
+    fixture.runner.next_reservation = Some(Instant::now() + Duration::from_secs(60));
+    let mut observed = Vec::new();
+    fixture.turn_published(&mut observed);
+    assert_eq!(fixture.runner.candidates.len(), 1);
+
+    write_source(
+        &fixture.root,
+        &fixture.root,
+        "session",
+        "synthetic source moved outside the approved folder",
+    );
+    fixture.runner.next_reservation = None;
+    fixture.turn_published(&mut observed);
+    let result = observed.last().unwrap();
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 0);
+    assert!(!result.backfill_in_progress);
+    assert_eq!(
+        session_progress(result),
+        serde_json::json!({
+            "uploaded": 0, "total": 0, "blocked": 0, "unsupported": 0,
+            "scanIncomplete": false
+        })
+    );
+}
+
+#[test]
+fn cloud_scheduler_claude_append_before_pin_cannot_stamp_an_older_observation() {
+    let mut fixture = Fixture::new(READY, 0);
+    fixture
+        .runner
+        .refresh_candidates(&fixture.policy, &|| true, &mut fixture.cache);
+    fixture.schedule_backfill();
+    fixture.runner.next_reservation = Some(Instant::now() + Duration::from_secs(60));
+    let mut observed = Vec::new();
+    fixture.turn_published(&mut observed);
+    let selection = &fixture.runner.candidates[0];
+    let source_id = selection.candidate.source_id().to_owned();
+    let old = selection.observation.clone();
+    let path = fixture.root.join("session.jsonl");
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&path).unwrap(),
+        "{}",
+        serde_json::json!({
+            "sessionId": "session", "cwd": fixture.project, "type": "user",
+            "message": {"role": "user", "content": "new synthetic message"}
+        })
+    )
+    .unwrap();
+    let new = antiburn_cloud_capture::file_generation_key(&[fs::metadata(path).unwrap()]).unwrap();
+    assert_ne!(old, new);
+
+    fixture.runner.next_reservation = None;
+    fixture.turn_published(&mut observed);
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 0);
+    assert!(fixture.host.spool().unwrap().entries().unwrap().is_empty());
+    assert_eq!(observed.last().unwrap().status, State::Syncing);
+    assert_eq!(observed.last().unwrap().interrupted_count, 0);
+    assert_eq!(
+        session_progress(observed.last().unwrap()),
+        serde_json::json!({
+            "uploaded": 0, "total": 1, "blocked": 0, "unsupported": 0,
+            "scanIncomplete": false
+        })
+    );
+
+    for _ in 0..10 {
+        fixture.runner.next_integrity_poll = None;
+        fixture.turn_published(&mut observed);
+    }
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
+    let receipt = fixture
+        .store
+        .cloud_sync_source("account", "personal", &fixture.service.origin, &source_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.observation_key.as_deref(), Some(new.as_str()));
+    assert_eq!(
+        serde_json::to_value(observed.last().unwrap()).unwrap()["uploadProgress"]["uploaded"],
+        1
+    );
+    fixture.runner.next_reconcile = None;
+    fixture.turn();
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn cloud_scheduler_backfill_tracks_the_requested_grant_and_retry_keeps_progress() {
+    let mut fixture = Fixture::new(READY, 0);
+    fixture.accept_first();
+    fixture.schedule_backfill();
+    let old_status = status(
+        &fixture.store,
+        &mut fixture.host,
+        &fixture.engine,
+        State::Ready,
+    )
+    .unwrap();
+    fixture.sign_in_again();
+    let grant_id = fixture.engine.session().unwrap().grant_id.clone();
+    let status_before_restart = fixture
+        .runner
+        .backfill_status(old_status.clone(), Some(&grant_id));
+    assert!(status_before_restart.upload_progress.is_none());
+    assert!(!status_before_restart.backfill_in_progress);
+
+    fixture.schedule_backfill();
+    let mut observed = Vec::new();
+    fixture.turn_published(&mut observed);
+    let progress = observed[0].upload_progress.clone();
+    assert!(progress.is_some());
+    assert_eq!(
+        fixture
+            .runner
+            .retry_status(&BTreeSet::new(), &grant_id, |_, _| Ok(old_status))
+            .unwrap()
+            .upload_progress,
+        progress
+    );
+}
+
+#[test]
+fn cloud_scheduler_backfill_does_not_reoffer_a_saved_job_accepted_during_the_scan() {
+    let mut fixture = Fixture::new(VERIFY_PENDING, 0);
+    for _ in 0..8 {
+        fixture.turn();
+        if fixture.service.finalizations.load(Ordering::Acquire) == 1 {
+            break;
+        }
+    }
+    let saved = fixture.host.spool().unwrap().entries().unwrap().remove(0);
+    assert_eq!(saved.state, CaptureState::AwaitingIntegrity);
+    assert!(saved.completion_submitted);
+    fixture.service.mode.store(READY, Ordering::Release);
+    fixture.restart_scheduler();
+    fixture.schedule_backfill();
+    let mut observed = Vec::new();
+    for _ in 0..12 {
+        fixture.runner.next_integrity_poll = None;
+        fixture.turn_published(&mut observed);
+    }
+    assert_eq!(
+        fixture
+            .service
+            .reserve_identities
+            .lock()
+            .unwrap()
+            .as_slice(),
+        &[saved.identity]
+    );
+    assert_eq!(
+        session_progress(observed.last().unwrap()),
+        serde_json::json!({
+            "uploaded": 1, "total": 1, "blocked": 0, "unsupported": 0,
+            "scanIncomplete": false
+        })
+    );
+}
+
+#[test]
+fn cloud_scheduler_reconciles_more_than_100_bindings_across_two_roots() {
+    let mut fixture = Fixture::new(READY, 0);
+    let base = fixture._directory.path().canonicalize().unwrap();
+    let other_root = base.join("other-sources");
+    fs::create_dir(&other_root).unwrap();
+    let mut paths = vec![fixture.project.clone()];
+    for index in 1..78 {
+        let path = base.join(format!("worktree-{index:02}"));
+        fs::create_dir(&path).unwrap();
+        paths.push(path);
+    }
+    write_source(&other_root, &paths[77], "other", "second source root");
+    write_source(&fixture.root, &paths[77], "outside", "wrong source root");
+    let roots = [&fixture.root, &other_root].map(|root| SourceSelection {
+        source_kind: SourceKind::ClaudeJsonl,
+        path: root.to_str().unwrap().into(),
+    });
+    let mut projects = Vec::new();
+    for root in &roots {
+        for path in &paths {
+            if root == &roots[0] && path == &paths[77] {
+                continue;
+            }
+            projects.push(ProjectSelection {
+                source_kind: root.source_kind,
+                source_path: root.path.clone(),
+                project_path: path.to_str().unwrap().into(),
+            });
+        }
+    }
+    projects.sort();
+    assert_eq!(projects.len(), 155);
+    validate_project_directories(projects.iter()).unwrap();
+    fixture.policy = fixture
+        .store
+        .save_cloud_sync_policy(
+            "account",
+            "personal",
+            &fixture.service.origin,
+            &roots,
+            &projects,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    fixture.restart_scheduler();
+    assert_eq!(
+        fixture
+            .store
+            .cloud_sync_policy("account", "personal", &fixture.service.origin)
+            .unwrap(),
+        Some(fixture.policy.clone())
+    );
+    fixture.accept_count(2);
+    let identities = fixture.service.reserve_identities.lock().unwrap();
+    assert_eq!(identities.len(), 2);
+    assert!(identities[0].source_id.ends_with("/session"));
+    assert!(identities[1].source_id.ends_with("/other"));
+}
+
+#[test]
+fn cloud_scheduler_backfill_only_offers_new_and_changed_sources() {
     let mut fixture = Fixture::new(SUPPRESSED, 0);
     fixture.turn();
     write_source(
@@ -2922,15 +4230,24 @@ fn cloud_scheduler_backfill_reoffers_accepted_sources_but_respects_pause_and_del
     );
     fixture.runner.next_reconcile = None;
     fixture.accept_first();
-    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 2);
+    write_source(&fixture.root, &fixture.project, "updated", "first version");
+    fixture.runner.next_reconcile = None;
+    fixture.accept_count(2);
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 3);
     assert_eq!(
         fixture
             .store
             .cloud_sync_outcome_counts("account", "personal", &fixture.service.origin)
             .unwrap(),
-        (1, 1)
+        (2, 1)
     );
 
+    write_source(
+        &fixture.root,
+        &fixture.project,
+        "updated",
+        "second version with new content",
+    );
     write_source(
         &fixture.root,
         &fixture.project,
@@ -2966,32 +4283,160 @@ fn cloud_scheduler_backfill_reoffers_accepted_sources_but_respects_pause_and_del
     fixture.runner.discovery_cursor = Some(DiscoveryCursor {
         root: 0,
         after: Some("zzzz".into()),
+        ..DiscoveryCursor::default()
     });
     fixture.runner.next_reconcile = Some(Instant::now() + Duration::from_secs(60));
-    fixture.runner.schedule_backfill(&fixture.policy);
+    fixture.schedule_backfill();
     assert!(fixture.runner.discovery_cursor.is_none());
     assert!(fixture.runner.next_reconcile.is_none());
     fixture.turn();
-    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 2);
+    assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 3);
     fixture.store.set_cloud_device_upload_enabled(true).unwrap();
-    fixture.turn();
-    fixture.runner.schedule_backfill(&fixture.policy);
+    let mut observed = Vec::new();
+    fixture.turn_published(&mut observed);
+    assert!(observed[0].backfill_in_progress);
+    assert_eq!(
+        session_progress(&observed[0]),
+        serde_json::json!({
+            "uploaded": 1, "total": null, "found": 3, "blocked": 0,
+            "unsupported": 0, "scanIncomplete": false
+        })
+    );
+    fixture.schedule_backfill();
     for _ in 0..10 {
         fixture.turn();
     }
     fixture.runner.next_reconcile = None;
-    fixture.turn();
+    observed.clear();
+    fixture.turn_published(&mut observed);
+    assert!(!observed[0].backfill_in_progress);
+    assert_eq!(
+        session_progress(&observed[0]),
+        serde_json::json!({
+            "uploaded": 3, "total": 3, "blocked": 0, "unsupported": 0,
+            "scanIncomplete": false
+        })
+    );
+    let mut changed_policy = observed.remove(0);
+    changed_policy.policy_revision = Some("other-revision".into());
+    assert!(
+        fixture
+            .runner
+            .backfill_status(
+                changed_policy,
+                Some(&fixture.engine.session().unwrap().grant_id),
+            )
+            .upload_progress
+            .is_none()
+    );
     let reservations = fixture.service.reserve_identities.lock().unwrap();
-    assert_eq!(reservations.len(), 4);
-    assert_eq!(reservations[2].source_id, reservations[1].source_id);
-    assert_ne!(reservations[2].capture_id, reservations[1].capture_id);
+    assert_eq!(reservations.len(), 5);
     assert!(reservations[3].source_id.ends_with("/third"));
+    assert_eq!(reservations[4].source_id, reservations[2].source_id);
+    assert_ne!(reservations[4].capture_id, reservations[2].capture_id);
     assert_eq!(
         fixture
             .store
             .cloud_sync_outcome_counts("account", "personal", &fixture.service.origin)
             .unwrap(),
-        (2, 1)
+        (3, 1)
+    );
+}
+
+#[test]
+fn cloud_scheduler_backfill_accounts_for_96_sources_across_pages() {
+    let mut fixture = Fixture::new(READY, 0);
+    let database = fixture.select_opencode(603);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute(
+            "UPDATE session_v2 SET directory=?1 WHERE id='session-0602'",
+            [fixture
+                .project
+                .parent()
+                .unwrap()
+                .join("unselected-project")
+                .to_str()
+                .unwrap()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE session_v2 SET directory=?1 WHERE id BETWEEN 'session-0507' AND 'session-0512'",
+            [fixture.project.to_str().unwrap()],
+        )
+        .unwrap();
+    let accepted = |fixture: &Fixture| {
+        fixture
+            .store
+            .cloud_sync_outcome_counts("account", "personal", &fixture.service.origin)
+            .unwrap()
+            .0
+    };
+    for _ in 0..96 {
+        fixture.runner.next_integrity_poll = None;
+        fixture.turn();
+        if accepted(&fixture) == 6 {
+            break;
+        }
+    }
+    assert_eq!(accepted(&fixture), 6);
+
+    connection
+        .execute(
+            "UPDATE session_v2 SET directory=?1 WHERE id >= 'session-0507'",
+            [fixture.project.to_str().unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+    fixture.restart_scheduler();
+    fixture.schedule_backfill();
+    let mut observed = Vec::new();
+    for _ in 0..900 {
+        fixture.runner.next_integrity_poll = None;
+        fixture.turn_published(&mut observed);
+        if accepted(&fixture) == 95 {
+            break;
+        }
+    }
+    assert_eq!(accepted(&fixture), 95);
+    assert!(observed[0].backfill_in_progress);
+    assert!(serde_json::to_value(&observed[0]).unwrap()["uploadProgress"]["total"].is_null());
+
+    fixture
+        .service
+        .mode
+        .store(VERIFY_PENDING, Ordering::Release);
+    for _ in 0..10 {
+        fixture.runner.next_integrity_poll = None;
+        fixture.turn_published(&mut observed);
+    }
+    let result = observed.last().unwrap();
+    assert!(!result.backfill_in_progress);
+    assert_eq!(
+        session_progress(result),
+        serde_json::json!({
+            "uploaded": 95, "total": 96, "blocked": 0, "unsupported": 0,
+            "scanIncomplete": false
+        })
+    );
+    fixture.service.mode.store(READY, Ordering::Release);
+    fixture.runner.next_integrity_poll = None;
+    fixture.turn_published(&mut observed);
+    assert_eq!(accepted(&fixture), 96);
+    assert_eq!(
+        serde_json::to_value(observed.last().unwrap()).unwrap()["uploadProgress"]["uploaded"],
+        96
+    );
+    let reservations = fixture.service.reserve_identities.lock().unwrap();
+    assert_eq!(reservations.len(), 96);
+    assert_eq!(
+        reservations
+            .iter()
+            .map(|reservation| &reservation.source_id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        96
     );
 }
 
@@ -3009,10 +4454,18 @@ fn cloud_scheduler_finishes_empty_recovery_only_after_saved_user_intent() {
     fixture.turn();
     assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
     assert_eq!(fixture.host.spool().unwrap().entries().unwrap().len(), 1);
+    let manual = fixture.published_status();
+    assert_eq!(manual.automatic_recovery_count, Some(0));
+    assert_eq!(manual.interrupted_count, 1);
+    assert!(manual.retry_available);
     fixture
         .store
         .set_cloud_sync_job_state(&job, JobState::Recovering)
         .unwrap();
+    let automatic = fixture.published_status();
+    assert_eq!(automatic.automatic_recovery_count, Some(1));
+    assert_eq!(automatic.interrupted_count, 0);
+    assert!(!automatic.retry_available);
     fixture.turn();
     assert_eq!(fixture.service.reserves.load(Ordering::Acquire), 1);
     assert!(fixture.host.spool().unwrap().entries().unwrap().is_empty());
@@ -3024,6 +4477,30 @@ fn cloud_scheduler_finishes_empty_recovery_only_after_saved_user_intent() {
             .unwrap()
             .state,
         JobState::Abandoned
+    );
+}
+
+#[test]
+fn cloud_scheduler_automatic_recovery_requires_a_valid_local_recovery_entry() {
+    let mut fixture = Fixture::new(READY, 0);
+    fixture.turn();
+    let saved = fixture.host.spool().unwrap().entries().unwrap().remove(0);
+    let job = fixture
+        .store
+        .cloud_sync_job(&saved.identity.capture_id)
+        .unwrap()
+        .unwrap();
+    fixture
+        .store
+        .set_cloud_sync_job_state(&job, JobState::Recovering)
+        .unwrap();
+    fixture.turn();
+    let observed = fixture.published_status();
+    assert_eq!(observed.automatic_recovery_count, Some(0));
+    assert_eq!(observed.interrupted_count, 1);
+    assert_eq!(
+        fixture.host.spool().unwrap().entries().unwrap(),
+        vec![saved]
     );
 }
 
@@ -3493,7 +4970,7 @@ fn cloud_scheduler_quarantined_partial_capture_keeps_its_identity_and_blocks_rec
     fixture.host = capture::Host::new(&base);
     fixture.store = Store::open(&base).unwrap();
     fixture.runner = Runner::default();
-    fixture.runner.schedule_backfill(&fixture.policy);
+    fixture.schedule_backfill();
     assert!(
         retry_saved_jobs(
             &fixture.store,
@@ -3511,7 +4988,7 @@ fn cloud_scheduler_quarantined_partial_capture_keeps_its_identity_and_blocks_rec
                 &mut fixture.host,
                 &mut fixture.engine,
                 &|| true,
-                &|| true,
+                (&|| true, None),
                 &mut fixture.cache
             )
             .is_ok()
@@ -3561,7 +5038,7 @@ fn cloud_scheduler_missing_pending_state_does_not_authorize_capture_or_recovery(
                 &mut fixture.host,
                 &mut fixture.engine,
                 &|| true,
-                &|| true,
+                (&|| true, None),
                 &mut fixture.cache
             )
             .is_ok()
@@ -3625,7 +5102,7 @@ fn cloud_scheduler_quarantined_queued_capture_is_not_abandoned_or_replaced() {
                 &mut fixture.host,
                 &mut fixture.engine,
                 &|| true,
-                &|| true,
+                (&|| true, None),
                 &mut fixture.cache
             )
             .is_ok()

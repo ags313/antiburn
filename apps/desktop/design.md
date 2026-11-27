@@ -719,6 +719,26 @@ every `colors` entry carries both values, and only those values differ between t
 System follows changes to the OS appearance and uses the same Light or Dark palette,
 including its opacity and native system colours. Reduced transparency applies equally
 to System and the corresponding explicit theme.
+
+## Desktop design principles
+
+- Show the normal task first. Hide optional sections with no confirmed items.
+  In Settings, let signed-in users refresh eligible workspaces.
+- Keep routine status short and tie it to current evidence. Put notices beside
+  the task they affect. Show an alert only when the user needs to know about an
+  action failure or a current problem. Do not put expired or superseded
+  conditions on the normal screen. Let background recovery run quietly.
+- Keep an action in place while loading, saving, or switching states. When an
+  action needs a prerequisite, show that prerequisite in plain language.
+  Keep an editable choice editable after Save.
+- Show switches only when they can change the setting. Use a setup action for
+  a setting that needs setup. Use short status text when an action cannot run.
+- Recover automatically when it is safe. Otherwise, put a working recovery
+  action next to the error. Do not retry a change without the user's approval.
+- Review first use, returning use, and a current failure in the actual window.
+  Check that keyboard focus and the main actions stay in place at narrow widths
+  and larger interface scales.
+
 Notes for what isn't expressible as a token:
 
 - **Overview panels** — the usage meters use a card background and inset
@@ -1102,10 +1122,46 @@ Notes for what isn't expressible as a token:
   before completing search focus. When Model usage has no visible content, its
   search result focuses the Model-based checks group without selecting a control.
   Keep the standard separation between groups.
-- **Cloud folder settings**: Keep Save in one compact footer row. Use the space
-  beside Save for status and recovery actions without moving the button or
-  the folder rows. Use the standard push button's short background and opacity
-  transition, with the global reduced-motion limit.
+- **Cloud folder settings**: Keep the primary action in a compact footer. Use the
+  space beside it for status and recovery actions. Align a single line of status
+  or error text with the button. Align the alert icon with the first line when
+  text wraps. Keep the button at the top of its column as the text grows.
+  Reuse the existing Skeleton and push button components, semantic colors,
+  `type-*` scale, `rounded-control`, and motion tokens. Change no tokens for
+  loading or progress. Use the push button's short background and opacity
+  transition with the global reduced-motion limit.
+  Show skeletons for content that awaits the first account or sync-status read.
+  Announce one `Loading Cloud settings` status, not each skeleton. Do not guess
+  account, switch, folder, or counter values. Keep verified account and folder
+  content visible during background refreshes in the same scope. End loading
+  on failure and pair the error with a supported recovery action.
+  Show compact progress such as `Syncing 1 of 5 sessions (12 MB transferred)`.
+  Use `sessions found` when the denominator is a discovery lower bound.
+  Use `session uploads` across workspaces. Do not present known workspace
+  subtotals as a complete total when another member is unknown. Transfer bytes
+  are confirmed compressed bytes, not session acceptance. Omit missing
+  measurements and guessed totals, percentages, or time remaining. With no
+  counts, show `Checking folders` for discovery or `Syncing sessions` for
+  transfer or automatic recovery.
+  If active work has no scan measurements, show the number of pending saved
+  uploads when known. Label bytes for a single job `Current upload`.
+  Mark retained explicit results `Last full scan` when sync is idle.
+  Use indexed folder counts until a verified sync scan can attribute sessions
+  to that saved row. Label sync counts `sessions found`. Keep verified choices
+  usable if later folder pages fail. Retry on return without showing an alert.
+  Do not claim `Up to date` without complete, successful scan evidence.
+  Keep the same footer button location and size. Show **Syncing** with native
+  `disabled` while a scan, upload, or automatic recovery is active, even after
+  the command response completes. Use `surface-tertiary` fill and
+  `label-secondary` text without reducing opacity. Return to **Sync now** when
+  activity ends.
+  If disabling removes keyboard focus and a save fails, restore the same
+  enabled retry button. Do not move focus back after the user chooses another
+  control or window.
+  Load later folder pages in the background without a separate paging button.
+  Use a short status if workspace verification blocks new selections.
+  Do not show a spinner or advisory warning while a partial read or refresh
+  leaves usable folders. Offer **Check again** if the read fails after retries.
 - **CLI settings pane** — present the CLI as an internal runtime managed by antiburn.
   Add the purpose-led pane description: “Helps antiburn share check findings with
   your coding agents.” The card explains automatic management by antiburn.
@@ -1423,9 +1479,9 @@ primary-label hairline underline by default. Set `selectedTone="accent"` to use 
 own shared tooltip description to its focusable radio: Cost explains estimated session cost, while Week % and 5h % explain the estimated share
 of the provider limit for that window when available. The control crossfades only color and underline opacity over `--duration-quick`; it never slides a moving indicator.
 
-The Sessions collection starts with a contextual filter header. Its first row pairs the primary Sessions heading with a round `CountPill` showing the full eligible total
+The Sessions collection starts with a contextual filter header. Its first row pairs the primary Sessions heading with one round `CountPill`
 with a trailing Filters menu. Its unfilled icon-only trigger uses a 14px descending-line filter icon, the regular control-height token for both dimensions, and the existing expanded pointer target. The descending lines identify filtering; a “Filter sessions” tooltip appears on hover and keyboard focus. Opening the menu clears the trigger tooltip and prevents it from reopening until the menu closes. The trigger has no resting fill or border. It uses secondary ink at rest, primary ink with a circular `surface-hover` fill on hover, and primary ink with `surface-selected` while the menu is open. It retains its accessible Filters name, keyboard focus ring and shared pressed-opacity feedback.
-A compact Today or N days control sits immediately before Filters in the right-aligned action group. The Sessions title and total badge form the left-hand group. When any facet is active, a quiet middle dot separates the badge from secondary caption text “Showing X” with tabular numerals, including “Showing 0” for no matches. It disappears when filters clear. A separate atomic polite live region contains both total and matching counts as text, so a matching-count change is announced even when the total stays fixed. The visible badge and summary are hidden from assistive technology to avoid duplicate counts. The range uses secondary caption text.
+A compact Today or N days control sits immediately before Filters in the right-aligned action group. The Sessions title and count badge form the left-hand group. The badge shows the exact date-range total as soon as the stream supplies it. When a facet is active, a muted dot and “Showing X” follow the badge. The summary counts matches among loaded sessions and its tooltip explains when that number can still change. The badge and summary tooltips open on hover and keyboard focus. The list shows its loading or check status before it reports “No matching sessions.” An atomic polite live region announces the loaded and matching counts. The range uses secondary caption text.
 Both collection totals use the regular `CountPill` size: `type-caption` (11px) with `space-lg` (16px) height and minimum width, matching the check-section count dimensions. Filter and overflow counts retain the compact metadata size.
 The Filters menu closes after the mouse leaves its bounds and the trigger by more than
 `space-sm` (8px), then stays outside for `duration-slow` (300ms). Re-entry cancels the timer.
@@ -1443,7 +1499,7 @@ Agent checkboxes support multiple selection; result and spend remain single-choi
 open across choices. Unselected zero-count options stay visible at 50% opacity but are disabled for pointer and keyboard input. Selected options
 and each All option stay enabled even with zero matches, so users can remove or reset filters. Agent menu rows pair vendor marks with visible names, accessible menu labels, and
 typeahead text. Vendor marks use 14px in menu rows. Active chips use 12px vendor marks centered in a 14px box to balance their visual weight against the 14px check-result marks. Agent chips show only the mark and remove icon; the whole chip provides its vendor-name tooltip. Failed and Passed menu
-rows and active chips reuse the shared 14px Burn Check marks and colors. Active facet labels use primary `text-label` ink; remove icons retain their secondary hierarchy. Active pills describe selected constraints and omit counts, including from their accessible removal labels. Contextual match counts remain in the menu; the header badge retains the full time-range total. Active chips use the quieter `surface-card` fill at rest and `surface-secondary` on hover in both themes.
+rows and active chips reuse the shared 14px Burn Check marks and colors. Active facet labels use primary `text-label` ink; remove icons retain their secondary hierarchy. Active pills describe selected constraints and omit counts, including from their accessible removal labels. The menu retains contextual counts for each facet choice. Active chips use the quieter `surface-card` fill at rest and `surface-secondary` on hover in both themes.
 The Source group keeps All sources and Local labels directly after their checkboxes. Only Remote adds a 12px Monitor mark; host rows keep their checkbox and text label without repeating the mark. Host row content starts 32px from the menu edge (`space-2xl` plus `space-sm`), 24px farther in than its Remote parent, so the hosts read as children without leaving a blank icon column on local choices.
 Remote session cards show a bare 12px Monitor in tertiary ink beside the model.
 Center the icon within the model line box while text retains baseline alignment;
@@ -2163,10 +2219,11 @@ Desktop evidence owns
 grouping and recorded project/CWD paths, including CWD changes during a session;
 provider database paths and file paths in tool calls are not project membership.
 Desktop captures preserve the provider's native session format, such as Claude JSONL.
-New onboarding groups show as selected without saving that default. Start requires separate
-full-content confirmation for the current selected path members. A later external
-worktree does not inherit that confirmation. Counts and display order do not change
-the selection.
+New onboarding groups show as selected without saving that default. Start requires
+separate full-content confirmation for the selected groups. Exact-folder approval
+does not extend to a later worktree outside the approved folders. Repository
+approval can cover later checkouts when Desktop verifies the same Git origin.
+Counts and display order do not change the selection.
 
 Start saves confirmed group choices, including exclusions, with the desktop sync
 policy. Unconfirmed onboarding edits stay in memory. Restoring these choices never uses
@@ -2174,27 +2231,43 @@ provider-file preferences or grants access to new paths. A policy without saved
 choice history requires one review before the user updates it.
 
 Project discovery reads one bounded page at a time. "Load more folders" adds the
-next page without saving defaults. Start approves only the current shown members
-with confirmed Claude or OpenCode V2 session files. Other agents can appear as folder
-suggestions, with upload support marked unavailable. Settings uses automatic provider
-discovery without source pickers. The Upload sessions
+next page without saving defaults or granting approval. Start approves the
+selected repositories and exact folders for confirmed, supported session sources.
+For exact-folder approval, this includes only the displayed selected paths.
+Other agents can appear as folder suggestions without upload support. Settings
+uses automatic provider discovery without source pickers. The Upload sessions
 switch pauses or resumes the saved ongoing policy; the old local upload preference
-does not grant consent. Settings shows brief actual failures and their available
-recovery actions, not transfer counters. Partial or
-paged empty discovery does not become a complete empty result. Folder content can
-scroll without moving the completion action
-out of the footer.
+does not grant consent. Settings shows brief current failures and their recovery
+actions. Partial or paged empty discovery does not become a complete empty
+result. Folder content can scroll without moving the completion action out of
+the footer.
 
 The folder list does not shrink to make room for consent paragraphs. A short
 subtitle states full-session scope. The account and destination share a compact
 chip; the selected group count sits above the list. Back, underlined Continue
 locally, and Start syncing are the folder footer's only content.
-Normal Settings shows account/sign-out, the upload switch, folder choices, and
-one short upload state. The Cloud card uses spacing instead of internal dividers.
-Folder switches reflect saved permission, so new unapproved groups stay off.
-Turning a folder off saves immediately. Turning it on opens a full-session
-confirmation dialog in Settings only. There is no separate Update button.
-An explicit global pause remains in effect after folder changes. Read and upload
-failures use a red inline alert with an icon and a recovery action.
+Normal Settings shows the account, folder choices, and a short sync status.
+Show workspace names when they distinguish active destinations, not as a
+separate Personal status section. After sign-in, onboarding offers browser
+workspace setup and waits for Continue. Check current destinations before
+showing folder choices. Do not show old remote sign-out warnings.
+The folder footer has one primary action: **Start syncing** for the first
+approval and **Sync now** after approval. A failure can change the action in
+place to **Try again**, **Review folders**, or **Check Cloud**. Do not add a
+second button for the same step. Show an upload switch only when it can pause
+or resume uploads.
+Use the Cloud folder settings rules above for initial skeletons, independent
+session and transfer progress, and the disabled **Syncing** action. Keep folder
+switches and workspace dropdowns in place while they are disabled.
+Keep repository approval in the same folder picker. Use one short scope note
+for pending Git choices. Do not add separate worktree or migration controls.
+The folder list shows existing directories. Keep exact saved rules that are
+not in that list removable under **Manage other saved folders**.
+With Personal only, folder switches reflect saved permission. Turning a saved
+switch off applies immediately. Add folders with the primary sync action.
+With Personal and Team, keep a workspace dropdown for folders that can change
+destination. Use the same primary action to apply the change. An explicit
+global pause remains in effect after folder changes.
+Read and upload failures use an inline alert with a recovery action when available.
 
 The Cloud sign-in card uses an 88px app image, symmetric 36px vertical padding, and an 18px reserved status line to match the prototype. Auth handoff has the prototype footer separator; Learn more keeps its approved plain footer. Identity uses a circular 64px image and a 24px green badge with a 3px paper border and contrasting action ink.

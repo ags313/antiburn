@@ -49,6 +49,7 @@ pub(crate) mod quota;
 #[cfg(test)]
 mod reader_routing_tests;
 pub(crate) mod session_locations;
+pub(crate) mod session_stream;
 
 use crate::insights_ipc::InsightsController;
 use crate::insights_report::ReportRequest;
@@ -381,11 +382,10 @@ pub fn restart_to_update(app: tauri::AppHandle) -> CommandResult<()> {
  * Settings
  * ---------------------------------------------------------------------- */
 
-/// Every persisted preference.
+/// Return the last committed preferences without locking either database connection.
 #[tauri::command]
 pub async fn get_settings(app: tauri::AppHandle) -> CommandResult<AppSettings> {
-    let store = app.state::<Store>().inner().clone();
-    run_blocking(move || store.settings().map_err(fail)).await
+    Ok(app.state::<Store>().settings_snapshot())
 }
 
 #[tauri::command]
@@ -812,6 +812,9 @@ fn cursor_opt_in_analytics_requires_a_saved_transition_and_excludes_the_value() 
 ///
 /// `window_days` overrides the stored preference, so the list can be widened
 /// without writing a setting first.
+///
+/// The list reads through [`crate::UiReadStore`], so long writer transactions
+/// do not delay it. It takes the connection lock about twice per row.
 #[tauri::command]
 pub async fn list_recent_sessions(
     app: tauri::AppHandle,
@@ -823,33 +826,15 @@ pub async fn list_recent_sessions(
         if let Some(entries) = crate::memory_probe::synthetic_sessions()? {
             return Ok(entries);
         }
-        let store = app.state::<Store>();
-        let settings = store.settings().map_err(fail)?;
-        let days = match window_days {
-            Some(days) => days.clamp(
-                crate::store::MIN_ACTIVITY_DAYS,
-                crate::store::MAX_ACTIVITY_DAYS,
-            ),
-            None => settings.activity_window_days,
-        };
-        let now = scan::unix_now();
-        let since = now - i64::from(days) * 86_400;
-        let sessions = if local_only.unwrap_or(false) {
-            store.recent_local_sessions_excluding(
-                since,
-                MAX_ACTIVITY_ROWS,
-                &settings.disabled_agents,
-            )
-        } else {
-            store.recent_sessions_excluding(since, MAX_ACTIVITY_ROWS, &settings.disabled_agents)
-        }
+        let pool = app.state::<crate::UiReadStore>();
+        let store = pool.checkout();
+        let entries = recent_activity_entries(
+            &store,
+            window_days,
+            local_only.unwrap_or(false),
+            scan::unix_now(),
+        )
         .map_err(fail)?;
-        let repositories = store.repositories().map_err(fail)?;
-
-        let mut entries = Vec::with_capacity(sessions.len());
-        for session in sessions {
-            entries.push(activity_entry(&store, &repositories, session, now).map_err(fail)?);
-        }
         if entries
             .iter()
             .any(|entry| entry.cost.is_none() && !entry.models.is_empty())
@@ -859,6 +844,35 @@ pub async fn list_recent_sessions(
         Ok(entries)
     })
     .await
+}
+
+/// The body of [`list_recent_sessions`]: the activity rows in the window,
+/// newest first. It only reads, so a [`Store::open_reader`] store is valid.
+pub(crate) fn recent_activity_entries(
+    store: &Store,
+    window_days: Option<u32>,
+    local_only: bool,
+    now: i64,
+) -> anyhow::Result<Vec<ActivityEntry>> {
+    let settings = store.settings()?;
+    let days = match window_days {
+        Some(days) => days.clamp(
+            crate::store::MIN_ACTIVITY_DAYS,
+            crate::store::MAX_ACTIVITY_DAYS,
+        ),
+        None => settings.activity_window_days,
+    };
+    let since = now - i64::from(days) * 86_400;
+    let sessions = if local_only {
+        store.recent_local_sessions_excluding(since, MAX_ACTIVITY_ROWS, &settings.disabled_agents)
+    } else {
+        store.recent_sessions_excluding(since, MAX_ACTIVITY_ROWS, &settings.disabled_agents)
+    }?;
+    let repositories = store.repositories()?;
+    sessions
+        .into_iter()
+        .map(|session| activity_entry(store, &repositories, session, now))
+        .collect()
 }
 
 /// Upper bound on rows one list request returns. Well past what any window can
@@ -953,7 +967,7 @@ fn repository_label(repositories: &[RepositoryRecord], cwd: Option<&str>) -> Str
 /// is a best-effort nudge, not a step the drilldown's own response depends
 /// on — the worker's next pass either way is what actually closes the gap.
 fn requeue_and_wake_worker(app: &tauri::AppHandle, store: &Store, key: &SessionKey) {
-    let _ = store.requeue_session_evidence(key);
+    let _ = store.request_drilldown_evidence(key);
     crate::insights_worker::wake(app);
 }
 
@@ -2366,6 +2380,8 @@ pub const SESSION_UPDATED_EVENT: &str = "session:updated";
 /// Only the projection bridge emits membership changes and invalidations on this scope.
 pub const SESSION_INDEX_CHANGED_EVENT: &str = "session:index-changed";
 pub const CHECKS_REPORT_CHANGED_EVENT: &str = "checks:report-changed";
+/// The report changed, and session updates carry the badge invalidations.
+pub(crate) const CHECKS_REPORT_SUMMARY_ONLY: &str = "summaryOnly";
 
 /// Only the insights worker pool emits this on a pool-wide backlog start/drain.
 pub const INSIGHTS_BACKLOG_CHANGED_EVENT: &str = "insights-backlog-changed";

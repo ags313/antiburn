@@ -1,4 +1,4 @@
-import { useId, useRef, useState, type ReactNode, type KeyboardEvent } from "react"
+import { useCallback, useId, useRef, useState, type ReactNode, type KeyboardEvent } from "react"
 
 import { ScrollPane } from "../../components/ui/ScrollPane"
 import { useViewportWidth } from "../../lib/viewport"
@@ -24,13 +24,21 @@ interface CollectionDetailPaneProps<T extends CollectionItem> {
   /** A feature may supply its own unselected detail presentation. */
   detailEmptyContent?: ReactNode
   renderDetail: (item: T) => ReactNode
+  /** Report the committed detail selection, or null while concealed. */
+  onDetailPresentation?: (item: T | null) => void
+  /** End detail presentation on unmount. Pass the owning controller's stable callback. */
+  onDetailUnmount?: () => void
   selection?: T | null
+  /** Use null while the feature can still load the selected item. */
+  outsideSelectionMessage?: string | null
   onSelectionChange?: (item: T) => void
+  /** Cancel feature work that depends on the compact detail staying open. */
+  onDetailDismiss?: () => void
   /** A shell request that must reveal the compact detail pane. */
   externalDetailRevealRevision?: number
   detailOwnsViewport?: boolean
   /** Feature lists own their viewport when this slot is supplied. */
-  renderCollection?: (selection: CollectionSelection<T>) => ReactNode
+  renderCollection?: (selection: CollectionSelection<T> & { visible: boolean }) => ReactNode
 }
 
 /** Provide stable collection and detail columns without owning feature data. */
@@ -41,9 +49,13 @@ export function CollectionDetailPane<T extends CollectionItem>({
   detailEmptyMessage,
   detailEmptyContent,
   renderDetail,
+  onDetailPresentation,
+  onDetailUnmount,
   renderCollection,
   selection: controlledSelection,
+  outsideSelectionMessage = "This item is outside the current list.",
   onSelectionChange,
+  onDetailDismiss,
   externalDetailRevealRevision,
   detailOwnsViewport = false,
 }: CollectionDetailPaneProps<T>) {
@@ -59,6 +71,18 @@ export function CollectionDetailPane<T extends CollectionItem>({
   const selection = controlledSelection === undefined ? localSelection : controlledSelection
   const selected = items.find((item) => item.id === selection?.id) ?? selection
   const selectedId = selected?.id ?? null
+  const bindLifetime = useCallback(
+    (node: HTMLDivElement | null) => {
+      if (!node || !onDetailUnmount) return
+      return () => {
+        // React can replay refs while the element stays mounted.
+        queueMicrotask(() => {
+          if (!node.isConnected) onDetailUnmount()
+        })
+      }
+    },
+    [onDetailUnmount],
+  )
   const select = (item: T) => {
     if (onSelectionChange) onSelectionChange(item)
     else setSelection(item)
@@ -74,13 +98,18 @@ export function CollectionDetailPane<T extends CollectionItem>({
     externalDetailRevealRevision !== dismissedExternalRevealRevision
   const showDetail = !compact || (selected !== null && (detailOpen || hasExternalDetailReveal))
   const backToCollection = () => {
+    onDetailDismiss?.()
     restoreCollectionFocus.current = true
     setDismissedExternalRevealRevision(externalDetailRevealRevision ?? null)
     setDetailOpen(false)
   }
 
   return (
-    <div className="main-window-collection-detail" data-single-pane={compact || undefined}>
+    <div
+      className="main-window-collection-detail"
+      data-single-pane={compact || undefined}
+      ref={bindLifetime}
+    >
       <section
         ref={(node) => {
           if (!node || (compact && showDetail) || !restoreCollectionFocus.current) return
@@ -127,7 +156,13 @@ export function CollectionDetailPane<T extends CollectionItem>({
           {title}
         </h1>
         {renderCollection ? (
-          renderCollection({ compact, selectedId, select, openDetail })
+          renderCollection({
+            compact,
+            visible: !compact || !showDetail,
+            selectedId,
+            select,
+            openDetail,
+          })
         ) : (
           <ScrollPane className="min-h-0" viewportClassName="main-window-collection-scroll">
             <CollectionList
@@ -146,6 +181,7 @@ export function CollectionDetailPane<T extends CollectionItem>({
         hidden={!showDetail}
         data-detail-pane
         ref={(node) => {
+          if (node) onDetailPresentation?.(showDetail ? selected : null)
           if (
             !node ||
             !hasExternalDetailReveal ||
@@ -179,11 +215,13 @@ export function CollectionDetailPane<T extends CollectionItem>({
         <h2 id={`${id}-detail-title`} tabIndex={-1} className="sr-only">
           {selected?.label ?? "Details"}
         </h2>
-        {selected && !items.some((item) => item.id === selected.id) && (
-          <p role="status" className="type-callout text-label-secondary px-4 py-2">
-            This item is outside the current list.
-          </p>
-        )}
+        {outsideSelectionMessage &&
+          selected &&
+          !items.some((item) => item.id === selected.id) && (
+            <p role="status" className="type-callout text-label-secondary px-4 py-2">
+              {outsideSelectionMessage}
+            </p>
+          )}
         {!selected && detailEmptyContent ? (
           detailEmptyContent
         ) : detailOwnsViewport && selected ? (

@@ -50,6 +50,23 @@ version and refuses the release if there is none.
   the granted protected folders. It reads no folder and runs no `git` process
   inside a consent-protected folder that is not granted.
 
+## [0.15.3] - 2026-11-27
+
+### Added
+
+- Expose `discovery::source_version::bundle_fingerprint` for callers that
+  need the discovery fingerprint of a file-backed bundle.
+
+### Changed
+
+- Use recorded Codex subagent transcript paths before scanning log directories.
+- Reduce database work when reading turn facts within a claimed evidence range.
+
+### Security
+
+- Update the locked URL dependencies to address an unbounded recursion
+  advisory.
+
 ## [0.15.2] - 2026-11-19
 
 ### Fixed

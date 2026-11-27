@@ -745,6 +745,7 @@ describe("SessionDetailPresentation — session facts", () => {
 
   it("shows no orchestrator banner, and opens a sub-agent from the Cost tab instead", () => {
     const onOpenSubagent = vi.fn()
+    const onDetailAction = vi.fn()
     const members = [
       {
         agent: "claude-code",
@@ -772,6 +773,7 @@ describe("SessionDetailPresentation — session facts", () => {
     ]
     view({
       onOpenSubagent,
+      onDetailAction,
       cost: cost(41.45),
       costSplit: {
         parent: cost(32.95),
@@ -789,12 +791,16 @@ describe("SessionDetailPresentation — session facts", () => {
     fireEvent.click(screen.getByText("2 sub-agents"))
     fireEvent.click(screen.getByText("Write tests"))
     expect(onOpenSubagent).toHaveBeenCalledWith("b", "Write tests")
+    expect(onDetailAction).toHaveBeenCalledExactlyOnceWith("open_subagent")
+    expect(onDetailAction).toHaveBeenCalledBefore(onOpenSubagent)
   })
 
   it("marks a sub-agent view and links up to its orchestrator", () => {
     const onOpenOrchestrator = vi.fn()
+    const onDetailAction = vi.fn()
     view({
       onOpenOrchestrator,
+      onDetailAction,
       session: {
         agent: "claude-code",
         sessionId: "child-1",
@@ -808,6 +814,8 @@ describe("SessionDetailPresentation — session facts", () => {
     fireEvent.click(screen.getByText("Autonomous sub-agent"))
     fireEvent.click(screen.getByText("Ship the release"))
     expect(onOpenOrchestrator).toHaveBeenCalledOnce()
+    expect(onDetailAction).toHaveBeenCalledExactlyOnceWith("open_orchestrator")
+    expect(onDetailAction).toHaveBeenCalledBefore(onOpenOrchestrator)
   })
 
   it("opens a fork parent through the callback", () => {

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use antiburn_local::discovery::{DiscoveryBatch, ProjectAccessSnapshot};
 use tokio::sync::mpsc;
@@ -9,9 +9,13 @@ use super::prepare::{
 };
 use super::queue::{QueueInput, ScanQueue, WorkOrigin};
 use super::*;
-use crate::store::{RepositoryPolicyPublishOutcome, RepositoryPolicySnapshot};
+use crate::store::{
+    EvidenceSourceRefresh, RepositoryPolicyPublishOutcome, RepositoryPolicySnapshot,
+};
 
 const BATCH_SIZE: usize = 64;
+const HISTORICAL_PREPARATION_LIMIT: usize = 8;
+const TICK_PREPARATION_LIMIT: usize = 2;
 const PASS_PENDING_LIMIT: usize = 1024;
 const LIVE_PENDING_LIMIT: usize = 256;
 
@@ -36,6 +40,14 @@ pub(super) async fn recover_fingerprints(app: &AppHandle) -> anyhow::Result<bool
     Ok(true)
 }
 
+/// Select preparation limits and admission reuse for a finite discovery pass.
+#[derive(Clone, Copy)]
+pub(super) enum PreparationProfile {
+    Standard,
+    Historical,
+    Periodic,
+}
+
 struct OwnerPolicy {
     home: PathBuf,
     repository_policy: RepositoryPolicySnapshot,
@@ -43,12 +55,18 @@ struct OwnerPolicy {
     include_non_repo_folders: bool,
     progress: bool,
     refresh_repositories: bool,
+    preparation_profile: PreparationProfile,
+    source_refresh: Option<Arc<HashSet<SessionKey>>>,
+    historical_missing: Option<(i64, HashSet<SessionKey>)>,
     #[cfg(test)]
     hooks: Option<Arc<prepare::PreparationHooks>>,
 }
 
 enum PreparedTask {
-    Identity(Option<DescriptionLog>, Option<SessionRecord>),
+    Identity(
+        anyhow::Result<Option<DescriptionLog>>,
+        Option<SessionRecord>,
+    ),
     Ready(PreparedDescription, SessionWriteGuard, SessionKey),
 }
 
@@ -56,6 +74,7 @@ struct TaskOwner {
     key: String,
     generation: u64,
     origin: WorkOrigin,
+    live: bool,
     activity: Option<i64>,
     session_key: Option<SessionKey>,
 }
@@ -77,6 +96,8 @@ pub(super) struct PassInputs {
     pub repository_policy: RepositoryPolicySnapshot,
     pub include_non_repo_folders: bool,
     pub refresh_repositories: bool,
+    pub preparation_profile: PreparationProfile,
+    pub source_refresh: Option<Arc<HashSet<SessionKey>>>,
 }
 
 pub(super) async fn refresh_titles(
@@ -139,6 +160,9 @@ pub(super) async fn refresh_titles(
         include_non_repo_folders: store.settings_snapshot().include_non_repo_folders,
         progress: false,
         refresh_repositories: false,
+        preparation_profile: PreparationProfile::Standard,
+        source_refresh: None,
+        historical_missing: None,
         #[cfg(test)]
         hooks: None,
     };
@@ -168,6 +192,8 @@ pub(super) async fn discover_and_run(
         repository_policy,
         include_non_repo_folders,
         refresh_repositories,
+        preparation_profile,
+        source_refresh,
     } = inputs;
     let (sender, receiver) = mpsc::channel(2);
     let scope = scope.clone();
@@ -204,6 +230,9 @@ pub(super) async fn discover_and_run(
         include_non_repo_folders,
         progress,
         refresh_repositories,
+        preparation_profile,
+        source_refresh,
+        historical_missing: None,
         #[cfg(test)]
         hooks: None,
     };
@@ -214,19 +243,63 @@ pub(super) async fn discover_and_run(
     Ok(described)
 }
 
+/// Find retained historical rows among the watcher paths. Check only rows
+/// whose evidence failed because the source was missing.
+pub(super) async fn historical_missing_sources(
+    store: &Store,
+    records: &HashMap<SessionActivityKey, SessionRecord>,
+    now: i64,
+    retention_days: i32,
+) -> anyhow::Result<Option<(i64, HashSet<SessionKey>)>> {
+    let Some(window) = history::window_secs(retention_days, now) else {
+        return Ok(None);
+    };
+    let retention_cutoff = now.saturating_sub(window);
+    let current_cutoff = now - CURRENT_WINDOW_SECS;
+    let candidates = records
+        .values()
+        .filter(|record| {
+            record
+                .updated_at_epoch
+                .is_some_and(|at| at >= retention_cutoff && at < current_cutoff)
+        })
+        .map(|record| record.key.clone())
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let store = store.clone();
+    let missing =
+        tokio::task::spawn_blocking(move || store.sessions_with_missing_source_for(&candidates))
+            .await??;
+    Ok(Some((retention_cutoff, missing.into_iter().collect())))
+}
+
 pub(super) async fn refresh_logs(
     app: &AppHandle,
     logs: Vec<SessionLog>,
     writer: &mut IncrementalAdmission<'_>,
 ) -> anyhow::Result<Described> {
     let store = app.state::<Store>();
+    let settings = store.settings_snapshot();
+    let now = unix_now();
+    let historical_missing = historical_missing_sources(
+        &store,
+        &writer.previous_records,
+        now,
+        settings.session_data_retention_days,
+    )
+    .await?;
     let policy = OwnerPolicy {
         home: home_dir().unwrap_or_default(),
         repository_policy: store.repository_policy_snapshot()?,
-        cutoff: Some(unix_now() - CURRENT_WINDOW_SECS),
-        include_non_repo_folders: store.settings_snapshot().include_non_repo_folders,
+        cutoff: Some(now - CURRENT_WINDOW_SECS),
+        include_non_repo_folders: settings.include_non_repo_folders,
         progress: false,
         refresh_repositories: false,
+        preparation_profile: PreparationProfile::Standard,
+        source_refresh: None,
+        historical_missing,
         #[cfg(test)]
         hooks: None,
     };
@@ -281,6 +354,51 @@ fn enqueue(queue: &mut ScanQueue<SessionLog>, log: SessionLog, origin: WorkOrigi
     });
 }
 
+/// Check the current retry state when discovery reaches a session.
+async fn prepare_source_refresh_identity(
+    store: &Store,
+    description: DescriptionLog,
+    origin: WorkOrigin,
+    project_deferral_replays: &HashSet<SessionKey>,
+) -> anyhow::Result<Option<DescriptionLog>> {
+    let reason = source_refresh_reason(store, description.key.clone()).await?;
+    if origin == WorkOrigin::Pass
+        && reason.is_none()
+        && !project_deferral_replays.contains(&description.key)
+    {
+        return Ok(None);
+    }
+    if reason == Some(EvidenceSourceRefresh::Changed)
+        && matches!(description.log.source, SessionSource::File(_))
+        && description.read.is_none()
+    {
+        // Read the file again when the size-based identity cache accepts it.
+        let mut logs = prepare_description_logs(vec![description.log], &HashMap::new()).await?;
+        let Some(fresh) = logs.pop() else {
+            return Ok(None);
+        };
+        if origin == WorkOrigin::Pass
+            && fresh.key != description.key
+            && !project_deferral_replays.contains(&fresh.key)
+            && source_refresh_reason(store, fresh.key.clone())
+                .await?
+                .is_none()
+        {
+            return Ok(None);
+        }
+        return Ok(Some(fresh));
+    }
+    Ok(Some(description))
+}
+
+async fn source_refresh_reason(
+    store: &Store,
+    key: SessionKey,
+) -> anyhow::Result<Option<EvidenceSourceRefresh>> {
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || store.evidence_source_refresh_reason(&key)).await?
+}
+
 async fn run(
     finite: mpsc::Receiver<DiscoveryBatch>,
     live: mpsc::Receiver<DiscoveryBatch>,
@@ -301,7 +419,13 @@ async fn run_with_titles(
     policy: &OwnerPolicy,
     writer: &mut IncrementalAdmission<'_>,
 ) -> Described {
-    let mut queue: ScanQueue<SessionLog> = ScanQueue::new();
+    let mut queue: ScanQueue<SessionLog> = match policy.preparation_profile {
+        PreparationProfile::Standard => ScanQueue::new(),
+        PreparationProfile::Historical => ScanQueue::with_pass_limit(HISTORICAL_PREPARATION_LIMIT),
+        PreparationProfile::Periodic => ScanQueue::with_pass_limit(TICK_PREPARATION_LIMIT),
+    };
+    let non_repository_cwds = matches!(policy.preparation_profile, PreparationProfile::Periodic)
+        .then(Arc::<NonRepositoryCwds>::default);
     let mut tasks = JoinSet::new();
     let mut owners: HashMap<Id, TaskOwner> = HashMap::new();
     let mut finite_closed = false;
@@ -420,10 +544,24 @@ async fn run_with_titles(
                     continue;
                 }
             };
+            let historical_restore = matches!(&work.payload.source, SessionSource::File(_))
+                && previous.as_ref().is_some_and(|record| {
+                    policy
+                        .historical_missing
+                        .as_ref()
+                        .is_some_and(|(_, keys)| keys.contains(&record.key))
+                });
             let previous_map = previous
-                .iter()
-                .map(|record| (activity_key.clone(), record.clone()))
+                .as_ref()
+                .filter(|_| !historical_restore)
+                .map(|record| (activity_key, record.clone()))
+                .into_iter()
                 .collect();
+            let source_refresh = policy
+                .source_refresh
+                .as_ref()
+                .map(|keys| (writer.store.clone(), Arc::clone(keys)));
+            let origin = work.origin;
             #[cfg(test)]
             let hooks = policy.hooks.clone();
             let handle = tasks.spawn(async move {
@@ -433,10 +571,15 @@ async fn run_with_titles(
                         .wait(&work.payload, prepare::PreparationStage::Identity)
                         .await;
                 }
-                let description = prepare_description_logs(vec![work.payload], &previous_map)
+                let prepared = prepare_description_logs(vec![work.payload], &previous_map)
                     .await
-                    .expect("identity preparation has no store writes")
-                    .pop();
+                    .map(|mut logs| logs.pop());
+                let description = match (prepared, source_refresh) {
+                    (Ok(Some(description)), Some((store, keys))) => {
+                        prepare_source_refresh_identity(&store, description, origin, &keys).await
+                    }
+                    (result, _) => result,
+                };
                 PreparedTask::Identity(description, previous)
             });
             owners.insert(
@@ -445,6 +588,7 @@ async fn run_with_titles(
                     key: work.key,
                     generation: work.generation,
                     origin: work.origin,
+                    live: work.live,
                     activity: work.activity,
                     session_key: None,
                 },
@@ -627,7 +771,7 @@ async fn run_with_titles(
                 let id = match &result { Ok((id, _)) => *id, Err(error) => error.id() };
                 let mut owner = owners.remove(&id).expect("each preparation task has an owner");
                 match result {
-                    Ok((_, PreparedTask::Identity(Some(description), previous))) => {
+                    Ok((_, PreparedTask::Identity(Ok(Some(description)), previous))) => {
                         let source_format = crate::analysis::source_format(description.log.agent_type, &description.log.source);
                         match writer.store.session_source_is_allowed(&description.key, source_format) {
                             Ok(true) => {},
@@ -662,10 +806,20 @@ async fn run_with_titles(
                         let repository_policy = repository_policy.clone();
                         let store = writer.store.clone();
                         let cutoff = match owner.origin {
-                            WorkOrigin::Pass => policy.cutoff,
+                            WorkOrigin::Pass => policy
+                                .historical_missing
+                                .as_ref()
+                                .filter(|(_, missing)| missing.contains(&description.key))
+                                .map(|(cutoff, _)| *cutoff)
+                                .or(policy.cutoff),
                             WorkOrigin::Live => Some(unix_now() - CURRENT_WINDOW_SECS),
                             WorkOrigin::Recovery => None,
                         };
+                        // A live hint can arrive after Git checks the working directory.
+                        let non_repository_cwds = non_repository_cwds
+                            .as_ref()
+                            .filter(|_| owner.origin == WorkOrigin::Pass && !owner.live)
+                            .cloned();
                         let include = policy.include_non_repo_folders;
                         let key = description.key.clone();
                         owner.session_key = Some(key.clone());
@@ -676,6 +830,7 @@ async fn run_with_titles(
                                 store: &store,
                                 repository: &repository_policy,
                                 include_non_repo_folders: include,
+                                non_repository_cwds: non_repository_cwds.as_deref(),
                             };
                             PreparedTask::Ready(prepare_description_with_read(description, home, previous, cutoff, policy,
                                 #[cfg(test)] hooks,
@@ -723,7 +878,7 @@ async fn run_with_titles(
                                 PreparationOutcome::Accepted { record, changed } => {
                                     writer.evidence_agents = agents::evidence_cohort().iter().copied().filter(|agent| *agent == record.key.agent).collect();
                                     let started = Instant::now();
-                                    let committed = writer.commit_with_incarnation(&guard, &record, changed).await;
+                                    let committed = writer.commit_with_incarnation(&guard, &record, changed, Some(&prepared.log.source)).await;
                                     if let (Some(incarnation), Some(deferral)) = (committed, deferral)
                                         && record.key.environment_key == "native"
                                     {
@@ -747,7 +902,8 @@ async fn run_with_titles(
                             writer.previous_records.retain(|_, record| record.key != key);
                         }
                     }
-                    Ok((_, PreparedTask::Identity(None, _))) => {}
+                    Ok((_, PreparedTask::Identity(Ok(None), _))) => {}
+                    Ok((_, PreparedTask::Identity(Err(error), _))) => writer.fail(error),
                     Err(error) => writer.fail(anyhow::anyhow!("Session preparation task failed: {error}")),
                 }
                 queue.release(&owner.key, owner.generation);
@@ -826,15 +982,20 @@ async fn run_with_titles(
             )
             .await;
     }
-    let mut project_deferrals_superseded = false;
+    let mut superseded_project_deferrals = None;
     if !project_deferrals.is_empty() && !writer.io.cancelled() {
+        let replay_keys = if policy.source_refresh.is_some() {
+            project_deferrals.keys().cloned().collect()
+        } else {
+            HashSet::new()
+        };
         match writer
             .store
             .publish_session_project_deferrals(repository_policy.generation, project_deferrals)
         {
             Ok(RepositoryPolicyPublishOutcome::Published) => {}
             Ok(RepositoryPolicyPublishOutcome::Superseded) => {
-                project_deferrals_superseded = true;
+                superseded_project_deferrals = Some(replay_keys);
             }
             Err(error) => writer.fail(error),
         }
@@ -866,7 +1027,7 @@ async fn run_with_titles(
         changed,
         list_changed: writer.list_changed,
         gate,
-        project_deferrals_superseded,
+        superseded_project_deferrals,
     }
 }
 

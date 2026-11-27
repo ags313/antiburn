@@ -32,6 +32,9 @@ CI changes, and documentation that no user acts on stay out — see
 
 ### Changed
 
+- SSH remote host syncing stays in this build. It does not take the upstream
+  removal of SSH syncing, so an update keeps the hosts, their settings, and the
+  synced sessions.
 - Overview's cost totals and daily spend chart now include sessions synced from
   remote hosts, so they match the costs shown in Sessions. The Subscription
   view and account limits still count only sessions on this computer.
@@ -70,6 +73,70 @@ CI changes, and documentation that no user acts on stay out — see
 - A session whose project folder was removed, or that recorded no folder,
   keeps its history. With **Include folders without Git** on, it shows as a
   folder session.
+
+## [0.12.1] - 2026-11-27
+
+### Added
+
+- Search locally indexed sessions from the command line with `antiburn search`.
+- Read supported local session transcripts with `antiburn get`. Use `--json`
+  for structured output.
+- On macOS, Antiburn installs its Claude Code skill alongside the bundled CLI.
+- Right-click the HUD to reveal the **Hide HUD** button.
+
+### Changed
+
+- Browse older sessions by scrolling. The Sessions view loads more entries
+  as you reach the end of the list.
+- Onboarding now shows a Cloud step after Checks. In the standard desktop app,
+  **Learn more** opens the Cloud waitlist and **Done** opens Sessions.
+
+### Fixed
+
+- Reduce CPU spikes during the first session scan and keep Sessions responsive
+  while background work updates the local database.
+- Retry interrupted Insights evidence work so session details can recover
+  when evidence becomes available.
+- Linux AppImages preserve the integrity of the bundled CLI so Antiburn can
+  install it on first launch.
+- On macOS and Linux, CLI Repair restores Antiburn-managed links and preserves
+  unrelated entries.
+
+### Removed
+
+- Removed SSH remote host syncing, host settings, and Source filters. Upgrade
+  cleanup removes previously synced SSH sessions and their local cached copies.
+  Local and WSL sessions, preferences, and remote originals are unchanged.
+
+### Security
+
+- Update the URL dependency to address an unbounded recursion vulnerability.
+
+## [0.12.0] - 2026-11-27
+
+### Added
+
+- Search locally indexed sessions from the command line with `antiburn search`.
+- On macOS, Antiburn installs its Claude Code skill alongside the bundled CLI.
+- Right-click the HUD to reveal the **Hide HUD** button.
+
+### Changed
+
+- Browse older sessions by scrolling. The Sessions view loads more entries
+  as you reach the end of the list.
+
+### Fixed
+
+- Reduce CPU spikes during the first session scan and keep Sessions responsive
+  while background work updates the local database.
+- Retry interrupted Insights evidence work so session details can recover
+  when evidence becomes available.
+
+### Removed
+
+- Removed SSH remote host syncing, host settings, and Source filters. Upgrade
+  cleanup removes previously synced SSH sessions and their local cached copies.
+  Local and WSL sessions, preferences, and remote originals are unchanged.
 
 ## [0.11.2] - 2026-11-19
 

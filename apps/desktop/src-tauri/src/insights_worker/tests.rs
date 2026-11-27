@@ -241,6 +241,7 @@ async fn live_journal_delivery_runs_while_evidence_and_verification_stay_ready()
                 &WorkProgress {
                     claimed: &|| {},
                     published: &|| {},
+                    source_changed: &|_| {},
                     authorities: Arc::new(tokio::sync::Mutex::new(None)),
                 },
                 &|| async {
@@ -277,14 +278,63 @@ fn failed_pass(outcome: PassOutcome) -> EvidencePass {
 }
 
 #[test]
-fn a_source_changed_pass_requests_a_fresh_scan_for_its_agent() {
-    let pass = failed_pass(PassOutcome::SourceChanged);
-    assert!(matches!(
-        source_refresh_agent_for_outcome(&pass.outcome, "opencode"),
+fn source_refresh_uses_local_discovery_only() {
+    assert_eq!(
+        local_source_refresh_agent(&SessionKey::new("native", "opencode", "session")),
         Some(AgentKind::OpenCode)
-    ));
-    assert!(source_refresh_agent_for_outcome(&PassOutcome::Published, "opencode").is_none());
-    assert!(source_refresh_agent_for_outcome(&pass.outcome, "unknown-agent").is_none());
+    );
+    assert!(local_source_refresh_agent(&SessionKey::new("native", "unknown", "session")).is_none());
+    assert!(
+        local_source_refresh_agent(&SessionKey::new("ssh:host", "claude-code", "session"))
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn source_refresh_follows_only_a_committed_retry() {
+    for superseded in [false, true] {
+        let store = store();
+        let session = record("refresh-after-retry");
+        let agents = crate::agents::evidence_cohort();
+        store
+            .upsert_sessions(std::slice::from_ref(&session), &agents)
+            .unwrap();
+        let runner = |record: &SessionRecord, _: PassSignal, _: i64| -> PassFuture {
+            if superseded {
+                let mut updated = record.clone();
+                updated.activity_cursor = "new".into();
+                store.upsert_sessions(&[updated], &agents).unwrap();
+            }
+            Box::pin(async { failed_pass(PassOutcome::SourceChanged) })
+        };
+        let refreshes = AtomicUsize::new(0);
+        let refresh = |key: &SessionKey| {
+            let row = store.evidence(key).unwrap().unwrap();
+            assert_eq!(
+                row.next_attempt_at_epoch,
+                Some(100 + crate::scan::TICK.as_secs() as i64)
+            );
+            refreshes.fetch_add(1, Ordering::SeqCst);
+        };
+        assert!(
+            process_next_with_progress(
+                &store,
+                &|| 100,
+                &runner,
+                &|_| {},
+                &|_, _| {},
+                &WorkProgress {
+                    claimed: &|| {},
+                    published: &|| {},
+                    source_changed: &refresh,
+                    authorities: Arc::new(tokio::sync::Mutex::new(None)),
+                },
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(refreshes.load(Ordering::SeqCst), usize::from(!superseded));
+    }
 }
 
 fn published_pass(record: &SessionRecord) -> EvidencePass {
@@ -561,6 +611,215 @@ fn a_capability_free_source_publishes_as_unsupported() {
     assert_eq!(
         store.evidence(&claim.key).unwrap().unwrap().status,
         EvidenceStatus::Unsupported
+    );
+}
+
+/// Rows of superseded passes go before the pass starts, so publication does
+/// not delete them in one long transaction.
+#[tokio::test]
+async fn a_claim_clears_superseded_rows_before_its_pass_starts() {
+    let store = Arc::new(store());
+    store
+        .upsert_sessions(&[record("leftovers")], &crate::agents::evidence_cohort())
+        .unwrap();
+    let key = SessionKey::new("native", "claude-code", "leftovers");
+    {
+        let connection = store.lock();
+        for fence in 1..=3 {
+            for turn in 0..2_000 {
+                connection
+                    .execute(
+                        "INSERT INTO turn (
+                            environment_key, agent, session_id, claim_fence, thread_id,
+                            turn_index, scope, role, source_key, input_tokens,
+                            cache_read_tokens, cache_write_tokens, output_tokens,
+                            is_compaction_boundary
+                         ) VALUES ('native', 'claude-code', 'leftovers', ?1, 't', ?2,
+                            'main', 'user', 's', 0, 0, 0, 0, 0)",
+                        rusqlite::params![-fence, turn],
+                    )
+                    .unwrap();
+            }
+        }
+    }
+    let seen = Arc::new(AtomicI64::new(-1));
+    let pass_seen = Arc::clone(&seen);
+    let pass_store = Arc::clone(&store);
+    let runner = move |_: &SessionRecord, _: PassSignal, _: i64| {
+        let rows: i64 = pass_store
+            .lock()
+            .query_row("SELECT COUNT(*) FROM turn", [], |row| row.get(0))
+            .unwrap();
+        pass_seen.store(rows, Ordering::SeqCst);
+        Box::pin(async { failed_pass(PassOutcome::SourceMissing) }) as PassFuture
+    };
+
+    assert!(
+        process_next(&store, &|| 100, &runner, &|_| {}, &|_, _| {}, &|| {})
+            .await
+            .unwrap()
+    );
+    assert_eq!(seen.load(Ordering::SeqCst), 0);
+    assert!(store.evidence(&key).unwrap().is_some());
+}
+
+/// A completed removal still requires the original claim.
+#[tokio::test]
+async fn an_empty_final_batch_rejects_a_superseded_claim() {
+    let store = store();
+    let claim = claim(&store, "empty-final-batch", 100);
+    let now = 100 + LEASE_SECS + 1;
+    let replacement = store
+        .claim_next_evidence(&["claude-code"], now, LEASE_SECS)
+        .unwrap()
+        .unwrap();
+    assert_ne!(replacement.claim_fence, claim.claim_fence);
+    assert!(
+        !clear_claim_leftovers(&store, &claim, &move || now)
+            .await
+            .unwrap()
+    );
+}
+
+/// A removal error permits the pass only while its claim is current.
+#[tokio::test]
+async fn a_cleanup_error_checks_the_original_claim() {
+    let store = store();
+    let claim = claim(&store, "cleanup-error", 100);
+    store
+        .lock()
+        .execute_batch(
+            "INSERT INTO turn (
+                environment_key, agent, session_id, claim_fence, thread_id,
+                turn_index, scope, role, source_key, input_tokens,
+                cache_read_tokens, cache_write_tokens, output_tokens,
+                is_compaction_boundary
+             ) VALUES ('native', 'claude-code', 'cleanup-error', -1, 't', 0,
+                'main', 'user', 's', 0, 0, 0, 0, 0);
+             CREATE TEMP TRIGGER reject_leftover_delete BEFORE DELETE ON turn
+             BEGIN SELECT RAISE(ABORT, 'cleanup error'); END;",
+        )
+        .unwrap();
+    assert!(store.clear_leftover_batch(&claim.key).is_err());
+    assert!(
+        clear_claim_leftovers(&store, &claim, &|| 100)
+            .await
+            .unwrap()
+    );
+
+    let now = 100 + LEASE_SECS + 1;
+    let replacement = store
+        .claim_next_evidence(&["claude-code"], now, LEASE_SECS)
+        .unwrap()
+        .unwrap();
+    assert_ne!(replacement.claim_fence, claim.claim_fence);
+    assert!(
+        !clear_claim_leftovers(&store, &claim, &move || now)
+            .await
+            .unwrap()
+    );
+}
+
+/// A superseded claim stops cleanup with rows still waiting for removal.
+#[tokio::test(start_paused = true)]
+async fn a_claim_lost_during_the_removal_stops_it() {
+    let store = store();
+    store
+        .upsert_sessions(&[record("removal-lost")], &crate::agents::evidence_cohort())
+        .unwrap();
+    let claim = store
+        .claim_next_evidence(&["claude-code"], 100, 60)
+        .unwrap()
+        .unwrap();
+    {
+        let connection = store.lock();
+        for turn in 0..32 {
+            connection
+                .execute(
+                    "INSERT INTO turn (
+                        environment_key, agent, session_id, claim_fence, thread_id,
+                        turn_index, scope, role, source_key, input_tokens,
+                            cache_read_tokens, cache_write_tokens, output_tokens,
+                            is_compaction_boundary
+                     ) VALUES ('native', 'claude-code', 'removal-lost', -1, 't', ?1,
+                        'main', 'user', 's', 0, 0, 0, 0, 0)",
+                    [turn],
+                )
+                .unwrap();
+        }
+    }
+    let mut batches = 0;
+    let held = clear_claim_leftovers_with(&store, &claim, &|| 200, || {
+        let first_batch = batches == 0;
+        batches += 1;
+        let (store, claim) = (&store, &claim);
+        async move {
+            let batch = store.clear_leftover_batch_within(&claim.key, Duration::ZERO)?;
+            if first_batch {
+                assert!(batch.more);
+                let replacement = store
+                    .claim_next_evidence(&["claude-code"], 200, 60)?
+                    .expect("replace the expired claim after the first batch commits");
+                assert!(replacement.claim_fence > claim.claim_fence);
+                tokio::time::advance(lease_renew_interval()).await;
+            }
+            Ok(batch.more)
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!held);
+    assert_eq!(batches, 1);
+    let remaining: i64 = store
+        .lock()
+        .query_row(
+            "SELECT COUNT(*) FROM turn WHERE claim_fence = -1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!((1..32).contains(&remaining));
+}
+
+/// A renewal error releases the claim for retry without running analysis.
+#[tokio::test]
+async fn a_pre_pass_renewal_error_retries_without_counting_an_attempt() {
+    let store = store();
+    let target = record("pre-pass-renewal-error");
+    store
+        .upsert_sessions(
+            std::slice::from_ref(&target),
+            &crate::agents::evidence_cohort(),
+        )
+        .unwrap();
+    store
+        .lock()
+        .execute_batch(
+            "CREATE TEMP TRIGGER reject_renewal BEFORE UPDATE OF lease_expires_at_epoch
+             ON session_evidence WHEN OLD.status = 'processing' AND NEW.status = 'processing'
+             BEGIN SELECT RAISE(ABORT, 'synthetic renewal error'); END;",
+        )
+        .unwrap();
+    let ran = AtomicBool::new(false);
+    let runner = |_: &SessionRecord, _: PassSignal, _: i64| {
+        ran.store(true, Ordering::SeqCst);
+        Box::pin(async { failed_pass(PassOutcome::SourceMissing) }) as PassFuture
+    };
+    assert!(
+        process_next(&store, &|| 100, &runner, &|_| {}, &|_, _| {}, &|| {})
+            .await
+            .unwrap()
+    );
+    assert!(!ran.load(Ordering::SeqCst));
+
+    let evidence = store.evidence(&target.key).unwrap().unwrap();
+    assert_eq!(evidence.status, EvidenceStatus::Pending);
+    assert_eq!(evidence.retry_count, 0);
+    assert_eq!(evidence.lease_expires_at_epoch, None);
+    assert_eq!(evidence.next_attempt_at_epoch, Some(100 + backoff_secs(0)));
+    assert_eq!(
+        evidence.last_error.as_deref(),
+        Some("worker-pre-pass-check-failed")
     );
 }
 
@@ -916,7 +1175,7 @@ async fn progress_renews_the_lease() {
         };
         process_next(
             &task_store,
-            &|| task_clock.load(Ordering::SeqCst),
+            &move || task_clock.load(Ordering::SeqCst),
             &runner,
             &|_| {},
             &|_, _| {},
@@ -979,7 +1238,7 @@ async fn a_stalled_pass_stops_renewing() {
         };
         process_next(
             &task_store,
-            &|| task_clock.load(Ordering::SeqCst),
+            &move || task_clock.load(Ordering::SeqCst),
             &runner,
             &|_| {},
             &|_, _| {},
@@ -1037,7 +1296,7 @@ async fn a_lost_renewal_cancels_without_a_post_claim_write() {
         };
         process_next(
             &task_store,
-            &|| task_clock.load(Ordering::SeqCst),
+            &move || task_clock.load(Ordering::SeqCst),
             &runner,
             &|_| {},
             &|_, _| {},
@@ -1089,7 +1348,7 @@ async fn a_stale_pass_cannot_affect_the_next_claim() {
         };
         process_next(
             &first_store,
-            &|| first_clock.load(Ordering::SeqCst),
+            &move || first_clock.load(Ordering::SeqCst),
             &runner,
             &|_| {},
             &|_, _| {},
@@ -1110,6 +1369,14 @@ async fn a_stale_pass_cannot_affect_the_next_claim() {
     first_release.notify_one();
     assert!(first_task.await.unwrap());
 
+    let key = SessionKey::new("native", "claude-code", "stale-pass");
+    let due = store
+        .evidence(&key)
+        .unwrap()
+        .unwrap()
+        .next_attempt_at_epoch
+        .unwrap();
+    clock.store(due, Ordering::SeqCst);
     let second_signal_slot = Arc::new(Mutex::new(None::<PassSignal>));
     let second_release = Arc::new(Notify::new());
     let second_store = Arc::clone(&store);
@@ -1128,7 +1395,7 @@ async fn a_stale_pass_cannot_affect_the_next_claim() {
         };
         process_next(
             &second_store,
-            &|| second_clock.load(Ordering::SeqCst),
+            &move || second_clock.load(Ordering::SeqCst),
             &runner,
             &|_| {},
             &|_, _| {},
@@ -1138,7 +1405,6 @@ async fn a_stale_pass_cannot_affect_the_next_claim() {
         .unwrap()
     });
     let second_signal = captured_signal(&second_signal_slot).await;
-    let key = SessionKey::new("native", "claude-code", "stale-pass");
     let successor_lease = store
         .evidence(&key)
         .unwrap()
@@ -1147,7 +1413,7 @@ async fn a_stale_pass_cannot_affect_the_next_claim() {
 
     first_signal.cancel();
     assert!(first_signal.observe());
-    clock.store(220, Ordering::SeqCst);
+    clock.store(due + 60, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(25)).await;
     assert_eq!(
         store
@@ -1647,10 +1913,19 @@ async fn a_missing_source_stops_being_claimed_through_the_worker() {
         Box::pin(async { failed_pass(PassOutcome::SourceMissing) }) as PassFuture
     };
 
-    process_next(&store, &|| 100, &runner, &|_| {}, &|_, _| {}, &|| {})
-        .await
-        .unwrap();
+    let announced = Mutex::new(Vec::new());
+    process_next(
+        &store,
+        &|| 100,
+        &runner,
+        &|key| announced.lock().unwrap().push(key.clone()),
+        &|_, _| {},
+        &|| {},
+    )
+    .await
+    .unwrap();
     let key = SessionKey::new("native", "claude-code", "worker-missing");
+    assert_eq!(*announced.lock().unwrap(), vec![key.clone()]);
     let row = store.evidence(&key).unwrap().unwrap();
     assert_eq!(row.status, EvidenceStatus::Failed);
     assert!(
@@ -1670,31 +1945,33 @@ async fn an_unreadable_source_reaches_the_cap_through_the_worker() {
             &crate::agents::evidence_cohort(),
         )
         .unwrap();
-    let clock = AtomicI64::new(100);
+    let mut now = 100;
     let runner = |_: &SessionRecord, _: PassSignal, _: i64| {
         Box::pin(async { failed_pass(PassOutcome::Unreadable(UnreadableReason::AdapterFailed)) })
             as PassFuture
     };
     let key = SessionKey::new("native", "claude-code", "worker-unreadable");
+    let announced = Mutex::new(Vec::new());
 
     for attempt in 0..=MAX_EVIDENCE_ATTEMPTS {
         process_next(
             &store,
-            &|| clock.load(Ordering::SeqCst),
+            &move || now,
             &runner,
-            &|_| {},
+            &|key| announced.lock().unwrap().push(key.clone()),
             &|_, _| {},
             &|| {},
         )
         .await
         .unwrap();
         let row = store.evidence(&key).unwrap().unwrap();
+        assert_eq!(announced.lock().unwrap().pop(), Some(key.clone()));
         if attempt == MAX_EVIDENCE_ATTEMPTS {
             assert_eq!(row.status, EvidenceStatus::Failed);
             assert_eq!(row.next_attempt_at_epoch, None);
         } else {
             assert_eq!(row.status, EvidenceStatus::Pending);
-            clock.store(row.next_attempt_at_epoch.unwrap(), Ordering::SeqCst);
+            now = row.next_attempt_at_epoch.unwrap();
         }
     }
 }
