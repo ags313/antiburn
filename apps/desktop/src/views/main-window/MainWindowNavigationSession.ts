@@ -25,7 +25,6 @@ const HISTORY_LIMIT = 100
 export type MainDestination = {
   section: MainViewId
   filters?: SessionFilters
-  /** Omit for section opening. Use null to keep detail empty during explicit navigation. */
   subject?: SessionSubject | null
   check?: CheckId
 }
@@ -52,6 +51,7 @@ function normalizeDestination(
       section: "activity",
       filters: normalizeSessionFilters(
         filters ?? {
+          source: { kind: "all" },
           agents: [],
           result: "all",
           spend: "all",
@@ -135,12 +135,11 @@ export class MainWindowNavigationSession {
 
   select(section: MainViewId): void {
     if (section === "activity" && this.activity) {
-      const { filters, subject } = this.activity.getSnapshot()
       this.navigate(
         {
           section,
-          filters,
-          ...(subject ? { subject } : {}),
+          filters: this.activity.getSnapshot().filters,
+          subject: this.activity.getSnapshot().subject,
         },
         false,
       )
@@ -217,6 +216,7 @@ export class MainWindowNavigationSession {
       if (destination.section === "activity" && this.activity) {
         this.activity.restoreNavigation(
           destination.filters ?? {
+            source: { kind: "all" },
             agents: [],
             result: "all",
             spend: "all",
@@ -359,6 +359,7 @@ export class MainWindowNavigationSession {
         {
           section: "activity",
           filters: this.activity?.getSnapshot().filters ?? {
+            source: { kind: "all" },
             agents: [],
             result: "all",
             spend: "all",
@@ -400,15 +401,31 @@ export class MainWindowNavigationSession {
       return { section: request.destination.section }
     }
     const activity = this.activity?.getSnapshot()
-    const subject = request.destination.target ?? activity?.subject
+    if (request.destination.remoteHostId) {
+      return {
+        section: "activity",
+        filters: {
+          source: {
+            kind: "selected",
+            includeLocal: false,
+            remote: [request.destination.remoteHostId],
+          },
+          agents: [],
+          result: "all",
+          spend: "all",
+        },
+        subject: null,
+      }
+    }
     return {
       section: "activity",
       filters: activity?.filters ?? {
+        source: { kind: "all" },
         agents: [],
         result: "all",
         spend: "all",
       },
-      ...(subject ? { subject } : {}),
+      subject: request.destination.target ?? activity?.subject ?? null,
     }
   }
 

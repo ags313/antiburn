@@ -83,8 +83,9 @@ function MenuBar({ interactive = false }: { interactive?: boolean }) {
   )
 }
 const fixtureNow = Date.now()
-const entries = f.sessions.slice(0, 3).map((s) => ({
+const entries = f.sessions.slice(0, 3).map((s, index) => ({
   ...s,
+  remoteHostId: index === 1 ? "prototype-cloud-codex" : s.remoteHostId,
   surface: "cli" as const,
   title: s.title ?? undefined,
   cost: s.cost ? { ...s.cost, figureLabel: "Projected cost" } : null,
@@ -181,6 +182,18 @@ function Preview() {
         >
           <SessionList
             entries={entries}
+            remoteHosts={[
+              {
+                id: "prototype-cloud-codex",
+                sshAlias: "Codex Cloud",
+                displayName: "Codex Cloud",
+                automaticSyncEnabled: false,
+                status: "idle",
+                lastSuccessfulSyncEpoch: null,
+                cachedSessionCount: 1,
+                lastError: null,
+              },
+            ]}
             days={7}
             now={new Date()}
             renderAgentIcon={renderAgentIcon}

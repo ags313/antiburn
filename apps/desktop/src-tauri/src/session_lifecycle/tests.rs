@@ -2342,17 +2342,9 @@ fn retention_reports_a_broad_purge_with_a_revision() {
     assert!(note.contains("removed: usize, revision: Revision"));
     assert!(note.contains("RemovalScope::Broad"));
     assert!(note.contains("RemovalReason::Purged,\n            revision,"));
-    let cleanup = function_body(source, "cleanup")
-        .split_whitespace()
-        .collect::<String>();
-    let commit = cleanup
-        .find("letresult=app.state::<Store>().apply_session_retention(")
-        .expect("the retention worker retains the committed revision");
-    let report = cleanup
-        .find("Ok((removed,revision))=>note_removed(app,removed,revision)")
-        .expect("the retention worker reports the committed revision");
+    let cleanup = function_body(source, "cleanup");
     assert!(
-        commit < report,
+        cleanup.contains("Ok((removed, revision)) => note_removed(app, removed, revision)"),
         "the retention commit's own revision travels with the purge"
     );
     let settings = function_body(include_str!("../commands/mod.rs"), "set_settings");

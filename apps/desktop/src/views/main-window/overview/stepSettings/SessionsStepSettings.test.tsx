@@ -8,7 +8,7 @@ import { localToolsStatus } from "../../../../onboarding/__tests__/cloudProjectF
 
 /**
  * The Sessions step owns the activity window, monitoring, scanning, folders,
- * repositories, the historical scan, indexed sessions, and
+ * repositories, remote hosts, the historical scan, indexed sessions, and
  * retention now that the General, Privacy, and Sources panes are gone: this
  * file keeps the coverage those panes' tests used to hold, plus the coverage
  * `AgentsStepSettings.test.tsx` held for the sections that moved here.
@@ -210,10 +210,8 @@ describe("SessionsStepSettings retention", () => {
 
     await waitFor(() => expect(confirmDialog).toHaveBeenCalledTimes(1))
     const [message] = confirmDialog.mock.calls[0] as [string]
-    expect(message).toMatch(/older than 30 days/i)
-    expect(message).toMatch(/original transcript files are unchanged/i)
-    expect(message).not.toMatch(/SSH/i)
-    expect(message).not.toMatch(/providers retain session history/i)
+    expect(message).toMatch(/providers retain session history for only 30 days/i)
+    expect(message).toMatch(/transcript files are not touched/i)
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("set_settings", {
         settings: expect.objectContaining({ sessionDataRetentionDays: 30 }),
@@ -276,12 +274,13 @@ describe("SessionsStepSettings scanning", () => {
     render(<SessionsStepSettings />)
 
     expect(await screen.findByText("Scanned 2m ago")).toBeInTheDocument()
-    // Show folder access guidance before the repository settings.
+    // The permission notice leads this step's sections, ahead of Remote
+    // hosts, so a blocked folder is the first thing a reader sees here.
     const warning = await screen.findByText("antiburn can’t read Documents yet.")
-    const repositories = screen.getByRole("heading", { name: "Repositories" })
-    expect(
-      warning.compareDocumentPosition(repositories) & Node.DOCUMENT_POSITION_FOLLOWING,
-    ).not.toBe(0)
+    const remote = screen.getByRole("heading", { name: "Remote hosts" })
+    expect(warning.compareDocumentPosition(remote) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(
+      0,
+    )
 
     fireEvent.click(screen.getByRole("button", { name: "Rescan" }))
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("scan_now"))

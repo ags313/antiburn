@@ -18,6 +18,7 @@ import {
   GitBranchPlus,
   GitFork,
   LoaderCircle,
+  Monitor,
   Moon,
   Trash2,
   WandSparkles,
@@ -110,6 +111,8 @@ interface SessionDetailSubject {
   title?: string
   wslDistro: string | null
   remoteHostId?: string | null
+  remoteHostName?: string
+  remoteLastSuccessfulSyncEpoch?: number | null
   /**
    * Present when the view is showing a sub-agent rather than a session the
    * user drove themselves.
@@ -1035,6 +1038,33 @@ export function SessionDetailPresentation({
             </Tooltip>
           </>
         )}
+        <div className="flex min-w-0 items-baseline gap-1.5 type-caption text-label-tertiary">
+          {(summary || firstModel) && (
+            <span aria-hidden="true" className="text-label-tertiary">
+              ·
+            </span>
+          )}
+          {session.remoteHostId ? (
+            <>
+              <Monitor size={12} className="shrink-0 self-center" aria-hidden="true" />
+              <Tooltip label={session.remoteHostName ?? "Remote computer"}>
+                <span className="truncate">
+                  Source {session.remoteHostName ?? "Remote computer"}
+                </span>
+              </Tooltip>
+              {session.remoteLastSuccessfulSyncEpoch != null ? (
+                <span className="shrink-0">
+                  · Last synced{" "}
+                  {relativeTime(
+                    new Date(session.remoteLastSuccessfulSyncEpoch * 1000).toISOString(),
+                  )}
+                </span>
+              ) : null}
+            </>
+          ) : (
+            <span>Source Local</span>
+          )}
+        </div>
       </div>
     </div>
   )

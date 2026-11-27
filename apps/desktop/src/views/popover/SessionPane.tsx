@@ -6,7 +6,7 @@ import {
 } from "../../lib/sessionAnalytics"
 import { environmentKey } from "../../lib/presentation/localIdentity"
 import { confirm } from "@tauri-apps/plugin-dialog"
-import { useCallback } from "react"
+import { useCallback, useSyncExternalStore } from "react"
 
 import { SessionDetailPresentation } from "../../components/session/SessionDetailPresentation"
 import type { SessionMemoriesPayload } from "../../lib/memoriesIpc"
@@ -38,6 +38,7 @@ import type {
   LocalSessionRelation,
   LocalSessionRelations,
 } from "../../lib/types/session"
+import { remoteHostLabel, remoteHosts } from "../../lib/remoteHosts"
 
 /**
  * One session's analysis, loaded and wired to the actions a reader can take.
@@ -248,6 +249,14 @@ export function SessionPane({
   embedded = false,
   active = true,
 }: SessionPaneProps) {
+  const remoteState = useSyncExternalStore(
+    remoteHosts.subscribe,
+    remoteHosts.getSnapshot,
+    remoteHosts.getSnapshot,
+  )
+  const remoteHost = subject.remoteHostId
+    ? remoteState.hosts.find((host) => host.id === subject.remoteHostId)
+    : undefined
   /**
    * Delete: antiburn's own records only.
    *
@@ -258,7 +267,9 @@ export function SessionPane({
   const handleDelete = useCallback(async () => {
     const requestConfirmation = () =>
       confirm(
-        "This removes antiburn’s stored analysis for the session. The agent’s own transcript file is not touched, and a later scan will find the session again.",
+        subject.remoteHostId
+          ? "This removes this cached session and its analysis from this Mac. The original transcript on the remote computer is unchanged, and a later sync can find it again."
+          : "This removes antiburn’s stored analysis for the session. The agent’s own transcript file is not touched, and a later scan will find the session again.",
         { title: "Remove this session from antiburn?", kind: "warning", okLabel: "Remove" },
       )
     const proceed = embedded
@@ -395,6 +406,12 @@ export function SessionPane({
         ...(title ? { title } : {}),
         wslDistro: subject.wslDistro ?? null,
         remoteHostId: subject.remoteHostId ?? null,
+        ...(remoteHost
+          ? {
+              remoteHostName: remoteHostLabel(remoteHost),
+              remoteLastSuccessfulSyncEpoch: remoteHost.lastSuccessfulSyncEpoch,
+            }
+          : {}),
         ...(subject.subagent
           ? {
               subagent: subject.subagent.parentTitle

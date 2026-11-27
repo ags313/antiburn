@@ -70,6 +70,8 @@ pub struct SessionTarget {
 pub struct NavigationDestination {
     section: MainWindowSection,
     target: Option<SessionTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_host_id: Option<String>,
 }
 
 /// The entry path of a targeted session request.
@@ -997,6 +999,7 @@ fn route_session_target(
         NavigationDestination {
             section: MainWindowSection::Activity,
             target: Some(target),
+            remote_host_id: None,
         },
         Some(entry),
         visit,
@@ -1244,10 +1247,16 @@ pub async fn open_main_window_section(
     window: WebviewWindow,
     app: AppHandle,
     section: MainWindowSection,
+    remote_host_id: Option<String>,
 ) -> Result<(), String> {
-    let destination = section_navigation_destination(window.label(), section)?;
+    let destination = section_navigation_destination(window.label(), section, remote_host_id)?;
+    let source = if destination.remote_host_id.is_some() {
+        "settings_remote_host"
+    } else {
+        "popover_section"
+    };
     on_main_value(&app, move |app| {
-        route_section_target(app, destination, "popover_section").map(|_| ())
+        route_section_target(app, destination, source).map(|_| ())
     })
     .await?
 }
@@ -1258,6 +1267,7 @@ pub(crate) fn open_sessions_after_onboarding(app: &AppHandle) -> Result<u64, Str
         NavigationDestination {
             section: MainWindowSection::Activity,
             target: None,
+            remote_host_id: None,
         },
         "onboarding",
     )
@@ -1266,13 +1276,21 @@ pub(crate) fn open_sessions_after_onboarding(app: &AppHandle) -> Result<u64, Str
 fn section_navigation_destination(
     caller: &str,
     section: MainWindowSection,
+    remote_host_id: Option<String>,
 ) -> Result<NavigationDestination, String> {
-    if caller != crate::popover::LABEL {
+    let settings_host = caller == crate::settings::LABEL
+        && section == MainWindowSection::Activity
+        && remote_host_id.is_some();
+    if !settings_host && (caller != crate::popover::LABEL || remote_host_id.is_some()) {
         return Err("main-window sections are unavailable to this window".to_owned());
+    }
+    if let Some(id) = remote_host_id.as_deref() {
+        crate::remote_sessions::validate_host_id(id)?;
     }
     Ok(NavigationDestination {
         section,
         target: None,
+        remote_host_id,
     })
 }
 
@@ -2276,6 +2294,7 @@ mod tests {
         NavigationDestination {
             section: MainWindowSection::Activity,
             target: Some(target(id)),
+            remote_host_id: None,
         }
     }
 
@@ -2283,6 +2302,7 @@ mod tests {
         NavigationDestination {
             section,
             target: None,
+            remote_host_id: None,
         }
     }
 
@@ -3107,30 +3127,60 @@ mod tests {
     }
 
     #[test]
-    fn popover_section_navigation_is_scoped_and_recoverable() {
-        for section in [
-            MainWindowSection::Overview,
+    fn settings_host_navigation_is_scoped_and_recoverable() {
+        let id = "11111111-1111-1111-1111-111111111111".to_owned();
+        let destination = section_navigation_destination(
+            crate::settings::LABEL,
             MainWindowSection::Activity,
-            MainWindowSection::BurnChecks,
-        ] {
-            let destination =
-                section_navigation_destination(crate::popover::LABEL, section).unwrap();
-            assert_eq!(destination, section_destination(section));
-            for caller in [crate::settings::LABEL, LABEL, "untrusted"] {
-                assert!(section_navigation_destination(caller, section).is_err());
-            }
-        }
+            Some(id.clone()),
+        )
+        .unwrap();
+        assert_eq!(destination.remote_host_id, Some(id.clone()));
+        assert!(destination.target.is_none());
         let state = state();
-        let destination =
-            section_navigation_destination(crate::popover::LABEL, MainWindowSection::Activity)
-                .unwrap();
         let request = state.request_navigation_target(destination);
         assert_eq!(
             lock(&state.navigation_target).pending,
             Some(request.clone())
         );
         let json = serde_json::to_value(request).unwrap();
-        assert!(json["destination"].get("remoteHostId").is_none());
+        assert_eq!(json["destination"]["remoteHostId"], id);
+        assert!(
+            section_navigation_destination(
+                crate::settings::LABEL,
+                MainWindowSection::Activity,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            section_navigation_destination(
+                crate::settings::LABEL,
+                MainWindowSection::Activity,
+                Some("invalid".to_owned())
+            )
+            .is_err()
+        );
+        assert!(
+            section_navigation_destination(
+                crate::popover::LABEL,
+                MainWindowSection::Activity,
+                Some(id.clone())
+            )
+            .is_err()
+        );
+        assert!(
+            section_navigation_destination("untrusted", MainWindowSection::Activity, Some(id))
+                .is_err()
+        );
+        assert!(
+            section_navigation_destination(
+                crate::popover::LABEL,
+                MainWindowSection::Activity,
+                None
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -3145,6 +3195,7 @@ mod tests {
                 wsl_distro: None,
                 remote_host_id: None,
             }),
+            remote_host_id: None,
         });
 
         assert!(external.revision > sample.revision);

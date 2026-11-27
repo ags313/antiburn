@@ -57,12 +57,13 @@ export function PrivacyPane({ settings, update, loaded, info }: PrivacyPaneProps
   const operator = info?.analyticsOperator ?? null
 
   /**
-   * Confirm removal before clearing the index. Keep original transcripts safe
-   * and explain which local data a later scan can restore.
+   * Clearing the index is confirmed first, and the confirmation says the two
+   * things a reader could reasonably fear: that their agents' own transcripts
+   * are safe, and that antiburn will find all of this again.
    */
   const handleClear = useCallback(async () => {
     const proceed = await confirm(
-      "This removes all sessions, analysis, evidence, and scan records saved on this computer. Original transcript files are unchanged. Available local transcripts can be rediscovered on a later scan.",
+      "This removes every session, analysis, evidence, and scan record antiburn has stored on this machine. Your agents’ own transcript files are not touched, and antiburn will rediscover them the next time it scans.",
       { title: "Clear the local index?", kind: "warning", okLabel: "Clear index" },
     )
     if (!proceed) return
@@ -387,7 +388,7 @@ export function PrivacyPane({ settings, update, loaded, info }: PrivacyPaneProps
         <Card>
           <SettingsRow
             searchId="clearIndex"
-            description="Remove all saved sessions, analysis, evidence, and scan records from this computer. Original transcripts are unchanged. Available local transcripts can be rediscovered. Preferences, scan folders, and repository choices are kept."
+            description="Forget every session, analysis, evidence, and scan record antiburn has stored. Your agents’ transcripts are untouched, so a later scan finds them again. Your preferences, scan folders, and repository choices are kept."
             trailing={
               <PushButton
                 onClick={() => void handleClear()}

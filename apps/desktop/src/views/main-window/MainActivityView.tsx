@@ -539,6 +539,12 @@ export function MainActivityView({
               hasMoreSessions={state.hasMoreSessions}
               awaitingResultFilter={awaitingResultFilter}
               agents={agents}
+              remoteHosts={state.remoteHosts}
+              onResetSources={session.resetSources}
+              onToggleLocalSource={session.toggleLocalSource}
+              onToggleRemoteSource={session.toggleRemoteSource}
+              onClearRemoteSources={session.clearRemoteSources}
+              onToggleRemoteHost={session.toggleRemoteHost}
               onToggleAgent={session.toggleAgent}
               onResetAgents={session.resetAgents}
               onResultChange={session.setResultFilter}
@@ -632,6 +638,7 @@ export function MainActivityView({
               }}
               liveUsage={state.liveUsage}
               sessionLimitAllocations={state.allocations}
+              remoteHosts={state.remoteHosts}
               hygieneBySession={hygieneBySession}
               snoozedDetectors={snoozedDetectors}
             />

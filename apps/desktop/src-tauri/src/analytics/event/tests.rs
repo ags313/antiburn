@@ -1233,6 +1233,14 @@ fn user_oriented_classification_excludes_automatic_events() {
     }));
     assert!(!EventName::ResourceUsageObserved.is_user_oriented(&Facts::default()));
     assert!(!EventName::AppLaunched.is_user_oriented(&Facts::default()));
+    assert!(EventName::RemoteSyncCompleted.is_user_oriented(&Facts {
+        detail: Some("manual"),
+        ..Facts::default()
+    }));
+    assert!(!EventName::RemoteSyncCompleted.is_user_oriented(&Facts {
+        detail: Some("automatic"),
+        ..Facts::default()
+    }));
     assert!(EventName::MemoryAction.is_user_oriented(&Facts::default()));
 }
 
@@ -1333,6 +1341,9 @@ fn no_variant_escapes_the_catalog() {
             | EventName::MemoryAction
             | EventName::SessionFilterSelected
             | EventName::SessionFiltersChanged
+            | EventName::RemoteHostConnectionChecked
+            | EventName::RemoteHostChanged
+            | EventName::RemoteSyncCompleted
             | EventName::QuotaIncidentsObserved
             | EventName::ProviderIncidentsObserved
             | EventName::ProviderIncidentsIngested
@@ -1357,7 +1368,7 @@ fn no_variant_escapes_the_catalog() {
     }
     assert_eq!(
         EVERY_EVENT.len(),
-        57,
+        60,
         "a variant was added to the match above but not to EVERY_EVENT"
     );
     assert!(EVERY_EVENT.iter().copied().all(listed));

@@ -34,6 +34,7 @@ import {
 } from "../lib/popoverPeekIpc"
 import { snoozedDetectorIds, useSnoozedBurnChecks } from "../lib/snoozedBurnChecks"
 import { sessionHygieneIdentities, useSessionHygiene } from "../lib/useSessionHygiene"
+import { remoteHosts } from "../lib/remoteHosts"
 import { PopoverSession } from "./popover/PopoverSession"
 import { foldActivityHeader } from "./popover/usageChartFold"
 
@@ -119,6 +120,11 @@ function ActivitySkeleton() {
 }
 
 export function PopoverView() {
+  const remoteState = useSyncExternalStore(
+    remoteHosts.subscribe,
+    remoteHosts.getSnapshot,
+    remoteHosts.getSnapshot,
+  )
   const [session] = useState(() => new PopoverSession())
   const [peekTriggers] = useState(createPopoverPeekTriggers)
   const state = useSyncExternalStore(
@@ -272,6 +278,7 @@ export function PopoverView() {
           ) : (
             <SessionList
               entries={currentEntries}
+              remoteHosts={remoteState.hosts}
               snoozedDetectors={snoozedDetectors}
               days={CURRENT_SESSION_GROUP_DAYS}
               emptyTitle="No current sessions"

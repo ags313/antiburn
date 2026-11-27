@@ -60,6 +60,16 @@ export const SETTINGS_SEARCH_TARGETS = {
       "extensions",
     ],
   },
+  sourceRemoteHosts: {
+    pane: "sessions",
+    label: "Remote hosts",
+    aliases: ["ssh", "remote sessions", "other computers"],
+  },
+  sourceAutomaticSync: {
+    pane: "sessions",
+    label: "Sync frequency",
+    aliases: ["automatic sync", "remote schedule", "sync interval"],
+  },
   sourceFolders: {
     pane: "sessions",
     label: "Scan folders",
