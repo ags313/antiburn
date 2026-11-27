@@ -68,7 +68,9 @@ export function prepareAppVersion(root, version) {
     ["apps/desktop/package.json", "json"],
     ["apps/desktop/src-tauri/tauri.conf.json", "json"],
     ["apps/desktop/src-tauri/Cargo.toml", "toml"],
-    ["apps/desktop/src-tauri/Cargo.lock", ["antiburn"]],
+    ["apps/desktop/src-tauri/Cargo.lock", ["antiburn", "antiburn-remote"]],
+    ["crates/antiburn-remote/Cargo.toml", "toml"],
+    ["crates/antiburn-remote/Cargo.lock", ["antiburn-remote"]],
   ];
   const changes = files.map(([file, type]) => {
     const contents = readFileSync(join(root, file), "utf8");

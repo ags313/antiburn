@@ -18,6 +18,7 @@ updates:
     directories:
       - "/crates/antiburn-local"
       - "/crates/antiburn-checks"
+      - "/crates/antiburn-remote"
       - "/apps/desktop/src-tauri"
       - "/apps/desktop/src-tauri/crates/nudge"
       - "/apps/desktop/src-tauri/crates/main-window"

@@ -24,7 +24,11 @@ function fixture() {
     "apps/desktop/src-tauri/Cargo.toml":
       '[package]\nname = "antiburn"\nversion = "0.9.0"\n\n[dependencies]\nsynthetic = "0.9.0"\n',
     "apps/desktop/src-tauri/Cargo.lock":
-      'version = 4\n\n[[package]]\nname = "antiburn"\nversion = "0.9.0"\n\n[[package]]\nname = "synthetic"\nversion = "0.9.0"\nchecksum = "synthetic"\n',
+      'version = 4\n\n[[package]]\nname = "antiburn"\nversion = "0.9.0"\n\n[[package]]\nname = "antiburn-remote"\nversion = "0.9.0"\n\n[[package]]\nname = "synthetic"\nversion = "0.9.0"\nchecksum = "synthetic"\n',
+    "crates/antiburn-remote/Cargo.toml":
+      '[package]\nname = "antiburn-remote"\nversion = "0.9.0"\n\n[dependencies]\nsynthetic = "0.9.0"\n',
+    "crates/antiburn-remote/Cargo.lock":
+      'version = 4\n\n[[package]]\nname = "antiburn-remote"\nversion = "0.9.0"\n\n[[package]]\nname = "synthetic"\nversion = "0.9.0"\n',
   };
   for (const [file, content] of Object.entries(files)) {
     mkdirSync(dirname(join(root, file)), { recursive: true });
@@ -37,7 +41,7 @@ function fixture() {
   };
 }
 
-test("changes application versions while preserving dependency versions", () => {
+test("changes application and helper versions while preserving dependency versions", () => {
   const data = fixture();
   try {
     prepareAppVersion(data.root, "0.10.0-rc.1");
@@ -53,7 +57,7 @@ test("changes application versions while preserving dependency versions", () => 
       /synthetic = "0.9.0"/,
     );
     const lock = data.read("apps/desktop/src-tauri/Cargo.lock");
-    assert.equal((lock.match(/version = "0.10.0-rc.1"/g) ?? []).length, 1);
+    assert.equal((lock.match(/version = "0.10.0-rc.1"/g) ?? []).length, 2);
     assert.match(
       lock,
       /name = "synthetic"\nversion = "0.9.0"\nchecksum = "synthetic"/,
@@ -65,11 +69,11 @@ test("changes application versions while preserving dependency versions", () => 
   }
 });
 
-test("a missing application lock entry fails before any file is changed", () => {
+test("a missing helper lock entry fails before any file is changed", () => {
   const data = fixture();
   try {
     writeFileSync(
-      join(data.root, "apps/desktop/src-tauri/Cargo.lock"),
+      join(data.root, "crates/antiburn-remote/Cargo.lock"),
       "version = 4\n",
     );
     assert.throws(
